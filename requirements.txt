@@ -4,3 +4,4 @@ requests
 python-dateutil
 pytz
 pyarrow
+pydantic
