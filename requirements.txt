@@ -3,5 +3,5 @@ numpy
 requests
 python-dateutil
 pytz
-pyarrow
+pyarrow==15.0.2
 pydantic
