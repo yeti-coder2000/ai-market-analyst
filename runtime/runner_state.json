@@ -1,0 +1,10 @@
+{
+  "cycle_id": "2026-03-31T15:39:19.057627+00:00",
+  "status": "failed",
+  "started_at": "2026-03-31T15:39:19.057627+00:00",
+  "finished_at": "2026-03-31T15:39:20.171458+00:00",
+  "instruments": [],
+  "errors": [
+    "TWELVEDATA_API_KEY is not configured in settings/environment."
+  ]
+}

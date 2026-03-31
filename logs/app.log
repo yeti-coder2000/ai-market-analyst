@@ -1,0 +1,205 @@
+2026-03-31 12:46:31 | INFO     | app.bootstrap | component=logger | cycle=- | symbol=- | Logging initialized.
+2026-03-31 12:46:31 | INFO     | app.bootstrap | component=logger | cycle=- | symbol=- | Environment=development | log_level=INFO | logs_dir=/Users/user/PycharmProjects/PythonProject1/logs
+2026-03-31 12:46:31 | INFO     | __main__ | component=main_worker | cycle=- | symbol=- | Starting main worker...
+2026-03-31 12:46:31 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat boot marked.
+2026-03-31 12:46:46 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T09:46:46.272472+00:00 | symbol=- | Cycle started.
+2026-03-31 12:46:46 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle started.
+2026-03-31 12:46:47 | ERROR    | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle failure: Failed to import stateful_batch_runner: cannot import name 'EXPECTED_PRICE_RANGES' from 'app.core.settings' (/Users/user/PycharmProjects/PythonProject1/app/core/settings.py)
+2026-03-31 12:46:47 | ERROR    | __main__ | component=main_worker | cycle=2026-03-31T09:46:46.272472+00:00 | symbol=- | Cycle failed: Failed to import stateful_batch_runner: cannot import name 'EXPECTED_PRICE_RANGES' from 'app.core.settings' (/Users/user/PycharmProjects/PythonProject1/app/core/settings.py)
+Traceback (most recent call last):
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/main_worker.py", line 187, in run_analytics_cycle
+    from app.runners import stateful_batch_runner as runner_module  # type: ignore
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/stateful_batch_runner.py", line 29, in <module>
+    from app.services.loader import MarketDataLoader
+  File "/Users/user/PycharmProjects/PythonProject1/app/services/loader.py", line 9, in <module>
+    from app.core.settings import EXPECTED_PRICE_RANGES, LoaderConfig
+ImportError: cannot import name 'EXPECTED_PRICE_RANGES' from 'app.core.settings' (/Users/user/PycharmProjects/PythonProject1/app/core/settings.py)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/main_worker.py", line 329, in main
+    cycle_result = run_analytics_cycle(cycle_id)
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/main_worker.py", line 189, in run_analytics_cycle
+    raise RuntimeError(f"Failed to import stateful_batch_runner: {exc}") from exc
+RuntimeError: Failed to import stateful_batch_runner: cannot import name 'EXPECTED_PRICE_RANGES' from 'app.core.settings' (/Users/user/PycharmProjects/PythonProject1/app/core/settings.py)
+2026-03-31 12:46:47 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T09:46:46.272472+00:00 | symbol=- | Cycle finished. elapsed=1s sleep_next=899s
+2026-03-31 13:01:49 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T10:01:49.135325+00:00 | symbol=- | Cycle started.
+2026-03-31 13:01:49 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle started.
+2026-03-31 13:01:49 | ERROR    | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle failure: Failed to import stateful_batch_runner: cannot import name 'EXPECTED_PRICE_RANGES' from 'app.core.settings' (/Users/user/PycharmProjects/PythonProject1/app/core/settings.py)
+2026-03-31 13:01:49 | ERROR    | __main__ | component=main_worker | cycle=2026-03-31T10:01:49.135325+00:00 | symbol=- | Cycle failed: Failed to import stateful_batch_runner: cannot import name 'EXPECTED_PRICE_RANGES' from 'app.core.settings' (/Users/user/PycharmProjects/PythonProject1/app/core/settings.py)
+Traceback (most recent call last):
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/main_worker.py", line 187, in run_analytics_cycle
+    from app.runners import stateful_batch_runner as runner_module  # type: ignore
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/stateful_batch_runner.py", line 29, in <module>
+    from app.services.loader import MarketDataLoader
+  File "/Users/user/PycharmProjects/PythonProject1/app/services/loader.py", line 9, in <module>
+    from app.core.settings import EXPECTED_PRICE_RANGES, LoaderConfig
+ImportError: cannot import name 'EXPECTED_PRICE_RANGES' from 'app.core.settings' (/Users/user/PycharmProjects/PythonProject1/app/core/settings.py)
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/main_worker.py", line 329, in main
+    cycle_result = run_analytics_cycle(cycle_id)
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/main_worker.py", line 189, in run_analytics_cycle
+    raise RuntimeError(f"Failed to import stateful_batch_runner: {exc}") from exc
+RuntimeError: Failed to import stateful_batch_runner: cannot import name 'EXPECTED_PRICE_RANGES' from 'app.core.settings' (/Users/user/PycharmProjects/PythonProject1/app/core/settings.py)
+2026-03-31 13:01:49 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T10:01:49.135325+00:00 | symbol=- | Cycle finished. elapsed=0s sleep_next=900s
+2026-03-31 13:16:51 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T10:16:51.860665+00:00 | symbol=- | Cycle started.
+2026-03-31 14:09:28 | INFO     | app.bootstrap | component=logger | cycle=- | symbol=- | Logging initialized.
+2026-03-31 14:09:28 | INFO     | app.bootstrap | component=logger | cycle=- | symbol=- | Environment=development | log_level=INFO | logs_dir=/Users/user/PycharmProjects/PythonProject1/logs
+2026-03-31 14:09:28 | INFO     | __main__ | component=main_worker | cycle=- | symbol=- | Starting main worker...
+2026-03-31 14:09:28 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat boot marked.
+2026-03-31 14:09:43 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T11:09:43.697724+00:00 | symbol=- | Cycle started.
+2026-03-31 14:09:43 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle started.
+2026-03-31 14:09:45 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T11:09:43.697724+00:00 | symbol=- | Using runner_module.run_batch_cycle()
+2026-03-31 14:09:45 | INFO     | app.runners.stateful_batch_runner | component=stateful_batch_runner | cycle=2026-03-31T11:09:45.022815+00:00 | symbol=- | Batch cycle finished. status=partial instruments=1 errors=1
+2026-03-31 14:09:45 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle success.
+2026-03-31 14:09:45 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T11:09:43.697724+00:00 | symbol=- | Cycle completed successfully. instruments=1 alerts=0
+2026-03-31 14:09:45 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T11:09:43.697724+00:00 | symbol=- | Cycle finished. elapsed=1s sleep_next=899s
+2026-03-31 14:24:48 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T11:24:48.905358+00:00 | symbol=- | Cycle started.
+2026-03-31 14:24:48 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle started.
+2026-03-31 14:24:48 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T11:24:48.905358+00:00 | symbol=- | Using runner_module.run_batch_cycle()
+2026-03-31 14:24:49 | INFO     | app.runners.stateful_batch_runner | component=stateful_batch_runner | cycle=2026-03-31T11:24:48.909465+00:00 | symbol=- | Batch cycle finished. status=partial instruments=1 errors=1
+2026-03-31 14:24:49 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle success.
+2026-03-31 14:24:49 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T11:24:48.905358+00:00 | symbol=- | Cycle completed successfully. instruments=1 alerts=0
+2026-03-31 14:24:49 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T11:24:48.905358+00:00 | symbol=- | Cycle finished. elapsed=0s sleep_next=900s
+2026-03-31 14:39:54 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T11:39:54.772625+00:00 | symbol=- | Cycle started.
+2026-03-31 14:39:54 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle started.
+2026-03-31 14:39:54 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T11:39:54.772625+00:00 | symbol=- | Using runner_module.run_batch_cycle()
+2026-03-31 14:39:55 | INFO     | app.runners.stateful_batch_runner | component=stateful_batch_runner | cycle=2026-03-31T11:39:54.776405+00:00 | symbol=- | Batch cycle finished. status=partial instruments=1 errors=1
+2026-03-31 14:39:55 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle success.
+2026-03-31 14:39:55 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T11:39:54.772625+00:00 | symbol=- | Cycle completed successfully. instruments=1 alerts=0
+2026-03-31 14:39:55 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T11:39:54.772625+00:00 | symbol=- | Cycle finished. elapsed=0s sleep_next=900s
+2026-03-31 14:55:00 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T11:55:00.563827+00:00 | symbol=- | Cycle started.
+2026-03-31 14:55:00 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle started.
+2026-03-31 14:55:00 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T11:55:00.563827+00:00 | symbol=- | Using runner_module.run_batch_cycle()
+2026-03-31 14:55:00 | INFO     | app.runners.stateful_batch_runner | component=stateful_batch_runner | cycle=2026-03-31T11:55:00.567844+00:00 | symbol=- | Batch cycle finished. status=partial instruments=1 errors=1
+2026-03-31 14:55:00 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle success.
+2026-03-31 14:55:00 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T11:55:00.563827+00:00 | symbol=- | Cycle completed successfully. instruments=1 alerts=0
+2026-03-31 14:55:00 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T11:55:00.563827+00:00 | symbol=- | Cycle finished. elapsed=0s sleep_next=900s
+2026-03-31 15:10:06 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T12:10:06.506514+00:00 | symbol=- | Cycle started.
+2026-03-31 15:10:06 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle started.
+2026-03-31 15:10:06 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T12:10:06.506514+00:00 | symbol=- | Using runner_module.run_batch_cycle()
+2026-03-31 15:10:07 | INFO     | app.runners.stateful_batch_runner | component=stateful_batch_runner | cycle=2026-03-31T12:10:06.511744+00:00 | symbol=- | Batch cycle finished. status=partial instruments=1 errors=1
+2026-03-31 15:10:07 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle success.
+2026-03-31 15:10:07 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T12:10:06.506514+00:00 | symbol=- | Cycle completed successfully. instruments=1 alerts=0
+2026-03-31 15:10:07 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T12:10:06.506514+00:00 | symbol=- | Cycle finished. elapsed=0s sleep_next=900s
+2026-03-31 15:25:12 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T12:25:12.651290+00:00 | symbol=- | Cycle started.
+2026-03-31 15:25:12 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle started.
+2026-03-31 15:25:12 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T12:25:12.651290+00:00 | symbol=- | Using runner_module.run_batch_cycle()
+2026-03-31 15:25:13 | INFO     | app.runners.stateful_batch_runner | component=stateful_batch_runner | cycle=2026-03-31T12:25:12.655340+00:00 | symbol=- | Batch cycle finished. status=partial instruments=1 errors=1
+2026-03-31 15:25:13 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle success.
+2026-03-31 15:25:13 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T12:25:12.651290+00:00 | symbol=- | Cycle completed successfully. instruments=1 alerts=0
+2026-03-31 15:25:13 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T12:25:12.651290+00:00 | symbol=- | Cycle finished. elapsed=0s sleep_next=900s
+2026-03-31 15:40:18 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T12:40:18.487590+00:00 | symbol=- | Cycle started.
+2026-03-31 15:40:18 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle started.
+2026-03-31 15:40:18 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T12:40:18.487590+00:00 | symbol=- | Using runner_module.run_batch_cycle()
+2026-03-31 15:40:18 | INFO     | app.runners.stateful_batch_runner | component=stateful_batch_runner | cycle=2026-03-31T12:40:18.494771+00:00 | symbol=- | Batch cycle finished. status=partial instruments=1 errors=1
+2026-03-31 15:40:18 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle success.
+2026-03-31 15:40:18 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T12:40:18.487590+00:00 | symbol=- | Cycle completed successfully. instruments=1 alerts=0
+2026-03-31 15:40:18 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T12:40:18.487590+00:00 | symbol=- | Cycle finished. elapsed=0s sleep_next=900s
+2026-03-31 15:55:24 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T12:55:24.346320+00:00 | symbol=- | Cycle started.
+2026-03-31 15:55:24 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle started.
+2026-03-31 15:55:24 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T12:55:24.346320+00:00 | symbol=- | Using runner_module.run_batch_cycle()
+2026-03-31 15:55:24 | INFO     | app.runners.stateful_batch_runner | component=stateful_batch_runner | cycle=2026-03-31T12:55:24.348873+00:00 | symbol=- | Batch cycle finished. status=partial instruments=1 errors=1
+2026-03-31 15:55:24 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle success.
+2026-03-31 15:55:24 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T12:55:24.346320+00:00 | symbol=- | Cycle completed successfully. instruments=1 alerts=0
+2026-03-31 15:55:24 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T12:55:24.346320+00:00 | symbol=- | Cycle finished. elapsed=0s sleep_next=900s
+2026-03-31 17:02:04 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T14:02:04.953699+00:00 | symbol=- | Cycle started.
+2026-03-31 17:02:05 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle started.
+2026-03-31 17:02:05 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T14:02:04.953699+00:00 | symbol=- | Using runner_module.run_batch_cycle()
+2026-03-31 17:02:05 | INFO     | app.runners.stateful_batch_runner | component=stateful_batch_runner | cycle=2026-03-31T14:02:05.038880+00:00 | symbol=- | Batch cycle finished. status=partial instruments=1 errors=1
+2026-03-31 17:02:05 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle success.
+2026-03-31 17:02:05 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T14:02:04.953699+00:00 | symbol=- | Cycle completed successfully. instruments=1 alerts=0
+2026-03-31 17:02:05 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T14:02:04.953699+00:00 | symbol=- | Cycle finished. elapsed=0s sleep_next=900s
+2026-03-31 17:17:08 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T14:17:08.573831+00:00 | symbol=- | Cycle started.
+2026-03-31 17:17:08 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle started.
+2026-03-31 17:17:08 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T14:17:08.573831+00:00 | symbol=- | Using runner_module.run_batch_cycle()
+2026-03-31 17:17:09 | INFO     | app.runners.stateful_batch_runner | component=stateful_batch_runner | cycle=2026-03-31T14:17:08.580277+00:00 | symbol=- | Batch cycle finished. status=partial instruments=1 errors=1
+2026-03-31 17:17:09 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle success.
+2026-03-31 17:17:09 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T14:17:08.573831+00:00 | symbol=- | Cycle completed successfully. instruments=1 alerts=0
+2026-03-31 17:17:09 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T14:17:08.573831+00:00 | symbol=- | Cycle finished. elapsed=0s sleep_next=900s
+2026-03-31 17:32:11 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T14:32:11.594755+00:00 | symbol=- | Cycle started.
+2026-03-31 17:32:11 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle started.
+2026-03-31 17:32:11 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T14:32:11.594755+00:00 | symbol=- | Using runner_module.run_batch_cycle()
+2026-03-31 17:32:12 | INFO     | app.runners.stateful_batch_runner | component=stateful_batch_runner | cycle=2026-03-31T14:32:11.601657+00:00 | symbol=- | Batch cycle finished. status=partial instruments=1 errors=1
+2026-03-31 17:32:12 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle success.
+2026-03-31 17:32:12 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T14:32:11.594755+00:00 | symbol=- | Cycle completed successfully. instruments=1 alerts=0
+2026-03-31 17:32:12 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T14:32:11.594755+00:00 | symbol=- | Cycle finished. elapsed=0s sleep_next=900s
+2026-03-31 17:47:14 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T14:47:14.911499+00:00 | symbol=- | Cycle started.
+2026-03-31 17:47:14 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle started.
+2026-03-31 17:47:14 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T14:47:14.911499+00:00 | symbol=- | Using runner_module.run_batch_cycle()
+2026-03-31 17:47:15 | INFO     | app.runners.stateful_batch_runner | component=stateful_batch_runner | cycle=2026-03-31T14:47:14.916811+00:00 | symbol=- | Batch cycle finished. status=partial instruments=1 errors=1
+2026-03-31 17:47:15 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle success.
+2026-03-31 17:47:15 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T14:47:14.911499+00:00 | symbol=- | Cycle completed successfully. instruments=1 alerts=0
+2026-03-31 17:47:15 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T14:47:14.911499+00:00 | symbol=- | Cycle finished. elapsed=0s sleep_next=900s
+2026-03-31 18:04:38 | INFO     | app.bootstrap | component=logger | cycle=- | symbol=- | Logging initialized.
+2026-03-31 18:04:38 | INFO     | app.bootstrap | component=logger | cycle=- | symbol=- | Environment=development | log_level=INFO | logs_dir=/Users/user/PycharmProjects/PythonProject1/logs
+2026-03-31 18:04:38 | INFO     | __main__ | component=main_worker | cycle=- | symbol=- | Starting main worker...
+2026-03-31 18:04:38 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat boot marked.
+2026-03-31 18:04:38 | INFO     | __main__ | component=main_worker | cycle=- | symbol=- | Startup grace sleep: 15s
+2026-03-31 18:04:53 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T15:04:53.685272+00:00 | symbol=- | Cycle started.
+2026-03-31 18:04:53 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle started.
+2026-03-31 18:04:55 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T15:04:53.685272+00:00 | symbol=- | Using runner_module.run_batch_cycle()
+2026-03-31 18:04:55 | ERROR    | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle failure: TWELVEDATA_API_KEY is not configured in settings/environment.
+2026-03-31 18:04:55 | ERROR    | __main__ | component=main_worker | cycle=2026-03-31T15:04:53.685272+00:00 | symbol=- | Cycle failed: TWELVEDATA_API_KEY is not configured in settings/environment.
+Traceback (most recent call last):
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/main_worker.py", line 445, in main
+    cycle_result = run_analytics_cycle(cycle_id)
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/main_worker.py", line 241, in run_analytics_cycle
+    result = runner_module.run_batch_cycle()  # type: ignore[attr-defined]
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/stateful_batch_runner.py", line 1689, in run_batch_cycle
+    raise RuntimeError("TWELVEDATA_API_KEY is not configured in settings/environment.")
+RuntimeError: TWELVEDATA_API_KEY is not configured in settings/environment.
+2026-03-31 18:04:55 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T15:04:53.685272+00:00 | symbol=- | Cycle finished. elapsed=1s sleep_next=899s
+2026-03-31 18:19:56 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T15:19:56.684442+00:00 | symbol=- | Cycle started.
+2026-03-31 18:19:56 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle started.
+2026-03-31 18:19:56 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T15:19:56.684442+00:00 | symbol=- | Using runner_module.run_batch_cycle()
+2026-03-31 18:19:56 | ERROR    | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle failure: TWELVEDATA_API_KEY is not configured in settings/environment.
+2026-03-31 18:19:56 | ERROR    | __main__ | component=main_worker | cycle=2026-03-31T15:19:56.684442+00:00 | symbol=- | Cycle failed: TWELVEDATA_API_KEY is not configured in settings/environment.
+Traceback (most recent call last):
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/main_worker.py", line 445, in main
+    cycle_result = run_analytics_cycle(cycle_id)
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/main_worker.py", line 241, in run_analytics_cycle
+    result = runner_module.run_batch_cycle()  # type: ignore[attr-defined]
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/stateful_batch_runner.py", line 1689, in run_batch_cycle
+    raise RuntimeError("TWELVEDATA_API_KEY is not configured in settings/environment.")
+RuntimeError: TWELVEDATA_API_KEY is not configured in settings/environment.
+2026-03-31 18:19:56 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T15:19:56.684442+00:00 | symbol=- | Cycle finished. elapsed=0s sleep_next=900s
+2026-03-31 18:34:59 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T15:34:59.284519+00:00 | symbol=- | Cycle started.
+2026-03-31 18:34:59 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle started.
+2026-03-31 18:34:59 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T15:34:59.284519+00:00 | symbol=- | Using runner_module.run_batch_cycle()
+2026-03-31 18:34:59 | ERROR    | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle failure: TWELVEDATA_API_KEY is not configured in settings/environment.
+2026-03-31 18:34:59 | ERROR    | __main__ | component=main_worker | cycle=2026-03-31T15:34:59.284519+00:00 | symbol=- | Cycle failed: TWELVEDATA_API_KEY is not configured in settings/environment.
+Traceback (most recent call last):
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/main_worker.py", line 445, in main
+    cycle_result = run_analytics_cycle(cycle_id)
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/main_worker.py", line 241, in run_analytics_cycle
+    result = runner_module.run_batch_cycle()  # type: ignore[attr-defined]
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/stateful_batch_runner.py", line 1689, in run_batch_cycle
+    raise RuntimeError("TWELVEDATA_API_KEY is not configured in settings/environment.")
+RuntimeError: TWELVEDATA_API_KEY is not configured in settings/environment.
+2026-03-31 18:34:59 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T15:34:59.284519+00:00 | symbol=- | Cycle finished. elapsed=0s sleep_next=900s
+2026-03-31 18:39:04 | INFO     | app.bootstrap | component=logger | cycle=- | symbol=- | Logging initialized.
+2026-03-31 18:39:04 | INFO     | app.bootstrap | component=logger | cycle=- | symbol=- | Environment=development | log_level=INFO | logs_dir=/Users/user/PycharmProjects/PythonProject1/logs
+2026-03-31 18:39:04 | INFO     | __main__ | component=main_worker | cycle=- | symbol=- | Starting main worker...
+2026-03-31 18:39:04 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat boot marked.
+2026-03-31 18:39:04 | INFO     | __main__ | component=main_worker | cycle=- | symbol=- | Startup grace sleep: 15s
+2026-03-31 18:39:19 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T15:39:19.057627+00:00 | symbol=- | Cycle started.
+2026-03-31 18:39:19 | INFO     | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle started.
+2026-03-31 18:39:20 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T15:39:19.057627+00:00 | symbol=- | Using runner_module.run_batch_cycle()
+2026-03-31 18:39:20 | ERROR    | app.services.heartbeat | component=heartbeat | cycle=- | symbol=- | Heartbeat cycle failure: TWELVEDATA_API_KEY is not configured in settings/environment.
+2026-03-31 18:39:20 | ERROR    | __main__ | component=main_worker | cycle=2026-03-31T15:39:19.057627+00:00 | symbol=- | Cycle failed: TWELVEDATA_API_KEY is not configured in settings/environment.
+Traceback (most recent call last):
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/main_worker.py", line 445, in main
+    cycle_result = run_analytics_cycle(cycle_id)
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/main_worker.py", line 241, in run_analytics_cycle
+    result = runner_module.run_batch_cycle()  # type: ignore[attr-defined]
+  File "/Users/user/PycharmProjects/PythonProject1/app/runners/stateful_batch_runner.py", line 1689, in run_batch_cycle
+    raise RuntimeError("TWELVEDATA_API_KEY is not configured in settings/environment.")
+RuntimeError: TWELVEDATA_API_KEY is not configured in settings/environment.
+2026-03-31 18:39:20 | INFO     | __main__ | component=main_worker | cycle=2026-03-31T15:39:19.057627+00:00 | symbol=- | Cycle finished. elapsed=1s sleep_next=899s

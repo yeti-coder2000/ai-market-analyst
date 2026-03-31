@@ -1,0 +1,95 @@
+services:
+  - type: worker
+    name: ai-market-analyst
+    runtime: python
+    plan: starter
+
+    buildCommand: |
+      pip install -r requirements.txt
+
+    startCommand: |
+      python -m app.runners.main_worker
+
+    autoDeploy: true
+    maxShutdownDelaySeconds: 30
+
+    envVars:
+      # -------------------------
+      # CORE
+      # -------------------------
+      - key: PYTHON_VERSION
+        value: 3.11.10
+
+      - key: PYTHONUNBUFFERED
+        value: "1"
+
+      - key: LOG_LEVEL
+        value: INFO
+
+      - key: APP_ENV
+        value: production
+
+      # -------------------------
+      # WORKER CONTROL
+      # -------------------------
+      - key: RUN_INTERVAL_SEC
+        value: "900"
+
+      - key: STARTUP_GRACE_SEC
+        value: "10"
+
+      - key: ENABLE_WEEKEND_SKIP
+        value: "true"
+
+      - key: FAIL_FAST
+        value: "false"
+
+      # 🔥 ВАЖЛИВО (додано)
+      - key: PAPER_MODE
+        value: "true"
+
+      # -------------------------
+      # TELEGRAM
+      # -------------------------
+      - key: ENABLE_TELEGRAM
+        value: "true"
+
+      - key: WATCH_ALERTS_ENABLED
+        value: "true"
+
+      - key: TELEGRAM_ENABLED
+        value: "true"
+
+      - key: TELEGRAM_PARSE_MODE
+        value: HTML
+
+      - key: TELEGRAM_TIMEOUT_SECONDS
+        value: "10"
+
+      - key: TELEGRAM_RETRIES
+        value: "3"
+
+      - key: TELEGRAM_RETRY_DELAY_SECONDS
+        value: "2"
+
+      - key: TELEGRAM_MAX_MESSAGE_LENGTH
+        value: "3900"
+
+      # 🔥 (опціонально, але корисно)
+      - key: TELEGRAM_PAPER_PREFIX
+        value: "🧪 PAPER"
+
+      - key: TELEGRAM_LIVE_PREFIX
+        value: "🚨 LIVE"
+
+      # -------------------------
+      # SECRETS
+      # -------------------------
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+
+      - key: TWELVEDATA_API_KEY
+        sync: false
