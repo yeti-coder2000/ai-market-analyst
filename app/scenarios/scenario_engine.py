@@ -8,6 +8,7 @@ from app.context.schema import (
     SetupStatus,
     SetupType,
 )
+from app.scenarios.execution import build_execution_plan
 from app.scenarios.schema import (
     ScenarioDecision,
     ScenarioEvidence,
@@ -88,15 +89,23 @@ class ScenarioEngine:
 
         # Fully confirmed trend continuation
         if setup_a_status == SetupStatus.READY.value:
+            execution = build_execution_plan(
+                context=context,
+                scenario_type=scenario_type,
+                direction=direction,
+                evidence=evidence,
+            )
+            decision, status = self._resolve_confirmed_tradeability(execution)
+
             return ScenarioResult(
                 instrument=getattr(context, "instrument"),
                 price=self._context_price(context),
                 scenario_type=scenario_type,
                 phase=ScenarioPhase.CONFIRMED,
-                decision=ScenarioDecision.TRADEABLE,
+                decision=decision,
                 market_state=getattr(context, "market_state"),
                 direction=direction,
-                status=SetupStatus.READY,
+                status=status,
                 setup_type=SetupType.IMPULSE_PULLBACK_CONTINUATION,
                 dominant_setup="setup_a",
                 setup_name=SetupType.IMPULSE_PULLBACK_CONTINUATION.value,
@@ -109,20 +118,37 @@ class ScenarioEngine:
                     setup_conf=evidence.setup_a_confidence,
                     bonus=0.10 if evidence.pullback_held_structure else 0.0,
                 ),
-                next_expected_event="continuation_trigger",
-                missing_conditions=[],
+                next_expected_event=(
+                    "continuation_trigger"
+                    if execution.status == "EXECUTABLE"
+                    else "execution_completion"
+                ),
+                missing_conditions=(
+                    []
+                    if execution.status == "EXECUTABLE"
+                    else ["execution_plan_incomplete"]
+                ),
                 alignment_score=self._infer_alignment_score(context, [setup_a]),
                 tags=["trend", "continuation", direction.value.lower(), "confirmed"],
                 evidence=evidence,
+                execution=self._to_execution_payload(execution),
                 metadata={
                     "engine_version": "scenario_engine_v1",
                     "resolver": "trend_continuation",
+                    "execution_status": getattr(execution, "status", None),
                 },
             )
 
         # Impulse exists, but pullback is not ready yet
         if evidence.impulse_detected and not evidence.pullback_detected:
             missing = ["pullback"]
+
+            execution = build_execution_plan(
+                context=context,
+                scenario_type=scenario_type,
+                direction=direction,
+                evidence=evidence,
+            )
 
             return ScenarioResult(
                 instrument=getattr(context, "instrument"),
@@ -150,14 +176,23 @@ class ScenarioEngine:
                 alignment_score=self._infer_alignment_score(context, [setup_a]),
                 tags=["trend", "impulse", "watch", direction.value.lower()],
                 evidence=evidence,
+                execution=self._to_execution_payload(execution),
                 metadata={
                     "engine_version": "scenario_engine_v1",
                     "resolver": "trend_continuation",
+                    "execution_status": getattr(execution, "status", None),
                 },
             )
 
         # Trend context exists, but structure is not built yet
         missing = self._collect_missing_conditions([setup_a])
+
+        execution = build_execution_plan(
+            context=context,
+            scenario_type=scenario_type,
+            direction=direction,
+            evidence=evidence,
+        )
 
         return ScenarioResult(
             instrument=getattr(context, "instrument"),
@@ -186,9 +221,11 @@ class ScenarioEngine:
             alignment_score=self._infer_alignment_score(context, [setup_a]),
             tags=["trend", "precondition", direction.value.lower()],
             evidence=evidence,
+            execution=self._to_execution_payload(execution),
             metadata={
                 "engine_version": "scenario_engine_v1",
                 "resolver": "trend_continuation",
+                "execution_status": getattr(execution, "status", None),
             },
         )
 
@@ -222,15 +259,23 @@ class ScenarioEngine:
         setup_b_status = evidence.setup_b_status
 
         if setup_b_status == SetupStatus.READY.value and evidence.return_to_value:
+            execution = build_execution_plan(
+                context=context,
+                scenario_type=scenario_type,
+                direction=direction,
+                evidence=evidence,
+            )
+            decision, status = self._resolve_confirmed_tradeability(execution)
+
             return ScenarioResult(
                 instrument=getattr(context, "instrument"),
                 price=self._context_price(context),
                 scenario_type=scenario_type,
                 phase=ScenarioPhase.CONFIRMED,
-                decision=ScenarioDecision.TRADEABLE,
+                decision=decision,
                 market_state=getattr(context, "market_state"),
                 direction=direction,
-                status=SetupStatus.READY,
+                status=status,
                 setup_type=SetupType.SWEEP_RETURN_TO_VALUE,
                 dominant_setup="setup_b",
                 setup_name=SetupType.SWEEP_RETURN_TO_VALUE.value,
@@ -243,19 +288,36 @@ class ScenarioEngine:
                     setup_conf=evidence.setup_b_confidence,
                     bonus=0.08 if evidence.return_to_value else 0.0,
                 ),
-                next_expected_event="entry_trigger",
-                missing_conditions=[],
+                next_expected_event=(
+                    "entry_trigger"
+                    if execution.status == "EXECUTABLE"
+                    else "execution_completion"
+                ),
+                missing_conditions=(
+                    []
+                    if execution.status == "EXECUTABLE"
+                    else ["execution_plan_incomplete"]
+                ),
                 alignment_score=self._infer_alignment_score(context, [setup_b]),
                 tags=["sweep", "return_to_value", direction.value.lower(), "confirmed"],
                 evidence=evidence,
+                execution=self._to_execution_payload(execution),
                 metadata={
                     "engine_version": "scenario_engine_v1",
                     "resolver": "sweep_return",
+                    "execution_status": getattr(execution, "status", None),
                 },
             )
 
         if evidence.sweep_detected and not evidence.return_to_value:
             missing = ["return_to_value"]
+
+            execution = build_execution_plan(
+                context=context,
+                scenario_type=scenario_type,
+                direction=direction,
+                evidence=evidence,
+            )
 
             return ScenarioResult(
                 instrument=getattr(context, "instrument"),
@@ -282,15 +344,24 @@ class ScenarioEngine:
                 alignment_score=self._infer_alignment_score(context, [setup_b]),
                 tags=["sweep", "watch", direction.value.lower()],
                 evidence=evidence,
+                execution=self._to_execution_payload(execution),
                 metadata={
                     "engine_version": "scenario_engine_v1",
                     "resolver": "sweep_return",
+                    "execution_status": getattr(execution, "status", None),
                 },
             )
 
         missing = self._collect_missing_conditions([setup_b])
         if "return_to_value" not in missing:
             missing.append("return_to_value")
+
+        execution = build_execution_plan(
+            context=context,
+            scenario_type=scenario_type,
+            direction=direction,
+            evidence=evidence,
+        )
 
         return ScenarioResult(
             instrument=getattr(context, "instrument"),
@@ -317,9 +388,11 @@ class ScenarioEngine:
             alignment_score=self._infer_alignment_score(context, [setup_b]),
             tags=["sweep", "precondition", direction.value.lower()],
             evidence=evidence,
+            execution=self._to_execution_payload(execution),
             metadata={
                 "engine_version": "scenario_engine_v1",
                 "resolver": "sweep_return",
+                "execution_status": getattr(execution, "status", None),
             },
         )
 
@@ -329,15 +402,24 @@ class ScenarioEngine:
         evidence: ScenarioEvidence,
     ) -> ScenarioResult:
         missing = self._collect_missing_conditions([])
+        scenario_type = ScenarioType.NO_ACTION
+        direction = Direction.NEUTRAL
+
+        execution = build_execution_plan(
+            context=context,
+            scenario_type=scenario_type,
+            direction=direction,
+            evidence=evidence,
+        )
 
         return ScenarioResult(
             instrument=getattr(context, "instrument"),
             price=self._context_price(context),
-            scenario_type=ScenarioType.NO_ACTION,
+            scenario_type=scenario_type,
             phase=ScenarioPhase.PRECONDITION,
             decision=ScenarioDecision.NO_TRADE,
             market_state=getattr(context, "market_state"),
-            direction=Direction.NEUTRAL,
+            direction=direction,
             status=SetupStatus.NO_SETUP,
             setup_type=SetupType.NONE,
             dominant_setup=None,
@@ -349,9 +431,11 @@ class ScenarioEngine:
             alignment_score=self._infer_alignment_score(context, []),
             tags=["no_action"],
             evidence=evidence,
+            execution=self._to_execution_payload(execution),
             metadata={
                 "engine_version": "scenario_engine_v1",
                 "resolver": "fallback",
+                "execution_status": getattr(execution, "status", None),
             },
         )
 
@@ -505,6 +589,31 @@ class ScenarioEngine:
     # ---------------------------------------------------------------------
     # Low-level helpers
     # ---------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_confirmed_tradeability(execution: Any) -> tuple[ScenarioDecision, SetupStatus]:
+        if getattr(execution, "status", None) == "EXECUTABLE":
+            return ScenarioDecision.TRADEABLE, SetupStatus.READY
+        return ScenarioDecision.WATCH, SetupStatus.WATCH
+
+    @staticmethod
+    def _to_execution_payload(execution: Any) -> dict[str, Any]:
+        if execution is None:
+            return {
+                "status": "NOT_EXECUTABLE",
+                "model": "NONE",
+            }
+
+        if hasattr(execution, "__dict__"):
+            return dict(execution.__dict__)
+
+        if isinstance(execution, dict):
+            return execution
+
+        return {
+            "status": "INCOMPLETE",
+            "model": "NONE",
+        }
 
     @staticmethod
     def _condition_names(items: list[Any]) -> list[str]:

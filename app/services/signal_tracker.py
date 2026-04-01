@@ -1,424 +1,490 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
 
-DEFAULT_OPEN_SIGNALS_PATH = Path("runtime/open_signals.json")
+OPEN_SIGNAL_STATES = {
+    "SCENARIO_FORMING",
+    "WATCH",
+    "READY",
+    "ACTIVE",
+}
 
+RESOLVED_SIGNAL_STATES = {
+    "RESOLVED",
+}
 
-@dataclass
-class TrackedSignal:
-    signal_id: str
-    symbol: str
-    timeframe: str
-    signal_class: str
-    scenario: str
-    direction: str
-    cycle_id: str
-    created_at_utc: str
-    updated_at_utc: str
-
-    market_state: str
-    htf_bias: str
-    probability: float
-
-    entry_reference_price: float
-    invalidation_reference_price: Optional[float]
-    target_reference_price: Optional[float]
-
-    status: str = "OPEN"
-    stage: str = "SCENARIO_FORMING"
-
-    bars_alive: int = 0
-    minutes_alive: int = 0
-
-    max_price_seen: Optional[float] = None
-    min_price_seen: Optional[float] = None
-    mfe_pct: float = 0.0
-    mae_pct: float = 0.0
-
-    validation_threshold_pct: Optional[float] = None
-    expiry_bars: int = 8
-
-    meta: Dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, payload: Dict[str, Any]) -> "TrackedSignal":
-        return cls(**payload)
+RESOLUTION_TYPES = {
+    "VALIDATED",
+    "INVALIDATED",
+    "EXPIRED",
+}
 
 
 @dataclass
-class SignalResolution:
-    signal_id: str
-    symbol: str
-    final_status: str
-    resolution_reason: str
-    resolved_at_utc: str
-    bars_alive: int
-    minutes_alive: int
-    mfe_pct: float
-    mae_pct: float
-    time_to_validation_min: Optional[int] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+class SignalTrackerResult:
+    action: str  # NOOP | REGISTERED | UPDATED | RESOLVED
+    signal_id: str | None
+    payload: dict[str, Any]
+    previous_payload: dict[str, Any] | None = None
+    changed_fields: list[str] | None = None
 
 
-def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+class SignalTracker:
+    """
+    Production signal lifecycle tracker.
 
+    Responsibilities:
+    - maintain runtime/open_signals.json
+    - register new open signals
+    - update existing signals
+    - resolve signals
+    - expose event-ready payloads for radar_journal layer
 
-def _ensure_parent_dir(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    Expected input:
+    - scenario_result (ScenarioResult or dict-like)
+    """
 
+    def __init__(self, open_signals_path: str | Path = "runtime/open_signals.json") -> None:
+        self.open_signals_path = Path(open_signals_path)
+        self.open_signals_path.parent.mkdir(parents=True, exist_ok=True)
 
-def load_open_signals(
-    path: Path | str = DEFAULT_OPEN_SIGNALS_PATH,
-) -> dict[str, TrackedSignal]:
-    path = Path(path)
-    if not path.exists():
-        return {}
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    with path.open("r", encoding="utf-8") as f:
-        raw = json.load(f)
+    def process(self, scenario_result: Any, cycle_id: str | None = None) -> SignalTrackerResult:
+        """
+        Main entrypoint.
 
-    return {signal_id: TrackedSignal.from_dict(item) for signal_id, item in raw.items()}
+        Behavior:
+        - NO_SETUP / NO_ACTION / NO_TRADE => no open signal action
+        - WATCH / READY / ACTIVE => register or update open signal
+        - RESOLVED => resolve existing signal
+        """
+        payload = self._normalize_signal_payload(scenario_result=scenario_result, cycle_id=cycle_id)
 
+        signal_class = payload.get("signal_class")
+        if signal_class in RESOLVED_SIGNAL_STATES:
+            return self._resolve_signal(payload)
 
-def save_open_signals(
-    signals: dict[str, TrackedSignal],
-    path: Path | str = DEFAULT_OPEN_SIGNALS_PATH,
-) -> None:
-    path = Path(path)
-    _ensure_parent_dir(path)
+        if signal_class not in OPEN_SIGNAL_STATES:
+            return SignalTrackerResult(
+                action="NOOP",
+                signal_id=None,
+                payload=payload,
+                previous_payload=None,
+                changed_fields=[],
+            )
 
-    payload = {signal_id: signal.to_dict() for signal_id, signal in signals.items()}
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
+        return self._register_or_update_signal(payload)
 
+    def resolve(
+        self,
+        scenario_result: Any,
+        resolution: str,
+        cycle_id: str | None = None,
+        resolution_note: str | None = None,
+    ) -> SignalTrackerResult:
+        """
+        Explicit resolution API.
 
-def build_signal_id(symbol: str, cycle_id: str, scenario: str, direction: str) -> str:
-    safe_cycle = (cycle_id or "unknown_cycle").replace(":", "-")
-    safe_scenario = (scenario or "UNKNOWN").replace(" ", "_")
-    safe_direction = (direction or "NEUTRAL").replace(" ", "_")
-    return f"{symbol}_{safe_cycle}_{safe_scenario}_{safe_direction}"
+        Use this when downstream logic decides that an open signal is:
+        - VALIDATED
+        - INVALIDATED
+        - EXPIRED
+        """
+        if resolution not in RESOLUTION_TYPES:
+            raise ValueError(f"Unsupported resolution: {resolution}")
 
+        payload = self._normalize_signal_payload(scenario_result=scenario_result, cycle_id=cycle_id)
+        payload["signal_class"] = "RESOLVED"
+        payload["resolution"] = resolution
+        payload["resolution_note"] = resolution_note
 
-def classify_signal_stage(final_signal: dict, scenario: dict) -> str:
-    scenario_decision = (scenario or {}).get("decision", "")
-    final_status = (final_signal or {}).get("status", "")
-    confidence = float(
-        (final_signal or {}).get("confidence", 0.0)
-        or (scenario or {}).get("alignment_score", 0.0)
-        or 0.0
-    )
+        return self._resolve_signal(payload)
 
-    if scenario_decision in {"NO_TRADE", "SKIPPED"} and final_status in {"NO_SETUP", "SKIPPED"}:
-        return "NO_ACTION"
+    def load_open_signals(self) -> dict[str, dict[str, Any]]:
+        return self._load_store()
 
-    if final_status == "READY":
-        return "READY"
+    # ------------------------------------------------------------------
+    # Core lifecycle
+    # ------------------------------------------------------------------
 
-    if final_status in {"ACTIVE", "CONFIRMED"}:
-        return "ACTIVE"
+    def _register_or_update_signal(self, payload: dict[str, Any]) -> SignalTrackerResult:
+        store = self._load_store()
 
-    if scenario_decision == "WATCH" and confidence >= 0.35:
+        existing_id = self._find_matching_open_signal_id(store=store, payload=payload)
+
+        if existing_id is None:
+            signal_id = payload["signal_id"]
+            now = self._utc_now()
+
+            payload["created_at_utc"] = now
+            payload["updated_at_utc"] = now
+            payload["update_count"] = 0
+
+            store[signal_id] = payload
+            self._save_store(store)
+
+            return SignalTrackerResult(
+                action="REGISTERED",
+                signal_id=signal_id,
+                payload=payload,
+                previous_payload=None,
+                changed_fields=self._sorted_top_level_fields(payload),
+            )
+
+        previous = deepcopy(store[existing_id])
+        updated = self._merge_signal_payload(existing=store[existing_id], incoming=payload)
+
+        changed_fields = self._diff_signal_fields(previous=previous, current=updated)
+        if not changed_fields:
+            return SignalTrackerResult(
+                action="NOOP",
+                signal_id=existing_id,
+                payload=updated,
+                previous_payload=previous,
+                changed_fields=[],
+            )
+
+        updated["updated_at_utc"] = self._utc_now()
+        updated["update_count"] = int(previous.get("update_count", 0)) + 1
+
+        store[existing_id] = updated
+        self._save_store(store)
+
+        return SignalTrackerResult(
+            action="UPDATED",
+            signal_id=existing_id,
+            payload=updated,
+            previous_payload=previous,
+            changed_fields=changed_fields,
+        )
+
+    def _resolve_signal(self, payload: dict[str, Any]) -> SignalTrackerResult:
+        store = self._load_store()
+
+        existing_id = self._find_matching_open_signal_id(store=store, payload=payload)
+        if existing_id is None:
+            return SignalTrackerResult(
+                action="NOOP",
+                signal_id=None,
+                payload=payload,
+                previous_payload=None,
+                changed_fields=[],
+            )
+
+        previous = deepcopy(store[existing_id])
+        resolved = deepcopy(store[existing_id])
+
+        resolved["signal_class"] = "RESOLVED"
+        resolved["status"] = "RESOLVED"
+        resolved["resolution"] = payload.get("resolution")
+        resolved["resolution_note"] = payload.get("resolution_note")
+        resolved["resolved_at_utc"] = self._utc_now()
+        resolved["updated_at_utc"] = resolved["resolved_at_utc"]
+
+        changed_fields = self._diff_signal_fields(previous=previous, current=resolved)
+
+        del store[existing_id]
+        self._save_store(store)
+
+        return SignalTrackerResult(
+            action="RESOLVED",
+            signal_id=existing_id,
+            payload=resolved,
+            previous_payload=previous,
+            changed_fields=changed_fields,
+        )
+
+    # ------------------------------------------------------------------
+    # Normalization
+    # ------------------------------------------------------------------
+
+    def _normalize_signal_payload(
+        self,
+        scenario_result: Any,
+        cycle_id: str | None,
+    ) -> dict[str, Any]:
+        raw = self._to_dict(scenario_result)
+
+        instrument = self._extract_enum_value(raw.get("instrument")) or "UNKNOWN"
+        scenario_type = self._extract_enum_value(raw.get("scenario_type")) or "NO_ACTION"
+        direction = self._extract_enum_value(raw.get("direction")) or "NEUTRAL"
+        market_state = self._extract_enum_value(raw.get("market_state")) or "TRANSITION"
+        decision = self._extract_enum_value(raw.get("decision")) or "NO_TRADE"
+        phase = self._extract_enum_value(raw.get("phase")) or "PRECONDITION"
+        status = self._extract_enum_value(raw.get("status")) or "NO_SETUP"
+        setup_type = self._extract_enum_value(raw.get("setup_type")) or "NONE"
+
+        execution = self._normalize_execution(raw.get("execution"))
+        signal_class = self._derive_signal_class(
+            decision=decision,
+            status=status,
+            execution=execution,
+        )
+
+        payload = {
+            "signal_id": self._build_signal_id(
+                instrument=instrument,
+                cycle_id=cycle_id,
+                scenario_type=scenario_type,
+                direction=direction,
+            ),
+            "symbol": instrument,
+            "instrument": instrument,
+            "cycle_id": cycle_id,
+            "scenario": scenario_type,
+            "scenario_type": scenario_type,
+            "phase": phase,
+            "decision": decision,
+            "market_state": market_state,
+            "direction": direction,
+            "status": status,
+            "signal_class": signal_class,
+            "setup_type": setup_type,
+            "setup_name": raw.get("setup_name"),
+            "dominant_setup": raw.get("dominant_setup"),
+            "price": self._float_or_none(raw.get("price")),
+            "confidence": self._float_or_none(raw.get("confidence")),
+            "alignment_score": self._float_or_none(raw.get("alignment_score")),
+            "rationale": raw.get("rationale"),
+            "next_expected_event": raw.get("next_expected_event"),
+            "missing_conditions": list(raw.get("missing_conditions") or []),
+            "tags": list(raw.get("tags") or []),
+            "metadata": deepcopy(raw.get("metadata") or {}),
+            "execution": execution,
+        }
+
+        payload["execution_status"] = execution.get("status")
+        payload["execution_model"] = execution.get("model")
+        payload["entry_reference_price"] = execution.get("entry_reference_price")
+        payload["invalidation_reference_price"] = execution.get("invalidation_reference_price")
+        payload["target_reference_price"] = execution.get("target_reference_price")
+        payload["risk_reward_ratio"] = execution.get("risk_reward_ratio")
+        payload["stop_distance"] = execution.get("stop_distance")
+        payload["target_distance"] = execution.get("target_distance")
+        payload["execution_timeframe"] = execution.get("execution_timeframe")
+        payload["trigger_reason"] = execution.get("trigger_reason")
+
+        return payload
+
+    def _normalize_execution(self, execution: Any) -> dict[str, Any]:
+        raw = self._to_dict(execution)
+
+        normalized = {
+            "status": raw.get("status", "NOT_EXECUTABLE"),
+            "model": raw.get("model", "NONE"),
+            "entry_reference_price": self._float_or_none(raw.get("entry_reference_price")),
+            "invalidation_reference_price": self._float_or_none(raw.get("invalidation_reference_price")),
+            "target_reference_price": self._float_or_none(raw.get("target_reference_price")),
+            "risk_reward_ratio": self._float_or_none(raw.get("risk_reward_ratio")),
+            "stop_distance": self._float_or_none(raw.get("stop_distance")),
+            "target_distance": self._float_or_none(raw.get("target_distance")),
+            "execution_timeframe": raw.get("execution_timeframe"),
+            "trigger_reason": raw.get("trigger_reason"),
+        }
+
+        return normalized
+
+    def _derive_signal_class(
+        self,
+        decision: str,
+        status: str,
+        execution: dict[str, Any],
+    ) -> str:
+        execution_status = execution.get("status")
+
+        if status == "RESOLVED":
+            return "RESOLVED"
+
+        if decision == "NO_TRADE" or status in {"NO_SETUP"}:
+            return "SCENARIO_FORMING"
+
+        if status == "IDLE":
+            return "SCENARIO_FORMING"
+
+        if status == "WATCH":
+            return "WATCH"
+
+        if status == "READY":
+            if execution_status == "EXECUTABLE":
+                return "READY"
+            return "WATCH"
+
+        if status == "ACTIVE":
+            return "ACTIVE"
+
         return "WATCH"
 
-    if scenario_decision in {"WATCH", "TRADEABLE"}:
-        return "SCENARIO_FORMING"
+    # ------------------------------------------------------------------
+    # Matching / merge / diff
+    # ------------------------------------------------------------------
 
-    if final_status == "IDLE" and confidence > 0.0:
-        return "BIAS_ONLY"
+    def _find_matching_open_signal_id(
+        self,
+        store: dict[str, dict[str, Any]],
+        payload: dict[str, Any],
+    ) -> str | None:
+        symbol = payload.get("symbol")
+        scenario = payload.get("scenario")
+        direction = payload.get("direction")
 
-    return "NO_ACTION"
+        for signal_id, existing in store.items():
+            if existing.get("symbol") != symbol:
+                continue
+            if existing.get("scenario") != scenario:
+                continue
+            if existing.get("direction") != direction:
+                continue
+            if existing.get("signal_class") == "RESOLVED":
+                continue
+            return signal_id
 
+        return None
 
-def create_tracked_signal(
-    *,
-    symbol: str,
-    timeframe: str,
-    cycle_id: str,
-    scenario_payload: dict,
-    final_signal_payload: dict,
-    price: float,
-    validation_threshold_pct: float,
-    expiry_bars: int = 8,
-) -> TrackedSignal:
-    scenario_name = (scenario_payload or {}).get("type", "UNKNOWN")
-    direction = (
-        (final_signal_payload or {}).get("direction")
-        or (scenario_payload or {}).get("direction")
-        or "NEUTRAL"
-    )
+    def _merge_signal_payload(
+        self,
+        existing: dict[str, Any],
+        incoming: dict[str, Any],
+    ) -> dict[str, Any]:
+        merged = deepcopy(existing)
 
-    probability = float(
-        (final_signal_payload or {}).get("confidence", 0.0)
-        or (scenario_payload or {}).get("alignment_score", 0.0)
-        or 0.0
-    )
+        for key, value in incoming.items():
+            if key == "signal_id":
+                continue
 
-    stage = classify_signal_stage(final_signal_payload, scenario_payload)
-    signal_id = build_signal_id(symbol, cycle_id, scenario_name, direction)
-    now = _utc_now_iso()
+            if key == "metadata":
+                merged["metadata"] = self._merge_dicts(
+                    existing.get("metadata") or {},
+                    value or {},
+                )
+                continue
 
-    invalidation_reference_price = (
-        (final_signal_payload or {}).get("invalidation_reference_price")
-        or (scenario_payload or {}).get("invalidation_reference_price")
-    )
+            if key == "execution":
+                merged["execution"] = self._merge_dicts(
+                    existing.get("execution") or {},
+                    value or {},
+                )
+                continue
 
-    target_reference_price = (
-        (final_signal_payload or {}).get("target_reference_price")
-        or (scenario_payload or {}).get("target_reference_price")
-    )
+            merged[key] = value
 
-    return TrackedSignal(
-        signal_id=signal_id,
-        symbol=symbol,
-        timeframe=timeframe,
-        signal_class=stage,
-        scenario=scenario_name,
-        direction=direction,
-        cycle_id=cycle_id,
-        created_at_utc=now,
-        updated_at_utc=now,
-        market_state=(scenario_payload or {}).get("market_state", ""),
-        htf_bias=(scenario_payload or {}).get("htf_bias", ""),
-        probability=probability,
-        entry_reference_price=float(price),
-        invalidation_reference_price=invalidation_reference_price,
-        target_reference_price=target_reference_price,
-        status="OPEN",
-        stage=stage,
-        bars_alive=0,
-        minutes_alive=0,
-        max_price_seen=float(price),
-        min_price_seen=float(price),
-        mfe_pct=0.0,
-        mae_pct=0.0,
-        validation_threshold_pct=validation_threshold_pct,
-        expiry_bars=expiry_bars,
-        meta={
-            "missing_conditions": (scenario_payload or {}).get("missing_conditions", []),
-            "next_expected_event": (scenario_payload or {}).get("next_expected_event"),
-        },
-    )
+        # keep mirrored execution fields in sync
+        execution = merged.get("execution") or {}
+        merged["execution_status"] = execution.get("status")
+        merged["execution_model"] = execution.get("model")
+        merged["entry_reference_price"] = execution.get("entry_reference_price")
+        merged["invalidation_reference_price"] = execution.get("invalidation_reference_price")
+        merged["target_reference_price"] = execution.get("target_reference_price")
+        merged["risk_reward_ratio"] = execution.get("risk_reward_ratio")
+        merged["stop_distance"] = execution.get("stop_distance")
+        merged["target_distance"] = execution.get("target_distance")
+        merged["execution_timeframe"] = execution.get("execution_timeframe")
+        merged["trigger_reason"] = execution.get("trigger_reason")
 
+        return merged
 
-def update_signal_market_metrics(
-    signal: TrackedSignal,
-    *,
-    current_price: float,
-    current_high: Optional[float] = None,
-    current_low: Optional[float] = None,
-    bar_minutes: int = 15,
-) -> TrackedSignal:
-    signal.updated_at_utc = _utc_now_iso()
-    signal.bars_alive += 1
-    signal.minutes_alive += bar_minutes
+    def _diff_signal_fields(
+        self,
+        previous: dict[str, Any],
+        current: dict[str, Any],
+    ) -> list[str]:
+        changed: list[str] = []
 
-    high = current_high if current_high is not None else current_price
-    low = current_low if current_low is not None else current_price
+        top_level_keys = sorted(set(previous.keys()) | set(current.keys()))
+        for key in top_level_keys:
+            if previous.get(key) != current.get(key):
+                changed.append(key)
 
-    if signal.max_price_seen is None:
-        signal.max_price_seen = high
-    else:
-        signal.max_price_seen = max(signal.max_price_seen, high)
+        return changed
 
-    if signal.min_price_seen is None:
-        signal.min_price_seen = low
-    else:
-        signal.min_price_seen = min(signal.min_price_seen, low)
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
 
-    entry = signal.entry_reference_price
+    def _load_store(self) -> dict[str, dict[str, Any]]:
+        if not self.open_signals_path.exists():
+            return {}
 
-    if signal.direction == "LONG":
-        favorable_move = ((signal.max_price_seen - entry) / entry) * 100.0
-        adverse_move = ((entry - signal.min_price_seen) / entry) * 100.0
-    elif signal.direction == "SHORT":
-        favorable_move = ((entry - signal.min_price_seen) / entry) * 100.0
-        adverse_move = ((signal.max_price_seen - entry) / entry) * 100.0
-    else:
-        favorable_move = 0.0
-        adverse_move = 0.0
+        try:
+            with self.open_signals_path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
 
-    signal.mfe_pct = round(max(signal.mfe_pct, favorable_move), 6)
-    signal.mae_pct = round(max(signal.mae_pct, adverse_move), 6)
+        if not isinstance(data, dict):
+            return {}
 
-    return signal
+        return data
 
+    def _save_store(self, store: dict[str, dict[str, Any]]) -> None:
+        with self.open_signals_path.open("w", encoding="utf-8") as f:
+            json.dump(store, f, indent=2, ensure_ascii=False, sort_keys=True)
 
-def should_validate(signal: TrackedSignal) -> tuple[bool, str]:
-    threshold = signal.validation_threshold_pct or 0.0
-    if threshold > 0 and signal.mfe_pct >= threshold:
-        return True, f"favorable_move_reached_{threshold:.3f}pct"
-    return False, ""
+    # ------------------------------------------------------------------
+    # Utility helpers
+    # ------------------------------------------------------------------
 
+    @staticmethod
+    def _utc_now() -> str:
+        return datetime.now(timezone.utc).isoformat()
 
-def should_invalidate(
-    signal: TrackedSignal,
-    *,
-    current_price: float,
-) -> tuple[bool, str]:
-    invalidation = signal.invalidation_reference_price
-    if invalidation is None:
-        return False, ""
+    @staticmethod
+    def _build_signal_id(
+        instrument: str,
+        cycle_id: str | None,
+        scenario_type: str,
+        direction: str,
+    ) -> str:
+        safe_cycle_id = cycle_id or datetime.now(timezone.utc).isoformat()
+        safe_cycle_id = safe_cycle_id.replace(":", "-")
+        return f"{instrument}_{safe_cycle_id}_{scenario_type}_{direction}"
 
-    if signal.direction == "LONG" and current_price <= invalidation:
-        return True, "long_invalidation_breached"
+    @staticmethod
+    def _extract_enum_value(value: Any) -> Any:
+        return getattr(value, "value", value)
 
-    if signal.direction == "SHORT" and current_price >= invalidation:
-        return True, "short_invalidation_breached"
+    @staticmethod
+    def _float_or_none(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
-    return False, ""
+    @staticmethod
+    def _merge_dicts(base: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+        result = deepcopy(base)
+        for key, value in incoming.items():
+            result[key] = value
+        return result
 
+    @staticmethod
+    def _sorted_top_level_fields(payload: dict[str, Any]) -> list[str]:
+        return sorted(payload.keys())
 
-def should_expire(signal: TrackedSignal) -> tuple[bool, str]:
-    if signal.bars_alive >= signal.expiry_bars:
-        return True, f"expiry_bars_reached_{signal.expiry_bars}"
-    return False, ""
+    def _to_dict(self, obj: Any) -> dict[str, Any]:
+        if obj is None:
+            return {}
 
+        if isinstance(obj, dict):
+            return deepcopy(obj)
 
-def maybe_promote_stage(
-    signal: TrackedSignal,
-    *,
-    final_signal_payload: dict,
-    scenario_payload: dict,
-) -> tuple[TrackedSignal, Optional[dict]]:
-    new_stage = classify_signal_stage(final_signal_payload, scenario_payload)
-    if new_stage == signal.stage:
-        return signal, None
+        if hasattr(obj, "model_dump"):
+            return obj.model_dump()
 
-    old_stage = signal.stage
-    old_probability = signal.probability
+        if hasattr(obj, "dict"):
+            return obj.dict()
 
-    new_probability = float(
-        (final_signal_payload or {}).get("confidence", 0.0)
-        or (scenario_payload or {}).get("alignment_score", old_probability)
-        or old_probability
-    )
+        if hasattr(obj, "__dict__"):
+            return deepcopy(obj.__dict__)
 
-    signal.stage = new_stage
-    signal.signal_class = new_stage
-    signal.probability = new_probability
-    signal.updated_at_utc = _utc_now_iso()
-
-    update_event = {
-        "from_stage": old_stage,
-        "to_stage": new_stage,
-        "probability_old": old_probability,
-        "probability_new": new_probability,
-        "reason": (scenario_payload or {}).get("next_expected_event"),
-    }
-    return signal, update_event
-
-
-def resolve_signal(
-    signal: TrackedSignal,
-    *,
-    final_status: str,
-    resolution_reason: str,
-) -> SignalResolution:
-    signal.status = "RESOLVED"
-    signal.updated_at_utc = _utc_now_iso()
-
-    return SignalResolution(
-        signal_id=signal.signal_id,
-        symbol=signal.symbol,
-        final_status=final_status,
-        resolution_reason=resolution_reason,
-        resolved_at_utc=signal.updated_at_utc,
-        bars_alive=signal.bars_alive,
-        minutes_alive=signal.minutes_alive,
-        mfe_pct=signal.mfe_pct,
-        mae_pct=signal.mae_pct,
-        time_to_validation_min=signal.minutes_alive if final_status == "VALIDATED" else None,
-    )
-
-
-def update_open_signals_for_symbol(
-    *,
-    signals: dict[str, TrackedSignal],
-    symbol: str,
-    current_price: float,
-    current_high: Optional[float],
-    current_low: Optional[float],
-    cycle_id: str,
-    final_signal_payload: dict,
-    scenario_payload: dict,
-    bar_minutes: int = 15,
-) -> tuple[dict[str, TrackedSignal], list[dict], list[SignalResolution]]:
-    stage_updates: list[dict] = []
-    resolved_items: list[SignalResolution] = []
-    to_remove: list[str] = []
-
-    for signal_id, signal in signals.items():
-        if signal.symbol != symbol:
-            continue
-        if signal.status != "OPEN":
-            continue
-
-        update_signal_market_metrics(
-            signal,
-            current_price=current_price,
-            current_high=current_high,
-            current_low=current_low,
-            bar_minutes=bar_minutes,
-        )
-
-        signal, upd = maybe_promote_stage(
-            signal,
-            final_signal_payload=final_signal_payload,
-            scenario_payload=scenario_payload,
-        )
-        if upd is not None:
-            stage_updates.append(
-                {
-                    "signal_id": signal.signal_id,
-                    **upd,
-                }
-            )
-
-        is_invalid, invalid_reason = should_invalidate(signal, current_price=current_price)
-        if is_invalid:
-            resolution = resolve_signal(
-                signal,
-                final_status="INVALIDATED",
-                resolution_reason=invalid_reason,
-            )
-            resolved_items.append(resolution)
-            to_remove.append(signal_id)
-            continue
-
-        is_valid, valid_reason = should_validate(signal)
-        if is_valid:
-            resolution = resolve_signal(
-                signal,
-                final_status="VALIDATED",
-                resolution_reason=valid_reason,
-            )
-            resolved_items.append(resolution)
-            to_remove.append(signal_id)
-            continue
-
-        is_expired, expire_reason = should_expire(signal)
-        if is_expired:
-            resolution = resolve_signal(
-                signal,
-                final_status="EXPIRED",
-                resolution_reason=expire_reason,
-            )
-            resolved_items.append(resolution)
-            to_remove.append(signal_id)
-
-    for signal_id in to_remove:
-        signals.pop(signal_id, None)
-
-    return signals, stage_updates, resolved_items
+        return {}

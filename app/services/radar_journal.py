@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -50,11 +51,11 @@ class JournalEvent:
             timeframe=timeframe,
             source=source,
             status=status,
-            payload=payload or {},
+            payload=_normalize_for_json(payload or {}),
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        return _normalize_for_json(asdict(self))
 
 
 def _ensure_parent_dir(path: Path) -> None:
@@ -143,7 +144,7 @@ def write_instrument_analyzed(
         runner_version=runner_version,
         symbol=symbol,
         timeframe=timeframe,
-        payload=analysis_payload,
+        payload=_compact_analysis_payload(analysis_payload),
         path=path,
     )
 
@@ -165,7 +166,7 @@ def write_signal_candidate_detected(
         runner_version=runner_version,
         symbol=symbol,
         timeframe=timeframe,
-        payload=signal_payload,
+        payload=_compact_signal_payload(signal_payload),
         path=path,
     )
 
@@ -181,6 +182,7 @@ def write_signal_registered(
     payload: Dict[str, Any],
     path: Path | str = DEFAULT_JOURNAL_PATH,
 ) -> None:
+    signal_payload = _compact_signal_payload(payload)
     _write_event(
         event_type="signal_registered",
         cycle_id=cycle_id,
@@ -190,7 +192,7 @@ def write_signal_registered(
         timeframe=timeframe,
         payload={
             "signal_id": signal_id,
-            **payload,
+            **signal_payload,
         },
         path=path,
     )
@@ -205,8 +207,13 @@ def write_signal_updated(
     timeframe: str,
     signal_id: str,
     payload: Dict[str, Any],
+    previous_payload: Optional[Dict[str, Any]] = None,
+    changed_fields: Optional[list[str]] = None,
     path: Path | str = DEFAULT_JOURNAL_PATH,
 ) -> None:
+    current_payload = _compact_signal_payload(payload)
+    previous_compact = _compact_signal_payload(previous_payload or {}) if previous_payload else None
+
     _write_event(
         event_type="signal_updated",
         cycle_id=cycle_id,
@@ -216,7 +223,10 @@ def write_signal_updated(
         timeframe=timeframe,
         payload={
             "signal_id": signal_id,
-            **payload,
+            "changed_fields": changed_fields or [],
+            "execution_changed": _has_execution_change(changed_fields or []),
+            "payload": current_payload,
+            "previous_payload": previous_compact,
         },
         path=path,
     )
@@ -233,6 +243,7 @@ def write_signal_resolved(
     payload: Dict[str, Any],
     path: Path | str = DEFAULT_JOURNAL_PATH,
 ) -> None:
+    signal_payload = _compact_signal_payload(payload)
     _write_event(
         event_type="signal_resolved",
         cycle_id=cycle_id,
@@ -242,7 +253,7 @@ def write_signal_resolved(
         timeframe=timeframe,
         payload={
             "signal_id": signal_id,
-            **payload,
+            **signal_payload,
         },
         path=path,
     )
@@ -354,3 +365,126 @@ def write_cycle_finished(
         },
         path=path,
     )
+
+
+# ---------------------------------------------------------------------
+# Normalization helpers
+# ---------------------------------------------------------------------
+
+
+def _normalize_for_json(value: Any) -> Any:
+    if value is None:
+        return None
+
+    if isinstance(value, (str, int, float, bool)):
+        return value
+
+    if isinstance(value, Enum):
+        return value.value
+
+    if isinstance(value, datetime):
+        return value.isoformat()
+
+    if isinstance(value, Path):
+        return str(value)
+
+    if is_dataclass(value):
+        return _normalize_for_json(asdict(value))
+
+    if hasattr(value, "model_dump"):
+        return _normalize_for_json(value.model_dump())
+
+    if hasattr(value, "dict"):
+        return _normalize_for_json(value.dict())
+
+    if isinstance(value, dict):
+        return {str(k): _normalize_for_json(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [_normalize_for_json(v) for v in value]
+
+    if hasattr(value, "__dict__"):
+        return _normalize_for_json(vars(value))
+
+    return str(value)
+
+
+def _compact_analysis_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    raw = _normalize_for_json(payload)
+
+    return {
+        "symbol": raw.get("symbol") or raw.get("instrument"),
+        "price": raw.get("price"),
+        "market_state": raw.get("market_state"),
+        "direction": raw.get("direction"),
+        "status": raw.get("status"),
+        "setup_type": raw.get("setup_type"),
+        "confidence": raw.get("confidence"),
+        "alignment_score": raw.get("alignment_score"),
+        "scenario": raw.get("scenario") or raw.get("scenario_type"),
+    }
+
+
+def _compact_signal_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    raw = _normalize_for_json(payload)
+    execution = raw.get("execution") or {}
+
+    compact = {
+        "symbol": raw.get("symbol") or raw.get("instrument"),
+        "scenario": raw.get("scenario") or raw.get("scenario_type"),
+        "phase": raw.get("phase"),
+        "decision": raw.get("decision"),
+        "market_state": raw.get("market_state"),
+        "direction": raw.get("direction"),
+        "status": raw.get("status"),
+        "signal_class": raw.get("signal_class"),
+        "setup_type": raw.get("setup_type"),
+        "setup_name": raw.get("setup_name"),
+        "dominant_setup": raw.get("dominant_setup"),
+        "price": raw.get("price"),
+        "confidence": raw.get("confidence"),
+        "alignment_score": raw.get("alignment_score"),
+        "rationale": raw.get("rationale"),
+        "next_expected_event": raw.get("next_expected_event"),
+        "missing_conditions": raw.get("missing_conditions") or [],
+        "tags": raw.get("tags") or [],
+        "execution": {
+            "status": execution.get("status"),
+            "model": execution.get("model"),
+            "entry_reference_price": execution.get("entry_reference_price"),
+            "invalidation_reference_price": execution.get("invalidation_reference_price"),
+            "target_reference_price": execution.get("target_reference_price"),
+            "risk_reward_ratio": execution.get("risk_reward_ratio"),
+            "stop_distance": execution.get("stop_distance"),
+            "target_distance": execution.get("target_distance"),
+            "execution_timeframe": execution.get("execution_timeframe"),
+            "trigger_reason": execution.get("trigger_reason"),
+        },
+        "execution_status": raw.get("execution_status") or execution.get("status"),
+        "execution_model": raw.get("execution_model") or execution.get("model"),
+        "entry_reference_price": raw.get("entry_reference_price") or execution.get("entry_reference_price"),
+        "invalidation_reference_price": raw.get("invalidation_reference_price") or execution.get("invalidation_reference_price"),
+        "target_reference_price": raw.get("target_reference_price") or execution.get("target_reference_price"),
+        "risk_reward_ratio": raw.get("risk_reward_ratio") or execution.get("risk_reward_ratio"),
+        "trigger_reason": raw.get("trigger_reason") or execution.get("trigger_reason"),
+        "metadata": raw.get("metadata") or {},
+    }
+
+    return compact
+
+
+def _has_execution_change(changed_fields: list[str]) -> bool:
+    execution_related = {
+        "execution",
+        "execution_status",
+        "execution_model",
+        "entry_reference_price",
+        "invalidation_reference_price",
+        "target_reference_price",
+        "risk_reward_ratio",
+        "stop_distance",
+        "target_distance",
+        "execution_timeframe",
+        "trigger_reason",
+    }
+    return any(field in execution_related for field in changed_fields)

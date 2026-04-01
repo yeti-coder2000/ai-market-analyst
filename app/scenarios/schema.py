@@ -82,6 +82,33 @@ class ScenarioEvidence(BaseModel):
     notes: list[str] = Field(default_factory=list)
 
 
+class ExecutionPayload(BaseModel):
+    """
+    Execution-ready payload attached to ScenarioResult.
+
+    This is the trading-action layer:
+    - whether the signal is executable
+    - how it should be executed
+    - where entry / invalidation / target are located
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    status: str = "NOT_EXECUTABLE"  # EXECUTABLE | INCOMPLETE | NOT_EXECUTABLE
+    model: str = "NONE"
+
+    entry_reference_price: float | None = None
+    invalidation_reference_price: float | None = None
+    target_reference_price: float | None = None
+
+    risk_reward_ratio: float | None = None
+    stop_distance: float | None = None
+    target_distance: float | None = None
+
+    execution_timeframe: str | None = None
+    trigger_reason: str | None = None
+
+
 class ScenarioResult(BaseModel):
     """
     Primary output of Scenario Engine.
@@ -133,4 +160,5 @@ class ScenarioResult(BaseModel):
 
     tags: list[str] = Field(default_factory=list)
     evidence: ScenarioEvidence = Field(default_factory=ScenarioEvidence)
+    execution: ExecutionPayload | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
