@@ -272,7 +272,7 @@ def load_settings() -> AppSettings:
         alert_cooldown_sec=_to_int(os.getenv("ALERT_COOLDOWN_SEC"), 3600),
 
         # Universe / runtime control
-        default_batch_size=_to_int(os.getenv("DEFAULT_BATCH_SIZE"), 2),
+        default_batch_size=_to_int(os.getenv("DEFAULT_BATCH_SIZE"), 5),
         force_batch=force_batch,
         auto_mode=_to_bool(os.getenv("AUTO_MODE"), True),
         simulation_mode=_to_bool(os.getenv("SIMULATION_MODE"), False),
