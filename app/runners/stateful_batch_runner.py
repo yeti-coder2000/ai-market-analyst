@@ -27,29 +27,23 @@ from app.scenarios.behavioral import (
 )
 from app.services.consistency_checker import check_consistency
 from app.services.loader import MarketDataLoader
-from app.storage.cache_store import ParquetCache
-
 from app.services.radar_journal import (
-    write_cycle_started,
     write_cycle_finished,
+    write_cycle_started,
     write_instrument_analyzed,
     write_signal_candidate_detected,
     write_signal_registered,
-    write_signal_updated,
     write_signal_resolved,
+    write_signal_updated,
 )
-from app.services.signal_tracker import (
-    load_open_signals,
-    save_open_signals,
-    create_tracked_signal,
-    update_open_signals_for_symbol,
-    classify_signal_stage,
-    TrackedSignal,
-)
+from app.services.signal_tracker import SignalTracker, SignalTrackerResult
+from app.services.statistics import build_and_export_statistics
+from app.services.telegram_formatter import format_signal_message
+from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.0.0"
+RUNNER_VERSION = "1.1.0"
 
 
 # =============================================================================
@@ -154,6 +148,13 @@ class InstrumentCycleResult:
     invalidation_level: float | None = None
     target_zone: list[float] = field(default_factory=list)
 
+    execution_status: str | None = None
+    execution_model: str | None = None
+    risk_reward_ratio: float | None = None
+    entry_reference_price: float | None = None
+    invalidation_reference_price: float | None = None
+    target_reference_price: float | None = None
+
     refreshed_timeframes: list[str] = field(default_factory=list)
     consistency_ok: bool | None = None
     consistency_score: float | None = None
@@ -235,7 +236,7 @@ def now_iso() -> str:
 
 def is_weekend_utc(dt: datetime | None = None) -> bool:
     ref = dt or datetime.now(UTC)
-    return ref.weekday() >= 5  # 5 = Saturday, 6 = Sunday
+    return ref.weekday() >= 5
 
 
 def to_jsonable(value: Any) -> Any:
@@ -340,17 +341,6 @@ def build_market_closed_journal_record(
     }
 
 
-def get_validation_threshold_pct(symbol: str) -> float:
-    mapping = {
-        "EURUSD": 0.15,
-        "GBPUSD": 0.18,
-        "XAUUSD": 0.35,
-        "BTCUSD": 0.60,
-        "ETHUSD": 0.70,
-    }
-    return mapping.get(symbol, 0.30)
-
-
 def extract_last_bar_high(df: pd.DataFrame | None):
     if df is None or df.empty:
         return None
@@ -371,6 +361,17 @@ def extract_last_bar_low(df: pd.DataFrame | None):
         return float(df.iloc[-1]["low"])
     except Exception:
         return None
+
+
+def _map_instrument_to_formatter_payload(inst: dict[str, Any]) -> Optional[dict[str, Any]]:
+    alert_payload = inst.get("alert_payload")
+    if not alert_payload:
+        return None
+
+    if not alert_payload.get("should_alert", False):
+        return None
+
+    return alert_payload
 
 
 # =============================================================================
@@ -430,18 +431,6 @@ def write_radar_journal(payload: dict[str, Any], path: Path | None = None) -> No
 class StatefulBatchRunner:
     """
     Orchestration-only runner.
-
-    Responsibilities:
-    - select current batch
-    - load market data through MarketDataLoader
-    - build market context
-    - run setup rules
-    - optionally run scenario engine
-    - persist runner state
-    - write radar journal
-    - write production event journal
-    - maintain open signal lifecycle
-    - return normalized cycle result for cloud worker
     """
 
     def __init__(
@@ -469,6 +458,7 @@ class StatefulBatchRunner:
         self.state.force_batch = force_batch
 
         self.budget = MinuteBudget(limit_per_minute=minute_limit)
+        self.signal_tracker = SignalTracker(open_signals_path="runtime/open_signals.json")
 
         self.instrument_profiles = sorted(
             instrument_profiles or DEFAULT_INSTRUMENT_PROFILES,
@@ -477,10 +467,6 @@ class StatefulBatchRunner:
         self.timeframes_by_symbol = timeframes_by_symbol or DEFAULT_TIMEFRAMES_BY_SYMBOL
         self.batches = self._make_batches(self.instrument_profiles, batch_size)
         self.state.total_batches = len(self.batches)
-
-    # -------------------------------------------------------------------------
-    # Public
-    # -------------------------------------------------------------------------
 
     def run(self) -> None:
         result = self.run_batch_cycle()
@@ -541,8 +527,6 @@ class StatefulBatchRunner:
             simulation_mode=self.simulation_mode,
         )
 
-        open_signals = load_open_signals()
-
         normalized_instruments: list[dict[str, Any]] = []
         cycle_errors: list[dict[str, Any]] = []
         batch_had_errors = False
@@ -574,11 +558,10 @@ class StatefulBatchRunner:
                 continue
 
             try:
-                instrument_result, open_signals = self._analyze_symbol(
+                instrument_result = self._analyze_symbol(
                     symbol,
                     cycle_id=cycle_id,
                     batch_id=batch_id,
-                    open_signals=open_signals,
                 )
                 normalized_instruments.append(instrument_result.to_dict())
                 processed_count += 1
@@ -684,8 +667,6 @@ class StatefulBatchRunner:
             print("\nБули помилки — стан batch не оновлюється, щоб не пропустити поточний batch.")
             cycle_status = "partial" if normalized_instruments else "error"
 
-        save_open_signals(open_signals)
-
         elapsed_sec = time.monotonic() - cycle_started_monotonic
 
         write_cycle_finished(
@@ -697,6 +678,11 @@ class StatefulBatchRunner:
             alerts=alerts_count,
             duration_sec=elapsed_sec,
         )
+
+        try:
+            build_and_export_statistics()
+        except Exception as stats_error:
+            cycle_logger.warning(f"Statistics export failed: {stats_error}")
 
         cycle_logger.info(
             f"Batch cycle finished. status={cycle_status} instruments={len(normalized_instruments)} errors={len(cycle_errors)}"
@@ -720,18 +706,13 @@ class StatefulBatchRunner:
             },
         ).to_dict()
 
-    # -------------------------------------------------------------------------
-    # Symbol analysis
-    # -------------------------------------------------------------------------
-
     def _analyze_symbol(
         self,
         symbol: Instrument,
         *,
         cycle_id: str,
         batch_id: str,
-        open_signals: dict[str, TrackedSignal],
-    ) -> tuple[InstrumentCycleResult, dict[str, TrackedSignal]]:
+    ) -> InstrumentCycleResult:
         symbol_logger = bind_logger(logger, cycle_id=cycle_id, symbol=symbol.value)
 
         print(f"\n### ANALYZING {symbol.value}")
@@ -800,38 +781,33 @@ class StatefulBatchRunner:
             write_radar_journal(journal_record, path=self.journal_path)
             save_state(self.state, self.state_path)
 
-            return (
-                InstrumentCycleResult(
-                    symbol=symbol.value,
-                    status="skipped",
-                    price=None,
-                    market_state=None,
-                    htf_bias=None,
-                    phase=None,
-                    setup=None,
-                    setup_status="SKIPPED",
-                    direction=None,
-                    confidence=0.0,
-                    scenario_type="MARKET_CLOSED",
-                    scenario_probability=0.0,
-                    final_signal="IDLE",
-                    watch_status="-",
-                    watch_reason="WEEKEND_MARKET_CLOSED",
-                    behavioral_summary="MARKET_CLOSED",
-                    invalidation_level=None,
-                    target_zone=[],
-                    refreshed_timeframes=refreshed_timeframes,
-                    consistency_ok=True,
-                    consistency_score=1.0,
-                    conflict_flags=[],
-                    consistency_warnings=[],
-                    consistency_summary="Market closed",
-                    data_status="market_closed",
-                    analysis_snapshot=to_jsonable(symbol_state.analysis_snapshot),
-                    error_message=None,
-                    alert_payload=None,
-                ),
-                open_signals,
+            return InstrumentCycleResult(
+                symbol=symbol.value,
+                status="skipped",
+                price=None,
+                market_state=None,
+                htf_bias=None,
+                phase=None,
+                setup=None,
+                setup_status="SKIPPED",
+                direction=None,
+                confidence=0.0,
+                scenario_type="MARKET_CLOSED",
+                scenario_probability=0.0,
+                final_signal="IDLE",
+                watch_status="-",
+                watch_reason="WEEKEND_MARKET_CLOSED",
+                behavioral_summary="MARKET_CLOSED",
+                refreshed_timeframes=refreshed_timeframes,
+                consistency_ok=True,
+                consistency_score=1.0,
+                conflict_flags=[],
+                consistency_warnings=[],
+                consistency_summary="Market closed",
+                data_status="market_closed",
+                analysis_snapshot=to_jsonable(symbol_state.analysis_snapshot),
+                error_message=None,
+                alert_payload=None,
             )
 
         analysis = self._run_analysis_pipeline(symbol, series_by_tf)
@@ -894,29 +870,6 @@ class StatefulBatchRunner:
         htf_bias = extract_context_htf_bias(context)
         phase = classify_market_phase(context)
 
-        signal_setup = self._safe_attr(final_signal, "setup_name")
-        if signal_setup is None:
-            signal_setup = self._safe_attr(final_signal, "setup_type")
-        signal_setup = getattr(signal_setup, "value", signal_setup)
-
-        signal_status = self._safe_attr(final_signal, "status")
-        signal_direction = self._safe_attr(final_signal, "direction")
-        signal_confidence = self._safe_attr(final_signal, "confidence")
-
-        signal_status = getattr(signal_status, "value", signal_status)
-        signal_direction = getattr(signal_direction, "value", signal_direction)
-
-        setup_result = self._find_setup_by_name(setups, signal_setup)
-        setup_status = self._safe_attr(setup_result, "status")
-        direction = self._safe_attr(setup_result, "direction")
-        confidence = self._safe_attr(setup_result, "confidence")
-
-        setup_status = getattr(setup_status, "value", setup_status)
-        direction = getattr(direction, "value", direction)
-
-        if confidence is None:
-            confidence = signal_confidence
-
         scenario_ok = scenario is not None and not (
             isinstance(scenario, dict) and scenario.get("scenario_engine_failed")
         )
@@ -925,9 +878,15 @@ class StatefulBatchRunner:
             scenario_type = self._safe_attr(scenario, "scenario_type")
             scenario_type = getattr(scenario_type, "value", scenario_type)
             scenario_probability = self._safe_attr(scenario, "alignment_score")
+            scenario_decision = self._safe_attr(scenario, "decision")
+            scenario_decision = getattr(scenario_decision, "value", scenario_decision)
+            signal_class = self._safe_attr(scenario, "status")
+            signal_class = getattr(signal_class, "value", signal_class)
         else:
             scenario_type = infer_behavioral_scenario(context, setups)
             scenario_probability = infer_alignment_score(context, setups)
+            scenario_decision = self._extract_scenario_decision(context, setups, scenario, final_signal)
+            signal_class = "NO_SETUP"
 
         analysis_payload = {
             "price": price,
@@ -935,11 +894,10 @@ class StatefulBatchRunner:
             "htf_bias": htf_bias,
             "phase": phase,
             "scenario_type": scenario_type,
-            "scenario_decision": self._extract_scenario_decision(context, setups, scenario, final_signal),
-            "final_signal_setup": signal_setup,
-            "final_signal_status": signal_status,
-            "final_signal_direction": signal_direction,
-            "final_signal_confidence": signal_confidence,
+            "scenario_decision": scenario_decision,
+            "final_signal_status": self._safe_attr(final_signal, "status"),
+            "final_signal_direction": self._safe_attr(final_signal, "direction"),
+            "final_signal_confidence": self._safe_attr(final_signal, "confidence"),
             "consistency_ok": consistency.is_consistent,
             "consistency_score": consistency.consistency_score,
         }
@@ -953,121 +911,59 @@ class StatefulBatchRunner:
             analysis_payload=analysis_payload,
         )
 
-        df_15m = series_by_tf.get(Timeframe.M15)
-        last_bar_high = extract_last_bar_high(df_15m)
-        last_bar_low = extract_last_bar_low(df_15m)
-
-        tracking_scenario_payload = self._build_tracking_scenario_payload(
-            context=context,
-            setups=setups,
-            scenario=scenario,
-            final_signal=final_signal,
-        )
-        tracking_final_signal_payload = self._build_tracking_final_signal_payload(
-            final_signal=final_signal,
-            setup_result=setup_result,
-        )
-
-        open_signals, stage_updates, resolved_items = update_open_signals_for_symbol(
-            signals=open_signals,
-            symbol=symbol.value,
-            current_price=price if price is not None else 0.0,
-            current_high=last_bar_high if last_bar_high is not None else price,
-            current_low=last_bar_low if last_bar_low is not None else price,
+        tracker_result = self.signal_tracker.process(
+            scenario_result=scenario if scenario_ok else final_signal,
             cycle_id=cycle_id,
-            final_signal_payload=tracking_final_signal_payload,
-            scenario_payload=tracking_scenario_payload,
-            bar_minutes=15,
         )
 
-        for upd in stage_updates:
-            write_signal_updated(
-                cycle_id=cycle_id,
-                batch_id=batch_id,
-                runner_version=RUNNER_VERSION,
-                symbol=symbol.value,
-                timeframe="15m",
-                signal_id=upd["signal_id"],
-                payload=upd,
-            )
-
-        for resolution in resolved_items:
-            write_signal_resolved(
-                cycle_id=cycle_id,
-                batch_id=batch_id,
-                runner_version=RUNNER_VERSION,
-                symbol=symbol.value,
-                timeframe="15m",
-                signal_id=resolution.signal_id,
-                payload=resolution.to_dict(),
-            )
-
-        stage = classify_signal_stage(tracking_final_signal_payload, tracking_scenario_payload)
-        should_register = stage in {"SCENARIO_FORMING", "WATCH", "READY", "ACTIVE"}
-
-        if should_register and price is not None:
-            signal_payload = {
-                "signal_class": stage,
-                "scenario": tracking_scenario_payload.get("type"),
-                "direction": tracking_final_signal_payload.get("direction") or "NEUTRAL",
-                "probability": float(
-                    tracking_final_signal_payload.get("confidence", 0.0)
-                    or tracking_scenario_payload.get("alignment_score", 0.0)
-                    or 0.0
-                ),
-                "entry_reference_price": price,
-                "invalidation_reference_price": tracking_final_signal_payload.get("invalidation_reference_price"),
-                "target_reference_price": tracking_final_signal_payload.get("target_reference_price"),
-                "market_state": market_state,
-                "htf_bias": htf_bias,
-                "reason": tracking_scenario_payload.get("next_expected_event"),
-                "missing_conditions": tracking_scenario_payload.get("missing_conditions", []),
-            }
-
+        candidate_payload = tracker_result.payload
+        if candidate_payload.get("signal_class") in {
+            "SCENARIO_FORMING",
+            "WATCH",
+            "READY",
+            "ACTIVE",
+        }:
             write_signal_candidate_detected(
                 cycle_id=cycle_id,
                 batch_id=batch_id,
                 runner_version=RUNNER_VERSION,
                 symbol=symbol.value,
                 timeframe="15m",
-                signal_payload=signal_payload,
+                signal_payload=candidate_payload,
             )
 
-            tracked = create_tracked_signal(
+        if tracker_result.action == "REGISTERED":
+            write_signal_registered(
+                cycle_id=cycle_id,
+                batch_id=batch_id,
+                runner_version=RUNNER_VERSION,
                 symbol=symbol.value,
                 timeframe="15m",
+                signal_id=tracker_result.signal_id or candidate_payload.get("signal_id", ""),
+                payload=tracker_result.payload,
+            )
+        elif tracker_result.action == "UPDATED":
+            write_signal_updated(
                 cycle_id=cycle_id,
-                scenario_payload=tracking_scenario_payload,
-                final_signal_payload=tracking_final_signal_payload,
-                price=price,
-                validation_threshold_pct=get_validation_threshold_pct(symbol.value),
-                expiry_bars=8,
+                batch_id=batch_id,
+                runner_version=RUNNER_VERSION,
+                symbol=symbol.value,
+                timeframe="15m",
+                signal_id=tracker_result.signal_id or candidate_payload.get("signal_id", ""),
+                payload=tracker_result.payload,
+                previous_payload=tracker_result.previous_payload,
+                changed_fields=tracker_result.changed_fields,
             )
-
-            existing_open = next(
-                (
-                    sig
-                    for sig in open_signals.values()
-                    if sig.symbol == tracked.symbol
-                    and sig.scenario == tracked.scenario
-                    and sig.direction == tracked.direction
-                    and sig.status == "OPEN"
-                ),
-                None,
+        elif tracker_result.action == "RESOLVED":
+            write_signal_resolved(
+                cycle_id=cycle_id,
+                batch_id=batch_id,
+                runner_version=RUNNER_VERSION,
+                symbol=symbol.value,
+                timeframe="15m",
+                signal_id=tracker_result.signal_id or candidate_payload.get("signal_id", ""),
+                payload=tracker_result.payload,
             )
-
-            if existing_open is None:
-                open_signals[tracked.signal_id] = tracked
-
-                write_signal_registered(
-                    cycle_id=cycle_id,
-                    batch_id=batch_id,
-                    runner_version=RUNNER_VERSION,
-                    symbol=symbol.value,
-                    timeframe="15m",
-                    signal_id=tracked.signal_id,
-                    payload=tracked.to_dict(),
-                )
 
         self._print_symbol_summary(symbol, analysis, refreshed_timeframes)
         self._print_consistency_summary(consistency)
@@ -1078,13 +974,14 @@ class StatefulBatchRunner:
             consistency=consistency,
             refreshed_timeframes=refreshed_timeframes,
             symbol_state=symbol_state,
+            tracker_result=tracker_result,
         )
 
         symbol_logger.info(
             f"Symbol analyzed. final_signal={instrument_result.final_signal} watch_status={instrument_result.watch_status}"
         )
 
-        return instrument_result, open_signals
+        return instrument_result
 
     def _build_instrument_cycle_result(
         self,
@@ -1094,6 +991,7 @@ class StatefulBatchRunner:
         consistency: Any,
         refreshed_timeframes: list[str],
         symbol_state: SymbolState,
+        tracker_result: SignalTrackerResult | None,
     ) -> InstrumentCycleResult:
         context = analysis.get("context")
         scenario = analysis.get("scenario")
@@ -1151,21 +1049,14 @@ class StatefulBatchRunner:
             scenario_probability = infer_alignment_score(context, setups)
             behavioral_summary = scenario_type
 
-        final_signal_normalized = self._normalize_final_signal(signal_status)
-        watch_status = self._derive_watch_status(final_signal_normalized, setup_status)
+        tracked_payload = tracker_result.payload if tracker_result is not None else {}
+        tracked_stage = tracked_payload.get("signal_class", "SCENARIO_FORMING")
+        final_signal_normalized = self._normalize_final_signal(tracked_stage)
+        watch_status = self._derive_watch_status_from_stage(tracked_stage)
 
-        alert_payload = self._build_alert_payload(
+        alert_payload = self._build_alert_payload_from_tracker_payload(
             symbol=symbol.value,
-            final_signal=final_signal_normalized,
-            watch_status=watch_status,
-            market_state=market_state,
-            htf_bias=htf_bias,
-            scenario_type=scenario_type,
-            scenario_probability=scenario_probability,
-            direction=direction or signal_direction,
-            watch_reason=watch_reason,
-            invalidation_level=invalidation_level,
-            target_zone=target_zone,
+            tracked_payload=tracked_payload,
         )
 
         return InstrumentCycleResult(
@@ -1187,6 +1078,12 @@ class StatefulBatchRunner:
             behavioral_summary=behavioral_summary,
             invalidation_level=invalidation_level,
             target_zone=target_zone,
+            execution_status=tracked_payload.get("execution_status"),
+            execution_model=tracked_payload.get("execution_model"),
+            risk_reward_ratio=tracked_payload.get("risk_reward_ratio"),
+            entry_reference_price=tracked_payload.get("entry_reference_price"),
+            invalidation_reference_price=tracked_payload.get("invalidation_reference_price"),
+            target_reference_price=tracked_payload.get("target_reference_price"),
             refreshed_timeframes=refreshed_timeframes,
             consistency_ok=getattr(consistency, "is_consistent", None),
             consistency_score=getattr(consistency, "consistency_score", None),
@@ -1200,10 +1097,6 @@ class StatefulBatchRunner:
         )
 
     def _load_timeframe(self, symbol: Instrument, timeframe: Timeframe) -> Any:
-        """
-        Tries to use current loader API, while staying compatible with a cache-only
-        simulation mode if the loader already supports such a flag.
-        """
         try:
             if self.simulation_mode:
                 try:
@@ -1236,10 +1129,6 @@ class StatefulBatchRunner:
             if "run out of API credits" in text or "current minute" in text or "code=429" in text:
                 raise TwelveDataRateLimitError(text) from error
             raise
-
-    # -------------------------------------------------------------------------
-    # Analysis pipeline
-    # -------------------------------------------------------------------------
 
     def _run_analysis_pipeline(
         self,
@@ -1308,13 +1197,6 @@ class StatefulBatchRunner:
         return [setup_a_result, setup_b_result]
 
     def _run_scenario_engine(self, context: Any, setups: list[Any]) -> Any:
-        """
-        Scenario layer is optional during migration.
-
-        Behavior:
-        - if module does not exist yet -> return None
-        - if runtime error happens inside scenario engine -> return structured error payload
-        """
         try:
             from app.scenarios.scenario_engine import ScenarioEngine
 
@@ -1324,20 +1206,14 @@ class StatefulBatchRunner:
         except ModuleNotFoundError:
             return None
 
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:
             return {
                 "scenario_engine_failed": True,
                 "scenario_engine_error": str(error),
             }
 
     def _select_final_signal(self, context: Any, setups: list[Any], scenario: Any) -> Any:
-        """
-        Priority:
-        1. valid scenario result from Scenario Engine
-        2. fallback to best setup
-        3. fallback to None
-        """
-        del context  # reserved for future arbitration logic
+        del context
 
         if scenario is not None and not (
             isinstance(scenario, dict) and scenario.get("scenario_engine_failed")
@@ -1398,10 +1274,6 @@ class StatefulBatchRunner:
             setattr(winner, "setup_name", setup_name)
 
         return winner
-
-    # -------------------------------------------------------------------------
-    # Behavioral journal
-    # -------------------------------------------------------------------------
 
     def _build_behavioral_journal_record(
         self,
@@ -1470,6 +1342,7 @@ class StatefulBatchRunner:
             scenario_phase = _enum_value(self._safe_attr(scenario, "phase"))
             scenario_decision = _enum_value(self._safe_attr(scenario, "decision"))
             scenario_evidence = self._safe_attr(scenario, "evidence")
+            execution = self._safe_attr(scenario, "execution")
         else:
             dominant_scenario = infer_behavioral_scenario(context, setups)
             next_expected_event = infer_next_expected_event(context, setups)
@@ -1478,6 +1351,7 @@ class StatefulBatchRunner:
             scenario_phase = None
             scenario_decision = None
             scenario_evidence = None
+            execution = None
 
         return {
             "ts": now_iso(),
@@ -1505,45 +1379,6 @@ class StatefulBatchRunner:
                     "hh_hl_structure": self._safe_attr(self._safe_attr(context, "structure_15m"), "hh_hl_structure"),
                     "ll_lh_structure": self._safe_attr(self._safe_attr(context, "structure_15m"), "ll_lh_structure"),
                 },
-                "impulse": {
-                    "detected": self._safe_attr(self._safe_attr(context, "impulse"), "detected"),
-                    "direction": _enum_value(self._safe_attr(self._safe_attr(context, "impulse"), "direction")),
-                    "range_points": self._safe_attr(self._safe_attr(context, "impulse"), "range_points"),
-                    "range_atr_multiple": self._safe_attr(self._safe_attr(context, "impulse"), "range_atr_multiple"),
-                    "body_ratio": self._safe_attr(self._safe_attr(context, "impulse"), "body_ratio"),
-                    "internal_pullback_pct": self._safe_attr(self._safe_attr(context, "impulse"), "internal_pullback_pct"),
-                    "broke_local_balance": self._safe_attr(self._safe_attr(context, "impulse"), "broke_local_balance"),
-                },
-                "pullback": {
-                    "detected": self._safe_attr(self._safe_attr(context, "pullback"), "detected"),
-                    "direction": _enum_value(self._safe_attr(self._safe_attr(context, "pullback"), "direction")),
-                    "depth_pct_of_impulse": self._safe_attr(self._safe_attr(context, "pullback"), "depth_pct_of_impulse"),
-                    "held_structure": self._safe_attr(self._safe_attr(context, "pullback"), "held_structure"),
-                },
-                "sweep": {
-                    "detected": self._safe_attr(self._safe_attr(context, "sweep"), "detected"),
-                    "direction": _enum_value(self._safe_attr(self._safe_attr(context, "sweep"), "direction")),
-                    "returned_to_value": self._safe_attr(self._safe_attr(context, "sweep"), "returned_to_value"),
-                    "swept_level": _enum_value(self._safe_attr(self._safe_attr(context, "sweep"), "swept_level")),
-                    "reference_price": self._safe_attr(self._safe_attr(context, "sweep"), "reference_price"),
-                },
-                "profile": {
-                    "monthly": {
-                        "val": self._safe_attr(self._safe_attr(self._safe_attr(context, "profile"), "monthly"), "val"),
-                        "poc": self._safe_attr(self._safe_attr(self._safe_attr(context, "profile"), "monthly"), "poc"),
-                        "vah": self._safe_attr(self._safe_attr(self._safe_attr(context, "profile"), "monthly"), "vah"),
-                    },
-                    "weekly": {
-                        "val": self._safe_attr(self._safe_attr(self._safe_attr(context, "profile"), "weekly"), "val"),
-                        "poc": self._safe_attr(self._safe_attr(self._safe_attr(context, "profile"), "weekly"), "poc"),
-                        "vah": self._safe_attr(self._safe_attr(self._safe_attr(context, "profile"), "weekly"), "vah"),
-                    },
-                    "daily": {
-                        "val": self._safe_attr(self._safe_attr(self._safe_attr(context, "profile"), "daily"), "val"),
-                        "poc": self._safe_attr(self._safe_attr(self._safe_attr(context, "profile"), "daily"), "poc"),
-                        "vah": self._safe_attr(self._safe_attr(self._safe_attr(context, "profile"), "daily"), "vah"),
-                    },
-                },
             },
             "setups": {
                 "setup_a": _setup_payload(setup_a) if setup_a else None,
@@ -1560,6 +1395,11 @@ class StatefulBatchRunner:
                     scenario_evidence.model_dump()
                     if hasattr(scenario_evidence, "model_dump")
                     else None
+                ),
+                "execution": (
+                    execution.model_dump()
+                    if hasattr(execution, "model_dump")
+                    else to_jsonable(execution)
                 ),
             },
             "final_signal": {
@@ -1592,11 +1432,6 @@ class StatefulBatchRunner:
         setups: list[Any],
         final_signal: Any,
     ) -> dict[str, Any]:
-        """
-        Normalizes current analysis state into payload expected by
-        app.services.consistency_checker.check_consistency().
-        """
-
         def _enum_value(value: Any) -> Any:
             return getattr(value, "value", value)
 
@@ -1670,10 +1505,6 @@ class StatefulBatchRunner:
             for warning in warnings:
                 print(f"      ⚠️ {warning}")
 
-    # -------------------------------------------------------------------------
-    # Batch/state helpers
-    # -------------------------------------------------------------------------
-
     def _ensure_budget_or_wait(self, credits: int) -> None:
         if self.budget.can_spend(credits):
             return
@@ -1720,10 +1551,6 @@ class StatefulBatchRunner:
             items[index:index + batch_size]
             for index in range(0, len(items), batch_size)
         ]
-
-    # -------------------------------------------------------------------------
-    # Console output
-    # -------------------------------------------------------------------------
 
     def _print_header(self, batch_index: int, current_batch: list[dict[str, Any]]) -> None:
         print("========================================================================================")
@@ -1818,72 +1645,64 @@ class StatefulBatchRunner:
                 message = self._safe_attr(condition, "message")
                 print(f"        ❌ {name}: {message}")
 
-    # -------------------------------------------------------------------------
-    # Signal normalization helpers
-    # -------------------------------------------------------------------------
-
     @staticmethod
-    def _normalize_final_signal(status: Any) -> str:
-        value = str(status or "").upper()
-        if value in {"TRIGGERED"}:
+    def _normalize_final_signal(stage: Any) -> str:
+        value = str(stage or "").upper()
+        if value == "ACTIVE":
             return "TRIGGERED"
-        if value in {"INVALIDATED", "INVALID"}:
-            return "INVALIDATED"
-        if value in {"ACTIVE", "READY", "WATCH", "BUILDING", "RETURNING_TO_VALUE", "PULLBACK_IN_PROGRESS"}:
+        if value == "READY":
             return "WATCH"
+        if value == "WATCH":
+            return "WATCH"
+        if value == "RESOLVED":
+            return "INVALIDATED"
         return "IDLE"
 
     @staticmethod
-    def _derive_watch_status(final_signal: str, setup_status: Any) -> str:
-        status = str(setup_status or "").upper()
-        if final_signal == "TRIGGERED":
+    def _derive_watch_status_from_stage(stage: Any) -> str:
+        value = str(stage or "").upper()
+        if value == "ACTIVE":
             return "TRIGGERED"
-        if final_signal == "INVALIDATED":
-            return "INVALIDATED"
-        if final_signal == "WATCH":
-            if status in {"READY", "ACTIVE", "WATCH", "BUILDING", "RETURNING_TO_VALUE", "PULLBACK_IN_PROGRESS"}:
-                return "NEW"
+        if value == "READY":
+            return "NEW"
+        if value == "WATCH":
             return "ACTIVE"
+        if value == "RESOLVED":
+            return "INVALIDATED"
         return "-"
 
-    def _build_alert_payload(
+    def _build_alert_payload_from_tracker_payload(
         self,
         *,
         symbol: str,
-        final_signal: str,
-        watch_status: str,
-        market_state: Any,
-        htf_bias: Any,
-        scenario_type: Any,
-        scenario_probability: Any,
-        direction: Any,
-        watch_reason: Any,
-        invalidation_level: Any,
-        target_zone: list[float],
+        tracked_payload: dict[str, Any],
     ) -> Optional[dict[str, Any]]:
-        if final_signal not in {"WATCH", "TRIGGERED", "INVALIDATED"}:
+        stage = str(tracked_payload.get("signal_class") or "").upper()
+        if stage not in {"WATCH", "READY", "ACTIVE"}:
             return None
-
-        if final_signal == "TRIGGERED":
-            alert_type = "TRIGGERED"
-        elif final_signal == "INVALIDATED":
-            alert_type = "INVALIDATED"
-        else:
-            alert_type = "WATCH_UPGRADED" if watch_status == "UPGRADED" else "WATCH_NEW"
 
         return {
             "should_alert": True,
+            "signal_id": tracked_payload.get("signal_id"),
             "symbol": symbol,
-            "alert_type": alert_type,
-            "scenario_type": scenario_type,
-            "direction": direction,
-            "scenario_probability": scenario_probability,
-            "watch_reason": watch_reason,
-            "market_state": market_state,
-            "htf_bias": htf_bias,
-            "invalidation_level": invalidation_level,
-            "target_zone": target_zone,
-            "paper_mode": settings.paper_mode,
+            "signal_class": tracked_payload.get("signal_class"),
+            "stage": tracked_payload.get("signal_class"),
+            "scenario": tracked_payload.get("scenario"),
+            "direction": tracked_payload.get("direction"),
+            "confidence": tracked_payload.get("confidence"),
+            "entry_reference_price": tracked_payload.get("entry_reference_price"),
+            "invalidation_reference_price": tracked_payload.get("invalidation_reference_price"),
+            "target_reference_price": tracked_payload.get("target_reference_price"),
+            "market_state": tracked_payload.get("market_state"),
+            "htf_bias": tracked_payload.get("htf_bias"),
+            "rationale": tracked_payload.get("rationale"),
+            "reason": tracked_payload.get("next_expected_event"),
+            "missing_conditions": tracked_payload.get("missing_conditions", []),
+            "execution_status": tracked_payload.get("execution_status"),
+            "execution_model": tracked_payload.get("execution_model"),
+            "risk_reward_ratio": tracked_payload.get("risk_reward_ratio"),
+            "execution_timeframe": tracked_payload.get("execution_timeframe"),
+            "trigger_reason": tracked_payload.get("trigger_reason"),
         }
 
     def _find_setup_by_name(self, setups: list[Any], setup_name: Any) -> Any:
@@ -1983,90 +1802,12 @@ class StatefulBatchRunner:
             return "WATCH"
         return "NO_TRADE"
 
-    def _build_tracking_scenario_payload(
-        self,
-        *,
-        context: Any,
-        setups: list[Any],
-        scenario: Any,
-        final_signal: Any,
-    ) -> dict[str, Any]:
-        market_state = extract_context_market_state(context)
-        htf_bias = extract_context_htf_bias(context)
-
-        if scenario is not None and not (
-            isinstance(scenario, dict) and scenario.get("scenario_engine_failed")
-        ):
-            scenario_type = self._safe_attr(scenario, "scenario_type")
-            decision = self._safe_attr(scenario, "decision")
-            alignment_score = self._safe_attr(scenario, "alignment_score")
-            missing_conditions = self._safe_attr(scenario, "missing_conditions") or []
-            next_expected_event = self._safe_attr(scenario, "next_expected_event")
-        else:
-            scenario_type = infer_behavioral_scenario(context, setups)
-            decision = self._extract_scenario_decision(context, setups, scenario, final_signal)
-            alignment_score = infer_alignment_score(context, setups)
-            missing_conditions = infer_missing_conditions(setups)
-            next_expected_event = infer_next_expected_event(context, setups)
-
-        scenario_type = getattr(scenario_type, "value", scenario_type)
-        decision = getattr(decision, "value", decision)
-
-        return {
-            "type": scenario_type,
-            "decision": decision,
-            "alignment_score": alignment_score or 0.0,
-            "missing_conditions": missing_conditions,
-            "next_expected_event": next_expected_event,
-            "market_state": market_state,
-            "htf_bias": htf_bias,
-            "invalidation_reference_price": None,
-            "target_reference_price": None,
-        }
-
-    def _build_tracking_final_signal_payload(
-        self,
-        *,
-        final_signal: Any,
-        setup_result: Any,
-    ) -> dict[str, Any]:
-        setup_name = self._safe_attr(final_signal, "setup_name")
-        if setup_name is None:
-            setup_name = self._safe_attr(final_signal, "setup_type")
-        setup_name = getattr(setup_name, "value", setup_name)
-
-        status = self._safe_attr(final_signal, "status")
-        direction = self._safe_attr(final_signal, "direction")
-        confidence = self._safe_attr(final_signal, "confidence")
-
-        status = getattr(status, "value", status)
-        direction = getattr(direction, "value", direction)
-
-        invalidation_reference_price = self._extract_invalidation_level(setup_result)
-        target_zone = self._extract_target_zone(setup_result)
-        target_reference_price = target_zone[0] if target_zone else None
-
-        return {
-            "setup": setup_name,
-            "status": status,
-            "direction": direction,
-            "confidence": confidence or 0.0,
-            "invalidation_reference_price": invalidation_reference_price,
-            "target_reference_price": target_reference_price,
-        }
-
-    # -------------------------------------------------------------------------
-    # Safe extractor
-    # -------------------------------------------------------------------------
-
     @staticmethod
     def _safe_attr(obj: Any, name: str) -> Any:
         if obj is None:
             return None
-
         if isinstance(obj, dict):
             return obj.get(name)
-
         return getattr(obj, name, None)
 
 
@@ -2113,12 +1854,26 @@ def run_batch_cycle() -> dict[str, Any]:
 def main() -> None:
     result = run_batch_cycle()
 
-    # DEBUG: дивимось alert payload
     if result.get("instruments"):
         for inst in result["instruments"]:
-            print("\n=== ALERT PAYLOAD DEBUG ===")
-            print(f"Symbol: {inst.get('symbol')}")
-            print(inst.get("alert_payload"))
+            payload = _map_instrument_to_formatter_payload(inst)
+            if payload is None:
+                print("\n=== ALERT PAYLOAD DEBUG ===")
+                print(f"Symbol: {inst.get('symbol')}")
+                print(inst.get("alert_payload"))
+                continue
+
+            try:
+                formatted = format_signal_message(payload)
+                message_text = formatted.render()
+
+                print("\n=== TELEGRAM MESSAGE ===")
+                print(message_text)
+                print("========================\n")
+
+            except Exception as error:
+                print(f"\n[TELEGRAM FORMAT ERROR] {inst.get('symbol')}: {error}")
+                print(inst.get("alert_payload"))
 
     print(json.dumps(
         {

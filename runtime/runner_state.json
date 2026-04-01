@@ -1,10 +1,14 @@
 {
-  "cycle_id": "2026-03-31T15:39:19.057627+00:00",
-  "status": "failed",
-  "started_at": "2026-03-31T15:39:19.057627+00:00",
-  "finished_at": "2026-03-31T15:39:20.171458+00:00",
-  "instruments": [],
-  "errors": [
-    "TWELVEDATA_API_KEY is not configured in settings/environment."
-  ]
+  "batch_index": 0,
+  "batch_size": 5,
+  "total_batches": 1,
+  "auto_mode": true,
+  "force_batch": null,
+  "current_batch_symbols": [],
+  "current_batch_started_at": null,
+  "current_batch_completed_at": null,
+  "symbol_states": {},
+  "last_run_status": "success",
+  "last_error": null,
+  "updated_at": "2026-04-01T09:52:29.259389+00:00"
 }
