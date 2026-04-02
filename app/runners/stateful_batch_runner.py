@@ -44,7 +44,25 @@ from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.2.0"
+RUNNER_VERSION = "1.3.0"
+
+
+# =============================================================================
+# GUARANTEED HISTORY WRITE LAYER
+# =============================================================================
+
+RUNTIME_DIR = Path("runtime")
+RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+
+JOURNAL_FALLBACK_PATH = RUNTIME_DIR / "radar_journal.ndjson"
+SNAPSHOT_FALLBACK_PATH = RUNTIME_DIR / "radar_snapshot_v2.ndjson"
+
+
+def safe_append_ndjson(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        f.flush()
 
 
 # =============================================================================
@@ -425,7 +443,7 @@ def save_state(state: BatchState, path: Path | None = None) -> None:
 
 class StatefulBatchRunner:
     """
-    Orchestration-only runner.
+    Orchestration-only runner with guaranteed history writes.
     """
 
     def __init__(
@@ -460,6 +478,105 @@ class StatefulBatchRunner:
         self.timeframes_by_symbol = timeframes_by_symbol or DEFAULT_TIMEFRAMES_BY_SYMBOL
         self.batches = self._make_batches(self.instrument_profiles, batch_size)
         self.state.total_batches = len(self.batches)
+
+    # -------------------------------------------------------------------------
+    # guaranteed history helpers
+    # -------------------------------------------------------------------------
+
+    def _safe_write_cycle_history(
+        self,
+        *,
+        event: str,
+        cycle_id: str,
+        batch_id: str,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        payload = {
+            "event_id": f"{event}_{cycle_id}_{batch_id}_{int(time.time() * 1000)}",
+            "event_type": event,
+            "ts_utc": now_iso(),
+            "cycle_id": cycle_id,
+            "batch_id": batch_id,
+            "runner_version": RUNNER_VERSION,
+            "symbol": "-",
+            "timeframe": "15m",
+            "source": "stateful_batch_runner_fallback",
+            "status": "ok",
+            "payload": to_jsonable(extra or {}),
+        }
+        try:
+            safe_append_ndjson(JOURNAL_FALLBACK_PATH, payload)
+        except Exception as e:
+            print(f"[FALLBACK JOURNAL WRITE ERROR] {e}")
+
+    def _safe_write_symbol_history(
+        self,
+        *,
+        symbol: str,
+        cycle_id: str,
+        batch_id: str,
+        snapshot_payload: dict[str, Any] | None = None,
+        journal_event: str = "symbol_checkpoint",
+        journal_payload: dict[str, Any] | None = None,
+    ) -> None:
+        if snapshot_payload is not None:
+            snapshot_record = to_jsonable(snapshot_payload)
+            try:
+                safe_append_ndjson(SNAPSHOT_FALLBACK_PATH, snapshot_record)
+            except Exception as e:
+                print(f"[FALLBACK SNAPSHOT WRITE ERROR] {symbol}: {e}")
+
+        event_record = {
+            "event_id": f"{journal_event}_{symbol}_{cycle_id}_{int(time.time() * 1000)}",
+            "event_type": journal_event,
+            "ts_utc": now_iso(),
+            "cycle_id": cycle_id,
+            "batch_id": batch_id,
+            "runner_version": RUNNER_VERSION,
+            "symbol": symbol,
+            "timeframe": "15m",
+            "source": "stateful_batch_runner_fallback",
+            "status": "ok",
+            "payload": to_jsonable(journal_payload or {}),
+        }
+        try:
+            safe_append_ndjson(JOURNAL_FALLBACK_PATH, event_record)
+        except Exception as e:
+            print(f"[FALLBACK JOURNAL WRITE ERROR] {symbol}: {e}")
+
+    def _build_fallback_snapshot_record(
+        self,
+        *,
+        symbol: str,
+        cycle_id: str,
+        batch_id: str,
+        payload: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        raw = to_jsonable(payload or {})
+        if not isinstance(raw, dict):
+            raw = {"raw_payload": raw}
+
+        record = {
+            "schema_version": raw.get("schema_version", "2.0"),
+            "ts": raw.get("ts", now_iso()),
+            "cycle_id": raw.get("cycle_id", cycle_id),
+            "batch_id": raw.get("batch_id", batch_id),
+            "runner_version": raw.get("runner_version", RUNNER_VERSION),
+            "instrument": raw.get("instrument", symbol),
+            "timeframe": raw.get("timeframe", "15m"),
+            "price": raw.get("price"),
+            "market_state": raw.get("market_state"),
+            "htf_bias": raw.get("htf_bias"),
+            "phase": raw.get("phase"),
+            "context": raw.get("context", {}),
+            "setups": raw.get("setups", {}),
+            "scenario": raw.get("scenario", {}),
+            "final_signal": raw.get("final_signal", {}),
+            "behavioral_summary": raw.get("behavioral_summary", {}),
+            "consistency": raw.get("consistency", {}),
+            "meta": raw.get("meta", {}),
+        }
+        return record
 
     def run(self) -> None:
         result = self.run_batch_cycle()
@@ -519,6 +636,17 @@ class StatefulBatchRunner:
             auto_mode=self.state.auto_mode,
             simulation_mode=self.simulation_mode,
         )
+        self._safe_write_cycle_history(
+            event="cycle_started_fallback",
+            cycle_id=cycle_id,
+            batch_id=batch_id,
+            extra={
+                "instruments": current_symbols,
+                "batch_size": self.state.batch_size,
+                "auto_mode": self.state.auto_mode,
+                "simulation_mode": self.simulation_mode,
+            },
+        )
 
         normalized_instruments: list[dict[str, Any]] = []
         cycle_errors: list[dict[str, Any]] = []
@@ -527,177 +655,264 @@ class StatefulBatchRunner:
         error_count = 0
         alerts_count = 0
 
-        for item in current_batch:
-            symbol: Instrument = item["symbol"]
-            symbol_state = self.state.symbol_states.setdefault(
-                symbol.value,
-                SymbolState(symbol=symbol.value),
-            )
-
-            if symbol_state.status in {
-                SymbolRunStatus.SUCCESS.value,
-                SymbolRunStatus.SKIPPED.value,
-            }:
-                print(f"\n### SKIPPING {symbol.value} (already completed in current batch)")
-                skipped_result = InstrumentCycleResult(
-                    symbol=symbol.value,
-                    status="skipped",
-                    final_signal="IDLE",
-                    watch_status="-",
-                    analysis_snapshot=to_jsonable(symbol_state.analysis_snapshot),
+        try:
+            for item in current_batch:
+                symbol: Instrument = item["symbol"]
+                symbol_state = self.state.symbol_states.setdefault(
+                    symbol.value,
+                    SymbolState(symbol=symbol.value),
                 )
-                normalized_instruments.append(skipped_result.to_dict())
-                processed_count += 1
-                continue
 
-            try:
-                instrument_result = self._analyze_symbol(
-                    symbol,
-                    cycle_id=cycle_id,
-                    batch_id=batch_id,
-                )
-                normalized_instruments.append(instrument_result.to_dict())
-                processed_count += 1
+                if symbol_state.status in {
+                    SymbolRunStatus.SUCCESS.value,
+                    SymbolRunStatus.SKIPPED.value,
+                }:
+                    print(f"\n### SKIPPING {symbol.value} (already completed in current batch)")
+                    skipped_result = InstrumentCycleResult(
+                        symbol=symbol.value,
+                        status="skipped",
+                        final_signal="IDLE",
+                        watch_status="-",
+                        analysis_snapshot=to_jsonable(symbol_state.analysis_snapshot),
+                    )
+                    normalized_instruments.append(skipped_result.to_dict())
+                    processed_count += 1
+                    continue
 
-                if instrument_result.alert_payload and instrument_result.alert_payload.get("should_alert"):
-                    alerts_count += 1
+                try:
+                    instrument_result = self._analyze_symbol(
+                        symbol,
+                        cycle_id=cycle_id,
+                        batch_id=batch_id,
+                    )
+                    normalized_instruments.append(instrument_result.to_dict())
+                    processed_count += 1
 
-                if instrument_result.status != "ok":
+                    if instrument_result.alert_payload and instrument_result.alert_payload.get("should_alert"):
+                        alerts_count += 1
+
+                    if instrument_result.status != "ok":
+                        batch_had_errors = True
+                        error_count += 1
+                        cycle_errors.append(
+                            {
+                                "symbol": symbol.value,
+                                "type": "symbol_analysis_error",
+                                "error_message": instrument_result.error_message,
+                            }
+                        )
+
+                except TwelveDataRateLimitError as error:
                     batch_had_errors = True
                     error_count += 1
+                    retry_after = datetime.now(UTC) + timedelta(
+                        seconds=self.budget.seconds_until_reset() + 1
+                    )
+
+                    symbol_state.status = SymbolRunStatus.RETRY_PENDING.value
+                    symbol_state.error_message = str(error)
+                    symbol_state.retry_after_utc = retry_after.isoformat()
+                    symbol_state.completed_at = None
+
+                    self.state.last_run_status = "partial_error"
+                    self.state.last_error = str(error)
+                    save_state(self.state, self.state_path)
+
+                    print(f"  [ERROR] {symbol.value}: {error}")
+
+                    normalized_instruments.append(
+                        InstrumentCycleResult(
+                            symbol=symbol.value,
+                            status="error",
+                            final_signal="IDLE",
+                            watch_status="-",
+                            error_message=str(error),
+                            data_status="rate_limit_error",
+                        ).to_dict()
+                    )
+
                     cycle_errors.append(
                         {
                             "symbol": symbol.value,
-                            "type": "symbol_analysis_error",
-                            "error_message": instrument_result.error_message,
+                            "type": "rate_limit_error",
+                            "error_message": str(error),
+                            "retry_after_utc": retry_after.isoformat(),
                         }
                     )
-
-            except TwelveDataRateLimitError as error:
-                batch_had_errors = True
-                error_count += 1
-                retry_after = datetime.now(UTC) + timedelta(
-                    seconds=self.budget.seconds_until_reset() + 1
-                )
-
-                symbol_state.status = SymbolRunStatus.RETRY_PENDING.value
-                symbol_state.error_message = str(error)
-                symbol_state.retry_after_utc = retry_after.isoformat()
-                symbol_state.completed_at = None
-
-                self.state.last_run_status = "partial_error"
-                self.state.last_error = str(error)
-                save_state(self.state, self.state_path)
-
-                print(f"  [ERROR] {symbol.value}: {error}")
-
-                normalized_instruments.append(
-                    InstrumentCycleResult(
+                    self._safe_write_symbol_history(
                         symbol=symbol.value,
-                        status="error",
-                        final_signal="IDLE",
-                        watch_status="-",
-                        error_message=str(error),
-                        data_status="rate_limit_error",
-                    ).to_dict()
-                )
+                        cycle_id=cycle_id,
+                        batch_id=batch_id,
+                        snapshot_payload=self._build_fallback_snapshot_record(
+                            symbol=symbol.value,
+                            cycle_id=cycle_id,
+                            batch_id=batch_id,
+                            payload={
+                                "instrument": symbol.value,
+                                "ts": now_iso(),
+                                "cycle_id": cycle_id,
+                                "batch_id": batch_id,
+                                "runner_version": RUNNER_VERSION,
+                                "timeframe": "15m",
+                                "price": None,
+                                "market_state": None,
+                                "htf_bias": None,
+                                "phase": None,
+                                "context": {},
+                                "setups": {},
+                                "scenario": {"type": "RATE_LIMIT_ERROR"},
+                                "final_signal": {"status": "ERROR"},
+                                "behavioral_summary": {"decision": "WAIT"},
+                                "consistency": {},
+                                "meta": {"error": str(error)},
+                            },
+                        ),
+                        journal_event="symbol_rate_limit_error_fallback",
+                        journal_payload={
+                            "error": str(error),
+                            "retry_after_utc": retry_after.isoformat(),
+                        },
+                    )
+                    break
 
-                cycle_errors.append(
-                    {
-                        "symbol": symbol.value,
-                        "type": "rate_limit_error",
-                        "error_message": str(error),
-                        "retry_after_utc": retry_after.isoformat(),
-                    }
-                )
-                break
+                except Exception as error:
+                    batch_had_errors = True
+                    error_count += 1
 
-            except Exception as error:
-                batch_had_errors = True
-                error_count += 1
+                    symbol_state.status = SymbolRunStatus.FAILED.value
+                    symbol_state.error_message = str(error)
+                    symbol_state.completed_at = None
 
-                symbol_state.status = SymbolRunStatus.FAILED.value
-                symbol_state.error_message = str(error)
-                symbol_state.completed_at = None
+                    self.state.last_run_status = "partial_error"
+                    self.state.last_error = str(error)
+                    save_state(self.state, self.state_path)
 
-                self.state.last_run_status = "partial_error"
-                self.state.last_error = str(error)
-                save_state(self.state, self.state_path)
+                    print(f"  [ERROR] {symbol.value}: {error}")
 
-                print(f"  [ERROR] {symbol.value}: {error}")
+                    normalized_instruments.append(
+                        InstrumentCycleResult(
+                            symbol=symbol.value,
+                            status="error",
+                            final_signal="IDLE",
+                            watch_status="-",
+                            error_message=str(error),
+                            data_status="exception",
+                        ).to_dict()
+                    )
 
-                normalized_instruments.append(
-                    InstrumentCycleResult(
+                    cycle_errors.append(
+                        {
+                            "symbol": symbol.value,
+                            "type": "symbol_exception",
+                            "error_message": str(error),
+                        }
+                    )
+                    self._safe_write_symbol_history(
                         symbol=symbol.value,
-                        status="error",
-                        final_signal="IDLE",
-                        watch_status="-",
-                        error_message=str(error),
-                        data_status="exception",
-                    ).to_dict()
-                )
+                        cycle_id=cycle_id,
+                        batch_id=batch_id,
+                        snapshot_payload=self._build_fallback_snapshot_record(
+                            symbol=symbol.value,
+                            cycle_id=cycle_id,
+                            batch_id=batch_id,
+                            payload={
+                                "instrument": symbol.value,
+                                "ts": now_iso(),
+                                "cycle_id": cycle_id,
+                                "batch_id": batch_id,
+                                "runner_version": RUNNER_VERSION,
+                                "timeframe": "15m",
+                                "price": None,
+                                "market_state": None,
+                                "htf_bias": None,
+                                "phase": None,
+                                "context": {},
+                                "setups": {},
+                                "scenario": {"type": "SYMBOL_EXCEPTION"},
+                                "final_signal": {"status": "ERROR"},
+                                "behavioral_summary": {"decision": "WAIT"},
+                                "consistency": {},
+                                "meta": {"error": str(error)},
+                            },
+                        ),
+                        journal_event="symbol_exception_fallback",
+                        journal_payload={"error": str(error)},
+                    )
+                    continue
 
-                cycle_errors.append(
-                    {
-                        "symbol": symbol.value,
-                        "type": "symbol_exception",
-                        "error_message": str(error),
-                    }
-                )
-                continue
+            if not batch_had_errors and self.state.is_current_batch_complete():
+                self.state.current_batch_completed_at = now_iso()
+                self.state.last_run_status = "success"
+                self.state.last_error = None
+                self._advance_batch_pointer()
+                save_state(self.state, self.state_path)
+                print("\nBatch completed successfully. State advanced to next batch.")
+                cycle_status = "ok"
+            else:
+                self.state.last_run_status = "partial_error"
+                save_state(self.state, self.state_path)
+                print("\nБули помилки — стан batch не оновлюється, щоб не пропустити поточний batch.")
+                cycle_status = "partial" if normalized_instruments else "error"
 
-        if not batch_had_errors and self.state.is_current_batch_complete():
-            self.state.current_batch_completed_at = now_iso()
-            self.state.last_run_status = "success"
-            self.state.last_error = None
-            self._advance_batch_pointer()
-            save_state(self.state, self.state_path)
-            print("\nBatch completed successfully. State advanced to next batch.")
-            cycle_status = "ok"
-        else:
-            self.state.last_run_status = "partial_error"
-            save_state(self.state, self.state_path)
-            print("\nБули помилки — стан batch не оновлюється, щоб не пропустити поточний batch.")
-            cycle_status = "partial" if normalized_instruments else "error"
+            elapsed_sec = time.monotonic() - cycle_started_monotonic
 
-        elapsed_sec = time.monotonic() - cycle_started_monotonic
+            write_cycle_finished(
+                cycle_id=cycle_id,
+                batch_id=batch_id,
+                runner_version=RUNNER_VERSION,
+                processed=processed_count,
+                errors=error_count,
+                alerts=alerts_count,
+                duration_sec=elapsed_sec,
+            )
+            self._safe_write_cycle_history(
+                event="cycle_finished_fallback",
+                cycle_id=cycle_id,
+                batch_id=batch_id,
+                extra={
+                    "processed": processed_count,
+                    "errors": error_count,
+                    "alerts": alerts_count,
+                    "duration_sec": round(elapsed_sec, 3),
+                    "status": cycle_status,
+                },
+            )
 
-        write_cycle_finished(
-            cycle_id=cycle_id,
-            batch_id=batch_id,
-            runner_version=RUNNER_VERSION,
-            processed=processed_count,
-            errors=error_count,
-            alerts=alerts_count,
-            duration_sec=elapsed_sec,
-        )
+            try:
+                build_and_export_statistics()
+            except Exception as stats_error:
+                cycle_logger.warning(f"Statistics export failed: {stats_error}")
 
-        try:
-            build_and_export_statistics()
-        except Exception as stats_error:
-            cycle_logger.warning(f"Statistics export failed: {stats_error}")
+            cycle_logger.info(
+                f"Batch cycle finished. status={cycle_status} instruments={len(normalized_instruments)} errors={len(cycle_errors)}"
+            )
 
-        cycle_logger.info(
-            f"Batch cycle finished. status={cycle_status} instruments={len(normalized_instruments)} errors={len(cycle_errors)}"
-        )
+            return CycleResult(
+                cycle_id=cycle_id,
+                started_at=started_at,
+                finished_at=now_iso(),
+                status=cycle_status,
+                instruments=normalized_instruments,
+                errors=cycle_errors,
+                meta={
+                    "batch_index": batch_index,
+                    "batch_size": self.state.batch_size,
+                    "total_batches": self.state.total_batches,
+                    "auto_mode": self.state.auto_mode,
+                    "force_batch": self.state.force_batch,
+                    "simulation_mode": self.simulation_mode,
+                    "current_batch_symbols": current_symbols,
+                },
+            ).to_dict()
 
-        return CycleResult(
-            cycle_id=cycle_id,
-            started_at=started_at,
-            finished_at=now_iso(),
-            status=cycle_status,
-            instruments=normalized_instruments,
-            errors=cycle_errors,
-            meta={
-                "batch_index": batch_index,
-                "batch_size": self.state.batch_size,
-                "total_batches": self.state.total_batches,
-                "auto_mode": self.state.auto_mode,
-                "force_batch": self.state.force_batch,
-                "simulation_mode": self.simulation_mode,
-                "current_batch_symbols": current_symbols,
-            },
-        ).to_dict()
+        except Exception as cycle_error:
+            self._safe_write_cycle_history(
+                event="cycle_crashed_fallback",
+                cycle_id=cycle_id,
+                batch_id=batch_id,
+                extra={"error": str(cycle_error)},
+            )
+            raise
 
     def _analyze_symbol(
         self,
@@ -717,59 +932,235 @@ class StatefulBatchRunner:
         symbol_state.retry_after_utc = None
         save_state(self.state, self.state_path)
 
-        timeframes = self.timeframes_by_symbol.get(
-            symbol,
-            [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
+        fallback_snapshot_payload: dict[str, Any] | None = None
+        fallback_journal_payload: dict[str, Any] = {"status": "started"}
+
+        self._safe_write_symbol_history(
+            symbol=symbol.value,
+            cycle_id=cycle_id,
+            batch_id=batch_id,
+            snapshot_payload=None,
+            journal_event="symbol_started_fallback",
+            journal_payload={"status": "started"},
         )
 
-        series_by_tf: dict[Timeframe, pd.DataFrame] = {}
-        refreshed_timeframes: list[str] = []
-        load_results: dict[str, Any] = {}
-
-        for timeframe in timeframes:
-            if not self.simulation_mode:
-                self._ensure_budget_or_wait(credits=1)
-
-            result = self._load_timeframe(symbol, timeframe)
-
-            if getattr(result, "source", None) == "api":
-                self.budget.spend(1)
-                refreshed_timeframes.append(timeframe.value)
-
-            df = getattr(result, "df", None)
-            if df is None:
-                raise RuntimeError(f"Loader returned no dataframe for {symbol.value} {timeframe.value}")
-
-            series_by_tf[timeframe] = df
-            load_results[timeframe.value] = {
-                "source": getattr(result, "source", None),
-                "rows": getattr(result, "rows", len(df)),
-                "last_ts": getattr(result, "last_ts", None),
-                "last_close": getattr(result, "last_close", None),
-            }
-
-        if is_weekend_utc():
-            print(f"  [SKIP] {symbol.value}: weekend market closed")
-
-            journal_record = build_market_closed_journal_record(
-                symbol=symbol,
-                reason="WEEKEND_MARKET_CLOSED",
-                refreshed_timeframes=refreshed_timeframes,
-                simulation_mode=self.simulation_mode,
+        try:
+            timeframes = self.timeframes_by_symbol.get(
+                symbol,
+                [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
             )
+
+            series_by_tf: dict[Timeframe, pd.DataFrame] = {}
+            refreshed_timeframes: list[str] = []
+            load_results: dict[str, Any] = {}
+
+            for timeframe in timeframes:
+                if not self.simulation_mode:
+                    self._ensure_budget_or_wait(credits=1)
+
+                result = self._load_timeframe(symbol, timeframe)
+
+                if getattr(result, "source", None) == "api":
+                    self.budget.spend(1)
+                    refreshed_timeframes.append(timeframe.value)
+
+                df = getattr(result, "df", None)
+                if df is None:
+                    raise RuntimeError(f"Loader returned no dataframe for {symbol.value} {timeframe.value}")
+
+                series_by_tf[timeframe] = df
+                load_results[timeframe.value] = {
+                    "source": getattr(result, "source", None),
+                    "rows": getattr(result, "rows", len(df)),
+                    "last_ts": getattr(result, "last_ts", None),
+                    "last_close": getattr(result, "last_close", None),
+                }
+
+            if is_weekend_utc():
+                print(f"  [SKIP] {symbol.value}: weekend market closed")
+
+                journal_record = build_market_closed_journal_record(
+                    symbol=symbol,
+                    reason="WEEKEND_MARKET_CLOSED",
+                    refreshed_timeframes=refreshed_timeframes,
+                    simulation_mode=self.simulation_mode,
+                )
+                journal_record["cycle_id"] = cycle_id
+                journal_record["batch_id"] = batch_id
+                journal_record["runner_version"] = RUNNER_VERSION
+                journal_record["timeframe"] = "15m"
+                journal_record["schema_version"] = "2.0"
+
+                symbol_state.refreshed_timeframes = refreshed_timeframes
+                symbol_state.analysis_snapshot = {
+                    "load_results": to_jsonable(load_results),
+                    "analysis": None,
+                    "behavioral_journal": to_jsonable(journal_record),
+                    "refreshed_timeframes": refreshed_timeframes,
+                    "completed_at": now_iso(),
+                    "skipped": True,
+                    "skip_reason": "WEEKEND_MARKET_CLOSED",
+                }
+                symbol_state.status = SymbolRunStatus.SKIPPED.value
+                symbol_state.completed_at = now_iso()
+
+                write_instrument_analyzed(
+                    cycle_id=cycle_id,
+                    batch_id=batch_id,
+                    runner_version=RUNNER_VERSION,
+                    symbol=symbol.value,
+                    timeframe="15m",
+                    analysis_payload={
+                        "symbol": symbol.value,
+                        "price": None,
+                        "market_state": None,
+                        "htf_bias": None,
+                        "phase": None,
+                        "scenario_type": "MARKET_CLOSED",
+                        "scenario_decision": "SKIPPED",
+                        "final_signal_status": "SKIPPED",
+                        "final_signal_direction": None,
+                        "final_signal_confidence": 0.0,
+                        "consistency_ok": True,
+                        "consistency_score": 1.0,
+                    },
+                )
+
+                write_instrument_snapshot(
+                    cycle_id=cycle_id,
+                    batch_id=batch_id,
+                    runner_version=RUNNER_VERSION,
+                    symbol=symbol.value,
+                    timeframe="15m",
+                    analysis_payload=journal_record,
+                )
+
+                fallback_snapshot_payload = journal_record
+                fallback_journal_payload = {
+                    "status": "skipped",
+                    "reason": "WEEKEND_MARKET_CLOSED",
+                }
+
+                save_state(self.state, self.state_path)
+
+                return InstrumentCycleResult(
+                    symbol=symbol.value,
+                    status="skipped",
+                    price=None,
+                    market_state=None,
+                    htf_bias=None,
+                    phase=None,
+                    setup=None,
+                    setup_status="SKIPPED",
+                    direction=None,
+                    confidence=0.0,
+                    scenario_type="MARKET_CLOSED",
+                    scenario_probability=0.0,
+                    final_signal="IDLE",
+                    watch_status="-",
+                    watch_reason="WEEKEND_MARKET_CLOSED",
+                    behavioral_summary="MARKET_CLOSED",
+                    refreshed_timeframes=refreshed_timeframes,
+                    consistency_ok=True,
+                    consistency_score=1.0,
+                    conflict_flags=[],
+                    consistency_warnings=[],
+                    consistency_summary="Market closed",
+                    data_status="market_closed",
+                    analysis_snapshot=to_jsonable(symbol_state.analysis_snapshot),
+                    error_message=None,
+                    alert_payload=None,
+                )
+
+            analysis = self._run_analysis_pipeline(symbol, series_by_tf)
+
+            consistency_payload = self._build_consistency_payload(
+                context=analysis["context"],
+                setups=analysis["setups"],
+                final_signal=analysis["final_signal"],
+            )
+
+            consistency = check_consistency(
+                symbol=symbol.value,
+                market_state=consistency_payload["market_state"],
+                htf_bias=consistency_payload["htf_bias"],
+                phase=consistency_payload["phase"],
+                final_signal_setup=consistency_payload["final_signal_setup"],
+                final_signal_status=consistency_payload["final_signal_status"],
+                final_signal_direction=consistency_payload["final_signal_direction"],
+                diagnostics=consistency_payload["diagnostics"],
+                behavioral_summary=consistency_payload["behavioral_summary"],
+            )
+
+            journal_record = self._build_behavioral_journal_record(
+                symbol=symbol,
+                context=analysis["context"],
+                setups=analysis["setups"],
+                scenario=analysis["scenario"],
+                final_signal=analysis["final_signal"],
+                refreshed_timeframes=refreshed_timeframes,
+            )
+
+            journal_record["consistency"] = to_jsonable(consistency.to_dict())
+            journal_record["cycle_id"] = cycle_id
+            journal_record["batch_id"] = batch_id
+            journal_record["runner_version"] = RUNNER_VERSION
+            journal_record["timeframe"] = "15m"
+            journal_record["schema_version"] = "2.0"
 
             symbol_state.refreshed_timeframes = refreshed_timeframes
             symbol_state.analysis_snapshot = {
                 "load_results": to_jsonable(load_results),
-                "analysis": None,
+                "analysis": to_jsonable(analysis),
                 "behavioral_journal": to_jsonable(journal_record),
                 "refreshed_timeframes": refreshed_timeframes,
                 "completed_at": now_iso(),
-                "skipped": True,
-                "skip_reason": "WEEKEND_MARKET_CLOSED",
             }
-            symbol_state.status = SymbolRunStatus.SKIPPED.value
+            symbol_state.status = SymbolRunStatus.SUCCESS.value
             symbol_state.completed_at = now_iso()
+
+            context = analysis.get("context")
+            scenario = analysis.get("scenario")
+            final_signal = analysis.get("final_signal")
+            setups = analysis.get("setups") or []
+
+            price = extract_context_price(context)
+            market_state = extract_context_market_state(context)
+            htf_bias = extract_context_htf_bias(context)
+            phase = classify_market_phase(context)
+
+            scenario_ok = scenario is not None and not (
+                isinstance(scenario, dict) and scenario.get("scenario_engine_failed")
+            )
+
+            if scenario_ok:
+                scenario_type = self._safe_attr(scenario, "scenario_type")
+                scenario_type = getattr(scenario_type, "value", scenario_type)
+                scenario_probability = self._safe_attr(scenario, "alignment_score")
+                scenario_decision = self._safe_attr(scenario, "decision")
+                scenario_decision = getattr(scenario_decision, "value", scenario_decision)
+            else:
+                scenario_type = infer_behavioral_scenario(context, setups)
+                scenario_probability = infer_alignment_score(context, setups)
+                scenario_decision = self._extract_scenario_decision(context, setups, scenario, final_signal)
+
+            analysis_payload = {
+                "symbol": symbol.value,
+                "price": price,
+                "market_state": market_state,
+                "htf_bias": htf_bias,
+                "phase": phase,
+                "scenario_type": scenario_type,
+                "scenario_decision": scenario_decision,
+                "final_signal_status": self._safe_attr(final_signal, "status"),
+                "final_signal_direction": self._safe_attr(final_signal, "direction"),
+                "final_signal_confidence": self._safe_attr(final_signal, "confidence"),
+                "consistency_ok": consistency.is_consistent,
+                "consistency_score": consistency.consistency_score,
+                "final_signal": to_jsonable(journal_record.get("final_signal")),
+                "behavioral_summary": to_jsonable(journal_record.get("behavioral_summary")),
+                "consistency": to_jsonable(journal_record.get("consistency")),
+            }
 
             write_instrument_analyzed(
                 cycle_id=cycle_id,
@@ -777,20 +1168,7 @@ class StatefulBatchRunner:
                 runner_version=RUNNER_VERSION,
                 symbol=symbol.value,
                 timeframe="15m",
-                analysis_payload={
-                    "symbol": symbol.value,
-                    "price": None,
-                    "market_state": None,
-                    "htf_bias": None,
-                    "phase": None,
-                    "scenario_type": "MARKET_CLOSED",
-                    "scenario_decision": "SKIPPED",
-                    "final_signal_status": "SKIPPED",
-                    "final_signal_direction": None,
-                    "final_signal_confidence": 0.0,
-                    "consistency_ok": True,
-                    "consistency_score": 1.0,
-                },
+                analysis_payload=analysis_payload,
             )
 
             write_instrument_snapshot(
@@ -802,216 +1180,127 @@ class StatefulBatchRunner:
                 analysis_payload=journal_record,
             )
 
+            fallback_snapshot_payload = journal_record
+            fallback_journal_payload = {
+                "status": "ok",
+                "market_state": market_state,
+                "htf_bias": htf_bias,
+                "phase": phase,
+                "scenario_type": scenario_type,
+                "scenario_decision": scenario_decision,
+                "final_signal": to_jsonable(journal_record.get("final_signal")),
+            }
+
             save_state(self.state, self.state_path)
 
-            return InstrumentCycleResult(
-                symbol=symbol.value,
-                status="skipped",
-                price=None,
-                market_state=None,
-                htf_bias=None,
-                phase=None,
-                setup=None,
-                setup_status="SKIPPED",
-                direction=None,
-                confidence=0.0,
-                scenario_type="MARKET_CLOSED",
-                scenario_probability=0.0,
-                final_signal="IDLE",
-                watch_status="-",
-                watch_reason="WEEKEND_MARKET_CLOSED",
-                behavioral_summary="MARKET_CLOSED",
+            tracker_result = self.signal_tracker.process(
+                scenario_result=scenario if scenario_ok else final_signal,
+                cycle_id=cycle_id,
+            )
+
+            candidate_payload = tracker_result.payload
+            if candidate_payload.get("signal_class") in {
+                "SCENARIO_FORMING",
+                "WATCH",
+                "READY",
+                "ACTIVE",
+            }:
+                write_signal_candidate_detected(
+                    cycle_id=cycle_id,
+                    batch_id=batch_id,
+                    runner_version=RUNNER_VERSION,
+                    symbol=symbol.value,
+                    timeframe="15m",
+                    signal_payload=candidate_payload,
+                )
+
+            if tracker_result.action == "REGISTERED":
+                write_signal_registered(
+                    cycle_id=cycle_id,
+                    batch_id=batch_id,
+                    runner_version=RUNNER_VERSION,
+                    symbol=symbol.value,
+                    timeframe="15m",
+                    signal_id=tracker_result.signal_id or candidate_payload.get("signal_id", ""),
+                    payload=tracker_result.payload,
+                )
+            elif tracker_result.action == "UPDATED":
+                write_signal_updated(
+                    cycle_id=cycle_id,
+                    batch_id=batch_id,
+                    runner_version=RUNNER_VERSION,
+                    symbol=symbol.value,
+                    timeframe="15m",
+                    signal_id=tracker_result.signal_id or candidate_payload.get("signal_id", ""),
+                    payload=tracker_result.payload,
+                    previous_payload=tracker_result.previous_payload,
+                    changed_fields=tracker_result.changed_fields,
+                )
+            elif tracker_result.action == "RESOLVED":
+                write_signal_resolved(
+                    cycle_id=cycle_id,
+                    batch_id=batch_id,
+                    runner_version=RUNNER_VERSION,
+                    symbol=symbol.value,
+                    timeframe="15m",
+                    signal_id=tracker_result.signal_id or candidate_payload.get("signal_id", ""),
+                    payload=tracker_result.payload,
+                )
+
+            self._print_symbol_summary(symbol, analysis, refreshed_timeframes)
+            self._print_consistency_summary(consistency)
+
+            instrument_result = self._build_instrument_cycle_result(
+                symbol=symbol,
+                analysis=analysis,
+                consistency=consistency,
                 refreshed_timeframes=refreshed_timeframes,
-                consistency_ok=True,
-                consistency_score=1.0,
-                conflict_flags=[],
-                consistency_warnings=[],
-                consistency_summary="Market closed",
-                data_status="market_closed",
-                analysis_snapshot=to_jsonable(symbol_state.analysis_snapshot),
-                error_message=None,
-                alert_payload=None,
+                symbol_state=symbol_state,
+                tracker_result=tracker_result,
             )
 
-        analysis = self._run_analysis_pipeline(symbol, series_by_tf)
+            symbol_logger.info(
+                f"Symbol analyzed. final_signal={instrument_result.final_signal} watch_status={instrument_result.watch_status}"
+            )
 
-        consistency_payload = self._build_consistency_payload(
-            context=analysis["context"],
-            setups=analysis["setups"],
-            final_signal=analysis["final_signal"],
-        )
+            return instrument_result
 
-        consistency = check_consistency(
-            symbol=symbol.value,
-            market_state=consistency_payload["market_state"],
-            htf_bias=consistency_payload["htf_bias"],
-            phase=consistency_payload["phase"],
-            final_signal_setup=consistency_payload["final_signal_setup"],
-            final_signal_status=consistency_payload["final_signal_status"],
-            final_signal_direction=consistency_payload["final_signal_direction"],
-            diagnostics=consistency_payload["diagnostics"],
-            behavioral_summary=consistency_payload["behavioral_summary"],
-        )
-
-        journal_record = self._build_behavioral_journal_record(
-            symbol=symbol,
-            context=analysis["context"],
-            setups=analysis["setups"],
-            scenario=analysis["scenario"],
-            final_signal=analysis["final_signal"],
-            refreshed_timeframes=refreshed_timeframes,
-        )
-
-        journal_record["consistency"] = to_jsonable(consistency.to_dict())
-
-        symbol_state.refreshed_timeframes = refreshed_timeframes
-        symbol_state.analysis_snapshot = {
-            "load_results": to_jsonable(load_results),
-            "analysis": to_jsonable(analysis),
-            "behavioral_journal": to_jsonable(journal_record),
-            "refreshed_timeframes": refreshed_timeframes,
-            "completed_at": now_iso(),
-        }
-        symbol_state.status = SymbolRunStatus.SUCCESS.value
-        symbol_state.completed_at = now_iso()
-
-        context = analysis.get("context")
-        scenario = analysis.get("scenario")
-        final_signal = analysis.get("final_signal")
-        setups = analysis.get("setups") or []
-
-        price = extract_context_price(context)
-        market_state = extract_context_market_state(context)
-        htf_bias = extract_context_htf_bias(context)
-        phase = classify_market_phase(context)
-
-        scenario_ok = scenario is not None and not (
-            isinstance(scenario, dict) and scenario.get("scenario_engine_failed")
-        )
-
-        if scenario_ok:
-            scenario_type = self._safe_attr(scenario, "scenario_type")
-            scenario_type = getattr(scenario_type, "value", scenario_type)
-            scenario_probability = self._safe_attr(scenario, "alignment_score")
-            scenario_decision = self._safe_attr(scenario, "decision")
-            scenario_decision = getattr(scenario_decision, "value", scenario_decision)
-            signal_class = self._safe_attr(scenario, "status")
-            signal_class = getattr(signal_class, "value", signal_class)
-        else:
-            scenario_type = infer_behavioral_scenario(context, setups)
-            scenario_probability = infer_alignment_score(context, setups)
-            scenario_decision = self._extract_scenario_decision(context, setups, scenario, final_signal)
-            signal_class = "NO_SETUP"
-
-        analysis_payload = {
-            "symbol": symbol.value,
-            "price": price,
-            "market_state": market_state,
-            "htf_bias": htf_bias,
-            "phase": phase,
-            "scenario_type": scenario_type,
-            "scenario_decision": scenario_decision,
-            "final_signal_status": self._safe_attr(final_signal, "status"),
-            "final_signal_direction": self._safe_attr(final_signal, "direction"),
-            "final_signal_confidence": self._safe_attr(final_signal, "confidence"),
-            "consistency_ok": consistency.is_consistent,
-            "consistency_score": consistency.consistency_score,
-            "final_signal": to_jsonable(journal_record.get("final_signal")),
-            "behavioral_summary": to_jsonable(journal_record.get("behavioral_summary")),
-            "consistency": to_jsonable(journal_record.get("consistency")),
-        }
-
-        write_instrument_analyzed(
-            cycle_id=cycle_id,
-            batch_id=batch_id,
-            runner_version=RUNNER_VERSION,
-            symbol=symbol.value,
-            timeframe="15m",
-            analysis_payload=analysis_payload,
-        )
-
-        write_instrument_snapshot(
-            cycle_id=cycle_id,
-            batch_id=batch_id,
-            runner_version=RUNNER_VERSION,
-            symbol=symbol.value,
-            timeframe="15m",
-            analysis_payload=journal_record,
-        )
-
-        save_state(self.state, self.state_path)
-
-        tracker_result = self.signal_tracker.process(
-            scenario_result=scenario if scenario_ok else final_signal,
-            cycle_id=cycle_id,
-        )
-
-        candidate_payload = tracker_result.payload
-        if candidate_payload.get("signal_class") in {
-            "SCENARIO_FORMING",
-            "WATCH",
-            "READY",
-            "ACTIVE",
-        }:
-            write_signal_candidate_detected(
+        except Exception as error:
+            fallback_journal_payload = {"status": "error", "error": str(error)}
+            fallback_snapshot_payload = self._build_fallback_snapshot_record(
+                symbol=symbol.value,
                 cycle_id=cycle_id,
                 batch_id=batch_id,
-                runner_version=RUNNER_VERSION,
-                symbol=symbol.value,
-                timeframe="15m",
-                signal_payload=candidate_payload,
+                payload={
+                    "instrument": symbol.value,
+                    "timeframe": "15m",
+                    "price": None,
+                    "market_state": None,
+                    "htf_bias": None,
+                    "phase": None,
+                    "context": {},
+                    "setups": {},
+                    "scenario": {"type": "SYMBOL_EXCEPTION"},
+                    "final_signal": {"status": "ERROR", "direction": None, "confidence": 0.0},
+                    "behavioral_summary": {"decision": "WAIT"},
+                    "consistency": {},
+                    "meta": {"error": str(error)},
+                },
             )
+            raise
 
-        if tracker_result.action == "REGISTERED":
-            write_signal_registered(
-                cycle_id=cycle_id,
-                batch_id=batch_id,
-                runner_version=RUNNER_VERSION,
-                symbol=symbol.value,
-                timeframe="15m",
-                signal_id=tracker_result.signal_id or candidate_payload.get("signal_id", ""),
-                payload=tracker_result.payload,
-            )
-        elif tracker_result.action == "UPDATED":
-            write_signal_updated(
-                cycle_id=cycle_id,
-                batch_id=batch_id,
-                runner_version=RUNNER_VERSION,
-                symbol=symbol.value,
-                timeframe="15m",
-                signal_id=tracker_result.signal_id or candidate_payload.get("signal_id", ""),
-                payload=tracker_result.payload,
-                previous_payload=tracker_result.previous_payload,
-                changed_fields=tracker_result.changed_fields,
-            )
-        elif tracker_result.action == "RESOLVED":
-            write_signal_resolved(
-                cycle_id=cycle_id,
-                batch_id=batch_id,
-                runner_version=RUNNER_VERSION,
-                symbol=symbol.value,
-                timeframe="15m",
-                signal_id=tracker_result.signal_id or candidate_payload.get("signal_id", ""),
-                payload=tracker_result.payload,
-            )
-
-        self._print_symbol_summary(symbol, analysis, refreshed_timeframes)
-        self._print_consistency_summary(consistency)
-
-        instrument_result = self._build_instrument_cycle_result(
-            symbol=symbol,
-            analysis=analysis,
-            consistency=consistency,
-            refreshed_timeframes=refreshed_timeframes,
-            symbol_state=symbol_state,
-            tracker_result=tracker_result,
-        )
-
-        symbol_logger.info(
-            f"Symbol analyzed. final_signal={instrument_result.final_signal} watch_status={instrument_result.watch_status}"
-        )
-
-        return instrument_result
+        finally:
+            try:
+                self._safe_write_symbol_history(
+                    symbol=symbol.value,
+                    cycle_id=cycle_id,
+                    batch_id=batch_id,
+                    snapshot_payload=fallback_snapshot_payload,
+                    journal_event="symbol_finished_fallback",
+                    journal_payload=fallback_journal_payload,
+                )
+            except Exception as fallback_error:
+                print(f"[FALLBACK FINAL WRITE ERROR] {symbol.value}: {fallback_error}")
 
     def _build_instrument_cycle_result(
         self,
