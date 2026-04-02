@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 
 
 DEFAULT_JOURNAL_PATH = Path("runtime/radar_journal.ndjson")
+SNAPSHOT_JOURNAL_PATH = Path("runtime/radar_snapshot_v2.ndjson")
 
 
 @dataclass
@@ -69,9 +70,23 @@ def append_event(
     path = Path(path)
     _ensure_parent_dir(path)
 
-    with path.open("a", encoding="utf-8") as f:
+    with path.open("a", encoding="utf-8", newline="\n") as f:
         f.write(json.dumps(event.to_dict(), ensure_ascii=False))
         f.write("\n")
+        f.flush()
+
+
+def append_snapshot(
+    record: Dict[str, Any],
+    path: Path | str = SNAPSHOT_JOURNAL_PATH,
+) -> None:
+    path = Path(path)
+    _ensure_parent_dir(path)
+
+    with path.open("a", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps(_normalize_for_json(record), ensure_ascii=False))
+        f.write("\n")
+        f.flush()
 
 
 def _write_event(
@@ -147,6 +162,27 @@ def write_instrument_analyzed(
         payload=_compact_analysis_payload(analysis_payload),
         path=path,
     )
+
+
+def write_instrument_snapshot(
+    *,
+    cycle_id: str,
+    batch_id: str,
+    runner_version: str,
+    symbol: str,
+    timeframe: str,
+    analysis_payload: Dict[str, Any],
+    path: Path | str = SNAPSHOT_JOURNAL_PATH,
+) -> None:
+    record = _build_snapshot_record(
+        cycle_id=cycle_id,
+        batch_id=batch_id,
+        runner_version=runner_version,
+        symbol=symbol,
+        timeframe=timeframe,
+        analysis_payload=analysis_payload,
+    )
+    append_snapshot(record, path=path)
 
 
 def write_signal_candidate_detected(
@@ -368,6 +404,52 @@ def write_cycle_finished(
 
 
 # ---------------------------------------------------------------------
+# Snapshot builder
+# ---------------------------------------------------------------------
+
+
+def _build_snapshot_record(
+    *,
+    cycle_id: str,
+    batch_id: str,
+    runner_version: str,
+    symbol: str,
+    timeframe: str,
+    analysis_payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    raw = _normalize_for_json(analysis_payload)
+
+    consistency_block = raw.get("consistency") or {
+        "is_consistent": raw.get("consistency_ok"),
+        "consistency_score": raw.get("consistency_score"),
+        "conflict_flags": raw.get("conflict_flags") or [],
+        "warnings": raw.get("consistency_warnings") or [],
+        "summary": raw.get("consistency_summary"),
+    }
+
+    return {
+        "schema_version": "2.0",
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "cycle_id": cycle_id,
+        "batch_id": batch_id,
+        "runner_version": runner_version,
+        "instrument": raw.get("instrument") or raw.get("symbol") or symbol,
+        "timeframe": timeframe,
+        "price": raw.get("price"),
+        "market_state": raw.get("market_state"),
+        "htf_bias": raw.get("htf_bias"),
+        "phase": raw.get("phase"),
+        "context": raw.get("context") or {},
+        "setups": raw.get("setups") or {},
+        "scenario": raw.get("scenario") or {},
+        "final_signal": raw.get("final_signal") or {},
+        "behavioral_summary": raw.get("behavioral_summary") or {},
+        "consistency": consistency_block or {},
+        "meta": raw.get("meta") or {},
+    }
+
+
+# ---------------------------------------------------------------------
 # Normalization helpers
 # ---------------------------------------------------------------------
 
@@ -422,6 +504,11 @@ def _compact_analysis_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "confidence": raw.get("confidence"),
         "alignment_score": raw.get("alignment_score"),
         "scenario": raw.get("scenario") or raw.get("scenario_type"),
+        "phase": raw.get("phase"),
+        "htf_bias": raw.get("htf_bias"),
+        "final_signal": raw.get("final_signal"),
+        "behavioral_summary": raw.get("behavioral_summary"),
+        "consistency": raw.get("consistency"),
     }
 
 

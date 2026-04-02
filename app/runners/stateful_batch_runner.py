@@ -31,6 +31,7 @@ from app.services.radar_journal import (
     write_cycle_finished,
     write_cycle_started,
     write_instrument_analyzed,
+    write_instrument_snapshot,
     write_signal_candidate_detected,
     write_signal_registered,
     write_signal_resolved,
@@ -43,7 +44,7 @@ from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.1.0"
+RUNNER_VERSION = "1.2.0"
 
 
 # =============================================================================
@@ -318,6 +319,7 @@ def build_market_closed_journal_record(
             "missing_conditions": [],
             "alignment_score": 0.0,
             "evidence": None,
+            "execution": None,
         },
         "final_signal": {
             "setup": None,
@@ -417,13 +419,6 @@ def save_state(state: BatchState, path: Path | None = None) -> None:
     tmp_path.replace(path)
 
 
-def write_radar_journal(payload: dict[str, Any], path: Path | None = None) -> None:
-    path = path or settings.radar_journal_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(to_jsonable(payload), ensure_ascii=False) + "\n")
-
-
 # =============================================================================
 # RUNNER
 # =============================================================================
@@ -438,7 +433,6 @@ class StatefulBatchRunner:
         loader: MarketDataLoader,
         *,
         state_path: Path | None = None,
-        journal_path: Path | None = None,
         minute_limit: int = 8,
         batch_size: int = 1,
         auto_mode: bool = True,
@@ -449,7 +443,6 @@ class StatefulBatchRunner:
     ) -> None:
         self.loader = loader
         self.state_path = state_path or settings.runner_state_path
-        self.journal_path = journal_path or settings.radar_journal_path
         self.simulation_mode = simulation_mode
 
         self.state = load_state(self.state_path)
@@ -778,7 +771,37 @@ class StatefulBatchRunner:
             symbol_state.status = SymbolRunStatus.SKIPPED.value
             symbol_state.completed_at = now_iso()
 
-            write_radar_journal(journal_record, path=self.journal_path)
+            write_instrument_analyzed(
+                cycle_id=cycle_id,
+                batch_id=batch_id,
+                runner_version=RUNNER_VERSION,
+                symbol=symbol.value,
+                timeframe="15m",
+                analysis_payload={
+                    "symbol": symbol.value,
+                    "price": None,
+                    "market_state": None,
+                    "htf_bias": None,
+                    "phase": None,
+                    "scenario_type": "MARKET_CLOSED",
+                    "scenario_decision": "SKIPPED",
+                    "final_signal_status": "SKIPPED",
+                    "final_signal_direction": None,
+                    "final_signal_confidence": 0.0,
+                    "consistency_ok": True,
+                    "consistency_score": 1.0,
+                },
+            )
+
+            write_instrument_snapshot(
+                cycle_id=cycle_id,
+                batch_id=batch_id,
+                runner_version=RUNNER_VERSION,
+                symbol=symbol.value,
+                timeframe="15m",
+                analysis_payload=journal_record,
+            )
+
             save_state(self.state, self.state_path)
 
             return InstrumentCycleResult(
@@ -840,11 +863,6 @@ class StatefulBatchRunner:
         )
 
         journal_record["consistency"] = to_jsonable(consistency.to_dict())
-        journal_record["consistency_ok"] = consistency.is_consistent
-        journal_record["consistency_score"] = consistency.consistency_score
-        journal_record["conflict_flags"] = list(consistency.conflict_flags)
-        journal_record["consistency_warnings"] = list(consistency.warnings)
-        journal_record["consistency_summary"] = consistency.summary
 
         symbol_state.refreshed_timeframes = refreshed_timeframes
         symbol_state.analysis_snapshot = {
@@ -856,9 +874,6 @@ class StatefulBatchRunner:
         }
         symbol_state.status = SymbolRunStatus.SUCCESS.value
         symbol_state.completed_at = now_iso()
-
-        write_radar_journal(journal_record, path=self.journal_path)
-        save_state(self.state, self.state_path)
 
         context = analysis.get("context")
         scenario = analysis.get("scenario")
@@ -889,6 +904,7 @@ class StatefulBatchRunner:
             signal_class = "NO_SETUP"
 
         analysis_payload = {
+            "symbol": symbol.value,
             "price": price,
             "market_state": market_state,
             "htf_bias": htf_bias,
@@ -900,6 +916,9 @@ class StatefulBatchRunner:
             "final_signal_confidence": self._safe_attr(final_signal, "confidence"),
             "consistency_ok": consistency.is_consistent,
             "consistency_score": consistency.consistency_score,
+            "final_signal": to_jsonable(journal_record.get("final_signal")),
+            "behavioral_summary": to_jsonable(journal_record.get("behavioral_summary")),
+            "consistency": to_jsonable(journal_record.get("consistency")),
         }
 
         write_instrument_analyzed(
@@ -910,6 +929,17 @@ class StatefulBatchRunner:
             timeframe="15m",
             analysis_payload=analysis_payload,
         )
+
+        write_instrument_snapshot(
+            cycle_id=cycle_id,
+            batch_id=batch_id,
+            runner_version=RUNNER_VERSION,
+            symbol=symbol.value,
+            timeframe="15m",
+            analysis_payload=journal_record,
+        )
+
+        save_state(self.state, self.state_path)
 
         tracker_result = self.signal_tracker.process(
             scenario_result=scenario if scenario_ok else final_signal,
@@ -1379,6 +1409,14 @@ class StatefulBatchRunner:
                     "hh_hl_structure": self._safe_attr(self._safe_attr(context, "structure_15m"), "hh_hl_structure"),
                     "ll_lh_structure": self._safe_attr(self._safe_attr(context, "structure_15m"), "ll_lh_structure"),
                 },
+                "impulse": to_jsonable(self._safe_attr(context, "impulse")),
+                "pullback": to_jsonable(self._safe_attr(context, "pullback")),
+                "sweep": to_jsonable(self._safe_attr(context, "sweep")),
+                "profile": {
+                    "monthly": to_jsonable(self._safe_attr(context, "monthly_profile")),
+                    "weekly": to_jsonable(self._safe_attr(context, "weekly_profile")),
+                    "daily": to_jsonable(self._safe_attr(context, "daily_profile")),
+                },
             },
             "setups": {
                 "setup_a": _setup_payload(setup_a) if setup_a else None,
@@ -1394,7 +1432,7 @@ class StatefulBatchRunner:
                 "evidence": (
                     scenario_evidence.model_dump()
                     if hasattr(scenario_evidence, "model_dump")
-                    else None
+                    else to_jsonable(scenario_evidence)
                 ),
                 "execution": (
                     execution.model_dump()
