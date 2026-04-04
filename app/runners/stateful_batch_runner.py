@@ -45,7 +45,7 @@ from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.4.0"
+RUNNER_VERSION = "1.4.1"
 
 
 # =============================================================================
@@ -612,6 +612,7 @@ class StatefulBatchRunner:
                 "batch_group": result.get("meta", {}).get("batch_group"),
                 "instrument_count": len(result.get("instruments", [])),
                 "error_count": len(result.get("errors", [])),
+                "skipped_count": result.get("meta", {}).get("skipped_count", 0),
             },
             ensure_ascii=False,
             indent=2,
@@ -635,6 +636,7 @@ class StatefulBatchRunner:
                 meta={
                     "reason": "no_instruments_configured",
                     "batch_group": self.batch_group,
+                    "skipped_count": 0,
                 },
             ).to_dict()
 
@@ -680,6 +682,7 @@ class StatefulBatchRunner:
         batch_had_errors = False
         processed_count = 0
         error_count = 0
+        skipped_count = 0
         alerts_count = 0
 
         try:
@@ -704,6 +707,7 @@ class StatefulBatchRunner:
                     )
                     normalized_instruments.append(skipped_result.to_dict())
                     processed_count += 1
+                    skipped_count += 1
                     continue
 
                 try:
@@ -718,7 +722,9 @@ class StatefulBatchRunner:
                     if instrument_result.alert_payload and instrument_result.alert_payload.get("should_alert"):
                         alerts_count += 1
 
-                    if instrument_result.status != "ok":
+                    if instrument_result.status == "skipped":
+                        skipped_count += 1
+                    elif instrument_result.status != "ok":
                         batch_had_errors = True
                         error_count += 1
                         cycle_errors.append(
@@ -874,7 +880,12 @@ class StatefulBatchRunner:
                 self.state.last_error = None
                 self._advance_batch_pointer()
                 save_state(self.state, self.state_path)
-                print("\nBatch completed successfully. State advanced to next batch.")
+
+                if skipped_count > 0 and error_count == 0:
+                    print("\nBatch completed with skipped instruments only/partially. State advanced to next batch.")
+                else:
+                    print("\nBatch completed successfully. State advanced to next batch.")
+
                 cycle_status = "ok"
             else:
                 self.state.last_run_status = "partial_error"
@@ -901,6 +912,7 @@ class StatefulBatchRunner:
                     "batch_group": self.batch_group,
                     "processed": processed_count,
                     "errors": error_count,
+                    "skipped": skipped_count,
                     "alerts": alerts_count,
                     "duration_sec": round(elapsed_sec, 3),
                     "status": cycle_status,
@@ -913,7 +925,7 @@ class StatefulBatchRunner:
                 cycle_logger.warning(f"Statistics export failed: {stats_error}")
 
             cycle_logger.info(
-                f"Batch cycle finished. batch_group={self.batch_group} status={cycle_status} instruments={len(normalized_instruments)} errors={len(cycle_errors)}"
+                f"Batch cycle finished. batch_group={self.batch_group} status={cycle_status} instruments={len(normalized_instruments)} errors={len(cycle_errors)} skipped={skipped_count}"
             )
 
             return CycleResult(
@@ -932,6 +944,7 @@ class StatefulBatchRunner:
                     "force_batch": self.state.force_batch,
                     "simulation_mode": self.simulation_mode,
                     "current_batch_symbols": current_symbols,
+                    "skipped_count": skipped_count,
                 },
             ).to_dict()
 
@@ -2194,7 +2207,6 @@ class StatefulBatchRunner:
         if isinstance(raw_symbol, Instrument):
             return raw_symbol
 
-        # support enums from other modules (e.g. schema.Instrument)
         enum_value = getattr(raw_symbol, "value", None)
         enum_name = getattr(raw_symbol, "name", None)
 
@@ -2208,13 +2220,11 @@ class StatefulBatchRunner:
             return getattr(Instrument, enum_name)
 
         if isinstance(raw_symbol, str):
-            # try exact enum value
             try:
                 return Instrument(raw_symbol)
             except Exception:
                 pass
 
-            # try enum name
             if hasattr(Instrument, raw_symbol):
                 return getattr(Instrument, raw_symbol)
 
@@ -2299,6 +2309,7 @@ def main() -> None:
             "batch_group": result.get("meta", {}).get("batch_group"),
             "instrument_count": len(result.get("instruments", [])),
             "error_count": len(result.get("errors", [])),
+            "skipped_count": result.get("meta", {}).get("skipped_count", 0),
         },
         ensure_ascii=False,
         indent=2,
