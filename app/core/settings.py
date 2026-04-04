@@ -117,6 +117,7 @@ class AppSettings:
     force_batch: Optional[int]
     auto_mode: bool
     simulation_mode: bool
+    batch_group: str
     enabled_symbols_raw: str
 
     @property
@@ -174,6 +175,9 @@ class AppSettings:
 
         if self.provider_retry_backoff_sec < 0:
             errors.append("PROVIDER_RETRY_BACKOFF_SEC must be >= 0.")
+
+        if self.batch_group not in {"core", "indices"}:
+            errors.append("BATCH_GROUP must be one of: core, indices.")
 
         if errors:
             raise ValueError("Invalid application settings:\n- " + "\n- ".join(errors))
@@ -276,10 +280,11 @@ def load_settings() -> AppSettings:
         force_batch=force_batch,
         auto_mode=_to_bool(os.getenv("AUTO_MODE"), True),
         simulation_mode=_to_bool(os.getenv("SIMULATION_MODE"), False),
+        batch_group=_clean_str(os.getenv("BATCH_GROUP"), "core").lower(),
         enabled_symbols_raw=_clean_str(
             os.getenv(
                 "ENABLED_SYMBOLS",
-                "XAUUSD,EURUSD,GBPUSD,BTCUSD,ETHUSD",
+                "XAUUSD,EURUSD,GBPUSD,BTCUSD,ETHUSD,UKOIL,GER40,NAS100,SPX500",
             ),
             "",
         ),
@@ -322,9 +327,11 @@ EXPECTED_PRICE_RANGES: dict[str, tuple[float, float]] = {
     "GBPUSD": (0.5, 2.5),
     "BTCUSD": (1000.0, 250000.0),
     "ETHUSD": (100.0, 20000.0),
-    "USOIL": (10.0, 200.0),
-    "NDQ": (1000.0, 50000.0),
-    "SPX": (1000.0, 10000.0),
+    "UKOIL": (10.0, 200.0),
+    "GER40": (5000.0, 50000.0),
+    "NAS100": (5000.0, 50000.0),
+    "SPX500": (1000.0, 10000.0),
+    "DXY": (50.0, 200.0),
 }
 
 # legacy path aliases
@@ -338,3 +345,6 @@ RUNNER_STATE_FILE = settings.runner_state_path
 RADAR_JOURNAL_FILE = settings.radar_journal_path
 ALERTS_STATE_FILE = settings.alerts_state_path
 HEARTBEAT_FILE = settings.heartbeat_path
+
+# legacy/simple exports
+BATCH_GROUP = settings.batch_group

@@ -11,6 +11,7 @@ from typing import Any, Optional
 import pandas as pd
 
 from app.core.enums import Instrument, Timeframe
+from app.core.instrument_batches import get_batch_symbols
 from app.core.logger import bind_logger, get_logger
 from app.core.settings import settings
 from app.providers.twelvedata_client import TwelveDataClient, TwelveDataClientConfig
@@ -44,7 +45,7 @@ from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.3.0"
+RUNNER_VERSION = "1.4.0"
 
 
 # =============================================================================
@@ -78,6 +79,12 @@ DEFAULT_TIMEFRAMES_BY_SYMBOL: dict[Instrument, list[Timeframe]] = {
     Instrument.GBPUSD: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
     Instrument.BTCUSD: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
     Instrument.ETHUSD: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
+
+    # indices / oil
+    Instrument.UKOIL: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
+    Instrument.GER40: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
+    Instrument.NAS100: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
+    Instrument.SPX500: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
 }
 
 DEFAULT_INSTRUMENT_PROFILES: list[dict[str, Any]] = [
@@ -461,10 +468,12 @@ class StatefulBatchRunner:
         simulation_mode: bool = False,
         instrument_profiles: list[dict[str, Any]] | None = None,
         timeframes_by_symbol: dict[Instrument, list[Timeframe]] | None = None,
+        batch_group: str = "core",
     ) -> None:
         self.loader = loader
         self.state_path = state_path or settings.runner_state_path
         self.simulation_mode = simulation_mode
+        self.batch_group = batch_group
 
         self.state = load_state(self.state_path)
         self.state.batch_size = batch_size
@@ -476,11 +485,22 @@ class StatefulBatchRunner:
             open_signals_path=str(RUNTIME_DIR / "open_signals.json")
         )
 
-        self.instrument_profiles = sorted(
-            instrument_profiles or DEFAULT_INSTRUMENT_PROFILES,
-            key=lambda item: (item.get("priority", 999), item["symbol"].value),
-        )
         self.timeframes_by_symbol = timeframes_by_symbol or DEFAULT_TIMEFRAMES_BY_SYMBOL
+
+        if instrument_profiles is not None:
+            selected_profiles = sorted(
+                instrument_profiles,
+                key=lambda item: (item.get("priority", 999), self._instrument_sort_key(item["symbol"])),
+            )
+        else:
+            batch_symbols_raw = get_batch_symbols(batch_group)
+            batch_symbols = [self._normalize_batch_symbol(sym) for sym in batch_symbols_raw]
+            selected_profiles = [
+                {"symbol": symbol, "priority": 1}
+                for symbol in batch_symbols
+            ]
+
+        self.instrument_profiles = selected_profiles
         self.batches = self._make_batches(self.instrument_profiles, batch_size)
         self.state.total_batches = len(self.batches)
 
@@ -592,6 +612,7 @@ class StatefulBatchRunner:
             {
                 "cycle_id": result.get("cycle_id"),
                 "status": result.get("status"),
+                "batch_group": result.get("meta", {}).get("batch_group"),
                 "instrument_count": len(result.get("instruments", [])),
                 "error_count": len(result.get("errors", [])),
             },
@@ -614,7 +635,10 @@ class StatefulBatchRunner:
                 status="skipped",
                 instruments=[],
                 errors=[],
-                meta={"reason": "no_instruments_configured"},
+                meta={
+                    "reason": "no_instruments_configured",
+                    "batch_group": self.batch_group,
+                },
             ).to_dict()
 
         batch_index = (
@@ -627,7 +651,7 @@ class StatefulBatchRunner:
 
         current_batch = self.batches[batch_index]
         current_symbols = [item["symbol"].value for item in current_batch]
-        batch_id = f"batch_{batch_index}_of_{self.state.total_batches}"
+        batch_id = f"{self.batch_group}_batch_{batch_index}_of_{self.state.total_batches}"
 
         self._ensure_batch_initialized(batch_index=batch_index, current_symbols=current_symbols)
         self._print_header(batch_index, current_batch)
@@ -646,6 +670,7 @@ class StatefulBatchRunner:
             cycle_id=cycle_id,
             batch_id=batch_id,
             extra={
+                "batch_group": self.batch_group,
                 "instruments": current_symbols,
                 "batch_size": self.state.batch_size,
                 "auto_mode": self.state.auto_mode,
@@ -769,13 +794,14 @@ class StatefulBatchRunner:
                                 "final_signal": {"status": "ERROR"},
                                 "behavioral_summary": {"decision": "WAIT"},
                                 "consistency": {},
-                                "meta": {"error": str(error)},
+                                "meta": {"error": str(error), "batch_group": self.batch_group},
                             },
                         ),
                         journal_event="symbol_rate_limit_error_fallback",
                         journal_payload={
                             "error": str(error),
                             "retry_after_utc": retry_after.isoformat(),
+                            "batch_group": self.batch_group,
                         },
                     )
                     break
@@ -837,11 +863,11 @@ class StatefulBatchRunner:
                                 "final_signal": {"status": "ERROR"},
                                 "behavioral_summary": {"decision": "WAIT"},
                                 "consistency": {},
-                                "meta": {"error": str(error)},
+                                "meta": {"error": str(error), "batch_group": self.batch_group},
                             },
                         ),
                         journal_event="symbol_exception_fallback",
-                        journal_payload={"error": str(error)},
+                        journal_payload={"error": str(error), "batch_group": self.batch_group},
                     )
                     continue
 
@@ -875,6 +901,7 @@ class StatefulBatchRunner:
                 cycle_id=cycle_id,
                 batch_id=batch_id,
                 extra={
+                    "batch_group": self.batch_group,
                     "processed": processed_count,
                     "errors": error_count,
                     "alerts": alerts_count,
@@ -889,7 +916,7 @@ class StatefulBatchRunner:
                 cycle_logger.warning(f"Statistics export failed: {stats_error}")
 
             cycle_logger.info(
-                f"Batch cycle finished. status={cycle_status} instruments={len(normalized_instruments)} errors={len(cycle_errors)}"
+                f"Batch cycle finished. batch_group={self.batch_group} status={cycle_status} instruments={len(normalized_instruments)} errors={len(cycle_errors)}"
             )
 
             return CycleResult(
@@ -900,6 +927,7 @@ class StatefulBatchRunner:
                 instruments=normalized_instruments,
                 errors=cycle_errors,
                 meta={
+                    "batch_group": self.batch_group,
                     "batch_index": batch_index,
                     "batch_size": self.state.batch_size,
                     "total_batches": self.state.total_batches,
@@ -915,7 +943,7 @@ class StatefulBatchRunner:
                 event="cycle_crashed_fallback",
                 cycle_id=cycle_id,
                 batch_id=batch_id,
-                extra={"error": str(cycle_error)},
+                extra={"error": str(cycle_error), "batch_group": self.batch_group},
             )
             raise
 
@@ -938,7 +966,7 @@ class StatefulBatchRunner:
         save_state(self.state, self.state_path)
 
         fallback_snapshot_payload: dict[str, Any] | None = None
-        fallback_journal_payload: dict[str, Any] = {"status": "started"}
+        fallback_journal_payload: dict[str, Any] = {"status": "started", "batch_group": self.batch_group}
 
         self._safe_write_symbol_history(
             symbol=symbol.value,
@@ -946,7 +974,7 @@ class StatefulBatchRunner:
             batch_id=batch_id,
             snapshot_payload=None,
             journal_event="symbol_started_fallback",
-            journal_payload={"status": "started"},
+            journal_payload={"status": "started", "batch_group": self.batch_group},
         )
 
         try:
@@ -993,11 +1021,13 @@ class StatefulBatchRunner:
                 journal_record["cycle_id"] = cycle_id
                 journal_record["batch_id"] = batch_id
                 journal_record["runner_version"] = RUNNER_VERSION
+                journal_record["batch_group"] = self.batch_group
                 journal_record["timeframe"] = "15m"
                 journal_record["schema_version"] = "2.0"
 
                 symbol_state.refreshed_timeframes = refreshed_timeframes
                 symbol_state.analysis_snapshot = {
+                    "batch_group": self.batch_group,
                     "load_results": to_jsonable(load_results),
                     "analysis": None,
                     "behavioral_journal": to_jsonable(journal_record),
@@ -1016,6 +1046,7 @@ class StatefulBatchRunner:
                     symbol=symbol.value,
                     timeframe="15m",
                     analysis_payload={
+                        "batch_group": self.batch_group,
                         "symbol": symbol.value,
                         "price": None,
                         "market_state": None,
@@ -1044,6 +1075,7 @@ class StatefulBatchRunner:
                 fallback_journal_payload = {
                     "status": "skipped",
                     "reason": "WEEKEND_MARKET_CLOSED",
+                    "batch_group": self.batch_group,
                 }
 
                 save_state(self.state, self.state_path)
@@ -1110,11 +1142,13 @@ class StatefulBatchRunner:
             journal_record["cycle_id"] = cycle_id
             journal_record["batch_id"] = batch_id
             journal_record["runner_version"] = RUNNER_VERSION
+            journal_record["batch_group"] = self.batch_group
             journal_record["timeframe"] = "15m"
             journal_record["schema_version"] = "2.0"
 
             symbol_state.refreshed_timeframes = refreshed_timeframes
             symbol_state.analysis_snapshot = {
+                "batch_group": self.batch_group,
                 "load_results": to_jsonable(load_results),
                 "analysis": to_jsonable(analysis),
                 "behavioral_journal": to_jsonable(journal_record),
@@ -1150,6 +1184,7 @@ class StatefulBatchRunner:
                 scenario_decision = self._extract_scenario_decision(context, setups, scenario, final_signal)
 
             analysis_payload = {
+                "batch_group": self.batch_group,
                 "symbol": symbol.value,
                 "price": price,
                 "market_state": market_state,
@@ -1188,6 +1223,7 @@ class StatefulBatchRunner:
             fallback_snapshot_payload = journal_record
             fallback_journal_payload = {
                 "status": "ok",
+                "batch_group": self.batch_group,
                 "market_state": market_state,
                 "htf_bias": htf_bias,
                 "phase": phase,
@@ -1216,7 +1252,7 @@ class StatefulBatchRunner:
                     runner_version=RUNNER_VERSION,
                     symbol=symbol.value,
                     timeframe="15m",
-                    signal_payload=candidate_payload,
+                    signal_payload={**candidate_payload, "batch_group": self.batch_group},
                 )
 
             if tracker_result.action == "REGISTERED":
@@ -1227,7 +1263,7 @@ class StatefulBatchRunner:
                     symbol=symbol.value,
                     timeframe="15m",
                     signal_id=tracker_result.signal_id or candidate_payload.get("signal_id", ""),
-                    payload=tracker_result.payload,
+                    payload={**tracker_result.payload, "batch_group": self.batch_group},
                 )
             elif tracker_result.action == "UPDATED":
                 write_signal_updated(
@@ -1237,7 +1273,7 @@ class StatefulBatchRunner:
                     symbol=symbol.value,
                     timeframe="15m",
                     signal_id=tracker_result.signal_id or candidate_payload.get("signal_id", ""),
-                    payload=tracker_result.payload,
+                    payload={**tracker_result.payload, "batch_group": self.batch_group},
                     previous_payload=tracker_result.previous_payload,
                     changed_fields=tracker_result.changed_fields,
                 )
@@ -1249,7 +1285,7 @@ class StatefulBatchRunner:
                     symbol=symbol.value,
                     timeframe="15m",
                     signal_id=tracker_result.signal_id or candidate_payload.get("signal_id", ""),
-                    payload=tracker_result.payload,
+                    payload={**tracker_result.payload, "batch_group": self.batch_group},
                 )
 
             self._print_symbol_summary(symbol, analysis, refreshed_timeframes)
@@ -1265,13 +1301,17 @@ class StatefulBatchRunner:
             )
 
             symbol_logger.info(
-                f"Symbol analyzed. final_signal={instrument_result.final_signal} watch_status={instrument_result.watch_status}"
+                f"Symbol analyzed. batch_group={self.batch_group} final_signal={instrument_result.final_signal} watch_status={instrument_result.watch_status}"
             )
 
             return instrument_result
 
         except Exception as error:
-            fallback_journal_payload = {"status": "error", "error": str(error)}
+            fallback_journal_payload = {
+                "status": "error",
+                "error": str(error),
+                "batch_group": self.batch_group,
+            }
             fallback_snapshot_payload = self._build_fallback_snapshot_record(
                 symbol=symbol.value,
                 cycle_id=cycle_id,
@@ -1289,7 +1329,7 @@ class StatefulBatchRunner:
                     "final_signal": {"status": "ERROR", "direction": None, "confidence": 0.0},
                     "behavioral_summary": {"decision": "WAIT"},
                     "consistency": {},
-                    "meta": {"error": str(error)},
+                    "meta": {"error": str(error), "batch_group": self.batch_group},
                 },
             )
             raise
@@ -1680,6 +1720,7 @@ class StatefulBatchRunner:
         return {
             "ts": now_iso(),
             "instrument": symbol.value,
+            "batch_group": self.batch_group,
             "price": price,
             "market_state": market_state,
             "htf_bias": htf_bias,
@@ -1753,6 +1794,7 @@ class StatefulBatchRunner:
             },
             "meta": {
                 "simulation_mode": self.simulation_mode,
+                "batch_group": self.batch_group,
                 "refreshed_timeframes": refreshed_timeframes,
                 "data_source": "cache_only" if not refreshed_timeframes else "mixed_or_api",
             },
@@ -1888,6 +1930,7 @@ class StatefulBatchRunner:
         print("========================================================================================")
         print("STATEFUL BATCH MULTI-INSTRUMENT ANALYTICS RUN")
         print("========================================================================================")
+        print(f"BATCH GROUP:    {self.batch_group}")
         print(f"Batch size:      {self.state.batch_size}")
         print(f"Batch index:     {batch_index}")
         print(f"Total batches:   {self.state.total_batches}")
@@ -2017,6 +2060,7 @@ class StatefulBatchRunner:
             "should_alert": True,
             "signal_id": tracked_payload.get("signal_id"),
             "symbol": symbol,
+            "batch_group": self.batch_group,
             "signal_class": tracked_payload.get("signal_class"),
             "stage": tracked_payload.get("signal_class"),
             "scenario": tracked_payload.get("scenario"),
@@ -2142,12 +2186,53 @@ class StatefulBatchRunner:
             return obj.get(name)
         return getattr(obj, name, None)
 
+    @staticmethod
+    def _instrument_sort_key(value: Any) -> str:
+        if isinstance(value, Instrument):
+            return value.value
+        return str(value)
+
+    @staticmethod
+    def _normalize_batch_symbol(raw_symbol: Any) -> Instrument:
+        if isinstance(raw_symbol, Instrument):
+            return raw_symbol
+
+        # support enums from other modules (e.g. schema.Instrument)
+        enum_value = getattr(raw_symbol, "value", None)
+        enum_name = getattr(raw_symbol, "name", None)
+
+        if enum_value is not None:
+            try:
+                return Instrument(enum_value)
+            except Exception:
+                pass
+
+        if enum_name is not None and hasattr(Instrument, enum_name):
+            return getattr(Instrument, enum_name)
+
+        if isinstance(raw_symbol, str):
+            # try exact enum value
+            try:
+                return Instrument(raw_symbol)
+            except Exception:
+                pass
+
+            # try enum name
+            if hasattr(Instrument, raw_symbol):
+                return getattr(Instrument, raw_symbol)
+
+            upper = raw_symbol.upper()
+            if hasattr(Instrument, upper):
+                return getattr(Instrument, upper)
+
+        raise ValueError(f"Unsupported batch symbol: {raw_symbol!r}")
+
 
 # =============================================================================
 # MODULE-LEVEL ENTRYPOINT FOR CLOUD WORKER
 # =============================================================================
 
-def run_batch_cycle() -> dict[str, Any]:
+def run_batch_cycle(batch_group: str | None = None) -> dict[str, Any]:
     if not settings.twelvedata_api_key:
         raise RuntimeError("TWELVEDATA_API_KEY is not configured in settings/environment.")
 
@@ -2168,6 +2253,8 @@ def run_batch_cycle() -> dict[str, Any]:
     cache = ParquetCache()
     loader = MarketDataLoader(client=provider, cache=cache)
 
+    effective_batch_group = batch_group or getattr(settings, "batch_group", "core")
+
     runner = StatefulBatchRunner(
         loader=loader,
         minute_limit=12,
@@ -2175,6 +2262,7 @@ def run_batch_cycle() -> dict[str, Any]:
         auto_mode=settings.auto_mode,
         force_batch=settings.force_batch,
         simulation_mode=settings.simulation_mode,
+        batch_group=effective_batch_group,
     )
     return runner.run_batch_cycle()
 
@@ -2211,6 +2299,7 @@ def main() -> None:
         {
             "cycle_id": result.get("cycle_id"),
             "status": result.get("status"),
+            "batch_group": result.get("meta", {}).get("batch_group"),
             "instrument_count": len(result.get("instruments", [])),
             "error_count": len(result.get("errors", [])),
         },
