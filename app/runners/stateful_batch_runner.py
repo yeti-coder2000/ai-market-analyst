@@ -48,10 +48,13 @@ RUNNER_VERSION = "1.3.0"
 
 
 # =============================================================================
-# GUARANTEED HISTORY WRITE LAYER
+# GUARANTEED HISTORY WRITE LAYER (PERSISTENT DISK READY)
 # =============================================================================
 
-RUNTIME_DIR = Path("runtime")
+import os
+
+BASE_PATH = os.getenv("DATA_PATH", "/var/data")
+RUNTIME_DIR = Path(BASE_PATH) / "runtime"
 RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
 JOURNAL_FALLBACK_PATH = RUNTIME_DIR / "radar_journal.ndjson"
@@ -469,7 +472,9 @@ class StatefulBatchRunner:
         self.state.force_batch = force_batch
 
         self.budget = MinuteBudget(limit_per_minute=minute_limit)
-        self.signal_tracker = SignalTracker(open_signals_path="runtime/open_signals.json")
+        self.signal_tracker = SignalTracker(
+            open_signals_path=str(RUNTIME_DIR / "open_signals.json")
+        )
 
         self.instrument_profiles = sorted(
             instrument_profiles or DEFAULT_INSTRUMENT_PROFILES,
