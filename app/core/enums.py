@@ -35,6 +35,15 @@ class Instrument(str, Enum):
     BTCUSD = "BTCUSD"
     ETHUSD = "ETHUSD"
 
+    # indices / commodities
+    UKOIL = "UKOIL"
+    GER40 = "GER40"
+    NAS100 = "NAS100"
+    SPX500 = "SPX500"
+
+    # optional / reserve
+    DXY = "DXY"
+
 
 class Timeframe(str, Enum):
     M15 = "15m"

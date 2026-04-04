@@ -52,10 +52,7 @@ RUNNER_VERSION = "1.4.0"
 # GUARANTEED HISTORY WRITE LAYER (PERSISTENT DISK READY)
 # =============================================================================
 
-import os
-
-BASE_PATH = os.getenv("DATA_PATH", "/var/data")
-RUNTIME_DIR = Path(BASE_PATH) / "runtime"
+RUNTIME_DIR = settings.runtime_dir
 RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
 JOURNAL_FALLBACK_PATH = RUNTIME_DIR / "radar_journal.ndjson"
