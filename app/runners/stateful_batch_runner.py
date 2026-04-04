@@ -45,7 +45,7 @@ from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.4.1"
+RUNNER_VERSION = "1.4.2"
 
 
 # =============================================================================
@@ -76,8 +76,6 @@ DEFAULT_TIMEFRAMES_BY_SYMBOL: dict[Instrument, list[Timeframe]] = {
     Instrument.GBPUSD: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
     Instrument.BTCUSD: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
     Instrument.ETHUSD: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
-
-    # indices / oil
     Instrument.UKOIL: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
     Instrument.GER40: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
     Instrument.NAS100: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
@@ -264,11 +262,12 @@ def is_weekend_utc(dt: datetime | None = None) -> bool:
     ref = dt or datetime.now(UTC)
     return ref.weekday() >= 5
 
+
 def should_skip_for_weekend(symbol: Instrument, dt: datetime | None = None) -> bool:
     """
     Weekend market policy:
-    - crypto аналізуємо і на вихідних
-    - всі інші інструменти скіпаємо
+    - Crypto (BTCUSD, ETHUSD) працює 24/7 -> НЕ скіпаємо
+    - Всі інші інструменти на вихідних -> скіпаємо
     """
     if not is_weekend_utc(dt):
         return False
@@ -279,6 +278,7 @@ def should_skip_for_weekend(symbol: Instrument, dt: datetime | None = None) -> b
     }
 
     return symbol not in crypto_symbols
+
 
 def to_jsonable(value: Any) -> Any:
     if value is None:
@@ -1008,33 +1008,13 @@ class StatefulBatchRunner:
                 [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
             )
 
-            series_by_tf: dict[Timeframe, pd.DataFrame] = {}
             refreshed_timeframes: list[str] = []
             load_results: dict[str, Any] = {}
 
-            for timeframe in timeframes:
-                if not self.simulation_mode:
-                    self._ensure_budget_or_wait(credits=1)
-
-                result = self._load_timeframe(symbol, timeframe)
-
-                if getattr(result, "source", None) == "api":
-                    self.budget.spend(1)
-                    refreshed_timeframes.append(timeframe.value)
-
-                df = getattr(result, "df", None)
-                if df is None:
-                    raise RuntimeError(f"Loader returned no dataframe for {symbol.value} {timeframe.value}")
-
-                series_by_tf[timeframe] = df
-                load_results[timeframe.value] = {
-                    "source": getattr(result, "source", None),
-                    "rows": getattr(result, "rows", len(df)),
-                    "last_ts": getattr(result, "last_ts", None),
-                    "last_close": getattr(result, "last_close", None),
-                }
-
-            if is_weekend_utc():
+            # -------------------------------------------------------------
+            # SMART WEEKEND SKIP: skip early for non-crypto markets
+            # -------------------------------------------------------------
+            if should_skip_for_weekend(symbol):
                 print(f"  [SKIP] {symbol.value}: weekend market closed")
 
                 journal_record = build_market_closed_journal_record(
@@ -1133,6 +1113,30 @@ class StatefulBatchRunner:
                     error_message=None,
                     alert_payload=None,
                 )
+
+            series_by_tf: dict[Timeframe, pd.DataFrame] = {}
+
+            for timeframe in timeframes:
+                if not self.simulation_mode:
+                    self._ensure_budget_or_wait(credits=1)
+
+                result = self._load_timeframe(symbol, timeframe)
+
+                if getattr(result, "source", None) == "api":
+                    self.budget.spend(1)
+                    refreshed_timeframes.append(timeframe.value)
+
+                df = getattr(result, "df", None)
+                if df is None:
+                    raise RuntimeError(f"Loader returned no dataframe for {symbol.value} {timeframe.value}")
+
+                series_by_tf[timeframe] = df
+                load_results[timeframe.value] = {
+                    "source": getattr(result, "source", None),
+                    "rows": getattr(result, "rows", len(df)),
+                    "last_ts": getattr(result, "last_ts", None),
+                    "last_close": getattr(result, "last_close", None),
+                }
 
             analysis = self._run_analysis_pipeline(symbol, series_by_tf)
 
