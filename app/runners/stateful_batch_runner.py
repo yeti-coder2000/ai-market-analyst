@@ -264,6 +264,21 @@ def is_weekend_utc(dt: datetime | None = None) -> bool:
     ref = dt or datetime.now(UTC)
     return ref.weekday() >= 5
 
+def should_skip_for_weekend(symbol: Instrument, dt: datetime | None = None) -> bool:
+    """
+    Weekend market policy:
+    - crypto аналізуємо і на вихідних
+    - всі інші інструменти скіпаємо
+    """
+    if not is_weekend_utc(dt):
+        return False
+
+    crypto_symbols = {
+        Instrument.BTCUSD,
+        Instrument.ETHUSD,
+    }
+
+    return symbol not in crypto_symbols
 
 def to_jsonable(value: Any) -> Any:
     if value is None:
