@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +25,13 @@ RESOLUTION_TYPES = {
     "EXPIRED",
 }
 
+DEFAULT_TTL_MINUTES_BY_STAGE = {
+    "SCENARIO_FORMING": 180,
+    "WATCH": 240,
+    "READY": 180,
+    "ACTIVE": 360,
+}
+
 
 @dataclass
 class SignalTrackerResult:
@@ -37,22 +44,25 @@ class SignalTrackerResult:
 
 class SignalTracker:
     """
-    Production signal lifecycle tracker.
+    Signal lifecycle tracker v2.
 
     Responsibilities:
     - maintain runtime/open_signals.json
-    - register new open signals
-    - update existing signals
-    - resolve signals
-    - expose event-ready payloads for radar_journal layer
-
-    Expected input:
-    - scenario_result (ScenarioResult or dict-like)
+    - register / update / resolve open signals
+    - expire stale signals via TTL
+    - keep Telegram delivery metadata on signals
+    - expose deterministic event-ready payloads for runner / journal / statistics
     """
 
-    def __init__(self, open_signals_path: str | Path = "runtime/open_signals.json") -> None:
+    def __init__(
+        self,
+        open_signals_path: str | Path = "runtime/open_signals.json",
+        *,
+        ttl_minutes_by_stage: dict[str, int] | None = None,
+    ) -> None:
         self.open_signals_path = Path(open_signals_path)
         self.open_signals_path.parent.mkdir(parents=True, exist_ok=True)
+        self.ttl_minutes_by_stage = ttl_minutes_by_stage or deepcopy(DEFAULT_TTL_MINUTES_BY_STAGE)
 
     # ------------------------------------------------------------------
     # Public API
@@ -63,11 +73,17 @@ class SignalTracker:
         Main entrypoint.
 
         Behavior:
+        - auto-expires stale signals before processing
         - NO_SETUP / NO_ACTION / NO_TRADE => no open signal action
         - WATCH / READY / ACTIVE => register or update open signal
         - RESOLVED => resolve existing signal
         """
-        payload = self._normalize_signal_payload(scenario_result=scenario_result, cycle_id=cycle_id)
+        self.expire_stale_signals()
+
+        payload = self._normalize_signal_payload(
+            scenario_result=scenario_result,
+            cycle_id=cycle_id,
+        )
 
         signal_class = payload.get("signal_class")
         if signal_class in RESOLVED_SIGNAL_STATES:
@@ -91,26 +107,124 @@ class SignalTracker:
         cycle_id: str | None = None,
         resolution_note: str | None = None,
     ) -> SignalTrackerResult:
-        """
-        Explicit resolution API.
-
-        Use this when downstream logic decides that an open signal is:
-        - VALIDATED
-        - INVALIDATED
-        - EXPIRED
-        """
         if resolution not in RESOLUTION_TYPES:
             raise ValueError(f"Unsupported resolution: {resolution}")
 
-        payload = self._normalize_signal_payload(scenario_result=scenario_result, cycle_id=cycle_id)
+        self.expire_stale_signals()
+
+        payload = self._normalize_signal_payload(
+            scenario_result=scenario_result,
+            cycle_id=cycle_id,
+        )
         payload["signal_class"] = "RESOLVED"
         payload["resolution"] = resolution
         payload["resolution_note"] = resolution_note
 
         return self._resolve_signal(payload)
 
+    def expire_stale_signals(self) -> list[SignalTrackerResult]:
+        """
+        Resolve stale open signals as EXPIRED.
+        """
+        store = self._load_store()
+        if not store:
+            return []
+
+        now = self._utc_now_dt()
+        expired_results: list[SignalTrackerResult] = []
+        ids_to_delete: list[str] = []
+
+        for signal_id, payload in store.items():
+            if payload.get("signal_class") not in OPEN_SIGNAL_STATES:
+                continue
+
+            if not self._is_signal_expired(payload, now=now):
+                continue
+
+            previous = deepcopy(payload)
+            resolved = deepcopy(payload)
+            resolved["signal_class"] = "RESOLVED"
+            resolved["status"] = "RESOLVED"
+            resolved["current_stage"] = "RESOLVED"
+            resolved["resolution"] = "EXPIRED"
+            resolved["resolution_note"] = "auto_expired_by_tracker_ttl"
+            resolved["resolved_at_utc"] = now.isoformat()
+            resolved["updated_at_utc"] = resolved["resolved_at_utc"]
+            resolved["ttl_expires_at_utc"] = None
+
+            changed_fields = self._diff_signal_fields(previous=previous, current=resolved)
+
+            expired_results.append(
+                SignalTrackerResult(
+                    action="RESOLVED",
+                    signal_id=signal_id,
+                    payload=resolved,
+                    previous_payload=previous,
+                    changed_fields=changed_fields,
+                )
+            )
+            ids_to_delete.append(signal_id)
+
+        if ids_to_delete:
+            for signal_id in ids_to_delete:
+                store.pop(signal_id, None)
+            self._save_store(store)
+
+        return expired_results
+
     def load_open_signals(self) -> dict[str, dict[str, Any]]:
         return self._load_store()
+
+    def mark_alert_sent(
+        self,
+        signal_id: str,
+        *,
+        alert_type: str | None = None,
+        sent_at_utc: str | None = None,
+    ) -> bool:
+        if not signal_id:
+            return False
+
+        store = self._load_store()
+        payload = store.get(signal_id)
+        if payload is None:
+            return False
+
+        payload["was_sent_to_telegram"] = True
+        payload["last_alert_type"] = alert_type
+        payload["last_alerted_at_utc"] = sent_at_utc or self._utc_now()
+        payload["updated_at_utc"] = self._utc_now()
+        payload["state_version"] = int(payload.get("state_version", 1)) + 1
+
+        store[signal_id] = payload
+        self._save_store(store)
+        return True
+
+    def clear_alert_sent_flag(
+        self,
+        signal_id: str,
+        *,
+        keep_history: bool = True,
+    ) -> bool:
+        if not signal_id:
+            return False
+
+        store = self._load_store()
+        payload = store.get(signal_id)
+        if payload is None:
+            return False
+
+        payload["was_sent_to_telegram"] = False
+        if not keep_history:
+            payload["last_alert_type"] = None
+            payload["last_alerted_at_utc"] = None
+
+        payload["updated_at_utc"] = self._utc_now()
+        payload["state_version"] = int(payload.get("state_version", 1)) + 1
+
+        store[signal_id] = payload
+        self._save_store(store)
+        return True
 
     # ------------------------------------------------------------------
     # Core lifecycle
@@ -128,6 +242,15 @@ class SignalTracker:
             payload["created_at_utc"] = now
             payload["updated_at_utc"] = now
             payload["update_count"] = 0
+            payload["state_version"] = 1
+
+            payload["was_sent_to_telegram"] = False
+            payload["last_alert_type"] = None
+            payload["last_alerted_at_utc"] = None
+            payload["was_deduped"] = False
+
+            payload["current_stage"] = payload.get("signal_class")
+            payload["ttl_expires_at_utc"] = self._compute_ttl_expires_at(payload)
 
             store[signal_id] = payload
             self._save_store(store)
@@ -143,6 +266,28 @@ class SignalTracker:
         previous = deepcopy(store[existing_id])
         updated = self._merge_signal_payload(existing=store[existing_id], incoming=payload)
 
+        updated["was_sent_to_telegram"] = bool(previous.get("was_sent_to_telegram", False))
+        updated["last_alert_type"] = previous.get("last_alert_type")
+        updated["last_alerted_at_utc"] = previous.get("last_alerted_at_utc")
+        updated["was_deduped"] = bool(previous.get("was_deduped", False))
+
+        updated["current_stage"] = updated.get("signal_class")
+        updated["ttl_expires_at_utc"] = self._compute_ttl_expires_at(updated)
+
+        previous_stage = str(previous.get("signal_class") or "")
+        new_stage = str(updated.get("signal_class") or "")
+        previous_exec = str(previous.get("execution_status") or "")
+        new_exec = str(updated.get("execution_status") or "")
+
+        meaningful_stage_transition = (
+            previous_stage != new_stage
+            or (previous_exec != new_exec and new_exec == "EXECUTABLE")
+        )
+
+        if meaningful_stage_transition:
+            updated["was_sent_to_telegram"] = False
+            updated["last_alert_type"] = None
+
         changed_fields = self._diff_signal_fields(previous=previous, current=updated)
         if not changed_fields:
             return SignalTrackerResult(
@@ -155,6 +300,7 @@ class SignalTracker:
 
         updated["updated_at_utc"] = self._utc_now()
         updated["update_count"] = int(previous.get("update_count", 0)) + 1
+        updated["state_version"] = int(previous.get("state_version", 1)) + 1
 
         store[existing_id] = updated
         self._save_store(store)
@@ -185,10 +331,12 @@ class SignalTracker:
 
         resolved["signal_class"] = "RESOLVED"
         resolved["status"] = "RESOLVED"
+        resolved["current_stage"] = "RESOLVED"
         resolved["resolution"] = payload.get("resolution")
         resolved["resolution_note"] = payload.get("resolution_note")
         resolved["resolved_at_utc"] = self._utc_now()
         resolved["updated_at_utc"] = resolved["resolved_at_utc"]
+        resolved["ttl_expires_at_utc"] = None
 
         changed_fields = self._diff_signal_fields(previous=previous, current=resolved)
 
@@ -230,6 +378,10 @@ class SignalTracker:
             execution=execution,
         )
 
+        trigger_reason = raw.get("trigger_reason")
+        if trigger_reason is None:
+            trigger_reason = execution.get("trigger_reason")
+
         payload = {
             "signal_id": self._build_signal_id(
                 instrument=instrument,
@@ -255,6 +407,7 @@ class SignalTracker:
             "confidence": self._float_or_none(raw.get("confidence")),
             "alignment_score": self._float_or_none(raw.get("alignment_score")),
             "rationale": raw.get("rationale"),
+            "reason": raw.get("reason") or raw.get("rationale"),
             "next_expected_event": raw.get("next_expected_event"),
             "missing_conditions": list(raw.get("missing_conditions") or []),
             "tags": list(raw.get("tags") or []),
@@ -271,14 +424,14 @@ class SignalTracker:
         payload["stop_distance"] = execution.get("stop_distance")
         payload["target_distance"] = execution.get("target_distance")
         payload["execution_timeframe"] = execution.get("execution_timeframe")
-        payload["trigger_reason"] = execution.get("trigger_reason")
+        payload["trigger_reason"] = trigger_reason
 
         return payload
 
     def _normalize_execution(self, execution: Any) -> dict[str, Any]:
         raw = self._to_dict(execution)
 
-        normalized = {
+        return {
             "status": raw.get("status", "NOT_EXECUTABLE"),
             "model": raw.get("model", "NONE"),
             "entry_reference_price": self._float_or_none(raw.get("entry_reference_price")),
@@ -290,8 +443,6 @@ class SignalTracker:
             "execution_timeframe": raw.get("execution_timeframe"),
             "trigger_reason": raw.get("trigger_reason"),
         }
-
-        return normalized
 
     def _derive_signal_class(
         self,
@@ -316,7 +467,7 @@ class SignalTracker:
         if status == "READY":
             if execution_status == "EXECUTABLE":
                 return "READY"
-            return "WATCH"
+            return "READY"
 
         if status == "ACTIVE":
             return "ACTIVE"
@@ -335,19 +486,63 @@ class SignalTracker:
         symbol = payload.get("symbol")
         scenario = payload.get("scenario")
         direction = payload.get("direction")
+        setup_type = payload.get("setup_type")
+        trigger_reason = payload.get("trigger_reason")
 
+        candidates: list[tuple[str, dict[str, Any]]] = []
         for signal_id, existing in store.items():
+            if existing.get("signal_class") == "RESOLVED":
+                continue
             if existing.get("symbol") != symbol:
                 continue
             if existing.get("scenario") != scenario:
                 continue
             if existing.get("direction") != direction:
                 continue
-            if existing.get("signal_class") == "RESOLVED":
-                continue
-            return signal_id
+            candidates.append((signal_id, existing))
 
-        return None
+        if not candidates:
+            return None
+
+        exact_matches: list[str] = []
+        for signal_id, existing in candidates:
+            same_setup = existing.get("setup_type") == setup_type
+            same_trigger = existing.get("trigger_reason") == trigger_reason
+            if same_setup and same_trigger:
+                exact_matches.append(signal_id)
+
+        if exact_matches:
+            return self._pick_most_recent_signal_id(store, exact_matches)
+
+        setup_matches = [
+            signal_id
+            for signal_id, existing in candidates
+            if existing.get("setup_type") == setup_type
+        ]
+        if setup_matches:
+            return self._pick_most_recent_signal_id(store, setup_matches)
+
+        return self._pick_most_recent_signal_id(store, [sid for sid, _ in candidates])
+
+    def _pick_most_recent_signal_id(
+        self,
+        store: dict[str, dict[str, Any]],
+        signal_ids: list[str],
+    ) -> str | None:
+        if not signal_ids:
+            return None
+
+        def sort_key(signal_id: str) -> tuple[float, str]:
+            payload = store.get(signal_id) or {}
+            ts = payload.get("updated_at_utc") or payload.get("created_at_utc") or ""
+            try:
+                dt = datetime.fromisoformat(ts)
+                return (dt.timestamp(), signal_id)
+            except Exception:
+                return (0.0, signal_id)
+
+        signal_ids = sorted(signal_ids, key=sort_key, reverse=True)
+        return signal_ids[0]
 
     def _merge_signal_payload(
         self,
@@ -376,7 +571,6 @@ class SignalTracker:
 
             merged[key] = value
 
-        # keep mirrored execution fields in sync
         execution = merged.get("execution") or {}
         merged["execution_status"] = execution.get("status")
         merged["execution_model"] = execution.get("model")
@@ -387,7 +581,7 @@ class SignalTracker:
         merged["stop_distance"] = execution.get("stop_distance")
         merged["target_distance"] = execution.get("target_distance")
         merged["execution_timeframe"] = execution.get("execution_timeframe")
-        merged["trigger_reason"] = execution.get("trigger_reason")
+        merged["trigger_reason"] = merged.get("trigger_reason") or execution.get("trigger_reason")
 
         return merged
 
@@ -429,12 +623,41 @@ class SignalTracker:
             json.dump(store, f, indent=2, ensure_ascii=False, sort_keys=True)
 
     # ------------------------------------------------------------------
+    # TTL helpers
+    # ------------------------------------------------------------------
+
+    def _compute_ttl_expires_at(self, payload: dict[str, Any]) -> str | None:
+        stage = str(payload.get("signal_class") or "WATCH").upper()
+        ttl_minutes = self.ttl_minutes_by_stage.get(stage)
+        if ttl_minutes is None:
+            return None
+
+        now = self._utc_now_dt()
+        return (now + timedelta(minutes=int(ttl_minutes))).isoformat()
+
+    def _is_signal_expired(self, payload: dict[str, Any], *, now: datetime) -> bool:
+        expires_at = payload.get("ttl_expires_at_utc")
+        if not expires_at:
+            return False
+
+        try:
+            expiry_dt = datetime.fromisoformat(expires_at)
+        except Exception:
+            return False
+
+        return now >= expiry_dt
+
+    # ------------------------------------------------------------------
     # Utility helpers
     # ------------------------------------------------------------------
 
     @staticmethod
     def _utc_now() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _utc_now_dt() -> datetime:
+        return datetime.now(timezone.utc)
 
     @staticmethod
     def _build_signal_id(
