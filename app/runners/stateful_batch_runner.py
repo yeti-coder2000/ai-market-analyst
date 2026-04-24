@@ -41,6 +41,7 @@ from app.services.radar_journal import (
 from app.services.signal_tracker import SignalTracker, SignalTrackerResult
 from app.services.statistics import build_and_export_statistics
 from app.services.telegram_formatter import format_signal_message
+from app.services.telegram_notifier import build_telegram_notifier
 from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
@@ -496,6 +497,7 @@ class StatefulBatchRunner:
         self.signal_tracker = SignalTracker(
             open_signals_path=str(RUNTIME_DIR / "open_signals.json")
         )
+        self.telegram = build_telegram_notifier()
 
         self.timeframes_by_symbol = timeframes_by_symbol or DEFAULT_TIMEFRAMES_BY_SYMBOL
 
@@ -734,8 +736,10 @@ class StatefulBatchRunner:
                     normalized_instruments.append(instrument_result.to_dict())
                     processed_count += 1
 
-                    if instrument_result.alert_payload and instrument_result.alert_payload.get("should_alert"):
-                        alerts_count += 1
+                    if instrument_result.alert_payload:
+                        sent = self._dispatch_alert_payload(instrument_result.alert_payload)
+                        if sent:
+                            alerts_count += 1
 
                     if instrument_result.status == "skipped":
                         skipped_count += 1
@@ -1443,6 +1447,7 @@ class StatefulBatchRunner:
             behavioral_summary = scenario_type
 
         tracked_payload = tracker_result.payload if tracker_result is not None else {}
+        previous_payload = tracker_result.previous_payload if tracker_result is not None else None
         tracked_stage = tracked_payload.get("signal_class", "SCENARIO_FORMING")
         final_signal_normalized = self._normalize_final_signal(tracked_stage)
         watch_status = self._derive_watch_status_from_stage(tracked_stage)
@@ -1450,6 +1455,17 @@ class StatefulBatchRunner:
         alert_payload = self._build_alert_payload_from_tracker_payload(
             symbol=symbol.value,
             tracked_payload=tracked_payload,
+            previous_payload=previous_payload,
+            tracker_action=tracker_result.action if tracker_result is not None else "NOOP",
+            cycle_id=tracked_payload.get("cycle_id"),
+            market_state=market_state,
+            htf_bias=htf_bias,
+            watch_reason=watch_reason,
+            scenario_probability=scenario_probability,
+            invalidation_level=invalidation_level,
+            target_zone=target_zone,
+            paper_mode=self.simulation_mode,
+            batch_group=self.batch_group,
         )
 
         return InstrumentCycleResult(
@@ -2075,39 +2091,188 @@ class StatefulBatchRunner:
             return "INVALIDATED"
         return "-"
 
+    @staticmethod
+    def _map_stage_to_alert_type(stage: str) -> str | None:
+        stage = str(stage or "").upper()
+        if stage == "ACTIVE":
+            return "TRIGGERED"
+        if stage == "READY":
+            return "ENTRY_READY"
+        if stage == "WATCH":
+            return "WATCH_NEW"
+        if stage == "RESOLVED":
+            return "INVALIDATED"
+        return None
+
+    sent = self.telegram.send_alert_payload(payload)
+
+    if sent and payload.get("signal_id"):
+        self.signal_tracker.mark_alert_sent(
+            payload["signal_id"],
+            alert_type=payload.get("alert_type"),
+        )
+            if sent:
+                logger.info(
+                    "Telegram alert sent. symbol=%s alert_type=%s signal_id=%s",
+                    payload.get("symbol"),
+                    payload.get("alert_type"),
+                    payload.get("signal_id"),
+                )
+            else:
+                logger.warning(
+                    "Telegram alert skipped or failed. symbol=%s alert_type=%s signal_id=%s",
+                    payload.get("symbol"),
+                    payload.get("alert_type"),
+                    payload.get("signal_id"),
+                )
+            return sent
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "Telegram dispatch failed. symbol=%s alert_type=%s signal_id=%s error=%s",
+                payload.get("symbol"),
+                payload.get("alert_type"),
+                payload.get("signal_id"),
+                exc,
+            )
+            return False
+
     def _build_alert_payload_from_tracker_payload(
         self,
         *,
         symbol: str,
         tracked_payload: dict[str, Any],
+        previous_payload: dict[str, Any] | None,
+        tracker_action: str,
+        cycle_id: str | None,
+        market_state: str | None,
+        htf_bias: str | None,
+        watch_reason: str | None,
+        scenario_probability: float | None,
+        invalidation_level: float | None,
+        target_zone: list[float] | None,
+        paper_mode: bool,
+        batch_group: str,
     ) -> Optional[dict[str, Any]]:
-        stage = str(tracked_payload.get("signal_class") or "").upper()
-        if stage not in {"WATCH", "READY", "ACTIVE"}:
+        if not tracked_payload:
             return None
 
+        signal_class = str(tracked_payload.get("signal_class") or "").upper()
+        execution_status = str(tracked_payload.get("execution_status") or "").upper()
+        scenario = str(tracked_payload.get("scenario") or "")
+        direction = str(tracked_payload.get("direction") or "")
+
+        previous_signal_class = str((previous_payload or {}).get("signal_class") or "").upper()
+        previous_execution_status = str((previous_payload or {}).get("execution_status") or "").upper()
+
+        if signal_class in {"", "SCENARIO_FORMING"}:
+            return None
+
+        if scenario in {"NO_ACTION", "MARKET_CLOSED"}:
+            return None
+
+        trigger_reason = str(tracked_payload.get("trigger_reason") or "")
+        if "invalid_geometry" in trigger_reason.lower():
+            return None
+
+        entry_price = tracked_payload.get("entry_reference_price")
+        stop_price = tracked_payload.get("invalidation_reference_price")
+        target_price = tracked_payload.get("target_reference_price")
+
+        became_active = signal_class == "ACTIVE" and previous_signal_class != "ACTIVE"
+        became_executable = execution_status == "EXECUTABLE" and previous_execution_status != "EXECUTABLE"
+        became_ready = signal_class == "READY" and previous_signal_class != "READY"
+        became_watch = signal_class == "WATCH" and previous_signal_class not in {"WATCH", "READY", "ACTIVE"}
+
+        alert_type = None
+
+        if signal_class == "ACTIVE":
+            alert_type = "TRIGGERED"
+
+        elif signal_class == "READY":
+            alert_type = "ENTRY_READY"
+
+        elif signal_class == "WATCH":
+            alert_type = "WATCH_NEW"
+
+        # ENTRY_READY дозволяємо навіть без execution
+        if alert_type == "ENTRY_READY":
+            if entry_price is None or stop_price is None:
+                return None
+            if entry_price is None or stop_price is None or target_price is None:
+                return None
+
+        # normalize message preview via shared formatter
+        fmt = format_signal_message(
+            {
+                "signal_id": tracked_payload.get("signal_id"),
+                "symbol": symbol,
+                "stage": signal_class,
+                "signal_class": signal_class,
+                "scenario": scenario,
+                "direction": direction,
+                "confidence": tracked_payload.get("confidence"),
+                "probability": tracked_payload.get("confidence"),
+                "market_state": market_state,
+                "htf_bias": htf_bias,
+                "rationale": tracked_payload.get("rationale") or watch_reason,
+                "reason": tracked_payload.get("rationale") or watch_reason,
+                "missing_conditions": tracked_payload.get("missing_conditions") or [],
+                "execution_status": execution_status,
+                "execution_model": tracked_payload.get("execution_model"),
+                "entry_reference_price": entry_price,
+                "invalidation_reference_price": stop_price,
+                "target_reference_price": target_price,
+                "risk_reward_ratio": tracked_payload.get("risk_reward_ratio"),
+                "execution_timeframe": tracked_payload.get("execution_timeframe"),
+                "trigger_reason": tracked_payload.get("trigger_reason"),
+            }
+        )
+
         return {
+            "schema_version": "2.0",
             "should_alert": True,
+            "alert_type": alert_type,
             "signal_id": tracked_payload.get("signal_id"),
             "symbol": symbol,
-            "batch_group": self.batch_group,
+            "batch_group": batch_group,
+            "cycle_id": cycle_id,
+            "paper_mode": paper_mode,
             "signal_class": tracked_payload.get("signal_class"),
             "stage": tracked_payload.get("signal_class"),
+            "current_stage": tracked_payload.get("signal_class"),
             "scenario": tracked_payload.get("scenario"),
+            "scenario_type": tracked_payload.get("scenario"),
             "direction": tracked_payload.get("direction"),
             "confidence": tracked_payload.get("confidence"),
-            "entry_reference_price": tracked_payload.get("entry_reference_price"),
-            "invalidation_reference_price": tracked_payload.get("invalidation_reference_price"),
-            "target_reference_price": tracked_payload.get("target_reference_price"),
-            "market_state": tracked_payload.get("market_state"),
-            "htf_bias": tracked_payload.get("htf_bias"),
-            "rationale": tracked_payload.get("rationale"),
-            "reason": tracked_payload.get("next_expected_event"),
-            "missing_conditions": tracked_payload.get("missing_conditions", []),
+            "scenario_probability": scenario_probability,
+            "alignment_score": tracked_payload.get("alignment_score"),
+            "market_state": market_state,
+            "htf_bias": htf_bias,
+            "phase": tracked_payload.get("phase"),
+            "status": tracked_payload.get("status"),
+            "watch_reason": tracked_payload.get("rationale") or watch_reason,
+            "reason": tracked_payload.get("rationale") or watch_reason,
+            "next_expected_event": tracked_payload.get("next_expected_event"),
+            "missing_conditions": tracked_payload.get("missing_conditions") or [],
+            "tags": tracked_payload.get("tags") or [],
             "execution_status": tracked_payload.get("execution_status"),
             "execution_model": tracked_payload.get("execution_model"),
-            "risk_reward_ratio": tracked_payload.get("risk_reward_ratio"),
             "execution_timeframe": tracked_payload.get("execution_timeframe"),
             "trigger_reason": tracked_payload.get("trigger_reason"),
+            "entry_reference_price": entry_price,
+            "invalidation_reference_price": stop_price,
+            "target_reference_price": target_price,
+            "risk_reward_ratio": tracked_payload.get("risk_reward_ratio"),
+            "stop_distance": tracked_payload.get("stop_distance"),
+            "target_distance": tracked_payload.get("target_distance"),
+            "invalidation_level": invalidation_level if invalidation_level is not None else stop_price,
+            "target_zone": target_zone if target_zone else ([target_price] if target_price is not None else []),
+            "previous_signal_class": previous_signal_class or None,
+            "previous_execution_status": previous_execution_status or None,
+            "tracker_action": tracker_action,
+            "telegram_title": fmt.title,
+            "telegram_body": fmt.body,
+            "telegram_text": fmt.render(),
         }
 
     def _find_setup_by_name(self, setups: list[Any], setup_name: Any) -> Any:

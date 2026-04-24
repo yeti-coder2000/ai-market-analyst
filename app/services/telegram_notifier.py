@@ -38,6 +38,8 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 def _truncate(text: str, max_len: int) -> str:
     if len(text) <= max_len:
         return text
+    if max_len <= 3:
+        return text[:max_len]
     return text[: max_len - 3] + "..."
 
 
@@ -68,6 +70,82 @@ def _normalize_target_zone(value: Any) -> str:
 
     text = str(value).strip()
     return _escape_html(text) if text else "-"
+
+
+def _infer_alert_type(payload: Dict[str, Any]) -> str:
+    """
+    Infer Telegram alert type from payload state.
+
+    This function is intentionally module-level because both the class method
+    and standalone helper may use it.
+    """
+    explicit = str(payload.get("alert_type", "")).strip().upper()
+    if explicit:
+        return explicit
+
+    signal_class = str(
+        payload.get("signal_class")
+        or payload.get("stage")
+        or payload.get("current_stage")
+        or ""
+    ).strip().upper()
+
+    execution_status = str(payload.get("execution_status") or "").strip().upper()
+
+    if signal_class == "ACTIVE":
+        return "TRIGGERED"
+
+    if signal_class == "READY":
+        return "ENTRY_READY"
+
+    if execution_status == "EXECUTABLE":
+        return "ENTRY_READY"
+
+    if signal_class == "WATCH":
+        return "WATCH_NEW"
+
+    if signal_class == "RESOLVED":
+        resolution = str(payload.get("resolution") or payload.get("resolution_reason") or "").upper()
+        if resolution == "INVALIDATED":
+            return "INVALIDATED"
+
+    return ""
+
+
+def _normalize_alert_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize alert payload v2 into Telegram-compatible fields.
+
+    Keeps original keys and adds compatibility aliases expected by the formatter.
+    """
+    normalized = dict(payload)
+
+    alert_type = _infer_alert_type(normalized)
+    if alert_type:
+        normalized["alert_type"] = alert_type
+
+    normalized.setdefault(
+        "scenario_type",
+        normalized.get("scenario") or normalized.get("scenario_type") or "UNKNOWN",
+    )
+    normalized.setdefault(
+        "watch_reason",
+        normalized.get("rationale") or normalized.get("reason") or "-",
+    )
+    normalized.setdefault(
+        "scenario_probability",
+        normalized.get("confidence") or normalized.get("scenario_probability") or 0.0,
+    )
+    normalized.setdefault(
+        "invalidation_level",
+        normalized.get("invalidation_reference_price"),
+    )
+
+    if "target_zone" not in normalized:
+        target = normalized.get("target_reference_price")
+        normalized["target_zone"] = [target] if target is not None else []
+
+    return normalized
 
 
 @dataclass
@@ -131,9 +209,6 @@ class TelegramNotifier:
 
     @property
     def is_active(self) -> bool:
-        """
-        Compatibility alias expected by main_worker.
-        """
         return self.is_enabled
 
     def send_text(self, text: str) -> bool:
@@ -202,15 +277,9 @@ class TelegramNotifier:
         return False
 
     def send_admin_message(self, text: str) -> bool:
-        """
-        Compatibility method expected by main_worker.
-        """
         return self.send_text(text)
 
     def send_alert(self, payload: Dict[str, Any]) -> bool:
-        """
-        Compatibility method expected by main_worker.
-        """
         return self.send_alert_payload(payload)
 
     def send_alert_payload(self, payload: Dict[str, Any]) -> bool:
@@ -223,19 +292,34 @@ class TelegramNotifier:
             logger.debug("alert_payload.should_alert=False, Telegram send skipped.")
             return False
 
-        alert_type = str(payload.get("alert_type", "")).strip().upper()
-        if self.config.allowed_alert_types and alert_type not in self.config.allowed_alert_types:
+        normalized_payload = _normalize_alert_payload(payload)
+        alert_type = str(normalized_payload.get("alert_type", "")).strip().upper()
+
+        if not alert_type:
             logger.info(
-                "Alert type not allowed for Telegram delivery. alert_type=%s",
-                alert_type,
+                "Alert type missing and could not be inferred. symbol=%s signal_class=%s execution_status=%s",
+                normalized_payload.get("symbol"),
+                normalized_payload.get("signal_class"),
+                normalized_payload.get("execution_status"),
             )
             return False
 
-        message = self.format_alert_payload(payload)
+        if self.config.allowed_alert_types and alert_type not in self.config.allowed_alert_types:
+            logger.info(
+                "Alert type not allowed for Telegram delivery. alert_type=%s symbol=%s signal_id=%s",
+                alert_type,
+                normalized_payload.get("symbol"),
+                normalized_payload.get("signal_id"),
+            )
+            return False
+
+        message = self.format_alert_payload(normalized_payload)
+
         logger.info(
-            "Sending Telegram alert. symbol=%s alert_type=%s",
-            payload.get("symbol"),
+            "Sending Telegram alert. symbol=%s alert_type=%s signal_id=%s",
+            normalized_payload.get("symbol"),
             alert_type,
+            normalized_payload.get("signal_id"),
         )
         return self.send_text(message)
 
@@ -253,8 +337,17 @@ class TelegramNotifier:
         paper_mode = bool(payload.get("paper_mode", True))
         cycle_id = _escape_html(payload.get("cycle_id", "-"))
 
+        execution_status = _escape_html(payload.get("execution_status", "-"))
+        execution_model = _escape_html(payload.get("execution_model", "-"))
+        entry_reference_price = payload.get("entry_reference_price")
+        invalidation_reference_price = payload.get("invalidation_reference_price")
+        target_reference_price = payload.get("target_reference_price")
+        risk_reward_ratio = payload.get("risk_reward_ratio")
+        signal_id = _escape_html(payload.get("signal_id", "-"))
+
         header = self.config.paper_mode_prefix if paper_mode else self.config.live_mode_prefix
-        probability_pct = f"{probability * 100:.0f}%"
+        probability_pct = f"{probability * 100:.0f}%" if probability <= 1 else f"{probability:.0f}%"
+
         invalidation_str = (
             _escape_html(invalidation_level) if invalidation_level is not None else "-"
         )
@@ -273,8 +366,27 @@ class TelegramNotifier:
             f"<b>Target zone:</b> {target_zone_str}",
             f"<b>Cycle:</b> {cycle_id}",
             "",
-            f"<b>Reason:</b> {watch_reason}",
+            f"<b>Execution status:</b> {execution_status}",
+            f"<b>Execution model:</b> {execution_model}",
         ]
+
+        if entry_reference_price is not None:
+            lines.append(f"<b>Entry:</b> {_escape_html(entry_reference_price)}")
+        if invalidation_reference_price is not None:
+            lines.append(f"<b>Stop:</b> {_escape_html(invalidation_reference_price)}")
+        if target_reference_price is not None:
+            lines.append(f"<b>Target:</b> {_escape_html(target_reference_price)}")
+        if risk_reward_ratio is not None:
+            lines.append(f"<b>RR:</b> {_escape_html(risk_reward_ratio)}")
+
+        lines.extend(
+            [
+                "",
+                f"<b>Reason:</b> {watch_reason}",
+                "",
+                f"<b>ID:</b> <code>{signal_id}</code>",
+            ]
+        )
 
         return _truncate("\n".join(lines), self.config.max_message_length)
 
@@ -326,17 +438,22 @@ if __name__ == "__main__":
     sample_payload = {
         "should_alert": True,
         "symbol": "BTCUSD",
-        "alert_type": "WATCH_NEW",
-        "scenario_type": "SWEEP_RETURN_LONG",
+        "signal_class": "READY",
+        "scenario": "SWEEP_RETURN_LONG",
         "direction": "LONG",
-        "scenario_probability": 0.7,
-        "watch_reason": "Sweep and return-to-value setup is fully confirmed.",
+        "confidence": 0.7,
+        "rationale": "Sweep and return-to-value setup is fully confirmed.",
         "market_state": "TRANSITION",
         "htf_bias": "SHORT",
-        "invalidation_level": None,
-        "target_zone": [],
+        "entry_reference_price": 78000,
+        "invalidation_reference_price": 77500,
+        "target_reference_price": 79000,
+        "execution_status": "EXECUTABLE",
+        "execution_model": "LIMIT_ON_RETEST",
+        "risk_reward_ratio": 2.0,
         "paper_mode": True,
         "cycle_id": "2026-03-31T10:00:00+00:00",
+        "signal_id": "TEST_SIGNAL",
     }
 
     notifier = build_telegram_notifier()
