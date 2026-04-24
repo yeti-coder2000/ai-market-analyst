@@ -100,6 +100,7 @@ class LevelType(str, Enum):
 class SetupStatus(str, Enum):
     NO_SETUP = "NO_SETUP"
     IDLE = "IDLE"
+    EDGE_FORMING = "EDGE_FORMING"
     WATCH = "WATCH"
     READY = "READY"
     ACTIVE = "ACTIVE"
@@ -433,6 +434,11 @@ class SetupBInput(BaseModel):
 class SetupARule(BaseModel):
     """
     Legacy-compatible evaluator for continuation setup.
+
+    EDGE_FORMING is a pre-edge state:
+    - it is NOT an executable trade signal
+    - it is NOT supposed to reach Telegram
+    - it is useful for journal/statistics/diagnostics
     """
 
     model_config = ConfigDict(extra="allow")
@@ -450,8 +456,8 @@ class SetupARule(BaseModel):
         )
 
         aligned_with_htf = (
-                ctx.htf_bias.bias != Direction.NEUTRAL
-                and effective_direction == ctx.htf_bias.bias
+            ctx.htf_bias.bias != Direction.NEUTRAL
+            and effective_direction == ctx.htf_bias.bias
         )
         valid_market_state = ctx.market_state == MarketState.TREND
         valid_impulse = ctx.impulse.detected
@@ -517,12 +523,11 @@ class SetupARule(BaseModel):
                 )
             )
 
-        result.direction = (
-            ctx.impulse.direction
-            if ctx.impulse.direction != Direction.NEUTRAL
-            else ctx.htf_bias.bias
-        )
+        result.direction = effective_direction
 
+        # ------------------------------------------------------------
+        # READY: full continuation setup confirmed.
+        # ------------------------------------------------------------
         if valid_market_state and valid_impulse and valid_pullback and aligned_with_htf:
             result.status = SetupStatus.READY
             result.grade = SetupGrade.A
@@ -536,12 +541,30 @@ class SetupARule(BaseModel):
             )
             return result
 
-        if valid_impulse and aligned_with_htf:
+        # ------------------------------------------------------------
+        # WATCH: impulse already exists, but pullback confirmation is incomplete.
+        # ------------------------------------------------------------
+        if valid_market_state and valid_impulse and aligned_with_htf:
             result.status = SetupStatus.WATCH
             result.grade = SetupGrade.B
             result.confidence = 0.55
             result.rationale = (
-                "Impulse exists, but continuation setup is not fully confirmed yet."
+                "Impulse exists in trend context and aligns with HTF bias; "
+                "waiting for pullback / structure hold confirmation."
+            )
+            return result
+
+        # ------------------------------------------------------------
+        # EDGE_FORMING: trend context + HTF alignment exist, but impulse is not confirmed.
+        # This is reconnaissance, not a trade signal.
+        # ------------------------------------------------------------
+        if valid_market_state and aligned_with_htf and not valid_impulse:
+            result.status = SetupStatus.EDGE_FORMING
+            result.grade = SetupGrade.C
+            result.confidence = 0.25
+            result.rationale = (
+                "EDGE_FORMING: trend context and HTF alignment are present; "
+                "waiting for confirmed impulse."
             )
             return result
 
@@ -555,6 +578,9 @@ class SetupARule(BaseModel):
 class SetupBRule(BaseModel):
     """
     Legacy-compatible evaluator for sweep -> return to value setup.
+
+    EDGE_FORMING is used when market context supports sweep/return behavior,
+    but the sweep itself has not appeared yet.
     """
 
     model_config = ConfigDict(extra="allow")
@@ -616,6 +642,9 @@ class SetupBRule(BaseModel):
 
         result.direction = ctx.sweep.direction
 
+        # ------------------------------------------------------------
+        # READY: sweep and return-to-value setup is fully confirmed.
+        # ------------------------------------------------------------
         if valid_state and has_sweep and returned:
             result.status = SetupStatus.READY
             result.grade = SetupGrade.A
@@ -627,12 +656,29 @@ class SetupBRule(BaseModel):
             )
             return result
 
+        # ------------------------------------------------------------
+        # WATCH: sweep exists, but return-to-value is incomplete.
+        # ------------------------------------------------------------
         if valid_state and has_sweep:
             result.status = SetupStatus.WATCH
             result.grade = SetupGrade.B
             result.confidence = 0.6
             result.rationale = (
                 "Sweep detected; waiting for clearer return-to-value confirmation."
+            )
+            return result
+
+        # ------------------------------------------------------------
+        # EDGE_FORMING: market state supports sweep behavior, but no sweep yet.
+        # This is useful for diagnostics and statistics only.
+        # ------------------------------------------------------------
+        if valid_state and not has_sweep:
+            result.status = SetupStatus.EDGE_FORMING
+            result.grade = SetupGrade.C
+            result.confidence = 0.2
+            result.rationale = (
+                "EDGE_FORMING: balance/transition context supports sweep-return scenario; "
+                "waiting for liquidity sweep."
             )
             return result
 

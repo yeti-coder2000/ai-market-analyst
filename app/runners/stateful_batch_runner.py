@@ -38,6 +38,7 @@ from app.services.radar_journal import (
     write_signal_resolved,
     write_signal_updated,
 )
+from app.services.signal_quality_engine import enrich_payload_with_quality
 from app.services.signal_tracker import SignalTracker, SignalTrackerResult
 from app.services.statistics import build_and_export_statistics
 from app.services.telegram_formatter import format_signal_message
@@ -412,6 +413,9 @@ def _map_instrument_to_formatter_payload(inst: dict[str, Any]) -> Optional[dict[
         return None
 
     if not alert_payload.get("should_alert", False):
+        return None
+
+    if alert_payload.get("telegram_allowed") is not True:
         return None
 
     return alert_payload
@@ -2111,6 +2115,18 @@ class StatefulBatchRunner:
         if not payload.get("should_alert", False):
             return False
 
+        if payload.get("telegram_allowed") is not True:
+            logger.info(
+                "Telegram blocked by Signal Quality Engine. symbol=%s signal_id=%s class=%s execution=%s reason=%s score=%s",
+                payload.get("symbol"),
+                payload.get("signal_id"),
+                payload.get("signal_class"),
+                payload.get("execution_status"),
+                payload.get("signal_quality_reason"),
+                payload.get("signal_quality_score"),
+            )
+            return False
+
         try:
             sent = self.telegram.send_alert_payload(payload)
 
@@ -2237,7 +2253,7 @@ class StatefulBatchRunner:
             }
         )
 
-        return {
+        alert_payload = {
             "schema_version": "2.0",
             "should_alert": True,
             "alert_type": alert_type,
@@ -2253,6 +2269,7 @@ class StatefulBatchRunner:
             "scenario_type": tracked_payload.get("scenario"),
             "direction": tracked_payload.get("direction"),
             "confidence": tracked_payload.get("confidence"),
+            "probability": tracked_payload.get("confidence"),
             "scenario_probability": scenario_probability,
             "alignment_score": tracked_payload.get("alignment_score"),
             "market_state": market_state,
@@ -2272,6 +2289,10 @@ class StatefulBatchRunner:
             "invalidation_reference_price": stop_price,
             "target_reference_price": target_price,
             "risk_reward_ratio": tracked_payload.get("risk_reward_ratio"),
+            "entry": entry_price,
+            "stop_loss": stop_price,
+            "take_profit": target_price,
+            "rr": tracked_payload.get("risk_reward_ratio"),
             "stop_distance": tracked_payload.get("stop_distance"),
             "target_distance": tracked_payload.get("target_distance"),
             "invalidation_level": invalidation_level if invalidation_level is not None else stop_price,
@@ -2283,6 +2304,8 @@ class StatefulBatchRunner:
             "telegram_body": fmt.body,
             "telegram_text": fmt.render(),
         }
+
+        return enrich_payload_with_quality(alert_payload)
 
     def _find_setup_by_name(self, setups: list[Any], setup_name: Any) -> Any:
         setup_name = getattr(setup_name, "value", setup_name)
