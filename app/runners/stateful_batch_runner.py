@@ -2104,13 +2104,22 @@ class StatefulBatchRunner:
             return "INVALIDATED"
         return None
 
-    sent = self.telegram.send_alert_payload(payload)
+    def _dispatch_alert_payload(self, payload: dict[str, Any]) -> bool:
+        if not payload:
+            return False
 
-    if sent and payload.get("signal_id"):
-        self.signal_tracker.mark_alert_sent(
-            payload["signal_id"],
-            alert_type=payload.get("alert_type"),
-        )
+        if not payload.get("should_alert", False):
+            return False
+
+        try:
+            sent = self.telegram.send_alert_payload(payload)
+
+            if sent and payload.get("signal_id"):
+                self.signal_tracker.mark_alert_sent(
+                    payload["signal_id"],
+                    alert_type=payload.get("alert_type"),
+                )
+
             if sent:
                 logger.info(
                     "Telegram alert sent. symbol=%s alert_type=%s signal_id=%s",
@@ -2125,7 +2134,9 @@ class StatefulBatchRunner:
                     payload.get("alert_type"),
                     payload.get("signal_id"),
                 )
+
             return sent
+
         except Exception as exc:  # noqa: BLE001
             logger.exception(
                 "Telegram dispatch failed. symbol=%s alert_type=%s signal_id=%s error=%s",
@@ -2194,10 +2205,8 @@ class StatefulBatchRunner:
         elif signal_class == "WATCH":
             alert_type = "WATCH_NEW"
 
-        # ENTRY_READY дозволяємо навіть без execution
+        # ENTRY_READY requires a complete execution plan.
         if alert_type == "ENTRY_READY":
-            if entry_price is None or stop_price is None:
-                return None
             if entry_price is None or stop_price is None or target_price is None:
                 return None
 
