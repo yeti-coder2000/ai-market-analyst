@@ -49,6 +49,13 @@ logger = get_logger(__name__, component="stateful_batch_runner")
 
 RUNNER_VERSION = "1.4.2"
 
+# Telegram is a trade-alert channel, not a reconnaissance feed.
+# WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
+# but must not reach Telegram.
+TELEGRAM_MIN_RR = 2.0
+TELEGRAM_MAX_RR = 10.0
+TELEGRAM_MIN_CONFIDENCE = 0.60
+
 
 # =============================================================================
 # GUARANTEED HISTORY WRITE LAYER (PERSISTENT DISK READY)
@@ -407,12 +414,103 @@ def extract_last_bar_low(df: pd.DataFrame | None):
         return None
 
 
+def _safe_float_for_alert(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_telegram_trade_alert_allowed(payload: dict[str, Any]) -> tuple[bool, str]:
+    """
+    Hard Telegram gate.
+
+    Telegram is allowed only for mature trade candidates:
+    READY + EXECUTABLE + valid direction + complete geometry + RR 2..10.
+
+    Everything else still goes to journal/statistics/open_signals,
+    but stays silent in Telegram.
+    """
+    if not isinstance(payload, dict):
+        return False, "payload_is_not_dict"
+
+    signal_class = str(payload.get("signal_class") or payload.get("stage") or "").upper()
+    execution_status = str(payload.get("execution_status") or "").upper()
+    direction = str(payload.get("direction") or "").upper()
+    scenario = str(payload.get("scenario") or payload.get("scenario_type") or "").upper()
+
+    rr = _safe_float_for_alert(payload.get("risk_reward_ratio") or payload.get("rr"))
+    confidence = _safe_float_for_alert(payload.get("confidence") or payload.get("probability"))
+
+    entry = _safe_float_for_alert(
+        payload.get("entry_reference_price")
+        or payload.get("entry")
+    )
+    stop = _safe_float_for_alert(
+        payload.get("invalidation_reference_price")
+        or payload.get("stop_loss")
+        or payload.get("stop")
+    )
+    target = _safe_float_for_alert(
+        payload.get("target_reference_price")
+        or payload.get("take_profit")
+        or payload.get("target")
+    )
+
+    if scenario in {"", "NO_ACTION", "MARKET_CLOSED"}:
+        return False, f"blocked_scenario:{scenario or '-'}"
+
+    if signal_class != "READY":
+        return False, f"blocked_non_ready_signal_class:{signal_class or '-'}"
+
+    if execution_status != "EXECUTABLE":
+        return False, f"blocked_non_executable_status:{execution_status or '-'}"
+
+    if direction not in {"LONG", "SHORT"}:
+        return False, f"blocked_invalid_direction:{direction or '-'}"
+
+    if confidence is None:
+        return False, "blocked_missing_confidence"
+
+    if confidence > 1.0:
+        confidence = confidence / 100.0
+
+    if confidence < TELEGRAM_MIN_CONFIDENCE:
+        return False, f"blocked_confidence_too_low:{confidence:.2f}"
+
+    if rr is None:
+        return False, "blocked_missing_rr"
+
+    if rr < TELEGRAM_MIN_RR:
+        return False, f"blocked_rr_too_low:{rr:.2f}"
+
+    if rr > TELEGRAM_MAX_RR:
+        return False, f"blocked_rr_too_high:{rr:.2f}"
+
+    if entry is None or stop is None or target is None:
+        return False, "blocked_missing_trade_geometry"
+
+    if direction == "LONG" and not (stop < entry < target):
+        return False, "blocked_invalid_long_geometry"
+
+    if direction == "SHORT" and not (target < entry < stop):
+        return False, "blocked_invalid_short_geometry"
+
+    return True, "telegram_allowed_ready_executable_trade"
+
+
 def _map_instrument_to_formatter_payload(inst: dict[str, Any]) -> Optional[dict[str, Any]]:
     alert_payload = inst.get("alert_payload")
     if not alert_payload:
         return None
 
     if not alert_payload.get("should_alert", False):
+        return None
+
+    allowed, _reason = _is_telegram_trade_alert_allowed(alert_payload)
+    if not allowed:
         return None
 
     if alert_payload.get("telegram_allowed") is not True:
@@ -2075,7 +2173,7 @@ class StatefulBatchRunner:
         if value == "ACTIVE":
             return "TRIGGERED"
         if value == "READY":
-            return "WATCH"
+            return "READY"
         if value == "WATCH":
             return "WATCH"
         if value == "RESOLVED":
@@ -2113,15 +2211,44 @@ class StatefulBatchRunner:
             return False
 
         if not payload.get("should_alert", False):
-            return False
-
-        if payload.get("telegram_allowed") is not True:
+            block_reason = payload.get("telegram_block_reason") or "should_alert_false"
             logger.info(
-                "Telegram blocked by Signal Quality Engine. symbol=%s signal_id=%s class=%s execution=%s reason=%s score=%s",
+                "Telegram skipped. symbol=%s signal_id=%s class=%s execution=%s rr=%s reason=%s",
                 payload.get("symbol"),
                 payload.get("signal_id"),
                 payload.get("signal_class"),
                 payload.get("execution_status"),
+                payload.get("risk_reward_ratio"),
+                block_reason,
+            )
+            return False
+
+        hard_allowed, hard_reason = _is_telegram_trade_alert_allowed(payload)
+        payload["telegram_hard_gate_allowed"] = hard_allowed
+        payload["telegram_hard_gate_reason"] = hard_reason
+
+        if not hard_allowed:
+            payload["telegram_allowed"] = False
+            payload["telegram_block_reason"] = hard_reason
+            logger.info(
+                "Telegram blocked by hard gate. symbol=%s signal_id=%s class=%s execution=%s rr=%s reason=%s",
+                payload.get("symbol"),
+                payload.get("signal_id"),
+                payload.get("signal_class"),
+                payload.get("execution_status"),
+                payload.get("risk_reward_ratio"),
+                hard_reason,
+            )
+            return False
+
+        if payload.get("telegram_allowed") is not True:
+            logger.info(
+                "Telegram blocked by Signal Quality Engine. symbol=%s signal_id=%s class=%s execution=%s rr=%s reason=%s score=%s",
+                payload.get("symbol"),
+                payload.get("signal_id"),
+                payload.get("signal_class"),
+                payload.get("execution_status"),
+                payload.get("risk_reward_ratio"),
                 payload.get("signal_quality_reason"),
                 payload.get("signal_quality_score"),
             )
@@ -2138,10 +2265,11 @@ class StatefulBatchRunner:
 
             if sent:
                 logger.info(
-                    "Telegram alert sent. symbol=%s alert_type=%s signal_id=%s",
+                    "Telegram alert sent. symbol=%s alert_type=%s signal_id=%s rr=%s",
                     payload.get("symbol"),
                     payload.get("alert_type"),
                     payload.get("signal_id"),
+                    payload.get("risk_reward_ratio"),
                 )
             else:
                 logger.warning(
@@ -2183,18 +2311,34 @@ class StatefulBatchRunner:
         if not tracked_payload:
             return None
 
+        # Send only lifecycle changes. Do not re-alert unchanged open signals.
+        if str(tracker_action or "").upper() not in {"REGISTERED", "UPDATED"}:
+            return None
+
+        # If this exact signal was already delivered, keep Telegram silent.
+        if tracked_payload.get("was_sent_to_telegram") is True:
+            return None
+
         signal_class = str(tracked_payload.get("signal_class") or "").upper()
         execution_status = str(tracked_payload.get("execution_status") or "").upper()
-        scenario = str(tracked_payload.get("scenario") or "")
-        direction = str(tracked_payload.get("direction") or "")
+        scenario = str(tracked_payload.get("scenario") or "").upper()
+        direction = str(tracked_payload.get("direction") or "").upper()
 
         previous_signal_class = str((previous_payload or {}).get("signal_class") or "").upper()
         previous_execution_status = str((previous_payload or {}).get("execution_status") or "").upper()
 
-        if signal_class in {"", "SCENARIO_FORMING"}:
+        # Telegram must be silent for reconnaissance states.
+        # These states are still tracked and written to journal/statistics above.
+        if signal_class != "READY":
             return None
 
-        if scenario in {"NO_ACTION", "MARKET_CLOSED"}:
+        if execution_status != "EXECUTABLE":
+            return None
+
+        if scenario in {"", "NO_ACTION", "MARKET_CLOSED"}:
+            return None
+
+        if direction not in {"LONG", "SHORT"}:
             return None
 
         trigger_reason = str(tracked_payload.get("trigger_reason") or "")
@@ -2204,59 +2348,12 @@ class StatefulBatchRunner:
         entry_price = tracked_payload.get("entry_reference_price")
         stop_price = tracked_payload.get("invalidation_reference_price")
         target_price = tracked_payload.get("target_reference_price")
+        rr = tracked_payload.get("risk_reward_ratio")
 
-        became_active = signal_class == "ACTIVE" and previous_signal_class != "ACTIVE"
-        became_executable = execution_status == "EXECUTABLE" and previous_execution_status != "EXECUTABLE"
-        became_ready = signal_class == "READY" and previous_signal_class != "READY"
-        became_watch = signal_class == "WATCH" and previous_signal_class not in {"WATCH", "READY", "ACTIVE"}
-
-        alert_type = None
-
-        if signal_class == "ACTIVE":
-            alert_type = "TRIGGERED"
-
-        elif signal_class == "READY":
-            alert_type = "ENTRY_READY"
-
-        elif signal_class == "WATCH":
-            alert_type = "WATCH_NEW"
-
-        # ENTRY_READY requires a complete execution plan.
-        if alert_type == "ENTRY_READY":
-            if entry_price is None or stop_price is None or target_price is None:
-                return None
-
-        # normalize message preview via shared formatter
-        fmt = format_signal_message(
-            {
-                "signal_id": tracked_payload.get("signal_id"),
-                "symbol": symbol,
-                "stage": signal_class,
-                "signal_class": signal_class,
-                "scenario": scenario,
-                "direction": direction,
-                "confidence": tracked_payload.get("confidence"),
-                "probability": tracked_payload.get("confidence"),
-                "market_state": market_state,
-                "htf_bias": htf_bias,
-                "rationale": tracked_payload.get("rationale") or watch_reason,
-                "reason": tracked_payload.get("rationale") or watch_reason,
-                "missing_conditions": tracked_payload.get("missing_conditions") or [],
-                "execution_status": execution_status,
-                "execution_model": tracked_payload.get("execution_model"),
-                "entry_reference_price": entry_price,
-                "invalidation_reference_price": stop_price,
-                "target_reference_price": target_price,
-                "risk_reward_ratio": tracked_payload.get("risk_reward_ratio"),
-                "execution_timeframe": tracked_payload.get("execution_timeframe"),
-                "trigger_reason": tracked_payload.get("trigger_reason"),
-            }
-        )
-
-        alert_payload = {
+        raw_alert_payload = {
             "schema_version": "2.0",
             "should_alert": True,
-            "alert_type": alert_type,
+            "alert_type": "ENTRY_READY",
             "signal_id": tracked_payload.get("signal_id"),
             "symbol": symbol,
             "batch_group": batch_group,
@@ -2288,11 +2385,11 @@ class StatefulBatchRunner:
             "entry_reference_price": entry_price,
             "invalidation_reference_price": stop_price,
             "target_reference_price": target_price,
-            "risk_reward_ratio": tracked_payload.get("risk_reward_ratio"),
+            "risk_reward_ratio": rr,
             "entry": entry_price,
             "stop_loss": stop_price,
             "take_profit": target_price,
-            "rr": tracked_payload.get("risk_reward_ratio"),
+            "rr": rr,
             "stop_distance": tracked_payload.get("stop_distance"),
             "target_distance": tracked_payload.get("target_distance"),
             "invalidation_level": invalidation_level if invalidation_level is not None else stop_price,
@@ -2300,12 +2397,54 @@ class StatefulBatchRunner:
             "previous_signal_class": previous_signal_class or None,
             "previous_execution_status": previous_execution_status or None,
             "tracker_action": tracker_action,
-            "telegram_title": fmt.title,
-            "telegram_body": fmt.body,
-            "telegram_text": fmt.render(),
         }
 
-        return enrich_payload_with_quality(alert_payload)
+        enriched_payload = enrich_payload_with_quality(raw_alert_payload)
+        hard_allowed, hard_reason = _is_telegram_trade_alert_allowed(enriched_payload)
+        enriched_payload["telegram_hard_gate_allowed"] = hard_allowed
+        enriched_payload["telegram_hard_gate_reason"] = hard_reason
+
+        if not hard_allowed:
+            enriched_payload["should_alert"] = False
+            enriched_payload["telegram_allowed"] = False
+            enriched_payload["telegram_block_reason"] = hard_reason
+            return enriched_payload
+
+        if enriched_payload.get("telegram_allowed") is not True:
+            enriched_payload["should_alert"] = False
+            enriched_payload["telegram_block_reason"] = enriched_payload.get("signal_quality_reason")
+            return enriched_payload
+
+        fmt = format_signal_message(
+            {
+                "signal_id": enriched_payload.get("signal_id"),
+                "symbol": symbol,
+                "stage": signal_class,
+                "signal_class": signal_class,
+                "scenario": scenario,
+                "direction": direction,
+                "confidence": enriched_payload.get("confidence"),
+                "probability": enriched_payload.get("confidence"),
+                "market_state": market_state,
+                "htf_bias": htf_bias,
+                "rationale": enriched_payload.get("reason"),
+                "reason": enriched_payload.get("reason"),
+                "missing_conditions": enriched_payload.get("missing_conditions") or [],
+                "execution_status": execution_status,
+                "execution_model": enriched_payload.get("execution_model"),
+                "entry_reference_price": entry_price,
+                "invalidation_reference_price": stop_price,
+                "target_reference_price": target_price,
+                "risk_reward_ratio": rr,
+                "execution_timeframe": enriched_payload.get("execution_timeframe"),
+                "trigger_reason": enriched_payload.get("trigger_reason"),
+            }
+        )
+
+        enriched_payload["telegram_title"] = fmt.title
+        enriched_payload["telegram_body"] = fmt.body
+        enriched_payload["telegram_text"] = fmt.render()
+        return enriched_payload
 
     def _find_setup_by_name(self, setups: list[Any], setup_name: Any) -> Any:
         setup_name = getattr(setup_name, "value", setup_name)
