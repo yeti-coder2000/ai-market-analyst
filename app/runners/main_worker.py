@@ -17,6 +17,103 @@ from app.services.telegram_notifier import TelegramNotifier
 logger = get_logger(__name__, component="main_worker")
 
 
+# =============================================================================
+# TELEGRAM HARD GATE
+# =============================================================================
+
+MIN_TELEGRAM_RR = 2.0
+MAX_TELEGRAM_RR = 10.0
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_present(payload: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        value = payload.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
+def is_trade_alert_allowed(payload: dict[str, Any]) -> tuple[bool, str]:
+    """
+    Final Telegram gate for the cloud worker.
+
+    Main rule:
+    Telegram is a battle siren, not a radar feed.
+
+    Allowed only:
+    - READY
+    - EXECUTABLE
+    - LONG / SHORT
+    - RR between 2.0 and 10.0
+    - entry / stop / target present
+
+    Everything else remains in journal/statistics/open_signals.
+    """
+    if not isinstance(payload, dict):
+        return False, "payload_is_not_dict"
+
+    signal_class = str(
+        _first_present(payload, "signal_class", "stage", "current_stage") or ""
+    ).upper()
+    execution_status = str(payload.get("execution_status") or "").upper()
+    direction = str(payload.get("direction") or "").upper()
+    scenario = str(_first_present(payload, "scenario", "scenario_type") or "").upper()
+    alert_type = str(payload.get("alert_type") or "").upper()
+
+    rr = _float_or_none(_first_present(payload, "risk_reward_ratio", "rr"))
+    entry = _first_present(payload, "entry_reference_price", "entry")
+    stop = _first_present(
+        payload,
+        "invalidation_reference_price",
+        "stop_loss",
+        "stop",
+    )
+    target = _first_present(
+        payload,
+        "target_reference_price",
+        "take_profit",
+        "target",
+    )
+
+    if scenario in {"NO_ACTION", "MARKET_CLOSED"}:
+        return False, f"blocked_non_trade_scenario:{scenario}"
+
+    if alert_type in {"WATCH_NEW", "WATCH_UPGRADED", "INVALIDATED"}:
+        return False, f"blocked_non_entry_alert_type:{alert_type}"
+
+    if signal_class != "READY":
+        return False, f"blocked_non_ready_signal_class:{signal_class or '-'}"
+
+    if execution_status != "EXECUTABLE":
+        return False, f"blocked_non_executable_status:{execution_status or '-'}"
+
+    if direction not in {"LONG", "SHORT"}:
+        return False, f"blocked_invalid_direction:{direction or '-'}"
+
+    if rr is None:
+        return False, "blocked_missing_rr"
+
+    if rr < MIN_TELEGRAM_RR:
+        return False, f"blocked_rr_too_low:{rr:.2f}"
+
+    if rr > MAX_TELEGRAM_RR:
+        return False, f"blocked_rr_too_high:{rr:.2f}"
+
+    if entry is None or stop is None or target is None:
+        return False, "blocked_missing_trade_geometry"
+
+    return True, "allowed_ready_executable"
+
+
 class GracefulShutdown:
     """
     Handles SIGINT / SIGTERM for clean worker shutdown.
@@ -31,6 +128,7 @@ class GracefulShutdown:
         signal.signal(signal.SIGTERM, self._handle_signal)
 
     def _handle_signal(self, signum: int, frame: Any) -> None:
+        del frame
         self.stop_requested = True
         self.last_signal = signum
         logger.warning(
@@ -103,24 +201,11 @@ def extract_alert_candidates(cycle_result: dict[str, Any]) -> list[dict[str, Any
     """
     Extract alert candidates from normalized cycle result.
 
-    Preferred structure:
-    {
-        "cycle_id": "...",
-        "instruments": [
-            {
-                "symbol": "XAUUSD",
-                "alert_payload": {
-                    "should_alert": True,
-                    "alert_type": "WATCH_NEW",
-                    ...
-                }
-            }
-        ]
-    }
-
-    Compatibility mode:
-    If alert_payload is missing, attempts to construct one
-    from legacy/common instrument fields.
+    Important production decision:
+    - We DO NOT build legacy WATCH_NEW payloads from summary fields anymore.
+    - Legacy fallback was the source of Telegram noise: EDGE_FORMING / WATCH / NOT_EXECUTABLE.
+    - Only explicit alert_payload from stateful_batch_runner is accepted.
+    - Even explicit payloads are still hard-gated in process_alerts().
     """
     cycle_id = str(cycle_result.get("cycle_id", "-"))
     instruments = cycle_result.get("instruments", [])
@@ -140,55 +225,16 @@ def extract_alert_candidates(cycle_result: dict[str, Any]) -> list[dict[str, Any
             continue
 
         raw_alert_payload = item.get("alert_payload")
-        if isinstance(raw_alert_payload, dict):
-            should_alert = bool(raw_alert_payload.get("should_alert", False))
-            if should_alert:
-                payload = dict(raw_alert_payload)
-                payload.setdefault("cycle_id", cycle_id)
-                payload.setdefault("symbol", symbol)
-                payload.setdefault("paper_mode", paper_mode)
-                alerts.append(payload)
+        if not isinstance(raw_alert_payload, dict):
             continue
 
-        final_signal = str(item.get("final_signal", "")).strip().upper()
-        watch_status = str(item.get("watch_status", "")).strip().upper()
-
-        if final_signal not in {"WATCH", "TRIGGERED", "INVALIDATED"} and watch_status not in {
-            "NEW",
-            "UPGRADED",
-            "TRIGGERED",
-            "INVALIDATED",
-        }:
+        if not bool(raw_alert_payload.get("should_alert", False)):
             continue
 
-        if watch_status == "NEW":
-            alert_type = "WATCH_NEW"
-        elif watch_status == "UPGRADED":
-            alert_type = "WATCH_UPGRADED"
-        elif watch_status == "TRIGGERED" or final_signal == "TRIGGERED":
-            alert_type = "TRIGGERED"
-        elif watch_status == "INVALIDATED" or final_signal == "INVALIDATED":
-            alert_type = "INVALIDATED"
-        else:
-            alert_type = "WATCH_NEW"
-
-        direction = str(item.get("direction") or item.get("htf_bias") or "-").upper()
-
-        payload = {
-            "should_alert": True,
-            "cycle_id": cycle_id,
-            "symbol": symbol,
-            "alert_type": alert_type,
-            "scenario_type": item.get("scenario_type", "-"),
-            "direction": direction,
-            "scenario_probability": item.get("scenario_probability"),
-            "watch_reason": item.get("watch_reason") or item.get("behavioral_summary") or "-",
-            "market_state": item.get("market_state", "-"),
-            "htf_bias": item.get("htf_bias", "-"),
-            "invalidation_level": item.get("invalidation_level") or item.get("invalidated_by"),
-            "target_zone": item.get("target_zone"),
-            "paper_mode": paper_mode,
-        }
+        payload = dict(raw_alert_payload)
+        payload.setdefault("cycle_id", cycle_id)
+        payload.setdefault("symbol", symbol)
+        payload.setdefault("paper_mode", paper_mode)
         alerts.append(payload)
 
     return alerts
@@ -203,7 +249,11 @@ def write_last_cycle_snapshot(cycle_result: dict[str, Any]) -> None:
     if runner_state_path is None:
         logger.warning(
             "settings.runner_state_path is not configured. Snapshot write skipped.",
-            extra={"component": "main_worker", "cycle_id": cycle_result.get("cycle_id", "-"), "symbol": "-"},
+            extra={
+                "component": "main_worker",
+                "cycle_id": cycle_result.get("cycle_id", "-"),
+                "symbol": "-",
+            },
         )
         return
 
@@ -218,16 +268,6 @@ def write_last_cycle_snapshot(cycle_result: dict[str, Any]) -> None:
 def run_analytics_cycle(cycle_id: str) -> dict[str, Any]:
     """
     Adapter around existing stateful_batch_runner.
-
-    Preferred contract:
-        from app.runners.stateful_batch_runner import run_batch_cycle
-        result = run_batch_cycle()
-
-    Compatibility fallback:
-        runner_module.main()
-
-    If compatibility fallback is used, we still return a valid normalized result,
-    but this mode should be treated as transitional.
     """
     cycle_logger = bind_logger(logger, cycle_id=cycle_id)
 
@@ -270,15 +310,17 @@ def process_alerts(
     deduper: AlertDeduper,
 ) -> list[dict[str, Any]]:
     """
-    Extract, dedupe and send alerts.
-    Returns processed alert diagnostics for snapshots and debugging.
+    Extract, hard-gate, dedupe and send alerts.
+
+    This is a secondary safety layer. The stateful runner should already enforce
+    Telegram rules, but main_worker must never be able to leak WATCH/EDGE messages.
     """
     cycle_id = str(cycle_result.get("cycle_id", "-"))
     cycle_logger = bind_logger(logger, cycle_id=cycle_id)
 
     alerts = extract_alert_candidates(cycle_result)
     if not alerts:
-        cycle_logger.info("No alert candidates found.")
+        cycle_logger.info("No explicit alert_payload candidates found.")
         return []
 
     processed: list[dict[str, Any]] = []
@@ -295,19 +337,40 @@ def process_alerts(
         except Exception:
             symbol_logger.info("Alert candidate payload could not be JSON-serialized.")
 
-        should_send, reason = deduper.should_send(payload)
+        allowed, gate_reason = is_trade_alert_allowed(payload)
 
         alert_result: dict[str, Any] = {
             "symbol": symbol,
             "alert_type": payload.get("alert_type"),
-            "scenario_type": payload.get("scenario_type"),
-            "dedupe_decision": reason,
+            "scenario_type": payload.get("scenario_type") or payload.get("scenario"),
+            "signal_class": payload.get("signal_class") or payload.get("stage"),
+            "execution_status": payload.get("execution_status"),
+            "risk_reward_ratio": payload.get("risk_reward_ratio") or payload.get("rr"),
+            "telegram_gate_allowed": allowed,
+            "telegram_gate_reason": gate_reason,
+            "dedupe_decision": None,
             "sent": False,
             "send_error": None,
         }
 
+        if not allowed:
+            symbol_logger.info(
+                "Main worker Telegram hard-blocked | symbol=%s | alert=%s | class=%s | execution=%s | rr=%s | reason=%s",
+                payload.get("symbol"),
+                payload.get("alert_type"),
+                payload.get("signal_class") or payload.get("stage"),
+                payload.get("execution_status"),
+                payload.get("risk_reward_ratio") or payload.get("rr"),
+                gate_reason,
+            )
+            processed.append(alert_result)
+            continue
+
+        should_send, dedupe_reason = deduper.should_send(payload)
+        alert_result["dedupe_decision"] = dedupe_reason
+
         if not should_send:
-            symbol_logger.info(f"Alert suppressed by deduper. reason={reason}")
+            symbol_logger.info(f"Alert suppressed by deduper. reason={dedupe_reason}")
             processed.append(alert_result)
             continue
 
@@ -316,10 +379,10 @@ def process_alerts(
             alert_result["sent"] = sent
 
             if sent:
-                deduper.mark_sent(payload, reason=reason)
-                symbol_logger.info(f"Alert sent successfully. reason={reason}")
+                deduper.mark_sent(payload, reason=dedupe_reason)
+                symbol_logger.info(f"Alert sent successfully. reason={dedupe_reason}")
             else:
-                symbol_logger.warning(f"Alert send returned False. reason={reason}")
+                symbol_logger.warning(f"Alert send returned False. reason={dedupe_reason}")
 
         except Exception as exc:
             alert_result["sent"] = False
@@ -387,8 +450,15 @@ def main() -> int:
     run_interval_sec = int(get_setting("run_interval_sec", 900))
     enable_weekend_skip = bool(get_setting("enable_weekend_skip", True))
     enable_telegram = bool(get_setting("enable_telegram", False))
-    watch_alerts_enabled = bool(get_setting("watch_alerts_enabled", True))
     fail_fast = bool(get_setting("fail_fast", False))
+
+    # Critical production behavior:
+    # stateful_batch_runner owns trade-alert dispatch.
+    # main_worker alert forwarding is OFF by default to prevent duplicate/noisy legacy alerts.
+    # If enabled later, process_alerts() still has a hard gate.
+    main_worker_alert_forwarding_enabled = bool(
+        get_setting("main_worker_alert_forwarding_enabled", False)
+    )
 
     heartbeat.mark_boot()
 
@@ -448,11 +518,16 @@ def main() -> int:
             write_last_cycle_snapshot(cycle_result)
 
             alert_results: list[dict[str, Any]] = []
-            if enable_telegram and watch_alerts_enabled:
+            if enable_telegram and main_worker_alert_forwarding_enabled:
                 alert_results = process_alerts(
                     cycle_result=cycle_result,
                     notifier=notifier,
                     deduper=deduper,
+                )
+            else:
+                cycle_logger.info(
+                    "Main worker alert forwarding disabled. "
+                    "Trade alerts are handled by stateful_batch_runner hard gate."
                 )
 
             cycle_result["alert_results"] = alert_results
@@ -461,7 +536,7 @@ def main() -> int:
                 "finished_at": utc_now_iso(),
                 "weekend_skip_enabled": enable_weekend_skip,
                 "telegram_enabled": enable_telegram,
-                "watch_alerts_enabled": watch_alerts_enabled,
+                "main_worker_alert_forwarding_enabled": main_worker_alert_forwarding_enabled,
             }
 
             write_last_cycle_snapshot(cycle_result)
