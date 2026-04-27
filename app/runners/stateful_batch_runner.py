@@ -83,6 +83,10 @@ DEFAULT_TIMEFRAMES_BY_SYMBOL: dict[Instrument, list[Timeframe]] = {
     Instrument.XAUUSD: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
     Instrument.EURUSD: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
     Instrument.GBPUSD: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
+    Instrument.USDJPY: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
+    Instrument.USDCHF: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
+    Instrument.USDCAD: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
+    Instrument.AUDUSD: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
     Instrument.BTCUSD: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
     Instrument.ETHUSD: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
     Instrument.UKOIL: [Timeframe.M15, Timeframe.M30, Timeframe.H1, Timeframe.H4, Timeframe.D1],
@@ -1369,8 +1373,28 @@ class StatefulBatchRunner:
 
             save_state(self.state, self.state_path)
 
+            tracker_source_payload = self._build_tracker_source_payload(
+                source=scenario if scenario_ok else final_signal,
+                symbol=symbol.value,
+                batch_group=self.batch_group,
+                cycle_id=cycle_id,
+                price=price,
+                market_state=market_state,
+                htf_bias=htf_bias,
+                phase=phase,
+                scenario_type=scenario_type,
+                scenario_probability=scenario_probability,
+                scenario_decision=scenario_decision,
+            )
+
             tracker_result = self.signal_tracker.process(
-                scenario_result=scenario if scenario_ok else final_signal,
+                scenario_result=tracker_source_payload,
+                cycle_id=cycle_id,
+            )
+            tracker_result = self._force_tracker_result_symbol(
+                tracker_result=tracker_result,
+                symbol=symbol.value,
+                batch_group=self.batch_group,
                 cycle_id=cycle_id,
             )
 
@@ -1481,6 +1505,145 @@ class StatefulBatchRunner:
                 )
             except Exception as fallback_error:
                 print(f"[FALLBACK FINAL WRITE ERROR] {symbol.value}: {fallback_error}")
+
+    def _build_tracker_source_payload(
+        self,
+        *,
+        source: Any,
+        symbol: str,
+        batch_group: str,
+        cycle_id: str,
+        price: float | None,
+        market_state: str | None,
+        htf_bias: str | None,
+        phase: str | None,
+        scenario_type: str | None,
+        scenario_probability: float | None,
+        scenario_decision: str | None,
+    ) -> dict[str, Any]:
+        """
+        Build a tracker-safe payload with guaranteed symbol propagation.
+
+        The scenario engine can sometimes return a neutral/NO_ACTION object without
+        instrument metadata. If that object goes directly into SignalTracker, the
+        tracker normalizes it as UNKNOWN, which corrupts open_signals/statistics.
+
+        The runner already knows the external symbol from the batch loop, so this
+        method makes that symbol the source of truth before lifecycle tracking.
+        """
+        raw = to_jsonable(source or {})
+        if not isinstance(raw, dict):
+            raw = {"raw_source": raw}
+
+        raw["symbol"] = symbol
+        raw["instrument"] = symbol
+        raw["cycle_id"] = cycle_id
+
+        if raw.get("price") is None:
+            raw["price"] = price
+        if raw.get("market_state") is None:
+            raw["market_state"] = market_state
+        if raw.get("htf_bias") is None:
+            raw["htf_bias"] = htf_bias
+        if raw.get("phase") is None:
+            raw["phase"] = phase
+
+        # Keep scenario fields stable even when final_signal/setup object is used
+        # as fallback instead of ScenarioResult.
+        if raw.get("scenario_type") is None and scenario_type is not None:
+            raw["scenario_type"] = scenario_type
+        if raw.get("alignment_score") is None and scenario_probability is not None:
+            raw["alignment_score"] = scenario_probability
+        if raw.get("decision") is None and scenario_decision is not None:
+            raw["decision"] = scenario_decision
+
+        metadata = raw.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        metadata.update(
+            {
+                "symbol": symbol,
+                "instrument": symbol,
+                "batch_group": batch_group,
+                "cycle_id": cycle_id,
+                "source": "stateful_batch_runner",
+            }
+        )
+        raw["metadata"] = metadata
+
+        return raw
+
+    def _force_payload_symbol(
+        self,
+        payload: dict[str, Any] | None,
+        *,
+        symbol: str,
+        batch_group: str,
+        cycle_id: str,
+    ) -> dict[str, Any]:
+        """Force payload-level symbol fields to match the batch symbol."""
+        if not isinstance(payload, dict):
+            return {}
+
+        payload["symbol"] = symbol
+        payload["instrument"] = symbol
+        payload.setdefault("cycle_id", cycle_id)
+        payload["batch_group"] = batch_group
+
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata.update(
+            {
+                "symbol": symbol,
+                "instrument": symbol,
+                "batch_group": batch_group,
+                "cycle_id": cycle_id,
+                "source": "stateful_batch_runner",
+            }
+        )
+        payload["metadata"] = metadata
+        return payload
+
+    def _force_tracker_result_symbol(
+        self,
+        *,
+        tracker_result: SignalTrackerResult,
+        symbol: str,
+        batch_group: str,
+        cycle_id: str,
+    ) -> SignalTrackerResult:
+        """
+        Defensive symbol guard after SignalTracker processing.
+
+        New payloads should already be correct because _build_tracker_source_payload
+        injects symbol before tracking. This second guard prevents accidental
+        UNKNOWN propagation if a future tracker normalization path changes.
+        """
+        tracker_result.payload = self._force_payload_symbol(
+            tracker_result.payload,
+            symbol=symbol,
+            batch_group=batch_group,
+            cycle_id=cycle_id,
+        )
+
+        if tracker_result.previous_payload is not None:
+            tracker_result.previous_payload = self._force_payload_symbol(
+                tracker_result.previous_payload,
+                symbol=symbol,
+                batch_group=batch_group,
+                cycle_id=cycle_id,
+            )
+
+        # If SignalTracker returned a legacy UNKNOWN id from an old store entry,
+        # do not use it as fallback for journal payloads. New registrations should
+        # already have a correct id because the incoming payload has symbol injected.
+        if isinstance(tracker_result.signal_id, str) and tracker_result.signal_id.startswith("UNKNOWN_"):
+            tracker_result.payload["legacy_unknown_signal_id"] = tracker_result.signal_id
+            tracker_result.signal_id = tracker_result.payload.get("signal_id")
+
+        return tracker_result
 
     def _build_instrument_cycle_result(
         self,
