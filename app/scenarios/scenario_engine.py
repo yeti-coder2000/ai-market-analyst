@@ -8,7 +8,7 @@ from app.context.schema import (
     SetupStatus,
     SetupType,
 )
-from app.scenarios.execution import build_execution_plan
+from app.scenarios.execution import ExecutionPlan, build_execution_plan
 from app.scenarios.schema import (
     ScenarioDecision,
     ScenarioEvidence,
@@ -18,18 +18,21 @@ from app.scenarios.schema import (
 )
 
 
+MIN_READY_RR = 2.0
+MAX_READY_RR = 10.0
+
+
 class ScenarioEngine:
     """
     Rule-based scenario resolver.
 
-    Goal of v1:
-    - sit on top of stable MarketContext + setup rules
-    - classify dominant market scenario
-    - expose explainable decision state
-    - remain deterministic and debuggable
-
-    This engine does NOT replace setup rules.
-    It interprets them in broader market context.
+    v1.2 state-machine guard:
+    - EDGE_FORMING is reconnaissance only.
+    - WATCH is surveillance only.
+    - READY is the only state that may receive EXECUTABLE execution.
+    - READY is downgraded to WATCH if execution geometry/RR is not good enough.
+    - SCENARIO_FORMING + EXECUTABLE is globally blocked.
+    - NO_ACTION is always NEUTRAL and NOT_EXECUTABLE.
     """
 
     def run(self, context: Any, setups: list[Any]) -> ScenarioResult:
@@ -38,7 +41,6 @@ class ScenarioEngine:
 
         evidence = self._build_evidence(context=context, setup_a=setup_a, setup_b=setup_b)
 
-        # Priority 1: trend continuation scenarios
         trend_result = self._resolve_trend_continuation(
             context=context,
             setup_a=setup_a,
@@ -47,7 +49,6 @@ class ScenarioEngine:
         if trend_result is not None:
             return trend_result
 
-        # Priority 2: sweep -> return to value scenarios
         sweep_result = self._resolve_sweep_return(
             context=context,
             setup_b=setup_b,
@@ -56,12 +57,11 @@ class ScenarioEngine:
         if sweep_result is not None:
             return sweep_result
 
-        # Fallback
         return self._build_no_action_result(context=context, evidence=evidence)
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Scenario resolvers
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def _resolve_trend_continuation(
         self,
@@ -87,7 +87,7 @@ class ScenarioEngine:
 
         setup_a_status = evidence.setup_a_status
 
-        # Fully confirmed trend continuation
+        # READY: only this branch may attempt real execution.
         if setup_a_status == SetupStatus.READY.value:
             execution = build_execution_plan(
                 context=context,
@@ -95,13 +95,20 @@ class ScenarioEngine:
                 direction=direction,
                 evidence=evidence,
             )
-            decision, status = self._resolve_confirmed_tradeability(execution)
+            execution_payload = self._guard_execution_payload(
+                execution=self._to_execution_payload(execution),
+                allow_executable=True,
+                setup_status=SetupStatus.READY.value,
+                scenario_type=scenario_type.value,
+                direction=direction.value,
+            )
+            decision, status, quality_reason = self._resolve_ready_tradeability(execution_payload)
 
             return ScenarioResult(
-                instrument=getattr(context, "instrument"),
+                instrument=self._context_instrument(context),
                 price=self._context_price(context),
                 scenario_type=scenario_type,
-                phase=ScenarioPhase.CONFIRMED,
+                phase=ScenarioPhase.CONFIRMED if status == SetupStatus.READY else ScenarioPhase.TRIGGER_ZONE,
                 decision=decision,
                 market_state=getattr(context, "market_state"),
                 direction=direction,
@@ -110,48 +117,56 @@ class ScenarioEngine:
                 dominant_setup="setup_a",
                 setup_name=SetupType.IMPULSE_PULLBACK_CONTINUATION.value,
                 rationale=(
-                    "Trend continuation scenario confirmed: HTF bias, market regime, "
-                    "impulse and pullback are aligned."
-                ),
+                    "Trend continuation scenario confirmed by setup engine. "
+                    if status == SetupStatus.READY
+                    else "Trend continuation setup is structurally READY, but execution quality is not sufficient. "
+                )
+                + quality_reason,
                 confidence=self._clamp_confidence(
-                    base=0.72,
+                    base=0.72 if status == SetupStatus.READY else 0.58,
                     setup_conf=evidence.setup_a_confidence,
                     bonus=0.10 if evidence.pullback_held_structure else 0.0,
                 ),
                 next_expected_event=(
                     "continuation_trigger"
-                    if execution.status == "EXECUTABLE"
-                    else "execution_completion"
+                    if execution_payload.get("status") == "EXECUTABLE"
+                    else "better_execution_geometry"
                 ),
                 missing_conditions=(
                     []
-                    if execution.status == "EXECUTABLE"
-                    else ["execution_plan_incomplete"]
+                    if execution_payload.get("status") == "EXECUTABLE"
+                    else [quality_reason]
                 ),
                 alignment_score=self._infer_alignment_score(context, [setup_a]),
-                tags=["trend", "continuation", direction.value.lower(), "confirmed"],
+                tags=["trend", "continuation", direction.value.lower(), "ready_guarded"],
                 evidence=evidence,
-                execution=self._to_execution_payload(execution),
+                execution=execution_payload,
                 metadata={
-                    "engine_version": "scenario_engine_v1",
+                    "engine_version": "scenario_engine_v1_2",
                     "resolver": "trend_continuation",
-                    "execution_status": getattr(execution, "status", None),
+                    "maturity": "ready" if status == SetupStatus.READY else "ready_blocked",
+                    "execution_status": execution_payload.get("status"),
+                    "execution_quality_reason": quality_reason,
                 },
             )
 
-        # Impulse exists, but pullback is not ready yet
+        # WATCH: impulse exists, but pullback is not confirmed.
         if evidence.impulse_detected and not evidence.pullback_detected:
-            missing = ["pullback"]
-
-            execution = build_execution_plan(
-                context=context,
-                scenario_type=scenario_type,
-                direction=direction,
-                evidence=evidence,
+            execution_payload = self._guard_execution_payload(
+                execution=self._to_execution_payload(
+                    self._not_executable_plan(
+                        model="LIMIT_ON_RETEST",
+                        trigger_reason="waiting_for_pullback_confirmation",
+                    )
+                ),
+                allow_executable=False,
+                setup_status=SetupStatus.WATCH.value,
+                scenario_type=scenario_type.value,
+                direction=direction.value,
             )
 
             return ScenarioResult(
-                instrument=getattr(context, "instrument"),
+                instrument=self._context_instrument(context),
                 price=self._context_price(context),
                 scenario_type=scenario_type,
                 phase=ScenarioPhase.TRIGGER_ZONE,
@@ -169,63 +184,71 @@ class ScenarioEngine:
                 confidence=self._clamp_confidence(
                     base=0.52,
                     setup_conf=evidence.setup_a_confidence,
-                    bonus=0.05 if evidence.impulse_detected else 0.0,
+                    bonus=0.05,
                 ),
                 next_expected_event="pullback_confirmation",
-                missing_conditions=missing,
+                missing_conditions=["pullback"],
                 alignment_score=self._infer_alignment_score(context, [setup_a]),
                 tags=["trend", "impulse", "watch", direction.value.lower()],
                 evidence=evidence,
-                execution=self._to_execution_payload(execution),
+                execution=execution_payload,
                 metadata={
-                    "engine_version": "scenario_engine_v1",
+                    "engine_version": "scenario_engine_v1_2",
                     "resolver": "trend_continuation",
-                    "execution_status": getattr(execution, "status", None),
+                    "maturity": "watch",
+                    "execution_status": execution_payload.get("status"),
                 },
             )
 
-        # Trend context exists, but structure is not built yet
-        missing = self._collect_missing_conditions([setup_a])
-
-        execution = build_execution_plan(
-            context=context,
-            scenario_type=scenario_type,
-            direction=direction,
-            evidence=evidence,
+        # EDGE_FORMING: trend context exists, no trigger yet.
+        missing = self._collect_missing_conditions([setup_a]) or ["impulse", "pullback"]
+        execution_payload = self._guard_execution_payload(
+            execution=self._to_execution_payload(
+                self._not_executable_plan(
+                    model="NONE",
+                    trigger_reason="edge_forming_waiting_for_impulse",
+                )
+            ),
+            allow_executable=False,
+            setup_status=SetupStatus.EDGE_FORMING.value,
+            scenario_type=scenario_type.value,
+            direction=direction.value,
         )
 
         return ScenarioResult(
-            instrument=getattr(context, "instrument"),
+            instrument=self._context_instrument(context),
             price=self._context_price(context),
             scenario_type=scenario_type,
             phase=ScenarioPhase.PRECONDITION,
             decision=ScenarioDecision.WATCH,
             market_state=getattr(context, "market_state"),
             direction=direction,
-            status=SetupStatus.IDLE,
+            status=SetupStatus.EDGE_FORMING,
             setup_type=SetupType.IMPULSE_PULLBACK_CONTINUATION,
             dominant_setup="setup_a",
             setup_name=SetupType.IMPULSE_PULLBACK_CONTINUATION.value,
             rationale=(
-                "Trend context exists, but continuation structure is not ready yet."
+                "EDGE_FORMING: trend context and HTF alignment are present, "
+                "but continuation structure is not ready yet."
             ),
             confidence=self._clamp_confidence(
                 base=0.35,
                 setup_conf=evidence.setup_a_confidence,
-                bonus=0.05 if market_state == MarketState.TREND.value else 0.0,
+                bonus=0.05,
             ),
             next_expected_event=(
                 "bullish_impulse" if direction == Direction.LONG else "bearish_impulse"
             ),
             missing_conditions=missing,
             alignment_score=self._infer_alignment_score(context, [setup_a]),
-            tags=["trend", "precondition", direction.value.lower()],
+            tags=["trend", "precondition", "edge_forming", direction.value.lower()],
             evidence=evidence,
-            execution=self._to_execution_payload(execution),
+            execution=execution_payload,
             metadata={
-                "engine_version": "scenario_engine_v1",
+                "engine_version": "scenario_engine_v1_2",
                 "resolver": "trend_continuation",
-                "execution_status": getattr(execution, "status", None),
+                "maturity": "edge_forming",
+                "execution_status": execution_payload.get("status"),
             },
         )
 
@@ -237,14 +260,74 @@ class ScenarioEngine:
     ) -> ScenarioResult | None:
         market_state = evidence.market_state
 
-        if market_state not in {
-            MarketState.BALANCE.value,
-            MarketState.TRANSITION.value,
-        }:
+        if market_state not in {MarketState.BALANCE.value, MarketState.TRANSITION.value}:
             return None
 
+        setup_b_status = evidence.setup_b_status
+
+        # EDGE_FORMING: no sweep yet.
         if not evidence.sweep_detected:
-            return None
+            direction = self._infer_sweep_watch_direction(evidence.htf_bias)
+            if direction == Direction.NEUTRAL:
+                return None
+
+            scenario_type = (
+                ScenarioType.SWEEP_RETURN_LONG
+                if direction == Direction.LONG
+                else ScenarioType.SWEEP_RETURN_SHORT
+            )
+
+            execution_payload = self._guard_execution_payload(
+                execution=self._to_execution_payload(
+                    self._not_executable_plan(
+                        model="NONE",
+                        trigger_reason="edge_forming_waiting_for_liquidity_sweep",
+                    )
+                ),
+                allow_executable=False,
+                setup_status=SetupStatus.EDGE_FORMING.value,
+                scenario_type=scenario_type.value,
+                direction=direction.value,
+            )
+
+            missing = self._collect_missing_conditions([setup_b]) or ["sweep", "return_to_value"]
+
+            return ScenarioResult(
+                instrument=self._context_instrument(context),
+                price=self._context_price(context),
+                scenario_type=scenario_type,
+                phase=ScenarioPhase.PRECONDITION,
+                decision=ScenarioDecision.WATCH,
+                market_state=getattr(context, "market_state"),
+                direction=direction,
+                status=SetupStatus.EDGE_FORMING,
+                setup_type=SetupType.SWEEP_RETURN_TO_VALUE,
+                dominant_setup="setup_b",
+                setup_name=SetupType.SWEEP_RETURN_TO_VALUE.value,
+                rationale=(
+                    "EDGE_FORMING: balance/transition context supports sweep-return scenario; "
+                    "waiting for liquidity sweep."
+                ),
+                confidence=self._clamp_confidence(
+                    base=0.22,
+                    setup_conf=evidence.setup_b_confidence,
+                    bonus=0.03,
+                ),
+                next_expected_event=(
+                    "liquidity_sweep_low" if direction == Direction.LONG else "liquidity_sweep_high"
+                ),
+                missing_conditions=missing,
+                alignment_score=self._infer_alignment_score(context, [setup_b]),
+                tags=["sweep", "precondition", "edge_forming", direction.value.lower()],
+                evidence=evidence,
+                execution=execution_payload,
+                metadata={
+                    "engine_version": "scenario_engine_v1_2",
+                    "resolver": "sweep_return",
+                    "maturity": "edge_forming",
+                    "execution_status": execution_payload.get("status"),
+                },
+            )
 
         if evidence.sweep_direction not in {Direction.LONG.value, Direction.SHORT.value}:
             return None
@@ -256,8 +339,7 @@ class ScenarioEngine:
             else ScenarioType.SWEEP_RETURN_SHORT
         )
 
-        setup_b_status = evidence.setup_b_status
-
+        # READY: sweep + return-to-value confirmed. Only this branch may execute.
         if setup_b_status == SetupStatus.READY.value and evidence.return_to_value:
             execution = build_execution_plan(
                 context=context,
@@ -265,13 +347,20 @@ class ScenarioEngine:
                 direction=direction,
                 evidence=evidence,
             )
-            decision, status = self._resolve_confirmed_tradeability(execution)
+            execution_payload = self._guard_execution_payload(
+                execution=self._to_execution_payload(execution),
+                allow_executable=True,
+                setup_status=SetupStatus.READY.value,
+                scenario_type=scenario_type.value,
+                direction=direction.value,
+            )
+            decision, status, quality_reason = self._resolve_ready_tradeability(execution_payload)
 
             return ScenarioResult(
-                instrument=getattr(context, "instrument"),
+                instrument=self._context_instrument(context),
                 price=self._context_price(context),
                 scenario_type=scenario_type,
-                phase=ScenarioPhase.CONFIRMED,
+                phase=ScenarioPhase.CONFIRMED if status == SetupStatus.READY else ScenarioPhase.TRIGGER_ZONE,
                 decision=decision,
                 market_state=getattr(context, "market_state"),
                 direction=direction,
@@ -280,47 +369,56 @@ class ScenarioEngine:
                 dominant_setup="setup_b",
                 setup_name=SetupType.SWEEP_RETURN_TO_VALUE.value,
                 rationale=(
-                    "Sweep-return scenario confirmed: liquidity sweep occurred and "
-                    "price returned to value in non-trend conditions."
-                ),
+                    "Sweep-return scenario confirmed by setup engine. "
+                    if status == SetupStatus.READY
+                    else "Sweep-return setup is structurally READY, but execution quality is not sufficient. "
+                )
+                + quality_reason,
                 confidence=self._clamp_confidence(
-                    base=0.70,
+                    base=0.70 if status == SetupStatus.READY else 0.58,
                     setup_conf=evidence.setup_b_confidence,
-                    bonus=0.08 if evidence.return_to_value else 0.0,
+                    bonus=0.08,
                 ),
                 next_expected_event=(
                     "entry_trigger"
-                    if execution.status == "EXECUTABLE"
-                    else "execution_completion"
+                    if execution_payload.get("status") == "EXECUTABLE"
+                    else "better_execution_geometry"
                 ),
                 missing_conditions=(
                     []
-                    if execution.status == "EXECUTABLE"
-                    else ["execution_plan_incomplete"]
+                    if execution_payload.get("status") == "EXECUTABLE"
+                    else [quality_reason]
                 ),
                 alignment_score=self._infer_alignment_score(context, [setup_b]),
-                tags=["sweep", "return_to_value", direction.value.lower(), "confirmed"],
+                tags=["sweep", "return_to_value", direction.value.lower(), "ready_guarded"],
                 evidence=evidence,
-                execution=self._to_execution_payload(execution),
+                execution=execution_payload,
                 metadata={
-                    "engine_version": "scenario_engine_v1",
+                    "engine_version": "scenario_engine_v1_2",
                     "resolver": "sweep_return",
-                    "execution_status": getattr(execution, "status", None),
+                    "maturity": "ready" if status == SetupStatus.READY else "ready_blocked",
+                    "execution_status": execution_payload.get("status"),
+                    "execution_quality_reason": quality_reason,
                 },
             )
 
+        # WATCH: sweep detected, waiting for return-to-value.
         if evidence.sweep_detected and not evidence.return_to_value:
-            missing = ["return_to_value"]
-
-            execution = build_execution_plan(
-                context=context,
-                scenario_type=scenario_type,
-                direction=direction,
-                evidence=evidence,
+            execution_payload = self._guard_execution_payload(
+                execution=self._to_execution_payload(
+                    self._not_executable_plan(
+                        model="LIMIT_ON_RETEST",
+                        trigger_reason="waiting_for_return_to_value_confirmation",
+                    )
+                ),
+                allow_executable=False,
+                setup_status=SetupStatus.WATCH.value,
+                scenario_type=scenario_type.value,
+                direction=direction.value,
             )
 
             return ScenarioResult(
-                instrument=getattr(context, "instrument"),
+                instrument=self._context_instrument(context),
                 price=self._context_price(context),
                 scenario_type=scenario_type,
                 phase=ScenarioPhase.TRIGGER_ZONE,
@@ -331,68 +429,75 @@ class ScenarioEngine:
                 setup_type=SetupType.SWEEP_RETURN_TO_VALUE,
                 dominant_setup="setup_b",
                 setup_name=SetupType.SWEEP_RETURN_TO_VALUE.value,
-                rationale=(
-                    "Sweep detected, but price has not yet clearly returned to value."
-                ),
+                rationale="Sweep detected, but price has not yet clearly returned to value.",
                 confidence=self._clamp_confidence(
                     base=0.50,
                     setup_conf=evidence.setup_b_confidence,
                     bonus=0.04,
                 ),
                 next_expected_event="return_to_value_confirmation",
-                missing_conditions=missing,
+                missing_conditions=["return_to_value"],
                 alignment_score=self._infer_alignment_score(context, [setup_b]),
                 tags=["sweep", "watch", direction.value.lower()],
                 evidence=evidence,
-                execution=self._to_execution_payload(execution),
+                execution=execution_payload,
                 metadata={
-                    "engine_version": "scenario_engine_v1",
+                    "engine_version": "scenario_engine_v1_2",
                     "resolver": "sweep_return",
-                    "execution_status": getattr(execution, "status", None),
+                    "maturity": "watch",
+                    "execution_status": execution_payload.get("status"),
                 },
             )
 
+        # EDGE_FORMING: sweep exists but return context is not mature.
         missing = self._collect_missing_conditions([setup_b])
         if "return_to_value" not in missing:
             missing.append("return_to_value")
 
-        execution = build_execution_plan(
-            context=context,
-            scenario_type=scenario_type,
-            direction=direction,
-            evidence=evidence,
+        execution_payload = self._guard_execution_payload(
+            execution=self._to_execution_payload(
+                self._not_executable_plan(
+                    model="NONE",
+                    trigger_reason="edge_forming_waiting_for_return_to_value",
+                )
+            ),
+            allow_executable=False,
+            setup_status=SetupStatus.EDGE_FORMING.value,
+            scenario_type=scenario_type.value,
+            direction=direction.value,
         )
 
         return ScenarioResult(
-            instrument=getattr(context, "instrument"),
+            instrument=self._context_instrument(context),
             price=self._context_price(context),
             scenario_type=scenario_type,
             phase=ScenarioPhase.PRECONDITION,
             decision=ScenarioDecision.WATCH,
             market_state=getattr(context, "market_state"),
             direction=direction,
-            status=SetupStatus.IDLE,
+            status=SetupStatus.EDGE_FORMING,
             setup_type=SetupType.SWEEP_RETURN_TO_VALUE,
             dominant_setup="setup_b",
             setup_name=SetupType.SWEEP_RETURN_TO_VALUE.value,
             rationale=(
-                "Sweep context exists, but return-to-value setup is not fully built yet."
+                "EDGE_FORMING: sweep context exists, but return-to-value setup is not fully built yet."
             ),
             confidence=self._clamp_confidence(
                 base=0.34,
                 setup_conf=evidence.setup_b_confidence,
-                bonus=0.05 if evidence.sweep_detected else 0.0,
+                bonus=0.05,
             ),
             next_expected_event="return_to_value_confirmation",
             missing_conditions=missing,
             alignment_score=self._infer_alignment_score(context, [setup_b]),
-            tags=["sweep", "precondition", direction.value.lower()],
+            tags=["sweep", "precondition", "edge_forming", direction.value.lower()],
             evidence=evidence,
-            execution=self._to_execution_payload(execution),
+            execution=execution_payload,
             metadata={
-                "engine_version": "scenario_engine_v1",
+                "engine_version": "scenario_engine_v1_2",
                 "resolver": "sweep_return",
-                "execution_status": getattr(execution, "status", None),
+                "maturity": "edge_forming",
+                "execution_status": execution_payload.get("status"),
             },
         )
 
@@ -401,25 +506,27 @@ class ScenarioEngine:
         context: Any,
         evidence: ScenarioEvidence,
     ) -> ScenarioResult:
-        missing = self._collect_missing_conditions([])
-        scenario_type = ScenarioType.NO_ACTION
-        direction = Direction.NEUTRAL
-
-        execution = build_execution_plan(
-            context=context,
-            scenario_type=scenario_type,
-            direction=direction,
-            evidence=evidence,
+        execution_payload = self._guard_execution_payload(
+            execution=self._to_execution_payload(
+                self._not_executable_plan(
+                    model="NONE",
+                    trigger_reason="no_dominant_scenario",
+                )
+            ),
+            allow_executable=False,
+            setup_status=SetupStatus.NO_SETUP.value,
+            scenario_type=ScenarioType.NO_ACTION.value,
+            direction=Direction.NEUTRAL.value,
         )
 
         return ScenarioResult(
-            instrument=getattr(context, "instrument"),
+            instrument=self._context_instrument(context),
             price=self._context_price(context),
-            scenario_type=scenario_type,
+            scenario_type=ScenarioType.NO_ACTION,
             phase=ScenarioPhase.PRECONDITION,
             decision=ScenarioDecision.NO_TRADE,
             market_state=getattr(context, "market_state"),
-            direction=direction,
+            direction=Direction.NEUTRAL,
             status=SetupStatus.NO_SETUP,
             setup_type=SetupType.NONE,
             dominant_setup=None,
@@ -427,21 +534,87 @@ class ScenarioEngine:
             rationale="No dominant scenario is currently confirmed.",
             confidence=0.10,
             next_expected_event=self._infer_next_expected_event(context),
-            missing_conditions=missing,
+            missing_conditions=self._collect_missing_conditions([]),
             alignment_score=self._infer_alignment_score(context, []),
             tags=["no_action"],
             evidence=evidence,
-            execution=self._to_execution_payload(execution),
+            execution=execution_payload,
             metadata={
-                "engine_version": "scenario_engine_v1",
+                "engine_version": "scenario_engine_v1_2",
                 "resolver": "fallback",
-                "execution_status": getattr(execution, "status", None),
+                "maturity": "none",
+                "execution_status": execution_payload.get("status"),
             },
         )
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Global execution guard / tradeability
+    # ------------------------------------------------------------------
+
+    def _guard_execution_payload(
+        self,
+        *,
+        execution: dict[str, Any],
+        allow_executable: bool,
+        setup_status: str,
+        scenario_type: str,
+        direction: str,
+    ) -> dict[str, Any]:
+        guarded = dict(execution or {})
+        guarded.setdefault("status", "NOT_EXECUTABLE")
+        guarded.setdefault("model", "NONE")
+
+        if scenario_type == ScenarioType.NO_ACTION.value or direction == Direction.NEUTRAL.value:
+            return self._force_not_executable(
+                guarded,
+                reason="blocked_no_action_or_neutral_direction",
+            )
+
+        if setup_status != SetupStatus.READY.value or not allow_executable:
+            return self._force_not_executable(
+                guarded,
+                reason="blocked_pre_ready_execution",
+            )
+
+        if guarded.get("status") != "EXECUTABLE":
+            return guarded
+
+        rr = self._float_or_none(guarded.get("risk_reward_ratio"))
+        if rr is None:
+            return self._force_not_executable(guarded, reason="blocked_missing_rr")
+        if rr < MIN_READY_RR:
+            return self._force_not_executable(guarded, reason="blocked_rr_below_ready_threshold")
+        if rr > MAX_READY_RR:
+            return self._force_not_executable(guarded, reason="blocked_rr_above_sane_threshold")
+
+        return guarded
+
+    @staticmethod
+    def _force_not_executable(execution: dict[str, Any], *, reason: str) -> dict[str, Any]:
+        updated = dict(execution or {})
+        updated["status"] = "NOT_EXECUTABLE"
+        updated["model"] = updated.get("model") or "NONE"
+        updated["risk_reward_ratio"] = None
+        updated["stop_distance"] = None
+        updated["target_distance"] = None
+        updated["trigger_reason"] = reason
+        return updated
+
+    def _resolve_ready_tradeability(
+        self,
+        execution_payload: dict[str, Any],
+    ) -> tuple[ScenarioDecision, SetupStatus, str]:
+        status = execution_payload.get("status")
+        reason = str(execution_payload.get("trigger_reason") or "execution_checked")
+
+        if status == "EXECUTABLE":
+            return ScenarioDecision.TRADEABLE, SetupStatus.READY, "execution_quality_ok"
+
+        return ScenarioDecision.WATCH, SetupStatus.WATCH, reason
+
+    # ------------------------------------------------------------------
     # Evidence / scoring / helpers
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     def _build_evidence(
         self,
@@ -457,8 +630,8 @@ class ScenarioEngine:
         setup_a_diag = getattr(setup_a, "diagnostics", None)
         setup_b_diag = getattr(setup_b, "diagnostics", None)
 
-        passed = []
-        failed = []
+        passed: list[str] = []
+        failed: list[str] = []
 
         passed.extend(self._condition_names(getattr(setup_a_diag, "passed_conditions", [])))
         passed.extend(self._condition_names(getattr(setup_b_diag, "passed_conditions", [])))
@@ -562,7 +735,9 @@ class ScenarioEngine:
             if setup is None:
                 continue
             status = self._enum_value(getattr(setup, "status", None))
-            if status == SetupStatus.WATCH.value:
+            if status == SetupStatus.EDGE_FORMING.value:
+                score += 0.03
+            elif status == SetupStatus.WATCH.value:
                 score += 0.05
             elif status == SetupStatus.READY.value:
                 score += 0.10
@@ -586,23 +761,27 @@ class ScenarioEngine:
 
         return missing
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Low-level helpers
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     @staticmethod
-    def _resolve_confirmed_tradeability(execution: Any) -> tuple[ScenarioDecision, SetupStatus]:
-        if getattr(execution, "status", None) == "EXECUTABLE":
-            return ScenarioDecision.TRADEABLE, SetupStatus.READY
-        return ScenarioDecision.WATCH, SetupStatus.WATCH
+    def _not_executable_plan(
+        *,
+        model: str = "NONE",
+        trigger_reason: str | None = None,
+    ) -> ExecutionPlan:
+        return ExecutionPlan(
+            status="NOT_EXECUTABLE",
+            model=model,
+            execution_timeframe=None,
+            trigger_reason=trigger_reason,
+        )
 
     @staticmethod
     def _to_execution_payload(execution: Any) -> dict[str, Any]:
         if execution is None:
-            return {
-                "status": "NOT_EXECUTABLE",
-                "model": "NONE",
-            }
+            return {"status": "NOT_EXECUTABLE", "model": "NONE"}
 
         if hasattr(execution, "__dict__"):
             return dict(execution.__dict__)
@@ -610,33 +789,59 @@ class ScenarioEngine:
         if isinstance(execution, dict):
             return execution
 
-        return {
-            "status": "INCOMPLETE",
-            "model": "NONE",
-        }
+        return {"status": "INCOMPLETE", "model": "NONE"}
+
+    @staticmethod
+    def _infer_sweep_watch_direction(htf_bias: Any) -> Direction:
+        if htf_bias == Direction.LONG.value:
+            return Direction.LONG
+        if htf_bias == Direction.SHORT.value:
+            return Direction.SHORT
+        return Direction.NEUTRAL
 
     @staticmethod
     def _condition_names(items: list[Any]) -> list[str]:
         result: list[str] = []
-
         for item in items or []:
             name = getattr(item, "name", None)
             if name is not None:
                 result.append(str(name))
-
         return result
 
     @staticmethod
     def _dedupe_keep_order(items: list[str]) -> list[str]:
         seen: set[str] = set()
         result: list[str] = []
-
         for item in items:
             if item not in seen:
                 seen.add(item)
                 result.append(item)
-
         return result
+
+    @staticmethod
+    def _context_instrument(context: Any) -> Any:
+        value = getattr(context, "instrument", None)
+        enum_value = getattr(value, "value", None)
+        if enum_value and str(enum_value).upper() != "UNKNOWN":
+            return str(enum_value).upper()
+
+        enum_name = getattr(value, "name", None)
+        if enum_name and str(enum_name).upper() != "UNKNOWN":
+            return str(enum_name).upper()
+
+        for attr_name in ("symbol", "ticker"):
+            fallback = getattr(context, attr_name, None)
+            if fallback and str(fallback).upper() != "UNKNOWN":
+                return str(fallback).upper()
+
+        raw = getattr(context, "raw", None)
+        if isinstance(raw, dict):
+            for key in ("instrument", "symbol", "ticker"):
+                fallback = raw.get(key)
+                if fallback and str(fallback).upper() != "UNKNOWN":
+                    return str(fallback).upper()
+
+        return "UNKNOWN"
 
     @staticmethod
     def _context_price(context: Any) -> float | None:
