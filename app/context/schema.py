@@ -435,10 +435,10 @@ class SetupARule(BaseModel):
     """
     Legacy-compatible evaluator for continuation setup.
 
-    EDGE_FORMING is a pre-edge state:
-    - it is NOT an executable trade signal
-    - it is NOT supposed to reach Telegram
-    - it is useful for journal/statistics/diagnostics
+    EDGE_FORMING is a pre-edge state. READY LIGHT is a controlled Grade B candidate:
+    - EDGE_FORMING is NOT executable and should not reach Telegram
+    - READY LIGHT may become READY but still must pass execution geometry and Signal Quality
+    - the goal is to detect the first tradable candidate without lowering Grade A standards
     """
 
     model_config = ConfigDict(extra="allow")
@@ -542,15 +542,42 @@ class SetupARule(BaseModel):
             return result
 
         # ------------------------------------------------------------
-        # WATCH: impulse already exists, but pullback confirmation is incomplete.
+        # READY LIGHT: aggressive continuation candidate.
+        #
+        # This is intentionally weaker than Grade A READY:
+        # - market is already TREND
+        # - impulse exists
+        # - direction aligns with HTF bias
+        # - pullback / structure hold is not fully confirmed yet
+        #
+        # It is allowed to become READY so execution + Signal Quality Engine
+        # can judge geometry, RR and Telegram eligibility.
         # ------------------------------------------------------------
-        if valid_market_state and valid_impulse and aligned_with_htf:
-            result.status = SetupStatus.WATCH
+        if valid_market_state and valid_impulse and aligned_with_htf and not valid_pullback:
+            result.status = SetupStatus.READY
             result.grade = SetupGrade.B
-            result.confidence = 0.55
+            result.confidence = 0.6
             result.rationale = (
-                "Impulse exists in trend context and aligns with HTF bias; "
-                "waiting for pullback / structure hold confirmation."
+                "READY LIGHT: impulse exists in trend context and aligns with HTF bias; "
+                "pullback confirmation is not complete yet, so execution quality must decide."
+            )
+            result.entry_plan = EntryPlan(
+                entry_min=ctx.current_price,
+                entry_max=ctx.current_price,
+            )
+            return result
+
+        # ------------------------------------------------------------
+        # WATCH: impulse exists, but context is not mature enough for READY.
+        # This branch is intentionally conservative and should not execute.
+        # ------------------------------------------------------------
+        if valid_impulse and aligned_with_htf:
+            result.status = SetupStatus.WATCH
+            result.grade = SetupGrade.C
+            result.confidence = 0.45
+            result.rationale = (
+                "Impulse exists and aligns with HTF bias, but market context or pullback "
+                "confirmation is not mature enough for READY."
             )
             return result
 

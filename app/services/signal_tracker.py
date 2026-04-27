@@ -8,6 +8,19 @@ from pathlib import Path
 from typing import Any
 
 
+KNOWN_INSTRUMENTS = {
+    "XAUUSD",
+    "EURUSD",
+    "GBPUSD",
+    "BTCUSD",
+    "ETHUSD",
+    "UKOIL",
+    "GER40",
+    "NAS100",
+    "SPX500",
+}
+
+
 OPEN_SIGNAL_STATES = {
     "SCENARIO_FORMING",
     "WATCH",
@@ -362,7 +375,14 @@ class SignalTracker:
     ) -> dict[str, Any]:
         raw = self._to_dict(scenario_result)
 
-        instrument = self._extract_enum_value(raw.get("instrument")) or "UNKNOWN"
+        metadata = deepcopy(raw.get("metadata") or {})
+
+        instrument = self._normalize_instrument_symbol(
+            raw.get("instrument"),
+            raw.get("symbol"),
+            metadata.get("instrument"),
+            metadata.get("symbol"),
+        )
         scenario_type = self._extract_enum_value(raw.get("scenario_type")) or "NO_ACTION"
         direction = self._extract_enum_value(raw.get("direction")) or "NEUTRAL"
         market_state = self._extract_enum_value(raw.get("market_state")) or "TRANSITION"
@@ -371,12 +391,26 @@ class SignalTracker:
         status = self._extract_enum_value(raw.get("status")) or "NO_SETUP"
         setup_type = self._extract_enum_value(raw.get("setup_type")) or "NONE"
 
+        # Defensive normalization: NO_ACTION must never carry directional trade state.
+        if scenario_type == "NO_ACTION":
+            direction = "NEUTRAL"
+            decision = "NO_TRADE"
+            status = "NO_SETUP"
+            setup_type = "NONE"
+
         execution = self._normalize_execution(raw.get("execution"))
         signal_class = self._derive_signal_class(
             decision=decision,
             status=status,
             execution=execution,
         )
+
+        # A non-READY signal must never be EXECUTABLE.
+        if signal_class != "READY" and execution.get("status") == "EXECUTABLE":
+            execution = self._force_not_executable(
+                execution,
+                reason="blocked_execution_before_ready",
+            )
 
         trigger_reason = raw.get("trigger_reason")
         if trigger_reason is None:
@@ -411,7 +445,7 @@ class SignalTracker:
             "next_expected_event": raw.get("next_expected_event"),
             "missing_conditions": list(raw.get("missing_conditions") or []),
             "tags": list(raw.get("tags") or []),
-            "metadata": deepcopy(raw.get("metadata") or {}),
+            "metadata": metadata,
             "execution": execution,
         }
 
@@ -458,7 +492,7 @@ class SignalTracker:
         if decision == "NO_TRADE" or status in {"NO_SETUP"}:
             return "SCENARIO_FORMING"
 
-        if status == "IDLE":
+        if status in {"IDLE", "EDGE_FORMING"}:
             return "SCENARIO_FORMING"
 
         if status == "WATCH":
@@ -467,12 +501,12 @@ class SignalTracker:
         if status == "READY":
             if execution_status == "EXECUTABLE":
                 return "READY"
-            return "READY"
+            return "WATCH"
 
         if status == "ACTIVE":
             return "ACTIVE"
 
-        return "WATCH"
+        return "SCENARIO_FORMING"
 
     # ------------------------------------------------------------------
     # Matching / merge / diff
@@ -669,6 +703,41 @@ class SignalTracker:
         safe_cycle_id = cycle_id or datetime.now(timezone.utc).isoformat()
         safe_cycle_id = safe_cycle_id.replace(":", "-")
         return f"{instrument}_{safe_cycle_id}_{scenario_type}_{direction}"
+
+    @staticmethod
+    def _normalize_instrument_symbol(*values: Any) -> str:
+        for value in values:
+            if value is None:
+                continue
+
+            enum_value = getattr(value, "value", None)
+            if enum_value is not None:
+                value = enum_value
+
+            enum_name = getattr(value, "name", None)
+            if enum_name is not None and str(enum_name).upper() in KNOWN_INSTRUMENTS:
+                return str(enum_name).upper()
+
+            text = str(value).strip().upper()
+            if not text or text == "UNKNOWN":
+                continue
+
+            if text in KNOWN_INSTRUMENTS:
+                return text
+
+        return "UNKNOWN"
+
+    @staticmethod
+    def _force_not_executable(execution: dict[str, Any], *, reason: str) -> dict[str, Any]:
+        patched = deepcopy(execution or {})
+        patched["status"] = "NOT_EXECUTABLE"
+        patched["model"] = patched.get("model") or "NONE"
+        patched["risk_reward_ratio"] = None
+        patched["stop_distance"] = None
+        patched["target_distance"] = None
+        patched["execution_timeframe"] = None
+        patched["trigger_reason"] = reason
+        return patched
 
     @staticmethod
     def _extract_enum_value(value: Any) -> Any:

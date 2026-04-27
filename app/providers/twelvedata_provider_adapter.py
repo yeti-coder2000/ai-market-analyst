@@ -24,16 +24,40 @@ class AdapterConfig:
 class TwelveDataProviderAdapter:
     """
     Adapter between internal enums/contracts and TwelveData client.
+
     Responsible for:
     - internal symbol/timeframe mapping
     - response validation
     - payload normalization
+
+    Important:
+    - TwelveData is currently trusted for core FX / metals / crypto.
+    - GER40 / NAS100 / SPX500 / UKOIL are intentionally NOT mapped here,
+      because discovery showed TwelveData returns ETFs/ETPs/wrong tickers
+      instead of the actual CFD/index/oil instruments.
     """
 
     SYMBOL_MAP: dict[Instrument, str] = {
+        # metals
         Instrument.XAUUSD: "XAU/USD",
+
+        # core FX
         Instrument.EURUSD: "EUR/USD",
         Instrument.GBPUSD: "GBP/USD",
+
+        # fx_major expansion
+        Instrument.USDJPY: "USD/JPY",
+        Instrument.USDCHF: "USD/CHF",
+        Instrument.USDCAD: "USD/CAD",
+        Instrument.AUDUSD: "AUD/USD",
+
+        # optional future fx reserve
+        Instrument.NZDUSD: "NZD/USD",
+        Instrument.EURJPY: "EUR/JPY",
+        Instrument.GBPJPY: "GBP/JPY",
+        Instrument.AUDJPY: "AUD/JPY",
+
+        # crypto
         Instrument.BTCUSD: "BTC/USD",
         Instrument.ETHUSD: "ETH/USD",
     }
@@ -86,13 +110,18 @@ class TwelveDataProviderAdapter:
         try:
             return self.SYMBOL_MAP[instrument]
         except KeyError as error:
-            raise TwelveDataAdapterError(f"No TwelveData symbol mapping for {instrument.value}") from error
+            raise TwelveDataAdapterError(
+                f"No TwelveData symbol mapping for {instrument.value}. "
+                "This instrument may require a different provider."
+            ) from error
 
     def _map_timeframe(self, timeframe: Timeframe) -> str:
         try:
             return self.TIMEFRAME_MAP[timeframe]
         except KeyError as error:
-            raise TwelveDataAdapterError(f"No TwelveData timeframe mapping for {timeframe.value}") from error
+            raise TwelveDataAdapterError(
+                f"No TwelveData timeframe mapping for {timeframe.value}"
+            ) from error
 
     def _call_client(
         self,
@@ -115,7 +144,8 @@ class TwelveDataProviderAdapter:
 
         if not isinstance(payload, dict):
             raise TwelveDataResponseError(
-                f"Non-dict payload returned for symbol={provider_symbol}, interval={provider_interval}"
+                f"Non-dict payload returned for symbol={provider_symbol}, "
+                f"interval={provider_interval}"
             )
 
         return payload
@@ -197,8 +227,10 @@ class TwelveDataProviderAdapter:
     def _to_float(value: Any, default: float | None = None) -> float | None:
         if value is None:
             return default
+
         if isinstance(value, (int, float)):
             return float(value)
+
         try:
             return float(value)
         except (TypeError, ValueError):

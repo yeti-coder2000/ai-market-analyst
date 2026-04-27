@@ -29,13 +29,29 @@ class DataQuality(str, Enum):
 
 
 class Instrument(str, Enum):
+    # core
     XAUUSD = "XAUUSD"
     EURUSD = "EURUSD"
     GBPUSD = "GBPUSD"
     BTCUSD = "BTCUSD"
     ETHUSD = "ETHUSD"
 
-    # indices / commodities
+    # fx_major expansion
+    USDJPY = "USDJPY"
+    USDCHF = "USDCHF"
+    USDCAD = "USDCAD"
+    AUDUSD = "AUDUSD"
+
+    # optional future fx reserve
+    NZDUSD = "NZDUSD"
+    EURJPY = "EURJPY"
+    GBPJPY = "GBPJPY"
+    AUDJPY = "AUDJPY"
+
+    # indices / commodities reserve
+    # NOTE:
+    # These are kept in enum for future multi-provider support.
+    # Do not route them to TwelveData until we have a correct provider mapping.
     UKOIL = "UKOIL"
     GER40 = "GER40"
     NAS100 = "NAS100"

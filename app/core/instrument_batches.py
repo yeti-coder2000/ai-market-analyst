@@ -95,12 +95,12 @@ INSTRUMENT_BATCHES: dict[str, BatchConfig] = {
         "interval_minutes": 15,
     },
 
-    "indices": {
+    "fx_major": {
         "symbols": [
-            "GER40",    # DAX
-            "NAS100",   # NDQ / Nasdaq 100
-            "SPX500",   # SNP500 / S&P 500
-            "UKOIL",    # Brent / UK Oil
+            "USDJPY",
+            "USDCHF",
+            "USDCAD",
+            "AUDUSD",
         ],
         "offset_minutes": 5,
         "interval_minutes": 15,

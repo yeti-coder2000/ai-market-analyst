@@ -45,6 +45,30 @@ def _expand_path(value: str | None, default: str) -> Path:
     return Path(raw).expanduser().resolve()
 
 
+def _available_batch_groups() -> set[str]:
+    """
+    Read supported batch groups from app.core.instrument_batches.
+
+    This prevents settings.py from becoming a stale hardcoded gate
+    every time we add a new batch group such as fx_major.
+    """
+    try:
+        from app.core.instrument_batches import list_available_batches
+
+        groups = {
+            str(item).strip().lower()
+            for item in list_available_batches()
+            if str(item).strip()
+        }
+        if groups:
+            return groups
+    except Exception:
+        pass
+
+    # Safe fallback for early imports / transitional states.
+    return {"core", "indices", "fx_major"}
+
+
 # =============================================================================
 # MAIN SETTINGS MODEL
 # =============================================================================
@@ -70,6 +94,7 @@ class AppSettings:
     enable_heartbeat: bool
     enable_alert_deduper: bool
     watch_alerts_enabled: bool
+    main_worker_alert_forwarding_enabled: bool
     paper_mode: bool
     fail_fast: bool
 
@@ -128,7 +153,11 @@ class AppSettings:
     def enabled_symbols(self) -> list[str]:
         if not self.enabled_symbols_raw:
             return []
-        return [item.strip().upper() for item in self.enabled_symbols_raw.split(",") if item.strip()]
+        return [
+            item.strip().upper()
+            for item in self.enabled_symbols_raw.split(",")
+            if item.strip()
+        ]
 
     def validate(self) -> None:
         """
@@ -176,8 +205,13 @@ class AppSettings:
         if self.provider_retry_backoff_sec < 0:
             errors.append("PROVIDER_RETRY_BACKOFF_SEC must be >= 0.")
 
-        if self.batch_group not in {"core", "indices"}:
-            errors.append("BATCH_GROUP must be one of: core, indices.")
+        allowed_batch_groups = _available_batch_groups()
+        if self.batch_group not in allowed_batch_groups:
+            errors.append(
+                "BATCH_GROUP must be one of: "
+                + ", ".join(sorted(allowed_batch_groups))
+                + "."
+            )
 
         if errors:
             raise ValueError("Invalid application settings:\n- " + "\n- ".join(errors))
@@ -240,6 +274,10 @@ def load_settings() -> AppSettings:
         enable_heartbeat=_to_bool(os.getenv("ENABLE_HEARTBEAT"), True),
         enable_alert_deduper=_to_bool(os.getenv("ENABLE_ALERT_DEDUPER"), True),
         watch_alerts_enabled=_to_bool(os.getenv("WATCH_ALERTS_ENABLED"), True),
+        main_worker_alert_forwarding_enabled=_to_bool(
+            os.getenv("MAIN_WORKER_ALERT_FORWARDING_ENABLED"),
+            False,
+        ),
         paper_mode=_to_bool(os.getenv("PAPER_MODE"), True),
         fail_fast=_to_bool(os.getenv("FAIL_FAST"), False),
 
@@ -284,7 +322,35 @@ def load_settings() -> AppSettings:
         enabled_symbols_raw=_clean_str(
             os.getenv(
                 "ENABLED_SYMBOLS",
-                "XAUUSD,EURUSD,GBPUSD,BTCUSD,ETHUSD,UKOIL,GER40,NAS100,SPX500",
+                ",".join(
+                    [
+                        # core
+                        "XAUUSD",
+                        "EURUSD",
+                        "GBPUSD",
+                        "BTCUSD",
+                        "ETHUSD",
+
+                        # fx_major
+                        "USDJPY",
+                        "USDCHF",
+                        "USDCAD",
+                        "AUDUSD",
+
+                        # optional future fx reserve
+                        "NZDUSD",
+                        "EURJPY",
+                        "GBPJPY",
+                        "AUDJPY",
+
+                        # multi-provider reserve
+                        "UKOIL",
+                        "GER40",
+                        "NAS100",
+                        "SPX500",
+                        "DXY",
+                    ]
+                ),
             ),
             "",
         ),
@@ -322,11 +388,30 @@ class LoaderConfig:
 
 
 EXPECTED_PRICE_RANGES: dict[str, tuple[float, float]] = {
+    # metals
     "XAUUSD": (1500.0, 5000.0),
+
+    # core FX
     "EURUSD": (0.5, 2.0),
     "GBPUSD": (0.5, 2.5),
+
+    # fx_major
+    "USDJPY": (50.0, 250.0),
+    "USDCHF": (0.3, 2.0),
+    "USDCAD": (0.5, 2.5),
+    "AUDUSD": (0.3, 1.5),
+
+    # optional future fx reserve
+    "NZDUSD": (0.3, 1.5),
+    "EURJPY": (50.0, 250.0),
+    "GBPJPY": (70.0, 300.0),
+    "AUDJPY": (40.0, 150.0),
+
+    # crypto
     "BTCUSD": (1000.0, 250000.0),
     "ETHUSD": (100.0, 20000.0),
+
+    # multi-provider reserve
     "UKOIL": (10.0, 200.0),
     "GER40": (5000.0, 50000.0),
     "NAS100": (5000.0, 50000.0),
