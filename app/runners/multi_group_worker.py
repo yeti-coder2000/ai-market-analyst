@@ -3,11 +3,13 @@ from __future__ import annotations
 """
 Multi-group worker for AI Market Analyst.
 
-Runs:
+Runs configured batch groups sequentially:
 1. core
-2. waits FX_MAJOR_DELAY_AFTER_CORE_SEC
+2. waits GROUP_DELAY_SEC / SECONDARY_GROUP_DELAY_SEC
 3. fx_major
-4. sleeps until RUN_INTERVAL_SEC window completes
+4. waits again
+5. indices
+6. sleeps until RUN_INTERVAL_SEC window completes
 
 Telegram trade alerts are NOT generated here.
 They remain inside stateful_batch_runner hard gate:
@@ -98,7 +100,7 @@ def _boot_message(groups: list[str], interval_sec: int, delay_sec: int) -> str:
         f"Env: {getattr(settings, 'app_env', 'unknown')}\n"
         f"Groups: {', '.join(groups)}\n"
         f"Interval: {interval_sec}s\n"
-        f"Delay after first group: {delay_sec}s\n"
+        f"Delay between groups: {delay_sec}s\n"
         f"Paper mode: {'ON' if getattr(settings, 'paper_mode', True) else 'OFF'}"
     )
 
@@ -176,7 +178,7 @@ def run_group_once(group: str) -> dict[str, Any]:
 def run_sequence(
     *,
     groups: list[str],
-    delay_after_first_sec: int,
+    delay_between_groups_sec: int,
     shutdown: GracefulShutdown,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
@@ -185,13 +187,13 @@ def run_sequence(
         if shutdown.stop_requested:
             break
 
-        if index == 1 and delay_after_first_sec > 0:
+        if index > 0 and delay_between_groups_sec > 0:
             logger.info(
-                "Waiting before secondary group. delay_sec=%s next_group=%s",
-                delay_after_first_sec,
+                "Waiting before next group. delay_sec=%s next_group=%s",
+                delay_between_groups_sec,
                 group,
             )
-            sleep_with_shutdown(delay_after_first_sec, shutdown)
+            sleep_with_shutdown(delay_between_groups_sec, shutdown)
 
         if shutdown.stop_requested:
             break
@@ -224,9 +226,10 @@ def main() -> int:
         os.getenv("STARTUP_GRACE_SEC"),
         int(getattr(settings, "startup_grace_sec", 10)),
     )
-    delay_after_first_sec = _to_int(
-        os.getenv("FX_MAJOR_DELAY_AFTER_CORE_SEC")
-        or os.getenv("SECONDARY_GROUP_DELAY_SEC"),
+    delay_between_groups_sec = _to_int(
+        os.getenv("GROUP_DELAY_SEC")
+        or os.getenv("SECONDARY_GROUP_DELAY_SEC")
+        or os.getenv("FX_MAJOR_DELAY_AFTER_CORE_SEC"),
         300,
     )
     enable_telegram = _to_bool(
@@ -239,10 +242,10 @@ def main() -> int:
     notifier = TelegramNotifier()
 
     worker_logger.info(
-        "Config groups=%s interval_sec=%s delay_after_first_sec=%s run_once=%s",
+        "Config groups=%s interval_sec=%s delay_between_groups_sec=%s run_once=%s",
         groups,
         interval_sec,
-        delay_after_first_sec,
+        delay_between_groups_sec,
         run_once,
     )
 
@@ -260,7 +263,7 @@ def main() -> int:
     if enable_telegram and getattr(notifier, "is_active", False):
         try:
             notifier.send_admin_message(
-                _boot_message(groups, interval_sec, delay_after_first_sec)
+                _boot_message(groups, interval_sec, delay_between_groups_sec)
             )
         except Exception as exc:
             log_exception(
@@ -295,7 +298,7 @@ def main() -> int:
 
         results = run_sequence(
             groups=groups,
-            delay_after_first_sec=delay_after_first_sec,
+            delay_between_groups_sec=delay_between_groups_sec,
             shutdown=shutdown,
         )
 

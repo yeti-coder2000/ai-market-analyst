@@ -4,7 +4,7 @@ from __future__ import annotations
 Instrument batch configuration.
 
 Цей модуль визначає:
-- групи інструментів: core / indices
+- групи інструментів: core / fx_major / indices
 - canonical symbols для runner
 - offset + interval для Render worker scheduling
 - aliases для людських назв: DAX, NDQ, SNP500, USOIL тощо
@@ -31,11 +31,11 @@ class BatchConfig(TypedDict):
 # ВАЖЛИВО:
 # Тут мають бути саме ті значення, які підтримує app.core.enums.Instrument:
 #
-# DAX     -> GER40
-# NDQ/NDX -> NAS100
-# SNP500  -> SPX500
-# UKOIL   -> UKOIL
-# USOIL   -> поки НЕ використовуємо, бо ти просив саме UKOIL
+# DAX / DE40       -> GER40
+# NDQ / NDX        -> NAS100
+# SNP500 / SPX     -> SPX500
+# UKOIL / BRENT    -> UKOIL
+# USOIL / WTI      -> поки alias на UKOIL, бо зараз додаємо саме Brent/UKOIL
 
 
 SYMBOL_ALIASES: dict[str, str] = {
@@ -52,26 +52,44 @@ SYMBOL_ALIASES: dict[str, str] = {
     "GBP": "GBPUSD",
     "GBPUSD": "GBPUSD",
 
+    # fx_major
+    "USDJPY": "USDJPY",
+    "USD/JPY": "USDJPY",
+    "USDCHF": "USDCHF",
+    "USD/CHF": "USDCHF",
+    "USDCAD": "USDCAD",
+    "USD/CAD": "USDCAD",
+    "AUDUSD": "AUDUSD",
+    "AUD/USD": "AUDUSD",
+
     # indices / oil
     "DAX": "GER40",
     "GER40": "GER40",
     "DE40": "GER40",
+    "GDAXI": "GER40",
+    "^GDAXI": "GER40",
 
     "NDQ": "NAS100",
     "NDX": "NAS100",
+    "^NDX": "NAS100",
     "NASDAQ": "NAS100",
+    "NASDAQ100": "NAS100",
     "NAS100": "NAS100",
 
     "SNP500": "SPX500",
     "SP500": "SPX500",
     "S&P500": "SPX500",
+    "S&P 500": "SPX500",
     "SPX": "SPX500",
+    "^GSPC": "SPX500",
+    "GSPC": "SPX500",
     "SPX500": "SPX500",
 
     "UKOIL": "UKOIL",
     "BRENT": "UKOIL",
+    "BZ=F": "UKOIL",
 
-    # Залишаємо alias, але свідомо мапимо USOIL не в indices за замовчуванням.
+    # Залишаємо alias, але свідомо мапимо USOIL/WTI не в окремий інструмент.
     # Якщо потім захочеш WTI, додамо окремий Instrument.USOIL у enums/settings/provider.
     "USOIL": "UKOIL",
     "WTI": "UKOIL",
@@ -103,6 +121,17 @@ INSTRUMENT_BATCHES: dict[str, BatchConfig] = {
             "AUDUSD",
         ],
         "offset_minutes": 5,
+        "interval_minutes": 15,
+    },
+
+    "indices": {
+        "symbols": [
+            "GER40",
+            "NAS100",
+            "SPX500",
+            "UKOIL",
+        ],
+        "offset_minutes": 10,
         "interval_minutes": 15,
     },
 }
