@@ -9,16 +9,66 @@ from typing import Any
 
 
 KNOWN_INSTRUMENTS = {
+    # core
     "XAUUSD",
     "EURUSD",
     "GBPUSD",
     "BTCUSD",
     "ETHUSD",
+
+    # fx_major
+    "USDJPY",
+    "USDCHF",
+    "USDCAD",
+    "AUDUSD",
+
+    # optional future fx reserve
+    "NZDUSD",
+    "EURJPY",
+    "GBPJPY",
+    "AUDJPY",
+
+    # indices / commodities reserve
     "UKOIL",
     "GER40",
     "NAS100",
     "SPX500",
+
+    # optional / reserve
+    "DXY",
 }
+
+
+SYMBOL_ALIASES = {
+    "GOLD": "XAUUSD",
+    "XAU": "XAUUSD",
+    "XAU/USD": "XAUUSD",
+    "BTC/USD": "BTCUSD",
+    "ETH/USD": "ETHUSD",
+    "EUR/USD": "EURUSD",
+    "GBP/USD": "GBPUSD",
+    "USD/JPY": "USDJPY",
+    "USD/CHF": "USDCHF",
+    "USD/CAD": "USDCAD",
+    "AUD/USD": "AUDUSD",
+    "NZD/USD": "NZDUSD",
+    "EUR/JPY": "EURJPY",
+    "GBP/JPY": "GBPJPY",
+    "AUD/JPY": "AUDJPY",
+    "DAX": "GER40",
+    "DE40": "GER40",
+    "NDQ": "NAS100",
+    "NDX": "NAS100",
+    "NASDAQ": "NAS100",
+    "SPX": "SPX500",
+    "SP500": "SPX500",
+    "SNP500": "SPX500",
+    "S&P500": "SPX500",
+    "BRENT": "UKOIL",
+}
+
+
+VALID_HTF_BIAS_VALUES = {"LONG", "SHORT", "NEUTRAL"}
 
 
 OPEN_SIGNAL_STATES = {
@@ -390,6 +440,20 @@ class SignalTracker:
         phase = self._extract_enum_value(raw.get("phase")) or "PRECONDITION"
         status = self._extract_enum_value(raw.get("status")) or "NO_SETUP"
         setup_type = self._extract_enum_value(raw.get("setup_type")) or "NONE"
+        htf_bias = self._normalize_htf_bias(
+            raw.get("htf_bias"),
+            metadata.get("htf_bias"),
+            self._nested_get(raw, "context", "htf_bias"),
+            self._nested_get(raw, "behavioral_summary", "htf_bias"),
+        )
+
+        # Keep identity/context fields inside metadata too. This prevents downstream
+        # journal/statistics exporters from losing symbol or HTF bias when the
+        # scenario object itself does not expose them directly.
+        metadata["symbol"] = instrument
+        metadata["instrument"] = instrument
+        if htf_bias:
+            metadata["htf_bias"] = htf_bias
 
         # Defensive normalization: NO_ACTION must never carry directional trade state.
         if scenario_type == "NO_ACTION":
@@ -431,6 +495,7 @@ class SignalTracker:
             "phase": phase,
             "decision": decision,
             "market_state": market_state,
+            "htf_bias": htf_bias,
             "direction": direction,
             "status": status,
             "signal_class": signal_class,
@@ -706,6 +771,52 @@ class SignalTracker:
 
     @staticmethod
     def _normalize_instrument_symbol(*values: Any) -> str:
+        def iter_candidates(value: Any):
+            if value is None:
+                return
+
+            enum_value = getattr(value, "value", None)
+            if enum_value is not None:
+                yield enum_value
+
+            enum_name = getattr(value, "name", None)
+            if enum_name is not None:
+                yield enum_name
+
+            if isinstance(value, dict):
+                for key in ("symbol", "instrument", "ticker", "provider_symbol"):
+                    if key in value:
+                        yield from iter_candidates(value.get(key))
+                metadata = value.get("metadata")
+                if isinstance(metadata, dict):
+                    yield from iter_candidates(metadata)
+                return
+
+            yield value
+
+        for value in values:
+            for candidate in iter_candidates(value):
+                if candidate is None:
+                    continue
+
+                text = str(candidate).strip().upper()
+                if not text or text == "UNKNOWN":
+                    continue
+
+                text = text.replace(" ", "")
+                aliased = SYMBOL_ALIASES.get(text, text)
+                compact = aliased.replace("/", "")
+
+                if aliased in KNOWN_INSTRUMENTS:
+                    return aliased
+
+                if compact in KNOWN_INSTRUMENTS:
+                    return compact
+
+        return "UNKNOWN"
+
+    @staticmethod
+    def _normalize_htf_bias(*values: Any) -> str:
         for value in values:
             if value is None:
                 continue
@@ -714,18 +825,23 @@ class SignalTracker:
             if enum_value is not None:
                 value = enum_value
 
-            enum_name = getattr(value, "name", None)
-            if enum_name is not None and str(enum_name).upper() in KNOWN_INSTRUMENTS:
-                return str(enum_name).upper()
-
             text = str(value).strip().upper()
-            if not text or text == "UNKNOWN":
-                continue
-
-            if text in KNOWN_INSTRUMENTS:
+            if text in VALID_HTF_BIAS_VALUES:
                 return text
 
-        return "UNKNOWN"
+        return ""
+
+    @staticmethod
+    def _nested_get(obj: Any, *keys: str) -> Any:
+        current = obj
+        for key in keys:
+            if current is None:
+                return None
+            if isinstance(current, dict):
+                current = current.get(key)
+            else:
+                current = getattr(current, key, None)
+        return current
 
     @staticmethod
     def _force_not_executable(execution: dict[str, Any], *, reason: str) -> dict[str, Any]:

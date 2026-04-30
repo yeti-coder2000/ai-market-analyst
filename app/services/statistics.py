@@ -14,6 +14,67 @@ DEFAULT_SIGNAL_RECORDS_PARQUET_PATH = Path("runtime/stats/signals_flat.parquet")
 DEFAULT_DAILY_SUMMARY_PATH = Path("runtime/stats/daily_summary.json")
 
 
+KNOWN_INSTRUMENTS = {
+    # core
+    "XAUUSD",
+    "EURUSD",
+    "GBPUSD",
+    "BTCUSD",
+    "ETHUSD",
+
+    # fx_major
+    "USDJPY",
+    "USDCHF",
+    "USDCAD",
+    "AUDUSD",
+
+    # optional future fx reserve
+    "NZDUSD",
+    "EURJPY",
+    "GBPJPY",
+    "AUDJPY",
+
+    # indices / commodities reserve
+    "UKOIL",
+    "GER40",
+    "NAS100",
+    "SPX500",
+
+    # optional / reserve
+    "DXY",
+}
+
+SYMBOL_ALIASES = {
+    "GOLD": "XAUUSD",
+    "XAU": "XAUUSD",
+    "XAU/USD": "XAUUSD",
+    "BTC/USD": "BTCUSD",
+    "ETH/USD": "ETHUSD",
+    "EUR/USD": "EURUSD",
+    "GBP/USD": "GBPUSD",
+    "USD/JPY": "USDJPY",
+    "USD/CHF": "USDCHF",
+    "USD/CAD": "USDCAD",
+    "AUD/USD": "AUDUSD",
+    "NZD/USD": "NZDUSD",
+    "EUR/JPY": "EURJPY",
+    "GBP/JPY": "GBPJPY",
+    "AUD/JPY": "AUDJPY",
+    "DAX": "GER40",
+    "DE40": "GER40",
+    "NDQ": "NAS100",
+    "NDX": "NAS100",
+    "NASDAQ": "NAS100",
+    "SPX": "SPX500",
+    "SP500": "SPX500",
+    "SNP500": "SPX500",
+    "S&P500": "SPX500",
+    "BRENT": "UKOIL",
+}
+
+VALID_HTF_BIAS_VALUES = {"LONG", "SHORT", "NEUTRAL"}
+
+
 @dataclass
 class SignalRecord:
     signal_id: str
@@ -82,6 +143,181 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _enum_value(value: Any) -> Any:
+    return getattr(value, "value", value)
+
+
+def _nested_get(obj: Any, *keys: str) -> Any:
+    current = obj
+    for key in keys:
+        if current is None:
+            return None
+        if isinstance(current, dict):
+            current = current.get(key)
+        else:
+            current = getattr(current, key, None)
+    return current
+
+
+def _normalize_symbol(*values: Any) -> str:
+    def iter_candidates(value: Any):
+        if value is None:
+            return
+
+        enum_value = getattr(value, "value", None)
+        if enum_value is not None:
+            yield enum_value
+
+        enum_name = getattr(value, "name", None)
+        if enum_name is not None:
+            yield enum_name
+
+        if isinstance(value, dict):
+            for key in ("symbol", "instrument", "ticker", "provider_symbol"):
+                if key in value:
+                    yield from iter_candidates(value.get(key))
+            metadata = value.get("metadata")
+            if isinstance(metadata, dict):
+                yield from iter_candidates(metadata)
+            return
+
+        yield value
+
+    for value in values:
+        for candidate in iter_candidates(value):
+            if candidate is None:
+                continue
+
+            text = str(candidate).strip().upper()
+            if not text or text == "UNKNOWN":
+                continue
+
+            text = text.replace(" ", "")
+            aliased = SYMBOL_ALIASES.get(text, text)
+            compact = aliased.replace("/", "")
+
+            if aliased in KNOWN_INSTRUMENTS:
+                return aliased
+            if compact in KNOWN_INSTRUMENTS:
+                return compact
+
+    return "UNKNOWN"
+
+
+def _normalize_htf_bias(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+
+        value = _enum_value(value)
+        text = str(value).strip().upper()
+
+        if text in VALID_HTF_BIAS_VALUES:
+            return text
+
+    return ""
+
+
+def _extract_htf_bias(payload: dict[str, Any] | None, event: dict[str, Any] | None = None) -> str:
+    payload = payload or {}
+    event = event or {}
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+    context = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    analysis = payload.get("analysis") if isinstance(payload.get("analysis"), dict) else {}
+    behavioral_summary = payload.get("behavioral_summary") if isinstance(payload.get("behavioral_summary"), dict) else {}
+
+    return _normalize_htf_bias(
+        payload.get("htf_bias"),
+        metadata.get("htf_bias"),
+        context.get("htf_bias"),
+        analysis.get("htf_bias"),
+        behavioral_summary.get("htf_bias"),
+        _nested_get(payload, "payload", "htf_bias"),
+        _nested_get(event, "payload", "htf_bias"),
+        _nested_get(event, "payload", "payload", "htf_bias"),
+    )
+
+
+def _context_key(cycle_id: str | None, symbol: str | None) -> tuple[str, str] | None:
+    if not cycle_id or not symbol or symbol == "UNKNOWN":
+        return None
+    return str(cycle_id), str(symbol)
+
+
+def _build_context_index(events: list[dict]) -> dict[tuple[str, str], dict[str, Any]]:
+    """
+    Context index lets flat statistics recover htf_bias/market_state from
+    instrument_analyzed or fallback events when signal payloads are minimal.
+    """
+    index: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for event in events:
+        payload = event.get("payload", {}) or {}
+        cycle_id = event.get("cycle_id") or payload.get("cycle_id")
+        symbol = _normalize_symbol(
+            payload.get("symbol"),
+            payload.get("instrument"),
+            event.get("symbol"),
+            payload.get("metadata"),
+        )
+        key = _context_key(cycle_id, symbol)
+        if key is None:
+            continue
+
+        entry = index.setdefault(key, {})
+
+        htf_bias = _extract_htf_bias(payload, event)
+        if htf_bias:
+            entry["htf_bias"] = htf_bias
+
+        market_state = payload.get("market_state")
+        if market_state:
+            entry["market_state"] = _enum_value(market_state)
+
+        price = payload.get("price")
+        if price is not None:
+            entry["price"] = _safe_float(price, None)
+
+        scenario = payload.get("scenario") or payload.get("scenario_type")
+        if scenario:
+            entry["scenario"] = _enum_value(scenario)
+
+        direction = payload.get("direction")
+        if direction:
+            entry["direction"] = _enum_value(direction)
+
+    return index
+
+
+def _normalize_signal_id(
+    signal_id: Any,
+    *,
+    symbol: str,
+    cycle_id: str,
+    scenario: str,
+    direction: str,
+) -> str:
+    raw = str(signal_id or "").strip()
+
+    if raw:
+        if raw.startswith("UNKNOWN_") and symbol and symbol != "UNKNOWN":
+            return f"{symbol}_{raw[len('UNKNOWN_'):]}"
+        return raw
+
+    safe_cycle_id = cycle_id or ""
+    safe_cycle_id = safe_cycle_id.replace(":", "-")
+    return f"{symbol}_{safe_cycle_id}_{scenario}_{direction}"
+
+
+def _event_symbol(event: dict[str, Any], payload: dict[str, Any]) -> str:
+    return _normalize_symbol(
+        payload.get("symbol"),
+        payload.get("instrument"),
+        payload.get("metadata"),
+        event.get("symbol"),
+    )
+
+
 def _confidence_bucket(confidence: float) -> str:
     if confidence < 0.30:
         return "0.00-0.29"
@@ -127,8 +363,13 @@ def build_signal_records(events: list[dict]) -> list[SignalRecord]:
     - signal_resolved
     - signal_deduped
     - telegram_sent
+
+    Important:
+    - signal_id is normalized for legacy UNKNOWN_ ids when event/payload symbol is known.
+    - htf_bias is recovered from signal payload, metadata, or same-cycle instrument context.
     """
     records: dict[str, SignalRecord] = {}
+    context_index = _build_context_index(events)
 
     for event in events:
         event_type = event.get("event_type")
@@ -138,22 +379,38 @@ def build_signal_records(events: list[dict]) -> list[SignalRecord]:
             continue
 
         if event_type == "signal_registered":
-            signal_id = payload.get("signal_id")
+            symbol = _event_symbol(event, payload)
+            cycle_id = event.get("cycle_id", "")
+            scenario = payload.get("scenario", "UNKNOWN")
+            direction = payload.get("direction", "NEUTRAL")
+            key = _context_key(cycle_id, symbol)
+            context = context_index.get(key or ("", ""), {})
+
+            signal_id = _normalize_signal_id(
+                payload.get("signal_id"),
+                symbol=symbol,
+                cycle_id=cycle_id,
+                scenario=scenario,
+                direction=direction,
+            )
             if not signal_id:
                 continue
 
             if signal_id not in records:
+                htf_bias = _extract_htf_bias(payload, event) or str(context.get("htf_bias") or "")
+                market_state = payload.get("market_state") or context.get("market_state") or ""
+
                 records[signal_id] = SignalRecord(
                     signal_id=signal_id,
-                    symbol=payload.get("symbol", event.get("symbol", "-")),
+                    symbol=symbol if symbol != "UNKNOWN" else event.get("symbol", "-"),
                     timeframe=event.get("timeframe", "15m"),
-                    cycle_id=event.get("cycle_id", ""),
+                    cycle_id=cycle_id,
                     created_at_utc=payload.get("created_at_utc", event.get("ts_utc", "")),
-                    scenario=payload.get("scenario", "UNKNOWN"),
+                    scenario=scenario,
                     signal_class=payload.get("signal_class", "SCENARIO_FORMING"),
-                    direction=payload.get("direction", "NEUTRAL"),
-                    market_state=payload.get("market_state", ""),
-                    htf_bias=payload.get("htf_bias", ""),
+                    direction=direction,
+                    market_state=market_state,
+                    htf_bias=htf_bias,
                     confidence=_safe_float(payload.get("confidence"), 0.0) or 0.0,
                     entry_reference_price=_safe_float(payload.get("entry_reference_price"), None),
                     invalidation_reference_price=_safe_float(
@@ -180,12 +437,36 @@ def build_signal_records(events: list[dict]) -> list[SignalRecord]:
             continue
 
         if event_type == "signal_updated":
-            signal_id = payload.get("signal_id")
-            if not signal_id or signal_id not in records:
+            updated_payload = payload.get("payload", {}) or {}
+            symbol = _event_symbol(event, updated_payload) or _event_symbol(event, payload)
+            cycle_id = event.get("cycle_id", "")
+            scenario = updated_payload.get("scenario", payload.get("scenario", "UNKNOWN"))
+            direction = updated_payload.get("direction", payload.get("direction", "NEUTRAL"))
+            key = _context_key(cycle_id, symbol)
+            context = context_index.get(key or ("", ""), {})
+
+            signal_id = _normalize_signal_id(
+                payload.get("signal_id"),
+                symbol=symbol,
+                cycle_id=cycle_id,
+                scenario=scenario,
+                direction=direction,
+            )
+            raw_signal_id = str(payload.get("signal_id") or "")
+
+            if not signal_id:
                 continue
 
-            rec = records[signal_id]
-            updated_payload = payload.get("payload", {}) or {}
+            rec = records.get(signal_id)
+            if rec is None and raw_signal_id:
+                rec = records.get(raw_signal_id)
+                if rec is not None:
+                    records[signal_id] = rec
+                    records.pop(raw_signal_id, None)
+                    rec.signal_id = signal_id
+
+            if rec is None:
+                continue
 
             rec.current_stage = updated_payload.get("signal_class", rec.current_stage)
             rec.signal_class = updated_payload.get("signal_class", rec.signal_class)
@@ -238,15 +519,51 @@ def build_signal_records(events: list[dict]) -> list[SignalRecord]:
 
             rec.scenario = updated_payload.get("scenario", rec.scenario)
             rec.direction = updated_payload.get("direction", rec.direction)
-            rec.market_state = updated_payload.get("market_state", rec.market_state)
+            rec.market_state = updated_payload.get(
+                "market_state",
+                rec.market_state or context.get("market_state", ""),
+            )
+
+            recovered_htf_bias = (
+                _extract_htf_bias(updated_payload, event)
+                or _extract_htf_bias(payload, event)
+                or str(context.get("htf_bias") or "")
+            )
+            if recovered_htf_bias:
+                rec.htf_bias = recovered_htf_bias
+
+            if symbol and symbol != "UNKNOWN" and rec.symbol in {"", "-", "UNKNOWN"}:
+                rec.symbol = symbol
+
             continue
 
         if event_type == "signal_resolved":
-            signal_id = payload.get("signal_id")
-            if not signal_id or signal_id not in records:
+            symbol = _event_symbol(event, payload)
+            cycle_id = event.get("cycle_id", "")
+            scenario = payload.get("scenario", "UNKNOWN")
+            direction = payload.get("direction", "NEUTRAL")
+            signal_id = _normalize_signal_id(
+                payload.get("signal_id"),
+                symbol=symbol,
+                cycle_id=cycle_id,
+                scenario=scenario,
+                direction=direction,
+            )
+            raw_signal_id = str(payload.get("signal_id") or "")
+
+            if not signal_id:
                 continue
 
-            rec = records[signal_id]
+            rec = records.get(signal_id)
+            if rec is None and raw_signal_id:
+                rec = records.get(raw_signal_id)
+                if rec is not None:
+                    records[signal_id] = rec
+                    records.pop(raw_signal_id, None)
+                    rec.signal_id = signal_id
+
+            if rec is None:
+                continue
 
             rec.signal_class = payload.get("signal_class", rec.signal_class)
             rec.current_stage = payload.get("signal_class", rec.current_stage)
@@ -294,6 +611,11 @@ def build_signal_records(events: list[dict]) -> list[SignalRecord]:
                 rec.execution_timeframe,
             )
             rec.trigger_reason = payload.get("trigger_reason", rec.trigger_reason)
+
+            recovered_htf_bias = _extract_htf_bias(payload, event)
+            if recovered_htf_bias:
+                rec.htf_bias = recovered_htf_bias
+
             continue
 
         if event_type == "signal_deduped":
@@ -301,6 +623,15 @@ def build_signal_records(events: list[dict]) -> list[SignalRecord]:
 
         if event_type == "telegram_sent":
             signal_id = payload.get("signal_id")
+            symbol = _event_symbol(event, payload)
+            signal_id = _normalize_signal_id(
+                signal_id,
+                symbol=symbol,
+                cycle_id=event.get("cycle_id", ""),
+                scenario=payload.get("scenario", "UNKNOWN"),
+                direction=payload.get("direction", "NEUTRAL"),
+            )
+
             if not signal_id or signal_id not in records:
                 continue
 
