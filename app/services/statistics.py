@@ -7,11 +7,20 @@ from typing import Any, Optional
 
 import pandas as pd
 
+from app.core.settings import settings
 
-DEFAULT_JOURNAL_PATH = Path("runtime/radar_journal.ndjson")
-DEFAULT_SIGNAL_RECORDS_JSON_PATH = Path("runtime/stats/signals_flat.json")
-DEFAULT_SIGNAL_RECORDS_PARQUET_PATH = Path("runtime/stats/signals_flat.parquet")
-DEFAULT_DAILY_SUMMARY_PATH = Path("runtime/stats/daily_summary.json")
+
+# =============================================================================
+# PERSISTENT RUNTIME PATHS
+# =============================================================================
+# All statistics must follow the active runtime directory from settings.
+# On Render production this should be /var/data/runtime, not project-local runtime/.
+
+DEFAULT_JOURNAL_PATH = settings.radar_journal_path
+DEFAULT_STATS_DIR = settings.runtime_dir / "stats"
+DEFAULT_SIGNAL_RECORDS_JSON_PATH = DEFAULT_STATS_DIR / "signals_flat.json"
+DEFAULT_SIGNAL_RECORDS_PARQUET_PATH = DEFAULT_STATS_DIR / "signals_flat.parquet"
+DEFAULT_DAILY_SUMMARY_PATH = DEFAULT_STATS_DIR / "daily_summary.json"
 
 
 KNOWN_INSTRUMENTS = {
