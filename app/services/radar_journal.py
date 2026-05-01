@@ -8,9 +8,19 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from app.core.settings import settings
 
-DEFAULT_JOURNAL_PATH = Path("runtime/radar_journal.ndjson")
-SNAPSHOT_JOURNAL_PATH = Path("runtime/radar_snapshot_v2.ndjson")
+
+# =============================================================================
+# PERSISTENT PATHS
+# =============================================================================
+# All journal/snapshot writers must use the same runtime root as the rest of the
+# production system. On Render this is /var/data/runtime after the settings.py fix.
+# Keeping these as settings-derived defaults prevents split-brain history where
+# fallback writes go to /var/data while primary journal writes go to ./runtime.
+
+DEFAULT_JOURNAL_PATH = settings.radar_journal_path
+SNAPSHOT_JOURNAL_PATH = settings.runtime_dir / "radar_snapshot_v2.ndjson"
 
 
 @dataclass
@@ -522,6 +532,7 @@ def _compact_signal_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "phase": raw.get("phase"),
         "decision": raw.get("decision"),
         "market_state": raw.get("market_state"),
+        "htf_bias": raw.get("htf_bias"),
         "direction": raw.get("direction"),
         "status": raw.get("status"),
         "signal_class": raw.get("signal_class"),
