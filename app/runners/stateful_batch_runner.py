@@ -26,6 +26,7 @@ from app.scenarios.behavioral import (
     infer_missing_conditions,
     infer_next_expected_event,
 )
+from app.scenarios.execution import build_execution_plan
 from app.services.consistency_checker import check_consistency
 from app.services.loader import MarketDataLoader
 from app.services.radar_journal import (
@@ -47,7 +48,7 @@ from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.4.2"
+RUNNER_VERSION = "1.4.3-execution-bridge-v1"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -1369,6 +1370,10 @@ class StatefulBatchRunner:
 
             save_state(self.state, self.state_path)
 
+            scenario_engine_failed = isinstance(scenario, dict) and bool(scenario.get("scenario_engine_failed"))
+            scenario_engine_error = scenario.get("scenario_engine_error") if isinstance(scenario, dict) else None
+            scenario_engine_error_type = scenario.get("scenario_engine_error_type") if isinstance(scenario, dict) else None
+
             tracker_source_payload = self._build_tracker_source_payload(
                 source=scenario if scenario_ok else final_signal,
                 symbol=symbol.value,
@@ -1381,6 +1386,15 @@ class StatefulBatchRunner:
                 scenario_type=scenario_type,
                 scenario_probability=scenario_probability,
                 scenario_decision=scenario_decision,
+                scenario_engine_failed=scenario_engine_failed,
+                scenario_engine_error=scenario_engine_error,
+                scenario_engine_error_type=scenario_engine_error_type,
+            )
+            tracker_source_payload = self._enrich_tracker_payload_with_execution_bridge(
+                payload=tracker_source_payload,
+                context=context,
+                scenario=scenario,
+                final_signal=final_signal,
             )
 
             tracker_result = self.signal_tracker.process(
@@ -1516,6 +1530,9 @@ class StatefulBatchRunner:
         scenario_type: str | None,
         scenario_probability: float | None,
         scenario_decision: str | None,
+        scenario_engine_failed: bool = False,
+        scenario_engine_error: str | None = None,
+        scenario_engine_error_type: str | None = None,
     ) -> dict[str, Any]:
         """
         Build a tracker-safe payload with guaranteed symbol propagation.
@@ -1565,11 +1582,227 @@ class StatefulBatchRunner:
                 "htf_bias": htf_bias,
                 "market_state": market_state,
                 "source": "stateful_batch_runner",
+                "scenario_engine_failed": bool(scenario_engine_failed),
+                "scenario_engine_error": scenario_engine_error,
+                "scenario_engine_error_type": scenario_engine_error_type,
             }
         )
         raw["metadata"] = metadata
 
         return raw
+
+    def _enrich_tracker_payload_with_execution_bridge(
+        self,
+        *,
+        payload: dict[str, Any],
+        context: Any,
+        scenario: Any,
+        final_signal: Any,
+    ) -> dict[str, Any]:
+        """
+        Conservative bridge from structural READY payloads to execution.py.
+
+        It does NOT lower standards. It only calls build_execution_plan when:
+        - payload status is READY;
+        - direction is LONG/SHORT;
+        - HTF bias is not NEUTRAL;
+        - a canonical execution scenario can be inferred.
+
+        If geometry/RR is incomplete, execution.py returns INCOMPLETE with a
+        trigger_reason. Telegram remains blocked unless SignalTracker promotes
+        the payload to READY with EXECUTABLE geometry.
+        """
+        if not isinstance(payload, dict):
+            return {}
+
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            payload["metadata"] = metadata
+
+        # If ScenarioEngine already provided a real execution payload, keep it.
+        existing_status = str(payload.get("execution_status") or "").upper()
+        existing_model = str(payload.get("execution_model") or "").upper()
+        if existing_status == "EXECUTABLE" or existing_model not in {"", "NONE"}:
+            metadata["execution_bridge_status"] = "kept_existing_execution"
+            metadata["execution_bridge_reason"] = "payload_already_has_execution"
+            return payload
+
+        status = str(payload.get("status") or "").upper()
+        direction = str(payload.get("direction") or "").upper()
+        htf_bias = str(payload.get("htf_bias") or metadata.get("htf_bias") or "").upper()
+
+        if status != "READY":
+            return self._mark_execution_bridge_block(
+                payload,
+                reason="not_ready_status",
+                detail=f"status={status or '-'}",
+            )
+
+        if direction not in {"LONG", "SHORT"}:
+            return self._mark_execution_bridge_block(
+                payload,
+                reason="neutral_or_invalid_direction",
+                detail=f"direction={direction or '-'}",
+            )
+
+        if htf_bias == "NEUTRAL":
+            return self._mark_execution_bridge_block(
+                payload,
+                reason="neutral_htf_bias",
+                detail="HTF bias is NEUTRAL; execution bridge skipped",
+            )
+
+        canonical_scenario = self._infer_execution_bridge_scenario(payload)
+        if canonical_scenario is None:
+            return self._mark_execution_bridge_block(
+                payload,
+                reason="unsupported_bridge_scenario",
+                detail=str(payload.get("scenario") or payload.get("scenario_type") or "-"),
+            )
+
+        try:
+            plan = build_execution_plan(
+                context=context,
+                scenario_type=canonical_scenario,
+                direction=direction,
+                evidence=None,
+            )
+            execution_payload = self._execution_plan_to_payload(plan)
+        except Exception as error:  # noqa: BLE001
+            logger.exception(
+                "Execution bridge failed. symbol=%s scenario=%s canonical=%s error=%s",
+                payload.get("symbol"),
+                payload.get("scenario"),
+                canonical_scenario,
+                error,
+            )
+            execution_payload = {
+                "status": "INCOMPLETE",
+                "model": "NONE",
+                "entry_reference_price": None,
+                "invalidation_reference_price": None,
+                "target_reference_price": None,
+                "risk_reward_ratio": None,
+                "stop_distance": None,
+                "target_distance": None,
+                "execution_timeframe": None,
+                "trigger_reason": f"execution_bridge_exception:{type(error).__name__}",
+            }
+
+        payload["execution"] = execution_payload
+        payload["execution_status"] = execution_payload.get("status")
+        payload["execution_model"] = execution_payload.get("model")
+        payload["entry_reference_price"] = execution_payload.get("entry_reference_price")
+        payload["invalidation_reference_price"] = execution_payload.get("invalidation_reference_price")
+        payload["target_reference_price"] = execution_payload.get("target_reference_price")
+        payload["risk_reward_ratio"] = execution_payload.get("risk_reward_ratio")
+        payload["stop_distance"] = execution_payload.get("stop_distance")
+        payload["target_distance"] = execution_payload.get("target_distance")
+        payload["execution_timeframe"] = execution_payload.get("execution_timeframe")
+        payload["trigger_reason"] = execution_payload.get("trigger_reason")
+
+        metadata["execution_bridge_status"] = execution_payload.get("status")
+        metadata["execution_bridge_model"] = execution_payload.get("model")
+        metadata["execution_bridge_scenario"] = canonical_scenario
+        metadata["execution_bridge_reason"] = execution_payload.get("trigger_reason")
+
+        return payload
+
+    def _mark_execution_bridge_block(
+        self,
+        payload: dict[str, Any],
+        *,
+        reason: str,
+        detail: str | None = None,
+    ) -> dict[str, Any]:
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            payload["metadata"] = metadata
+
+        metadata["execution_bridge_status"] = "SKIPPED"
+        metadata["execution_bridge_reason"] = reason
+        metadata["execution_bridge_detail"] = detail
+
+        execution = payload.get("execution")
+        if not isinstance(execution, dict):
+            execution = {}
+
+        execution.setdefault("status", "NOT_EXECUTABLE")
+        execution.setdefault("model", "NONE")
+        execution.setdefault("entry_reference_price", None)
+        execution.setdefault("invalidation_reference_price", None)
+        execution.setdefault("target_reference_price", None)
+        execution.setdefault("risk_reward_ratio", None)
+        execution.setdefault("stop_distance", None)
+        execution.setdefault("target_distance", None)
+        execution.setdefault("execution_timeframe", None)
+        execution["trigger_reason"] = execution.get("trigger_reason") or reason
+
+        payload["execution"] = execution
+        payload["execution_status"] = execution.get("status")
+        payload["execution_model"] = execution.get("model")
+        payload["trigger_reason"] = execution.get("trigger_reason")
+        return payload
+
+    def _infer_execution_bridge_scenario(self, payload: dict[str, Any]) -> str | None:
+        direction = str(payload.get("direction") or "").upper()
+        if direction not in {"LONG", "SHORT"}:
+            return None
+
+        scenario = str(payload.get("scenario") or payload.get("scenario_type") or "").upper()
+        setup_type = str(payload.get("setup_type") or "").upper()
+
+        if (
+            "SWEEP_RETURN" in scenario
+            or "RETURN_TO_VALUE" in scenario
+            or setup_type == "SWEEP_RETURN_TO_VALUE"
+        ):
+            return f"SWEEP_RETURN_{direction}"
+
+        if (
+            "TREND_CONTINUATION" in scenario
+            or "CONTINUATION" in scenario
+            or "IMPULSE" in scenario
+            or setup_type == "IMPULSE_PULLBACK_CONTINUATION"
+        ):
+            return f"TREND_CONTINUATION_{direction}"
+
+        return None
+
+    @staticmethod
+    def _execution_plan_to_payload(plan: Any) -> dict[str, Any]:
+        if plan is None:
+            return {
+                "status": "NOT_EXECUTABLE",
+                "model": "NONE",
+                "entry_reference_price": None,
+                "invalidation_reference_price": None,
+                "target_reference_price": None,
+                "risk_reward_ratio": None,
+                "stop_distance": None,
+                "target_distance": None,
+                "execution_timeframe": None,
+                "trigger_reason": "execution_plan_none",
+            }
+
+        raw = to_jsonable(plan)
+        if not isinstance(raw, dict):
+            raw = {}
+
+        return {
+            "status": raw.get("status", "NOT_EXECUTABLE"),
+            "model": raw.get("model", "NONE"),
+            "entry_reference_price": raw.get("entry_reference_price"),
+            "invalidation_reference_price": raw.get("invalidation_reference_price"),
+            "target_reference_price": raw.get("target_reference_price"),
+            "risk_reward_ratio": raw.get("risk_reward_ratio"),
+            "stop_distance": raw.get("stop_distance"),
+            "target_distance": raw.get("target_distance"),
+            "execution_timeframe": raw.get("execution_timeframe"),
+            "trigger_reason": raw.get("trigger_reason"),
+        }
 
     def _force_payload_symbol(
         self,
@@ -1891,13 +2124,22 @@ class StatefulBatchRunner:
             engine = ScenarioEngine()
             return engine.run(context=context, setups=setups)
 
-        except ModuleNotFoundError:
-            return None
-
-        except Exception as error:
+        except ModuleNotFoundError as error:
+            logger.exception("ScenarioEngine module import failed: %s", error)
             return {
                 "scenario_engine_failed": True,
                 "scenario_engine_error": str(error),
+                "scenario_engine_error_type": type(error).__name__,
+                "scenario_engine_stage": "module_import",
+            }
+
+        except Exception as error:
+            logger.exception("ScenarioEngine runtime failed: %s", error)
+            return {
+                "scenario_engine_failed": True,
+                "scenario_engine_error": str(error),
+                "scenario_engine_error_type": type(error).__name__,
+                "scenario_engine_stage": "runtime",
             }
 
     def _select_final_signal(self, context: Any, setups: list[Any], scenario: Any) -> Any:
