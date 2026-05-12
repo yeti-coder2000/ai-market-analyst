@@ -44,11 +44,12 @@ from app.services.signal_tracker import SignalTracker, SignalTrackerResult
 from app.services.statistics import build_and_export_statistics
 from app.services.telegram_formatter import format_signal_message
 from app.services.telegram_notifier import build_telegram_notifier
+from app.services.telegram_alert_store import record_telegram_alert
 from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.4.3-execution-bridge-v1"
+RUNNER_VERSION = "1.4.4-telegram-alert-store-v1"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -2675,14 +2676,43 @@ class StatefulBatchRunner:
 
         try:
             sent = self.telegram.send_alert_payload(payload)
+            sent_at_utc = now_iso() if sent else None
 
             if sent and payload.get("signal_id"):
                 self.signal_tracker.mark_alert_sent(
                     payload["signal_id"],
                     alert_type=payload.get("alert_type"),
+                    sent_at_utc=sent_at_utc,
                 )
 
             if sent:
+                try:
+                    payload["telegram_sent_at_utc"] = sent_at_utc
+                    alert_snapshot = record_telegram_alert(
+                        payload,
+                        sent_at_utc=sent_at_utc,
+                        source="stateful_batch_runner",
+                    )
+                    payload["telegram_alert_id"] = alert_snapshot.get("alert_id")
+
+                    logger.info(
+                        "Telegram alert snapshot recorded. symbol=%s alert_type=%s signal_id=%s alert_id=%s outcome=%s",
+                        payload.get("symbol"),
+                        payload.get("alert_type"),
+                        payload.get("signal_id"),
+                        alert_snapshot.get("alert_id"),
+                        alert_snapshot.get("outcome_status"),
+                    )
+
+                except Exception as snapshot_error:  # noqa: BLE001
+                    logger.exception(
+                        "Telegram alert snapshot recording failed. symbol=%s alert_type=%s signal_id=%s error=%s",
+                        payload.get("symbol"),
+                        payload.get("alert_type"),
+                        payload.get("signal_id"),
+                        snapshot_error,
+                    )
+
                 logger.info(
                     "Telegram alert sent. symbol=%s alert_type=%s signal_id=%s rr=%s",
                     payload.get("symbol"),
