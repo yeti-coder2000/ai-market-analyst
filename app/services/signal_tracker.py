@@ -525,6 +525,17 @@ class SignalTracker:
         payload["execution_timeframe"] = execution.get("execution_timeframe")
         payload["trigger_reason"] = trigger_reason
 
+        signal_alignment = self._infer_signal_alignment(direction, htf_bias)
+        payload["signal_alignment"] = signal_alignment
+        payload["signal_alignment_marker"] = self._signal_alignment_marker(signal_alignment)
+        payload["signal_alignment_label"] = self._signal_alignment_label(signal_alignment)
+
+        stop_quality, stop_quality_reason, theoretical_rr, practical_rr = self._infer_stop_quality(payload)
+        payload["stop_quality"] = stop_quality
+        payload["stop_quality_reason"] = stop_quality_reason
+        payload["theoretical_rr"] = theoretical_rr
+        payload["practical_rr"] = practical_rr
+
         return payload
 
     def _normalize_execution(self, execution: Any) -> dict[str, Any]:
@@ -681,6 +692,17 @@ class SignalTracker:
         merged["target_distance"] = execution.get("target_distance")
         merged["execution_timeframe"] = execution.get("execution_timeframe")
         merged["trigger_reason"] = merged.get("trigger_reason") or execution.get("trigger_reason")
+
+        signal_alignment = self._infer_signal_alignment(merged.get("direction"), merged.get("htf_bias"))
+        merged["signal_alignment"] = signal_alignment
+        merged["signal_alignment_marker"] = self._signal_alignment_marker(signal_alignment)
+        merged["signal_alignment_label"] = self._signal_alignment_label(signal_alignment)
+
+        stop_quality, stop_quality_reason, theoretical_rr, practical_rr = self._infer_stop_quality(merged)
+        merged["stop_quality"] = stop_quality
+        merged["stop_quality_reason"] = stop_quality_reason
+        merged["theoretical_rr"] = theoretical_rr
+        merged["practical_rr"] = practical_rr
 
         return merged
 
@@ -842,6 +864,53 @@ class SignalTracker:
             else:
                 current = getattr(current, key, None)
         return current
+
+
+    @staticmethod
+    def _infer_signal_alignment(direction: Any, htf_bias: Any) -> str:
+        direction_text = str(direction or "").strip().upper()
+        htf_text = str(htf_bias or "").strip().upper()
+        if direction_text not in {"LONG", "SHORT"}:
+            return "NO_DIRECTION"
+        if htf_text == "NEUTRAL" or not htf_text:
+            return "NEUTRAL_HTF"
+        if htf_text not in {"LONG", "SHORT"}:
+            return "UNKNOWN_HTF"
+        if direction_text == htf_text:
+            return "TREND_ALIGNED"
+        return "COUNTER_TREND"
+
+    @staticmethod
+    def _signal_alignment_marker(alignment: Any) -> str:
+        mapping = {"TREND_ALIGNED":"🟢", "COUNTER_TREND":"🔴", "NEUTRAL_HTF":"⚪", "NO_DIRECTION":"⚫", "UNKNOWN_HTF":"⚫"}
+        return mapping.get(str(alignment or "UNKNOWN_HTF").upper(), "⚫")
+
+    @staticmethod
+    def _signal_alignment_label(alignment: Any) -> str:
+        mapping = {"TREND_ALIGNED":"TREND-ALIGNED", "COUNTER_TREND":"COUNTER-TREND", "NEUTRAL_HTF":"NEUTRAL HTF", "NO_DIRECTION":"NO DIRECTION", "UNKNOWN_HTF":"UNKNOWN HTF"}
+        return mapping.get(str(alignment or "UNKNOWN_HTF").upper(), "UNKNOWN HTF")
+
+    @staticmethod
+    def _min_stop_distance_by_symbol(symbol: Any) -> float | None:
+        mapping = {"XAUUSD":8.0, "BTCUSD":100.0, "ETHUSD":3.0, "EURUSD":0.00050, "GBPUSD":0.00060, "AUDUSD":0.00040, "USDCHF":0.00050, "USDCAD":0.00050, "USDJPY":0.08, "GER40":30.0, "NAS100":50.0, "SPX500":8.0, "UKOIL":0.20}
+        return mapping.get(str(symbol or "").upper())
+
+    def _infer_stop_quality(self, payload: dict[str, Any]) -> tuple[str, str | None, float | None, float | None]:
+        symbol = payload.get("symbol") or payload.get("instrument")
+        entry = self._float_or_none(payload.get("entry_reference_price"))
+        stop = self._float_or_none(payload.get("invalidation_reference_price"))
+        target = self._float_or_none(payload.get("target_reference_price"))
+        rr = self._float_or_none(payload.get("risk_reward_ratio"))
+        if entry is None or stop is None:
+            return "UNKNOWN", None, rr, None
+        min_stop = self._min_stop_distance_by_symbol(symbol)
+        if min_stop is None:
+            return "UNKNOWN", None, rr, rr
+        stop_distance = abs(entry - stop)
+        if stop_distance < min_stop:
+            practical_rr = round(abs(target - entry) / min_stop, 3) if target is not None and min_stop else None
+            return "TIGHT_STOP", f"stop_distance {stop_distance:.6f} below practical_min_stop {min_stop:.6f}", rr, practical_rr
+        return "OK", None, rr, rr
 
     @staticmethod
     def _force_not_executable(execution: dict[str, Any], *, reason: str) -> dict[str, Any]:

@@ -33,6 +33,16 @@ def _safe_float(value: Any, default: float | None = 0.0) -> float | None:
         return default
 
 
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is None:
+            continue
+        if value == "":
+            continue
+        return value
+    return None
+
+
 def _format_price(value: Any) -> str:
     if value is None:
         return "не задано"
@@ -146,6 +156,125 @@ def humanize_bias(bias: str) -> str:
     return mapping.get(_safe_str(bias, "NEUTRAL"), _safe_str(bias, "Neutral"))
 
 
+def infer_signal_alignment(direction: Any, htf_bias: Any) -> str:
+    direction_text = _safe_str(direction, "").upper()
+    htf_text = _safe_str(htf_bias, "").upper()
+
+    if direction_text not in {"LONG", "SHORT"}:
+        return "NO_DIRECTION"
+    if htf_text == "NEUTRAL" or not htf_text:
+        return "NEUTRAL_HTF"
+    if htf_text not in {"LONG", "SHORT"}:
+        return "UNKNOWN_HTF"
+    if direction_text == htf_text:
+        return "TREND_ALIGNED"
+    return "COUNTER_TREND"
+
+
+def signal_alignment_marker(alignment: Any) -> str:
+    mapping = {
+        "TREND_ALIGNED": "🟢",
+        "COUNTER_TREND": "🔴",
+        "NEUTRAL_HTF": "⚪",
+        "NO_DIRECTION": "⚫",
+        "UNKNOWN_HTF": "⚫",
+    }
+    return mapping.get(_safe_str(alignment, "UNKNOWN_HTF").upper(), "⚫")
+
+
+def signal_alignment_label(alignment: Any) -> str:
+    mapping = {
+        "TREND_ALIGNED": "TREND-ALIGNED",
+        "COUNTER_TREND": "COUNTER-TREND",
+        "NEUTRAL_HTF": "NEUTRAL HTF",
+        "NO_DIRECTION": "NO DIRECTION",
+        "UNKNOWN_HTF": "UNKNOWN HTF",
+    }
+    return mapping.get(_safe_str(alignment, "UNKNOWN_HTF").upper(), "UNKNOWN HTF")
+
+
+def build_alignment_text(signal_payload: dict) -> str:
+    alignment = _safe_str(signal_payload.get("signal_alignment"), "")
+    if alignment in {"", "-"}:
+        alignment = infer_signal_alignment(
+            signal_payload.get("direction"),
+            signal_payload.get("htf_bias"),
+        )
+
+    marker = _safe_str(
+        signal_payload.get("signal_alignment_marker"),
+        signal_alignment_marker(alignment),
+    )
+    label = _safe_str(
+        signal_payload.get("signal_alignment_label"),
+        signal_alignment_label(alignment),
+    )
+    return f"{marker} {label}"
+
+
+MIN_STOP_DISTANCE_BY_SYMBOL = {
+    "XAUUSD": 8.0,
+    "BTCUSD": 100.0,
+    "ETHUSD": 3.0,
+    "EURUSD": 0.00050,
+    "GBPUSD": 0.00060,
+    "AUDUSD": 0.00040,
+    "USDCHF": 0.00050,
+    "USDCAD": 0.00050,
+    "USDJPY": 0.08,
+    "GER40": 30.0,
+    "NAS100": 50.0,
+    "SPX500": 8.0,
+    "UKOIL": 0.20,
+}
+
+
+def infer_stop_quality(signal_payload: dict) -> tuple[str, str | None]:
+    symbol = _safe_str(signal_payload.get("symbol"), "").upper()
+    entry = _safe_float(
+        _first_present(signal_payload.get("entry_reference_price"), signal_payload.get("entry")),
+        None,
+    )
+    stop = _safe_float(
+        _first_present(
+            signal_payload.get("invalidation_reference_price"),
+            signal_payload.get("stop_loss"),
+            signal_payload.get("stop"),
+        ),
+        None,
+    )
+
+    if entry is None or stop is None:
+        return "UNKNOWN", None
+
+    stop_distance = abs(entry - stop)
+    min_stop = MIN_STOP_DISTANCE_BY_SYMBOL.get(symbol)
+
+    if min_stop is None:
+        return "UNKNOWN", None
+
+    if stop_distance < min_stop:
+        return (
+            "TIGHT_STOP",
+            f"⚠️ TIGHT STOP / RR INFLATED: stop distance {_format_price(stop_distance)} is below practical minimum {_format_price(min_stop)} for {symbol}.",
+        )
+
+    return "OK", None
+
+
+def build_execution_warning_text(signal_payload: dict) -> str | None:
+    explicit_quality = _safe_str(signal_payload.get("stop_quality"), "").upper()
+    explicit_reason = _safe_str(signal_payload.get("stop_quality_reason"), "")
+
+    if explicit_quality == "TIGHT_STOP" and explicit_reason not in {"", "-"}:
+        return f"⚠️ TIGHT STOP / RR INFLATED: {explicit_reason}"
+
+    quality, reason = infer_stop_quality(signal_payload)
+    if quality == "TIGHT_STOP":
+        return reason
+    return None
+
+
 def humanize_execution_model(model: str) -> str:
     mapping = {
         "LIMIT_ON_RETEST": "Limit on Retest",
@@ -252,6 +381,7 @@ def build_levels_text(signal_payload: dict) -> str:
     target = signal_payload.get("target_reference_price")
     entry = signal_payload.get("entry_reference_price")
     rr = signal_payload.get("risk_reward_ratio")
+    practical_rr = signal_payload.get("practical_rr")
     execution_model = signal_payload.get("execution_model")
     execution_status = signal_payload.get("execution_status")
     execution_timeframe = signal_payload.get("execution_timeframe")
@@ -264,6 +394,9 @@ def build_levels_text(signal_payload: dict) -> str:
         f"Target: {_format_price(target)}",
         f"RR: {_format_rr(rr)}",
     ]
+
+    if practical_rr is not None and practical_rr != rr:
+        lines.append(f"Practical RR estimate: {_format_rr(practical_rr)}")
 
     if execution_timeframe not in {"", "-"}:
         lines.append(f"TF execution: {_safe_str(execution_timeframe)}")
@@ -281,10 +414,13 @@ def format_signal_message(signal_payload: dict) -> FormattedTelegramMessage:
     htf_bias = humanize_bias(signal_payload.get("htf_bias"))
     signal_id = signal_payload.get("signal_id")
     execution_status = _safe_str(signal_payload.get("execution_status"), "NOT_EXECUTABLE")
+    alignment_text = build_alignment_text(signal_payload)
+    execution_warning = build_execution_warning_text(signal_payload)
 
     title = f"{humanize_stage(stage)} | {symbol} | {direction}"
 
     body_parts = [
+        alignment_text,
         f"Сценарій: {scenario}",
         (
             f"Ринок: {market_state} | HTF: {htf_bias} | "
@@ -306,6 +442,9 @@ def format_signal_message(signal_payload: dict) -> FormattedTelegramMessage:
         "",
         build_levels_text(signal_payload),
     ]
+
+    if execution_warning:
+        body_parts.extend(["", "Execution warning:", execution_warning])
 
     if stage == "WATCH" and execution_status != "EXECUTABLE":
         body_parts.extend([
