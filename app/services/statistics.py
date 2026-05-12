@@ -103,6 +103,32 @@ class SignalRecord:
     invalidation_reference_price: Optional[float]
     target_reference_price: Optional[float]
 
+    # Diagnostic / transparency fields.
+    # These do not change signal logic. They only explain why a signal is or is not executable.
+    phase: Optional[str] = None
+    status: Optional[str] = None
+    setup_type: Optional[str] = None
+    setup_name: Optional[str] = None
+    dominant_setup: Optional[str] = None
+    alignment_score: Optional[float] = None
+
+    next_expected_event: Optional[str] = None
+    missing_conditions: list[str] | None = None
+    reason: Optional[str] = None
+    rationale: Optional[str] = None
+
+    execution_quality_reason: Optional[str] = None
+    promotion_blocker: Optional[str] = None
+
+    signal_alignment: Optional[str] = None
+    signal_alignment_marker: Optional[str] = None
+    signal_alignment_label: Optional[str] = None
+
+    stop_quality: Optional[str] = None
+    stop_quality_reason: Optional[str] = None
+    theoretical_rr: Optional[float] = None
+    practical_rr: Optional[float] = None
+
     execution_status: Optional[str] = None
     execution_model: Optional[str] = None
     risk_reward_ratio: Optional[float] = None
@@ -152,6 +178,218 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _safe_list_str(value: Any) -> list[str]:
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        return [str(x) for x in value if x is not None]
+
+    if isinstance(value, (tuple, set)):
+        return [str(x) for x in value if x is not None]
+
+    return [str(value)]
+
+
+def _metadata_dict(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+
+    metadata = payload.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _execution_payload_dict(payload: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+
+    execution = payload.get("execution")
+    return execution if isinstance(execution, dict) else {}
+
+
+def _clean_text(value: Any) -> str | None:
+    if value in [None, "", [], {}]:
+        return None
+    return str(value)
+
+
+def _execution_quality_reason(payload: dict[str, Any] | None) -> str | None:
+    payload = payload or {}
+    metadata = _metadata_dict(payload)
+    execution = _execution_payload_dict(payload)
+
+    value = (
+        payload.get("execution_quality_reason")
+        or metadata.get("execution_quality_reason")
+        or metadata.get("promotion_blocker")
+        or execution.get("execution_quality_reason")
+    )
+    return _clean_text(value)
+
+
+def _infer_promotion_blocker(payload: dict[str, Any] | None) -> str:
+    """
+    Human-readable reason why a signal did not become executable.
+
+    This is intentionally diagnostic-only. It does not change signal state,
+    Telegram behavior, risk model, or scenario promotion rules.
+    """
+    payload = payload or {}
+    metadata = _metadata_dict(payload)
+    execution = _execution_payload_dict(payload)
+
+    execution_status = (
+        payload.get("execution_status")
+        or execution.get("status")
+        or metadata.get("execution_status")
+    )
+    execution_status_text = str(execution_status or "").upper()
+
+    if execution_status_text == "EXECUTABLE":
+        return "EXECUTABLE"
+
+    trigger_reason = (
+        payload.get("trigger_reason")
+        or execution.get("trigger_reason")
+        or metadata.get("execution_quality_reason")
+        or metadata.get("promotion_blocker")
+    )
+    if trigger_reason:
+        return str(trigger_reason)
+
+    missing_conditions = _safe_list_str(payload.get("missing_conditions"))
+    if missing_conditions:
+        return "missing:" + ",".join(missing_conditions)
+
+    next_expected_event = payload.get("next_expected_event")
+    if next_expected_event:
+        return "waiting_for:" + str(next_expected_event)
+
+    signal_class = str(payload.get("signal_class") or "").upper()
+    status = str(payload.get("status") or "").upper()
+    direction = str(payload.get("direction") or "").upper()
+    htf_bias = str(payload.get("htf_bias") or metadata.get("htf_bias") or "").upper()
+    scenario = str(payload.get("scenario") or payload.get("scenario_type") or "").upper()
+
+    if scenario == "NO_ACTION":
+        return "no_dominant_scenario"
+
+    if direction == "NEUTRAL":
+        return "neutral_direction"
+
+    if htf_bias == "NEUTRAL":
+        return "neutral_htf_bias"
+
+    if status in {"NO_SETUP", "IDLE", "EDGE_FORMING"}:
+        return "setup_not_ready"
+
+    if signal_class in {"SCENARIO_FORMING", "WATCH"}:
+        return "pre_ready_state"
+
+    return "not_executable_unknown_reason"
+
+
+
+# =============================================================================
+# DERIVED SIGNAL QUALITY FIELDS: ALIGNMENT + PRACTICAL STOP QUALITY
+# =============================================================================
+
+MIN_STOP_DISTANCE_BY_SYMBOL: dict[str, float] = {
+    "XAUUSD": 15.0,
+    "BTCUSD": 100.0,
+    "ETHUSD": 8.0,
+    "EURUSD": 0.0005,
+    "GBPUSD": 0.0007,
+    "AUDUSD": 0.0005,
+    "USDJPY": 0.08,
+    "USDCHF": 0.0005,
+    "USDCAD": 0.0007,
+    "GER40": 25.0,
+    "NAS100": 35.0,
+    "SPX500": 8.0,
+    "UKOIL": 0.25,
+}
+
+
+def _derive_signal_alignment(direction: Any, htf_bias: Any) -> tuple[str, str, str]:
+    d = str(direction or "").strip().upper()
+    h = str(htf_bias or "").strip().upper()
+
+    if d not in {"LONG", "SHORT"}:
+        return "NO_DIRECTION", "⚫", "NO DIRECTION"
+
+    if h == "NEUTRAL":
+        return "NEUTRAL_HTF", "⚪", "NEUTRAL HTF"
+
+    if h not in {"LONG", "SHORT"}:
+        return "UNKNOWN_HTF", "⚫", "UNKNOWN HTF"
+
+    if d == h:
+        return "TREND_ALIGNED", "🟢", "TREND-ALIGNED"
+
+    return "COUNTER_TREND", "🔴", "COUNTER-TREND"
+
+
+def _derive_stop_quality(rec: SignalRecord) -> tuple[str, str, float | None, float | None]:
+    theoretical_rr = rec.risk_reward_ratio
+
+    entry = rec.entry_reference_price
+    stop = rec.invalidation_reference_price
+    target = rec.target_reference_price
+
+    if entry is None or stop is None or target is None:
+        return "UNKNOWN", "missing entry/stop/target", theoretical_rr, None
+
+    try:
+        entry_f = float(entry)
+        stop_f = float(stop)
+        target_f = float(target)
+    except (TypeError, ValueError):
+        return "UNKNOWN", "invalid entry/stop/target", theoretical_rr, None
+
+    stop_distance = abs(entry_f - stop_f)
+    target_distance = abs(target_f - entry_f)
+
+    symbol = str(rec.symbol or "").upper()
+    min_stop = MIN_STOP_DISTANCE_BY_SYMBOL.get(symbol)
+
+    if stop_distance <= 0:
+        return "INVALID", "stop distance is zero or negative", theoretical_rr, None
+
+    if min_stop is None:
+        return "OK", "no instrument-specific practical stop threshold", theoretical_rr, theoretical_rr
+
+    if stop_distance < min_stop:
+        practical_rr = round(target_distance / min_stop, 3) if min_stop > 0 else None
+        return (
+            "TIGHT_STOP",
+            f"stop_distance {stop_distance:.5f} below practical_min_stop {min_stop:.5f}",
+            theoretical_rr,
+            practical_rr,
+        )
+
+    return (
+        "OK",
+        f"stop_distance {stop_distance:.5f} >= practical_min_stop {min_stop:.5f}",
+        theoretical_rr,
+        theoretical_rr,
+    )
+
+
+def _apply_record_derived_fields(rec: SignalRecord) -> SignalRecord:
+    alignment, marker, label = _derive_signal_alignment(rec.direction, rec.htf_bias)
+    rec.signal_alignment = alignment
+    rec.signal_alignment_marker = marker
+    rec.signal_alignment_label = label
+
+    stop_quality, stop_reason, theoretical_rr, practical_rr = _derive_stop_quality(rec)
+    rec.stop_quality = stop_quality
+    rec.stop_quality_reason = stop_reason
+    rec.theoretical_rr = theoretical_rr
+    rec.practical_rr = practical_rr
+
+    return rec
+
 def _enum_value(value: Any) -> Any:
     return getattr(value, "value", value)
 
@@ -166,110 +404,6 @@ def _nested_get(obj: Any, *keys: str) -> Any:
         else:
             current = getattr(current, key, None)
     return current
-
-
-
-
-MIN_STOP_DISTANCE_BY_SYMBOL = {
-    "XAUUSD": 8.0,
-    "BTCUSD": 100.0,
-    "ETHUSD": 3.0,
-    "EURUSD": 0.00050,
-    "GBPUSD": 0.00060,
-    "AUDUSD": 0.00040,
-    "USDCHF": 0.00050,
-    "USDCAD": 0.00050,
-    "USDJPY": 0.08,
-    "GER40": 30.0,
-    "NAS100": 50.0,
-    "SPX500": 8.0,
-    "UKOIL": 0.20,
-}
-
-
-def _infer_signal_alignment(direction: Any, htf_bias: Any) -> str:
-    direction_text = str(direction or "").strip().upper()
-    htf_text = str(htf_bias or "").strip().upper()
-
-    if direction_text not in {"LONG", "SHORT"}:
-        return "NO_DIRECTION"
-    if htf_text == "NEUTRAL" or not htf_text:
-        return "NEUTRAL_HTF"
-    if htf_text not in {"LONG", "SHORT"}:
-        return "UNKNOWN_HTF"
-    if direction_text == htf_text:
-        return "TREND_ALIGNED"
-    return "COUNTER_TREND"
-
-
-def _signal_alignment_marker(alignment: Any) -> str:
-    mapping = {
-        "TREND_ALIGNED": "🟢",
-        "COUNTER_TREND": "🔴",
-        "NEUTRAL_HTF": "⚪",
-        "NO_DIRECTION": "⚫",
-        "UNKNOWN_HTF": "⚫",
-    }
-    return mapping.get(str(alignment or "UNKNOWN_HTF").upper(), "⚫")
-
-
-def _signal_alignment_label(alignment: Any) -> str:
-    mapping = {
-        "TREND_ALIGNED": "TREND-ALIGNED",
-        "COUNTER_TREND": "COUNTER-TREND",
-        "NEUTRAL_HTF": "NEUTRAL HTF",
-        "NO_DIRECTION": "NO DIRECTION",
-        "UNKNOWN_HTF": "UNKNOWN HTF",
-    }
-    return mapping.get(str(alignment or "UNKNOWN_HTF").upper(), "UNKNOWN HTF")
-
-
-def _infer_stop_quality(symbol: str, entry: Any, stop: Any, rr: Any = None, target: Any = None) -> tuple[str, str | None, float | None, float | None]:
-    entry_f = _safe_float(entry, None)
-    stop_f = _safe_float(stop, None)
-    target_f = _safe_float(target, None)
-    rr_f = _safe_float(rr, None)
-
-    if entry_f is None or stop_f is None:
-        return "UNKNOWN", None, rr_f, None
-
-    min_stop = MIN_STOP_DISTANCE_BY_SYMBOL.get(str(symbol or "").upper())
-    if min_stop is None:
-        return "UNKNOWN", None, rr_f, rr_f
-
-    stop_distance = abs(entry_f - stop_f)
-    if stop_distance < min_stop:
-        practical_rr = None
-        if target_f is not None:
-            target_distance = abs(target_f - entry_f)
-            practical_rr = round(target_distance / min_stop, 3) if min_stop else None
-        return (
-            "TIGHT_STOP",
-            f"stop_distance {stop_distance:.6f} below practical_min_stop {min_stop:.6f}",
-            rr_f,
-            practical_rr,
-        )
-
-    return "OK", None, rr_f, rr_f
-
-
-def _apply_record_derived_fields(rec: SignalRecord) -> None:
-    alignment = _infer_signal_alignment(rec.direction, rec.htf_bias)
-    rec.signal_alignment = alignment
-    rec.signal_alignment_marker = _signal_alignment_marker(alignment)
-    rec.signal_alignment_label = _signal_alignment_label(alignment)
-
-    stop_quality, stop_quality_reason, theoretical_rr, practical_rr = _infer_stop_quality(
-        rec.symbol,
-        rec.entry_reference_price,
-        rec.invalidation_reference_price,
-        rec.risk_reward_ratio,
-        rec.target_reference_price,
-    )
-    rec.stop_quality = stop_quality
-    rec.stop_quality_reason = stop_quality_reason
-    rec.theoretical_rr = theoretical_rr
-    rec.practical_rr = practical_rr
 
 
 def _normalize_symbol(*values: Any) -> str:
@@ -525,6 +659,18 @@ def build_signal_records(events: list[dict]) -> list[SignalRecord]:
                     market_state=market_state,
                     htf_bias=htf_bias,
                     confidence=_safe_float(payload.get("confidence"), 0.0) or 0.0,
+                    phase=payload.get("phase"),
+                    status=payload.get("status"),
+                    setup_type=payload.get("setup_type"),
+                    setup_name=payload.get("setup_name"),
+                    dominant_setup=payload.get("dominant_setup"),
+                    alignment_score=_safe_float(payload.get("alignment_score"), None),
+                    next_expected_event=payload.get("next_expected_event"),
+                    missing_conditions=_safe_list_str(payload.get("missing_conditions")),
+                    reason=payload.get("reason"),
+                    rationale=payload.get("rationale"),
+                    execution_quality_reason=_execution_quality_reason(payload),
+                    promotion_blocker=_infer_promotion_blocker(payload),
                     entry_reference_price=_safe_float(payload.get("entry_reference_price"), None),
                     invalidation_reference_price=_safe_float(
                         payload.get("invalidation_reference_price"),
@@ -547,7 +693,6 @@ def build_signal_records(events: list[dict]) -> list[SignalRecord]:
                     ),
                     runner_version=event.get("runner_version"),
                 )
-                _apply_record_derived_fields(records[signal_id])
             continue
 
         if event_type == "signal_updated":
@@ -588,6 +733,30 @@ def build_signal_records(events: list[dict]) -> list[SignalRecord]:
                 _safe_float(updated_payload.get("confidence"), rec.confidence)
                 or rec.confidence
             )
+
+            rec.phase = updated_payload.get("phase", rec.phase)
+            rec.status = updated_payload.get("status", rec.status)
+            rec.setup_type = updated_payload.get("setup_type", rec.setup_type)
+            rec.setup_name = updated_payload.get("setup_name", rec.setup_name)
+            rec.dominant_setup = updated_payload.get("dominant_setup", rec.dominant_setup)
+            rec.alignment_score = _safe_float(
+                updated_payload.get("alignment_score"),
+                rec.alignment_score,
+            )
+            rec.next_expected_event = updated_payload.get(
+                "next_expected_event",
+                rec.next_expected_event,
+            )
+            rec.missing_conditions = _safe_list_str(
+                updated_payload.get("missing_conditions", rec.missing_conditions),
+            )
+            rec.reason = updated_payload.get("reason", rec.reason)
+            rec.rationale = updated_payload.get("rationale", rec.rationale)
+            rec.execution_quality_reason = (
+                _execution_quality_reason(updated_payload)
+                or rec.execution_quality_reason
+            )
+            rec.promotion_blocker = _infer_promotion_blocker(updated_payload)
 
             rec.entry_reference_price = _safe_float(
                 updated_payload.get("entry_reference_price"),
@@ -649,7 +818,6 @@ def build_signal_records(events: list[dict]) -> list[SignalRecord]:
             if symbol and symbol != "UNKNOWN" and rec.symbol in {"", "-", "UNKNOWN"}:
                 rec.symbol = symbol
 
-            _apply_record_derived_fields(rec)
             continue
 
         if event_type == "signal_resolved":
@@ -685,6 +853,30 @@ def build_signal_records(events: list[dict]) -> list[SignalRecord]:
 
             rec.final_status = payload.get("resolution")
             rec.resolution_reason = payload.get("resolution_note")
+
+            rec.phase = payload.get("phase", rec.phase)
+            rec.status = payload.get("status", rec.status)
+            rec.setup_type = payload.get("setup_type", rec.setup_type)
+            rec.setup_name = payload.get("setup_name", rec.setup_name)
+            rec.dominant_setup = payload.get("dominant_setup", rec.dominant_setup)
+            rec.alignment_score = _safe_float(
+                payload.get("alignment_score"),
+                rec.alignment_score,
+            )
+            rec.next_expected_event = payload.get(
+                "next_expected_event",
+                rec.next_expected_event,
+            )
+            rec.missing_conditions = _safe_list_str(
+                payload.get("missing_conditions", rec.missing_conditions),
+            )
+            rec.reason = payload.get("reason", rec.reason)
+            rec.rationale = payload.get("rationale", rec.rationale)
+            rec.execution_quality_reason = (
+                _execution_quality_reason(payload)
+                or rec.execution_quality_reason
+            )
+            rec.promotion_blocker = _infer_promotion_blocker(payload)
 
             rec.bars_alive = _safe_int(payload.get("bars_alive"), rec.bars_alive)
             rec.minutes_alive = _safe_int(payload.get("minutes_alive"), rec.minutes_alive)
@@ -731,7 +923,6 @@ def build_signal_records(events: list[dict]) -> list[SignalRecord]:
             if recovered_htf_bias:
                 rec.htf_bias = recovered_htf_bias
 
-            _apply_record_derived_fields(rec)
             continue
 
         if event_type == "signal_deduped":
@@ -753,7 +944,6 @@ def build_signal_records(events: list[dict]) -> list[SignalRecord]:
 
             rec = records[signal_id]
             rec.was_sent_to_telegram = True
-            _apply_record_derived_fields(rec)
             continue
 
     for rec in records.values():
@@ -999,13 +1189,84 @@ def compute_metrics_by_execution_model(records: list[SignalRecord]) -> dict:
     return out
 
 
+def _compute_grouped_record_metrics(items: list[SignalRecord]) -> dict:
+    total = len(items)
+    if total == 0:
+        return {
+            "signals_total": 0,
+            "validated_total": 0,
+            "invalidated_total": 0,
+            "expired_total": 0,
+            "validation_rate": 0.0,
+            "avg_confidence": 0.0,
+            "executable_signals": 0,
+            "executable_rate": 0.0,
+            "avg_rr": 0.0,
+        }
+
+    validated = sum(1 for r in items if r.final_status == "VALIDATED")
+    invalidated = sum(1 for r in items if r.final_status == "INVALIDATED")
+    expired = sum(1 for r in items if r.final_status == "EXPIRED")
+    executable = sum(1 for r in items if r.execution_status == "EXECUTABLE")
+    rr_values = [r.risk_reward_ratio for r in items if r.risk_reward_ratio is not None]
+
+    return {
+        "signals_total": total,
+        "validated_total": validated,
+        "invalidated_total": invalidated,
+        "expired_total": expired,
+        "validation_rate": round(validated / total, 4),
+        "avg_confidence": round(sum(r.confidence for r in items) / total, 6),
+        "executable_signals": executable,
+        "executable_rate": round(executable / total, 4),
+        "avg_rr": round(sum(rr_values) / len(rr_values), 3) if rr_values else 0.0,
+    }
+
+
+def compute_metrics_by_promotion_blocker(records: list[SignalRecord]) -> dict:
+    grouped: dict[str, list[SignalRecord]] = {}
+    for rec in records:
+        key = rec.promotion_blocker or "UNKNOWN"
+        grouped.setdefault(key, []).append(rec)
+
+    return {key: _compute_grouped_record_metrics(items) for key, items in grouped.items()}
+
+
+def compute_metrics_by_next_expected_event(records: list[SignalRecord]) -> dict:
+    grouped: dict[str, list[SignalRecord]] = {}
+    for rec in records:
+        key = rec.next_expected_event or "UNKNOWN"
+        grouped.setdefault(key, []).append(rec)
+
+    return {key: _compute_grouped_record_metrics(items) for key, items in grouped.items()}
+
+
+def compute_metrics_by_setup_type(records: list[SignalRecord]) -> dict:
+    grouped: dict[str, list[SignalRecord]] = {}
+    for rec in records:
+        key = rec.setup_type or "UNKNOWN"
+        grouped.setdefault(key, []).append(rec)
+
+    return {key: _compute_grouped_record_metrics(items) for key, items in grouped.items()}
+
+
+def compute_metrics_by_status(records: list[SignalRecord]) -> dict:
+    grouped: dict[str, list[SignalRecord]] = {}
+    for rec in records:
+        key = rec.status or "UNKNOWN"
+        grouped.setdefault(key, []).append(rec)
+
+    return {key: _compute_grouped_record_metrics(items) for key, items in grouped.items()}
+
+
 
 
 def compute_metrics_by_signal_alignment(records: list[SignalRecord]) -> dict:
     grouped: dict[str, list[SignalRecord]] = {}
     for rec in records:
-        key = rec.signal_alignment or _infer_signal_alignment(rec.direction, rec.htf_bias)
+        key = rec.signal_alignment or "UNKNOWN"
         grouped.setdefault(key, []).append(rec)
+
     return {key: _compute_grouped_record_metrics(items) for key, items in grouped.items()}
 
 
@@ -1014,6 +1275,7 @@ def compute_metrics_by_stop_quality(records: list[SignalRecord]) -> dict:
     for rec in records:
         key = rec.stop_quality or "UNKNOWN"
         grouped.setdefault(key, []).append(rec)
+
     return {key: _compute_grouped_record_metrics(items) for key, items in grouped.items()}
 
 def records_to_dataframe(records: list[SignalRecord]) -> pd.DataFrame:
@@ -1030,14 +1292,26 @@ def records_to_dataframe(records: list[SignalRecord]) -> pd.DataFrame:
             "direction",
             "market_state",
             "htf_bias",
-            "signal_alignment",
-            "signal_alignment_marker",
-            "signal_alignment_label",
-            "stop_quality",
-            "stop_quality_reason",
-            "theoretical_rr",
-            "practical_rr",
             "confidence",
+            "phase",
+            "status",
+            "setup_type",
+            "setup_name",
+            "dominant_setup",
+            "alignment_score",
+            "next_expected_event",
+            "missing_conditions",
+            "reason",
+            "rationale",
+            "execution_quality_reason",
+            "promotion_blocker",
+            "practical_rr",
+            "theoretical_rr",
+            "stop_quality_reason",
+            "stop_quality",
+            "signal_alignment_label",
+            "signal_alignment_marker",
+            "signal_alignment",
             "entry_reference_price",
             "invalidation_reference_price",
             "target_reference_price",
@@ -1105,6 +1379,12 @@ def build_statistics_bundle(
         "metrics_by_scenario": compute_metrics_by_scenario(records),
         "confidence_buckets": compute_confidence_buckets(records),
         "metrics_by_execution_model": compute_metrics_by_execution_model(records),
+        "metrics_by_promotion_blocker": compute_metrics_by_promotion_blocker(records),
+        "metrics_by_next_expected_event": compute_metrics_by_next_expected_event(records),
+        "metrics_by_setup_type": compute_metrics_by_setup_type(records),
+        "metrics_by_status": compute_metrics_by_status(records),
+        "metrics_by_signal_alignment": compute_metrics_by_signal_alignment(records),
+        "metrics_by_stop_quality": compute_metrics_by_stop_quality(records),
         "records_count": len(records),
         "events_count": len(events),
     }
@@ -1126,6 +1406,12 @@ def build_and_export_statistics(
         "metrics_by_scenario": compute_metrics_by_scenario(records),
         "confidence_buckets": compute_confidence_buckets(records),
         "metrics_by_execution_model": compute_metrics_by_execution_model(records),
+        "metrics_by_promotion_blocker": compute_metrics_by_promotion_blocker(records),
+        "metrics_by_next_expected_event": compute_metrics_by_next_expected_event(records),
+        "metrics_by_setup_type": compute_metrics_by_setup_type(records),
+        "metrics_by_status": compute_metrics_by_status(records),
+        "metrics_by_signal_alignment": compute_metrics_by_signal_alignment(records),
+        "metrics_by_stop_quality": compute_metrics_by_stop_quality(records),
         "records_count": len(records),
         "events_count": len(events),
     }
