@@ -75,6 +75,17 @@ def _first_present(*values: Any) -> Any:
     return None
 
 
+def _format_percent(value: Any) -> str:
+    number = _safe_float_or_none(value)
+    if number is None:
+        return "-"
+
+    if number <= 1:
+        return f"{number * 100:.0f}%"
+
+    return f"{number:.0f}%"
+
+
 def _truncate(text: str, max_len: int) -> str:
     if len(text) <= max_len:
         return text
@@ -249,11 +260,11 @@ def _normalize_alert_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     Normalize alert payload v2 into Telegram-compatible fields.
 
     Keeps original keys and adds compatibility aliases expected by the formatter.
-    Also adds derived risk labels:
-    - signal_alignment
-    - stop_quality
-    - theoretical_rr
-    - practical_rr
+
+    Important:
+    - trade_confidence is the value that explains why signal passed the Telegram gate.
+    - scenario_probability is the scenario/background probability and can be lower.
+    - Telegram displays both separately to avoid misleading "Probability: 45%" on READY signals.
     """
     normalized = dict(payload)
 
@@ -269,10 +280,26 @@ def _normalize_alert_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "watch_reason",
         normalized.get("rationale") or normalized.get("reason") or "-",
     )
+
+    normalized.setdefault(
+        "trade_confidence",
+        _first_present(
+            normalized.get("confidence"),
+            normalized.get("probability"),
+            normalized.get("trade_probability"),
+            normalized.get("signal_confidence"),
+        ),
+    )
+
     normalized.setdefault(
         "scenario_probability",
-        normalized.get("confidence") or normalized.get("scenario_probability") or 0.0,
+        _first_present(
+            normalized.get("scenario_probability"),
+            normalized.get("setup_probability"),
+            normalized.get("scenario_confidence"),
+        ),
     )
+
     normalized.setdefault(
         "invalidation_level",
         normalized.get("invalidation_reference_price"),
@@ -498,13 +525,15 @@ class TelegramNotifier:
         message = self.format_alert_payload(normalized_payload)
 
         logger.info(
-            "Sending Telegram alert. symbol=%s alert_type=%s signal_id=%s alignment=%s stop_quality=%s practical_rr=%s",
+            "Sending Telegram alert. symbol=%s alert_type=%s signal_id=%s alignment=%s stop_quality=%s practical_rr=%s trade_confidence=%s scenario_probability=%s",
             normalized_payload.get("symbol"),
             alert_type,
             normalized_payload.get("signal_id"),
             normalized_payload.get("signal_alignment"),
             normalized_payload.get("stop_quality"),
             normalized_payload.get("practical_rr"),
+            normalized_payload.get("trade_confidence"),
+            normalized_payload.get("scenario_probability"),
         )
         return self.send_text(message)
 
@@ -520,7 +549,19 @@ class TelegramNotifier:
         htf_bias = _escape_html(payload.get("htf_bias", "-"))
         invalidation_level = payload.get("invalidation_level")
         target_zone = payload.get("target_zone")
-        probability = _safe_float(payload.get("scenario_probability"), 0.0)
+
+        trade_confidence_raw = _first_present(
+            payload.get("trade_confidence"),
+            payload.get("confidence"),
+            payload.get("probability"),
+            payload.get("trade_probability"),
+            payload.get("signal_confidence"),
+        )
+        scenario_probability_raw = payload.get("scenario_probability")
+
+        trade_confidence_pct = _format_percent(trade_confidence_raw)
+        scenario_probability_pct = _format_percent(scenario_probability_raw)
+
         paper_mode = bool(payload.get("paper_mode", True))
         cycle_id = _escape_html(payload.get("cycle_id", "-"))
 
@@ -542,7 +583,6 @@ class TelegramNotifier:
         practical_rr = payload.get("practical_rr")
 
         header = self.config.paper_mode_prefix if paper_mode else self.config.live_mode_prefix
-        probability_pct = f"{probability * 100:.0f}%" if probability <= 1 else f"{probability:.0f}%"
 
         invalidation_str = (
             _escape_html(invalidation_level) if invalidation_level is not None else "-"
@@ -565,7 +605,15 @@ class TelegramNotifier:
                 f"<b>Alert:</b> {alert_type}",
                 f"<b>Scenario:</b> {scenario_type}",
                 f"<b>Direction:</b> {direction}",
-                f"<b>Probability:</b> {probability_pct}",
+                f"<b>Trade confidence:</b> {trade_confidence_pct}",
+            ]
+        )
+
+        if scenario_probability_raw is not None:
+            lines.append(f"<b>Scenario probability:</b> {scenario_probability_pct}")
+
+        lines.extend(
+            [
                 f"<b>Market state:</b> {market_state}",
                 f"<b>HTF bias:</b> {htf_bias}",
                 f"<b>Invalidation:</b> {invalidation_str}",
@@ -663,23 +711,26 @@ def send_alert_payload(payload: Dict[str, Any]) -> bool:
 if __name__ == "__main__":
     sample_payload = {
         "should_alert": True,
-        "symbol": "BTCUSD",
+        "symbol": "AUDUSD",
         "signal_class": "READY",
-        "scenario": "SWEEP_RETURN_LONG",
-        "direction": "LONG",
-        "confidence": 0.7,
-        "rationale": "Sweep and return-to-value setup is fully confirmed.",
+        "alert_type": "ENTRY_READY",
+        "scenario": "SWEEP_RETURN_SHORT",
+        "scenario_type": "SWEEP_RETURN_SHORT",
+        "direction": "SHORT",
+        "confidence": 0.8,
+        "scenario_probability": 0.45,
+        "rationale": "Sweep-return scenario confirmed by setup engine. execution_quality_ok",
         "market_state": "TRANSITION",
-        "htf_bias": "SHORT",
-        "entry_reference_price": 78000,
-        "invalidation_reference_price": 77500,
-        "target_reference_price": 79000,
+        "htf_bias": "NEUTRAL",
+        "entry_reference_price": 0.72433,
+        "invalidation_reference_price": 0.72472,
+        "target_reference_price": 0.7232,
         "execution_status": "EXECUTABLE",
         "execution_model": "LIMIT_ON_RETEST",
-        "risk_reward_ratio": 2.0,
-        "paper_mode": True,
-        "cycle_id": "2026-03-31T10:00:00+00:00",
-        "signal_id": "TEST_SIGNAL",
+        "risk_reward_ratio": 2.9,
+        "paper_mode": False,
+        "cycle_id": "2026-05-13T12:49:17.416321+00:00",
+        "signal_id": "TEST_AUDUSD_SIGNAL",
     }
 
     notifier = build_telegram_notifier()
