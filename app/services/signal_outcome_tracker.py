@@ -154,6 +154,53 @@ def is_final(alert: dict[str, Any]) -> bool:
     return str(alert.get("outcome_status") or "").upper() in FINAL_STATUSES
 
 
+
+def add_note(alert: dict[str, Any], note: str) -> None:
+    if not note:
+        return
+
+    notes = alert.get("notes")
+    if not isinstance(notes, list):
+        notes = []
+        alert["notes"] = notes
+
+    if note not in notes:
+        notes.append(note)
+
+
+def normalize_existing_alert_metrics(alerts: list[dict[str, Any]]) -> int:
+    """
+    Repair old outcome records.
+
+    v1 could produce negative MFE_R/MAE_R when entry and SL were detected
+    on the same snapshot. Excursions are distances and cannot be negative.
+    """
+    changed = 0
+
+    for alert in alerts:
+        mfe_r = safe_float(alert.get("mfe_R"))
+        mae_r = safe_float(alert.get("mae_R"))
+
+        if mfe_r is not None and mfe_r < 0:
+            alert["mfe_R"] = 0.0
+            alert["mfe_price"] = alert.get("entry_reference_price")
+            add_note(
+                alert,
+                "mfe_R normalized to 0.0 because favorable excursion cannot be negative.",
+            )
+            changed += 1
+
+        if mae_r is not None and mae_r < 0:
+            alert["mae_R"] = 0.0
+            alert["mae_price"] = alert.get("entry_reference_price")
+            add_note(
+                alert,
+                "mae_R normalized to 0.0 because adverse excursion cannot be negative.",
+            )
+            changed += 1
+
+    return changed
+
 # =============================================================================
 # SNAPSHOT READER
 # =============================================================================
@@ -326,6 +373,10 @@ def update_mfe_mae(alert: dict[str, Any], price: float) -> None:
     else:
         return
 
+    # Excursions are distances. They cannot be negative.
+    favorable = max(0.0, favorable)
+    adverse = max(0.0, adverse)
+
     favorable_r = round(favorable / risk, 4)
     adverse_r = round(adverse / risk, 4)
 
@@ -334,11 +385,11 @@ def update_mfe_mae(alert: dict[str, Any], price: float) -> None:
 
     if current_mfe_r is None or favorable_r > current_mfe_r:
         alert["mfe_R"] = favorable_r
-        alert["mfe_price"] = price
+        alert["mfe_price"] = price if favorable_r > 0 else entry
 
     if current_mae_r is None or adverse_r > current_mae_r:
         alert["mae_R"] = adverse_r
-        alert["mae_price"] = price
+        alert["mae_price"] = price if adverse_r > 0 else entry
 
 
 def mark_entry_triggered(alert: dict[str, Any], *, ts: datetime, price: float) -> None:
@@ -466,6 +517,7 @@ def update_single_alert_from_snapshot(
     changed = True
 
     entry_triggered = bool(alert.get("entry_triggered"))
+    entry_triggered_on_this_snapshot = False
 
     if not entry_triggered:
         # If target is reached before limit entry, this is a missed move,
@@ -477,6 +529,7 @@ def update_single_alert_from_snapshot(
         if should_trigger_entry(alert, price):
             mark_entry_triggered(alert, ts=ts, price=price)
             entry_triggered = True
+            entry_triggered_on_this_snapshot = True
             changed = True
 
     if entry_triggered:
@@ -485,14 +538,26 @@ def update_single_alert_from_snapshot(
         # Conservative order:
         # SL first avoids over-crediting ambiguous snapshot moves.
         if is_sl_hit(alert, price):
+            if entry_triggered_on_this_snapshot:
+                add_note(
+                    alert,
+                    "Entry and SL detected on same snapshot. Conservative SL.",
+                )
             mark_sl_hit(alert, ts=ts, price=price)
             return True
 
         if is_tp_hit(alert, price):
+            if entry_triggered_on_this_snapshot:
+                add_note(
+                    alert,
+                    "Entry and TP detected on same snapshot. Conservative TP.",
+                )
             mark_tp_hit(alert, ts=ts, price=price)
             return True
 
     return changed
+
+
 
 
 # =============================================================================
@@ -558,12 +623,19 @@ def track_outcomes(
     dry_run: bool = False,
 ) -> dict[str, Any]:
     alerts = load_telegram_alerts(alerts_path)
+
+    normalization_changes = normalize_existing_alert_metrics(alerts)
     active_alerts = collect_active_alerts(alerts)
 
     now_dt = datetime.now(timezone.utc)
 
     if not active_alerts:
         summary = build_summary(alerts)
+
+        if normalization_changes and not dry_run:
+            alerts.sort(key=lambda x: str(x.get("sent_at_utc") or ""))
+            save_telegram_alerts(alerts, alerts_path)
+
         write_outcomes_report(
             alerts=alerts,
             summary=summary,
@@ -573,7 +645,7 @@ def track_outcomes(
         return {
             "status": "ok",
             "message": "no active alerts",
-            "changed": 0,
+            "changed": normalization_changes,
             "summary": summary,
         }
 
@@ -582,7 +654,7 @@ def track_outcomes(
 
     since_utc = get_tracking_start_time(active_alerts)
 
-    changed_count = 0
+    changed_count = normalization_changes
     snapshot_count = 0
 
     for snapshot in iter_relevant_snapshots(
@@ -631,8 +703,11 @@ def track_outcomes(
         "snapshot_count": snapshot_count,
         "active_alerts": len(active_alerts),
         "changed": changed_count,
+        "normalization_changes": normalization_changes,
         "summary": summary,
     }
+
+
 
 
 # =============================================================================
