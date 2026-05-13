@@ -14,6 +14,13 @@ Runs configured batch groups sequentially:
 Telegram trade alerts are NOT generated here.
 They remain inside stateful_batch_runner hard gate:
 READY + EXECUTABLE + RR 2-10 + complete geometry.
+
+Telegram admin messages are controlled separately by:
+ENABLE_TELEGRAM_ADMIN_MESSAGES=true/false
+
+Default:
+- trade Telegram alerts stay enabled through normal alert pipeline
+- admin boot/stop messages are disabled by default to avoid Telegram spam
 """
 
 import os
@@ -232,21 +239,35 @@ def main() -> int:
         or os.getenv("FX_MAJOR_DELAY_AFTER_CORE_SEC"),
         300,
     )
+
+    # General Telegram flag.
+    # Keep this enabled if trade alerts must work.
     enable_telegram = _to_bool(
         os.getenv("ENABLE_TELEGRAM"),
         bool(getattr(settings, "enable_telegram", False)),
     )
+
+    # Admin Telegram flag.
+    # This controls only boot/stop service messages.
+    # It does NOT affect ENTRY_READY / trade alerts from stateful_batch_runner.
+    enable_telegram_admin_messages = _to_bool(
+        os.getenv("ENABLE_TELEGRAM_ADMIN_MESSAGES"),
+        bool(getattr(settings, "enable_telegram_admin_messages", False)),
+    )
+
     run_once = _to_bool(os.getenv("RUN_ONCE"), False)
 
     heartbeat = HeartbeatService()
     notifier = TelegramNotifier()
 
     worker_logger.info(
-        "Config groups=%s interval_sec=%s delay_between_groups_sec=%s run_once=%s",
+        "Config groups=%s interval_sec=%s delay_between_groups_sec=%s run_once=%s enable_telegram=%s enable_telegram_admin_messages=%s",
         groups,
         interval_sec,
         delay_between_groups_sec,
         run_once,
+        enable_telegram,
+        enable_telegram_admin_messages,
     )
 
     try:
@@ -260,7 +281,11 @@ def main() -> int:
             symbol="-",
         )
 
-    if enable_telegram and getattr(notifier, "is_active", False):
+    if (
+        enable_telegram
+        and enable_telegram_admin_messages
+        and getattr(notifier, "is_active", False)
+    ):
         try:
             notifier.send_admin_message(
                 _boot_message(groups, interval_sec, delay_between_groups_sec)
@@ -273,6 +298,13 @@ def main() -> int:
                 cycle_id="-",
                 symbol="-",
             )
+    else:
+        worker_logger.info(
+            "Telegram admin boot message skipped. enable_telegram=%s enable_admin_messages=%s notifier_active=%s",
+            enable_telegram,
+            enable_telegram_admin_messages,
+            getattr(notifier, "is_active", False),
+        )
 
     if startup_grace_sec > 0:
         worker_logger.info("Startup grace sleep: %ss", startup_grace_sec)
@@ -345,7 +377,11 @@ def main() -> int:
             symbol="-",
         )
 
-    if enable_telegram and getattr(notifier, "is_active", False):
+    if (
+        enable_telegram
+        and enable_telegram_admin_messages
+        and getattr(notifier, "is_active", False)
+    ):
         try:
             notifier.send_admin_message(_stop_message())
         except Exception as exc:
@@ -356,6 +392,13 @@ def main() -> int:
                 cycle_id="-",
                 symbol="-",
             )
+    else:
+        worker_logger.info(
+            "Telegram admin stop message skipped. enable_telegram=%s enable_admin_messages=%s notifier_active=%s",
+            enable_telegram,
+            enable_telegram_admin_messages,
+            getattr(notifier, "is_active", False),
+        )
 
     worker_logger.info("Multi-group worker stopped.")
     return 0
