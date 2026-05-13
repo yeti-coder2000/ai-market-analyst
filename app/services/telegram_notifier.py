@@ -12,6 +12,27 @@ from urllib import error, parse, request
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# TELEGRAM NOTIFIER CONFIG / HELPERS
+# =============================================================================
+
+MIN_STOP_DISTANCE_BY_SYMBOL: dict[str, float] = {
+    "XAUUSD": 15.0,
+    "BTCUSD": 100.0,
+    "ETHUSD": 8.0,
+    "EURUSD": 0.0005,
+    "GBPUSD": 0.0007,
+    "AUDUSD": 0.0005,
+    "USDJPY": 0.08,
+    "USDCHF": 0.0005,
+    "USDCAD": 0.0007,
+    "GER40": 25.0,
+    "NAS100": 35.0,
+    "SPX500": 8.0,
+    "UKOIL": 0.25,
+}
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -33,6 +54,25 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _safe_float_or_none(value: Any) -> float | None:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is None:
+            continue
+        if value == "":
+            continue
+        return value
+    return None
 
 
 def _truncate(text: str, max_len: int) -> str:
@@ -70,6 +110,98 @@ def _normalize_target_zone(value: Any) -> str:
 
     text = str(value).strip()
     return _escape_html(text) if text else "-"
+
+
+def _normalize_direction(value: Any) -> str:
+    direction = str(value or "NEUTRAL").strip().upper()
+    if direction in {"LONG", "SHORT", "NEUTRAL"}:
+        return direction
+    return "NEUTRAL"
+
+
+def _normalize_htf_bias(value: Any) -> str:
+    htf_bias = str(value or "NEUTRAL").strip().upper()
+    if htf_bias in {"LONG", "SHORT", "NEUTRAL"}:
+        return htf_bias
+    return "NEUTRAL"
+
+
+def _derive_signal_alignment(direction: Any, htf_bias: Any) -> tuple[str, str, str]:
+    d = _normalize_direction(direction)
+    h = _normalize_htf_bias(htf_bias)
+
+    if d not in {"LONG", "SHORT"}:
+        return "NO_DIRECTION", "⚫", "NO DIRECTION"
+
+    if h == "NEUTRAL":
+        return "NEUTRAL_HTF", "⚪", "NEUTRAL HTF"
+
+    if h not in {"LONG", "SHORT"}:
+        return "UNKNOWN_HTF", "⚫", "UNKNOWN HTF"
+
+    if d == h:
+        return "TREND_ALIGNED", "🟢", "TREND-ALIGNED"
+
+    return "COUNTER_TREND", "🔴", "COUNTER-TREND"
+
+
+def _derive_stop_quality(
+    *,
+    symbol: Any,
+    entry: Any,
+    stop: Any,
+    target: Any,
+    rr: Any,
+) -> tuple[str, str, float | None, float | None]:
+    """
+    Returns:
+    - stop_quality
+    - stop_quality_reason
+    - theoretical_rr
+    - practical_rr
+    """
+    symbol_text = str(symbol or "").strip().upper()
+    entry_f = _safe_float_or_none(entry)
+    stop_f = _safe_float_or_none(stop)
+    target_f = _safe_float_or_none(target)
+    rr_f = _safe_float_or_none(rr)
+
+    theoretical_rr = rr_f
+
+    if entry_f is None or stop_f is None or target_f is None:
+        return "UNKNOWN", "missing entry/stop/target", theoretical_rr, None
+
+    stop_distance = abs(entry_f - stop_f)
+    target_distance = abs(target_f - entry_f)
+
+    if stop_distance <= 0:
+        return "INVALID", "stop distance is zero or negative", theoretical_rr, None
+
+    min_stop = MIN_STOP_DISTANCE_BY_SYMBOL.get(symbol_text)
+
+    if min_stop is None:
+        return (
+            "OK",
+            "no instrument-specific practical stop threshold",
+            theoretical_rr,
+            theoretical_rr,
+        )
+
+    if stop_distance < min_stop:
+        practical_rr = round(target_distance / min_stop, 3) if min_stop > 0 else None
+        return (
+            "TIGHT_STOP",
+            f"stop_distance {stop_distance:.5f} below practical_min_stop {min_stop:.5f}",
+            theoretical_rr,
+            practical_rr,
+        )
+
+    return (
+        "OK",
+        f"stop_distance {stop_distance:.5f} >= practical_min_stop {min_stop:.5f}",
+        theoretical_rr,
+        theoretical_rr,
+    )
 
 
 def _infer_alert_type(payload: Dict[str, Any]) -> str:
@@ -117,6 +249,11 @@ def _normalize_alert_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     Normalize alert payload v2 into Telegram-compatible fields.
 
     Keeps original keys and adds compatibility aliases expected by the formatter.
+    Also adds derived risk labels:
+    - signal_alignment
+    - stop_quality
+    - theoretical_rr
+    - practical_rr
     """
     normalized = dict(payload)
 
@@ -144,6 +281,51 @@ def _normalize_alert_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if "target_zone" not in normalized:
         target = normalized.get("target_reference_price")
         normalized["target_zone"] = [target] if target is not None else []
+
+    direction = normalized.get("direction")
+    htf_bias = normalized.get("htf_bias")
+
+    signal_alignment, signal_alignment_marker, signal_alignment_label = _derive_signal_alignment(
+        direction,
+        htf_bias,
+    )
+
+    normalized.setdefault("signal_alignment", signal_alignment)
+    normalized.setdefault("signal_alignment_marker", signal_alignment_marker)
+    normalized.setdefault("signal_alignment_label", signal_alignment_label)
+
+    entry = _first_present(
+        normalized.get("entry_reference_price"),
+        normalized.get("entry"),
+    )
+    stop = _first_present(
+        normalized.get("invalidation_reference_price"),
+        normalized.get("stop_loss"),
+        normalized.get("stop"),
+    )
+    target = _first_present(
+        normalized.get("target_reference_price"),
+        normalized.get("take_profit"),
+        normalized.get("target"),
+    )
+    rr = _first_present(
+        normalized.get("risk_reward_ratio"),
+        normalized.get("rr"),
+        normalized.get("risk_reward"),
+    )
+
+    stop_quality, stop_quality_reason, theoretical_rr, practical_rr = _derive_stop_quality(
+        symbol=normalized.get("symbol"),
+        entry=entry,
+        stop=stop,
+        target=target,
+        rr=rr,
+    )
+
+    normalized.setdefault("stop_quality", stop_quality)
+    normalized.setdefault("stop_quality_reason", stop_quality_reason)
+    normalized.setdefault("theoretical_rr", theoretical_rr)
+    normalized.setdefault("practical_rr", practical_rr)
 
     return normalized
 
@@ -316,14 +498,19 @@ class TelegramNotifier:
         message = self.format_alert_payload(normalized_payload)
 
         logger.info(
-            "Sending Telegram alert. symbol=%s alert_type=%s signal_id=%s",
+            "Sending Telegram alert. symbol=%s alert_type=%s signal_id=%s alignment=%s stop_quality=%s practical_rr=%s",
             normalized_payload.get("symbol"),
             alert_type,
             normalized_payload.get("signal_id"),
+            normalized_payload.get("signal_alignment"),
+            normalized_payload.get("stop_quality"),
+            normalized_payload.get("practical_rr"),
         )
         return self.send_text(message)
 
     def format_alert_payload(self, payload: Dict[str, Any]) -> str:
+        payload = _normalize_alert_payload(payload)
+
         symbol = _escape_html(payload.get("symbol", "UNKNOWN"))
         alert_type = _escape_html(payload.get("alert_type", "UNKNOWN"))
         scenario_type = _escape_html(payload.get("scenario_type", "UNKNOWN"))
@@ -345,6 +532,15 @@ class TelegramNotifier:
         risk_reward_ratio = payload.get("risk_reward_ratio")
         signal_id = _escape_html(payload.get("signal_id", "-"))
 
+        signal_alignment = str(payload.get("signal_alignment") or "UNKNOWN")
+        signal_alignment_marker = str(payload.get("signal_alignment_marker") or "⚫")
+        signal_alignment_label = str(payload.get("signal_alignment_label") or signal_alignment)
+
+        stop_quality = str(payload.get("stop_quality") or "UNKNOWN")
+        stop_quality_reason = str(payload.get("stop_quality_reason") or "")
+        theoretical_rr = payload.get("theoretical_rr")
+        practical_rr = payload.get("practical_rr")
+
         header = self.config.paper_mode_prefix if paper_mode else self.config.live_mode_prefix
         probability_pct = f"{probability * 100:.0f}%" if probability <= 1 else f"{probability:.0f}%"
 
@@ -355,20 +551,31 @@ class TelegramNotifier:
 
         lines = [
             f"<b>{header} | {symbol}</b>",
-            "",
-            f"<b>Alert:</b> {alert_type}",
-            f"<b>Scenario:</b> {scenario_type}",
-            f"<b>Direction:</b> {direction}",
-            f"<b>Probability:</b> {probability_pct}",
-            f"<b>Market state:</b> {market_state}",
-            f"<b>HTF bias:</b> {htf_bias}",
-            f"<b>Invalidation:</b> {invalidation_str}",
-            f"<b>Target zone:</b> {target_zone_str}",
-            f"<b>Cycle:</b> {cycle_id}",
-            "",
-            f"<b>Execution status:</b> {execution_status}",
-            f"<b>Execution model:</b> {execution_model}",
+            f"<b>{_escape_html(signal_alignment_marker)} {_escape_html(signal_alignment_label)}</b>",
         ]
+
+        if stop_quality == "TIGHT_STOP":
+            lines.append("<b>⚠️ TIGHT STOP / RR INFLATED</b>")
+        elif stop_quality == "INVALID":
+            lines.append("<b>⛔ INVALID STOP GEOMETRY</b>")
+
+        lines.extend(
+            [
+                "",
+                f"<b>Alert:</b> {alert_type}",
+                f"<b>Scenario:</b> {scenario_type}",
+                f"<b>Direction:</b> {direction}",
+                f"<b>Probability:</b> {probability_pct}",
+                f"<b>Market state:</b> {market_state}",
+                f"<b>HTF bias:</b> {htf_bias}",
+                f"<b>Invalidation:</b> {invalidation_str}",
+                f"<b>Target zone:</b> {target_zone_str}",
+                f"<b>Cycle:</b> {cycle_id}",
+                "",
+                f"<b>Execution status:</b> {execution_status}",
+                f"<b>Execution model:</b> {execution_model}",
+            ]
+        )
 
         if entry_reference_price is not None:
             lines.append(f"<b>Entry:</b> {_escape_html(entry_reference_price)}")
@@ -378,6 +585,25 @@ class TelegramNotifier:
             lines.append(f"<b>Target:</b> {_escape_html(target_reference_price)}")
         if risk_reward_ratio is not None:
             lines.append(f"<b>RR:</b> {_escape_html(risk_reward_ratio)}")
+
+        if practical_rr is not None and theoretical_rr is not None:
+            try:
+                practical_rr_f = float(practical_rr)
+                theoretical_rr_f = float(theoretical_rr)
+
+                if abs(practical_rr_f - theoretical_rr_f) >= 0.05:
+                    lines.append(f"<b>Practical RR:</b> {_escape_html(f'{practical_rr_f:.2f}')}")
+            except (TypeError, ValueError):
+                pass
+        elif practical_rr is not None:
+            try:
+                lines.append(f"<b>Practical RR:</b> {_escape_html(f'{float(practical_rr):.2f}')}")
+            except (TypeError, ValueError):
+                lines.append(f"<b>Practical RR:</b> {_escape_html(practical_rr)}")
+
+        if stop_quality in {"TIGHT_STOP", "INVALID"} and stop_quality_reason:
+            lines.append(f"<b>Stop quality:</b> {_escape_html(stop_quality)}")
+            lines.append(f"<b>Stop note:</b> {_escape_html(stop_quality_reason)}")
 
         lines.extend(
             [
