@@ -4,6 +4,7 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 import json
+import os
 from pathlib import Path
 import time
 from typing import Any, Optional
@@ -49,7 +50,7 @@ from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.4.4-telegram-alert-store-v1"
+RUNNER_VERSION = "1.4.5-memory-safe-stats-v1"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -57,6 +58,13 @@ RUNNER_VERSION = "1.4.4-telegram-alert-store-v1"
 TELEGRAM_MIN_RR = 2.0
 TELEGRAM_MAX_RR = 10.0
 TELEGRAM_MIN_CONFIDENCE = 0.60
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 # =============================================================================
@@ -1042,10 +1050,15 @@ class StatefulBatchRunner:
                 },
             )
 
-            try:
-                build_and_export_statistics()
-            except Exception as stats_error:
-                cycle_logger.warning(f"Statistics export failed: {stats_error}")
+            if _env_bool("ENABLE_AUTO_STATISTICS_EXPORT", False):
+                try:
+                    build_and_export_statistics()
+                except Exception as stats_error:
+                    cycle_logger.warning(f"Statistics export failed: {stats_error}")
+            else:
+                cycle_logger.info(
+                    "Statistics export skipped. ENABLE_AUTO_STATISTICS_EXPORT=false"
+                )
 
             cycle_logger.info(
                 f"Batch cycle finished. batch_group={self.batch_group} status={cycle_status} instruments={len(normalized_instruments)} errors={len(cycle_errors)} skipped={skipped_count}"
