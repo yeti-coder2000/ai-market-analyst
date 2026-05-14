@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 from urllib import error, parse, request
 
+from app.services.telegram_formatter import format_signal_message
+
 
 logger = logging.getLogger(__name__)
 
@@ -257,9 +259,11 @@ def _infer_alert_type(payload: Dict[str, Any]) -> str:
 
 def _normalize_alert_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Normalize alert payload v2 into Telegram-compatible fields.
+    Normalize alert payload v3 into Telegram-compatible fields.
 
-    Keeps original keys and adds compatibility aliases expected by the formatter.
+    Keeps original keys and adds compatibility aliases expected by both:
+    - legacy HTML formatter
+    - Ukrainian telegram_formatter.py
 
     Important:
     - trade_confidence is the value that explains why signal passed the Telegram gate.
@@ -272,10 +276,15 @@ def _normalize_alert_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if alert_type:
         normalized["alert_type"] = alert_type
 
-    normalized.setdefault(
-        "scenario_type",
-        normalized.get("scenario") or normalized.get("scenario_type") or "UNKNOWN",
+    scenario_value = _first_present(
+        normalized.get("scenario"),
+        normalized.get("scenario_type"),
+        "UNKNOWN",
     )
+
+    normalized.setdefault("scenario", scenario_value)
+    normalized.setdefault("scenario_type", scenario_value)
+
     normalized.setdefault(
         "watch_reason",
         normalized.get("rationale") or normalized.get("reason") or "-",
@@ -306,8 +315,8 @@ def _normalize_alert_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     if "target_zone" not in normalized:
-        target = normalized.get("target_reference_price")
-        normalized["target_zone"] = [target] if target is not None else []
+        target_for_zone = normalized.get("target_reference_price")
+        normalized["target_zone"] = [target_for_zone] if target_for_zone is not None else []
 
     direction = normalized.get("direction")
     htf_bias = normalized.get("htf_bias")
@@ -329,6 +338,7 @@ def _normalize_alert_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized.get("invalidation_reference_price"),
         normalized.get("stop_loss"),
         normalized.get("stop"),
+        normalized.get("invalidation_level"),
     )
     target = _first_present(
         normalized.get("target_reference_price"),
@@ -340,6 +350,20 @@ def _normalize_alert_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized.get("rr"),
         normalized.get("risk_reward"),
     )
+
+    if entry is not None:
+        normalized.setdefault("entry_reference_price", entry)
+
+    if stop is not None:
+        normalized.setdefault("invalidation_reference_price", stop)
+        normalized.setdefault("stop", stop)
+
+    if target is not None:
+        normalized.setdefault("target_reference_price", target)
+        normalized.setdefault("target", target)
+
+    if rr is not None:
+        normalized.setdefault("risk_reward_ratio", rr)
 
     stop_quality, stop_quality_reason, theoretical_rr, practical_rr = _derive_stop_quality(
         symbol=normalized.get("symbol"),
@@ -353,6 +377,17 @@ def _normalize_alert_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     normalized.setdefault("stop_quality_reason", stop_quality_reason)
     normalized.setdefault("theoretical_rr", theoretical_rr)
     normalized.setdefault("practical_rr", practical_rr)
+
+    # Formatter compatibility.
+    # telegram_formatter.py uses stage/signal_class and execution_status to render READY/WATCH.
+    if "stage" not in normalized:
+        if str(normalized.get("signal_class") or "").strip():
+            normalized["stage"] = normalized.get("signal_class")
+        elif normalized.get("alert_type") == "ENTRY_READY":
+            normalized["stage"] = "READY"
+
+    if "rationale" not in normalized and normalized.get("watch_reason"):
+        normalized["rationale"] = normalized.get("watch_reason")
 
     return normalized
 
@@ -370,6 +405,7 @@ class TelegramConfig:
     paper_mode_prefix: str = "🧪 PAPER"
     live_mode_prefix: str = "🚨 LIVE"
     max_message_length: int = 3900
+    use_ukrainian_formatter: bool = True
     allowed_alert_types: tuple[str, ...] = (
         "WATCH_NEW",
         "WATCH_UPGRADED",
@@ -406,6 +442,7 @@ class TelegramNotifier:
             paper_mode_prefix=os.getenv("TELEGRAM_PAPER_PREFIX", "🧪 PAPER").strip() or "🧪 PAPER",
             live_mode_prefix=os.getenv("TELEGRAM_LIVE_PREFIX", "🚨 LIVE").strip() or "🚨 LIVE",
             max_message_length=_safe_int(os.getenv("TELEGRAM_MAX_MESSAGE_LENGTH", "3900"), 3900),
+            use_ukrainian_formatter=_env_bool("ENABLE_UKRAINIAN_TELEGRAM_FORMATTER", True),
         )
 
     @property
@@ -525,7 +562,7 @@ class TelegramNotifier:
         message = self.format_alert_payload(normalized_payload)
 
         logger.info(
-            "Sending Telegram alert. symbol=%s alert_type=%s signal_id=%s alignment=%s stop_quality=%s practical_rr=%s trade_confidence=%s scenario_probability=%s",
+            "Sending Telegram alert. symbol=%s alert_type=%s signal_id=%s alignment=%s stop_quality=%s practical_rr=%s trade_confidence=%s scenario_probability=%s formatter=%s",
             normalized_payload.get("symbol"),
             alert_type,
             normalized_payload.get("signal_id"),
@@ -534,10 +571,49 @@ class TelegramNotifier:
             normalized_payload.get("practical_rr"),
             normalized_payload.get("trade_confidence"),
             normalized_payload.get("scenario_probability"),
+            "ukrainian" if self.config.use_ukrainian_formatter else "legacy_html",
         )
         return self.send_text(message)
 
     def format_alert_payload(self, payload: Dict[str, Any]) -> str:
+        payload = _normalize_alert_payload(payload)
+
+        if self.config.use_ukrainian_formatter:
+            try:
+                return self.format_alert_payload_ukrainian(payload)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(
+                    "Ukrainian telegram_formatter failed. Falling back to legacy HTML formatter. symbol=%s signal_id=%s error=%s",
+                    payload.get("symbol"),
+                    payload.get("signal_id"),
+                    exc,
+                )
+
+        return self.format_alert_payload_legacy_html(payload)
+
+    def format_alert_payload_ukrainian(self, payload: Dict[str, Any]) -> str:
+        """
+        Ukrainian human-facing live alert formatter.
+
+        telegram_formatter.py returns plain text. This notifier still sends messages
+        with parse_mode=HTML by default, so we escape the whole rendered message.
+        Telegram will display it as normal text while keeping line breaks and emojis.
+        """
+        payload = _normalize_alert_payload(payload)
+
+        formatted = format_signal_message(payload)
+        text = formatted.render()
+
+        # Escape for Telegram HTML parse_mode safety.
+        return _truncate(_escape_html(text), self.config.max_message_length)
+
+    def format_alert_payload_legacy_html(self, payload: Dict[str, Any]) -> str:
+        """
+        Legacy HTML formatter.
+
+        Kept as a safe fallback:
+        ENABLE_UKRAINIAN_TELEGRAM_FORMATTER=false
+        """
         payload = _normalize_alert_payload(payload)
 
         symbol = _escape_html(payload.get("symbol", "UNKNOWN"))
