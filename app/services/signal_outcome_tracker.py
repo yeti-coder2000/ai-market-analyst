@@ -15,7 +15,7 @@ from app.services.telegram_alert_store import (
 
 
 # =============================================================================
-# SIGNAL OUTCOME TRACKER v1
+# SIGNAL OUTCOME TRACKER v1.2
 # =============================================================================
 # Purpose:
 # - Track real Telegram ENTRY_READY signals from telegram_alerts.json.
@@ -25,6 +25,12 @@ from app.services.telegram_alert_store import (
 # - Safe to run manually:
 #
 #   python -m app.services.signal_outcome_tracker
+#
+# v1.2 changes:
+# - Fixed idempotent changed-counter.
+# - last_checked_at_utc / last_price are operational fields and do NOT count
+#   as material outcome changes.
+# - changed now means: number of alerts with real material outcome changes.
 #
 # v1 limitations:
 # - Uses snapshot price points, not candle high/low.
@@ -55,6 +61,29 @@ ACTIVE_STATUSES = {
 DEFAULT_EXPIRY_HOURS = 24
 
 
+# Fields that represent real outcome/statistical state.
+# Operational heartbeat fields like last_checked_at_utc / last_price are excluded.
+MATERIAL_FIELDS = (
+    "outcome_status",
+    "outcome_error",
+    "entry_triggered",
+    "entry_triggered_at_utc",
+    "tp_hit",
+    "tp_hit_at_utc",
+    "sl_hit",
+    "sl_hit_at_utc",
+    "expired",
+    "expired_at_utc",
+    "closed_at_utc",
+    "result_R",
+    "mfe_R",
+    "mfe_price",
+    "mae_R",
+    "mae_price",
+    "notes",
+)
+
+
 # =============================================================================
 # BASIC HELPERS
 # =============================================================================
@@ -72,7 +101,13 @@ def parse_utc(value: Any) -> datetime | None:
         text = str(value).strip()
         if not text:
             return None
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+
+        return dt
     except Exception:
         return None
 
@@ -147,12 +182,40 @@ def get_alert_expiry(alert: dict[str, Any]) -> datetime | None:
     if sent_at is None:
         return None
 
-    return sent_at.replace(tzinfo=timezone.utc) if sent_at.tzinfo is None else sent_at
+    # Current live alerts normally carry expires_at_utc.
+    # Keep fallback conservative: no implicit expiry if not provided.
+    return None
 
 
 def is_final(alert: dict[str, Any]) -> bool:
     return str(alert.get("outcome_status") or "").upper() in FINAL_STATUSES
 
+
+def alert_key(alert: dict[str, Any]) -> str:
+    return str(
+        alert.get("alert_id")
+        or alert.get("signal_id")
+        or f"{alert.get('symbol')}_{alert.get('sent_at_utc')}"
+        or id(alert)
+    )
+
+
+def stable_json(value: Any) -> str:
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    except TypeError:
+        return str(value)
+
+
+def material_fingerprint(alert: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+    return tuple(
+        (key, stable_json(alert.get(key)))
+        for key in MATERIAL_FIELDS
+    )
+
+
+def has_material_change(before: tuple[tuple[str, str], ...], alert: dict[str, Any]) -> bool:
+    return before != material_fingerprint(alert)
 
 
 def add_note(alert: dict[str, Any], note: str) -> None:
@@ -168,16 +231,23 @@ def add_note(alert: dict[str, Any], note: str) -> None:
         notes.append(note)
 
 
-def normalize_existing_alert_metrics(alerts: list[dict[str, Any]]) -> int:
+def normalize_existing_alert_metrics(alerts: list[dict[str, Any]]) -> set[str]:
     """
     Repair old outcome records.
 
     v1 could produce negative MFE_R/MAE_R when entry and SL were detected
     on the same snapshot. Excursions are distances and cannot be negative.
+
+    Returns alert keys that were materially changed.
     """
-    changed = 0
+    changed_alerts: set[str] = set()
 
     for alert in alerts:
+        if not isinstance(alert, dict):
+            continue
+
+        before = material_fingerprint(alert)
+
         mfe_r = safe_float(alert.get("mfe_R"))
         mae_r = safe_float(alert.get("mae_R"))
 
@@ -188,7 +258,6 @@ def normalize_existing_alert_metrics(alerts: list[dict[str, Any]]) -> int:
                 alert,
                 "mfe_R normalized to 0.0 because favorable excursion cannot be negative.",
             )
-            changed += 1
 
         if mae_r is not None and mae_r < 0:
             alert["mae_R"] = 0.0
@@ -197,9 +266,12 @@ def normalize_existing_alert_metrics(alerts: list[dict[str, Any]]) -> int:
                 alert,
                 "mae_R normalized to 0.0 because adverse excursion cannot be negative.",
             )
-            changed += 1
 
-    return changed
+        if has_material_change(before, alert):
+            changed_alerts.add(alert_key(alert))
+
+    return changed_alerts
+
 
 # =============================================================================
 # SNAPSHOT READER
@@ -452,11 +524,10 @@ def mark_missed_target_before_entry(
     alert["result_R"] = 0.0
     alert["last_checked_at_utc"] = ts.isoformat()
     alert["last_price"] = price
-    alert.setdefault("notes", [])
-    if isinstance(alert["notes"], list):
-        alert["notes"].append(
-            "Target was reached before limit entry was triggered. Not counted as TP."
-        )
+    add_note(
+        alert,
+        "Target was reached before limit entry was triggered. Not counted as TP.",
+    )
 
 
 def validate_alert_for_tracking(alert: dict[str, Any]) -> tuple[bool, str]:
@@ -498,23 +569,28 @@ def update_single_alert_from_snapshot(
     price: float,
 ) -> bool:
     """
-    Returns True if alert was changed.
+    Returns True only if alert had a material outcome/statistical change.
+
+    Important:
+    - last_checked_at_utc and last_price are operational tracking fields.
+    - They are updated for observability but do not count as material changes.
     """
     if is_final(alert):
         return False
 
-    changed = False
+    before = material_fingerprint(alert)
 
     valid, reason = validate_alert_for_tracking(alert)
     if not valid:
         alert["outcome_status"] = "INVALID"
         alert["outcome_error"] = reason
         alert["last_checked_at_utc"] = utc_now()
-        return True
+        alert["last_price"] = price
+        return has_material_change(before, alert)
 
+    # Operational heartbeat, not counted as material change.
     alert["last_checked_at_utc"] = ts.isoformat()
     alert["last_price"] = price
-    changed = True
 
     entry_triggered = bool(alert.get("entry_triggered"))
     entry_triggered_on_this_snapshot = False
@@ -524,13 +600,12 @@ def update_single_alert_from_snapshot(
         # not a real TP.
         if is_target_reached_before_entry(alert, price):
             mark_missed_target_before_entry(alert, ts=ts, price=price)
-            return True
+            return has_material_change(before, alert)
 
         if should_trigger_entry(alert, price):
             mark_entry_triggered(alert, ts=ts, price=price)
             entry_triggered = True
             entry_triggered_on_this_snapshot = True
-            changed = True
 
     if entry_triggered:
         update_mfe_mae(alert, price)
@@ -544,7 +619,7 @@ def update_single_alert_from_snapshot(
                     "Entry and SL detected on same snapshot. Conservative SL.",
                 )
             mark_sl_hit(alert, ts=ts, price=price)
-            return True
+            return has_material_change(before, alert)
 
         if is_tp_hit(alert, price):
             if entry_triggered_on_this_snapshot:
@@ -553,11 +628,9 @@ def update_single_alert_from_snapshot(
                     "Entry and TP detected on same snapshot. Conservative TP.",
                 )
             mark_tp_hit(alert, ts=ts, price=price)
-            return True
+            return has_material_change(before, alert)
 
-    return changed
-
-
+    return has_material_change(before, alert)
 
 
 # =============================================================================
@@ -586,6 +659,8 @@ def get_tracking_start_time(active_alerts: list[dict[str, Any]]) -> datetime | N
     times: list[datetime] = []
 
     for alert in active_alerts:
+        # Re-scan from sent_at for correctness.
+        # This is slower than last_checked_at_utc but safer while tracker is young.
         sent_at = parse_utc(alert.get("sent_at_utc"))
         if sent_at is not None:
             times.append(sent_at)
@@ -596,23 +671,29 @@ def get_tracking_start_time(active_alerts: list[dict[str, Any]]) -> datetime | N
     return min(times)
 
 
-def apply_expiry(alerts: list[dict[str, Any]], *, now_dt: datetime) -> int:
-    changed = 0
+def apply_expiry(alerts: list[dict[str, Any]], *, now_dt: datetime) -> set[str]:
+    changed_alerts: set[str] = set()
 
     for alert in alerts:
+        if not isinstance(alert, dict):
+            continue
+
         if is_final(alert):
             continue
 
-        expiry = parse_utc(alert.get("expires_at_utc"))
+        expiry = get_alert_expiry(alert)
         if expiry is None:
             continue
 
         if now_dt >= expiry:
+            before = material_fingerprint(alert)
             price = safe_float(alert.get("last_price"))
             mark_expired(alert, ts=now_dt, price=price)
-            changed += 1
 
-    return changed
+            if has_material_change(before, alert):
+                changed_alerts.add(alert_key(alert))
+
+    return changed_alerts
 
 
 def track_outcomes(
@@ -624,15 +705,17 @@ def track_outcomes(
 ) -> dict[str, Any]:
     alerts = load_telegram_alerts(alerts_path)
 
-    normalization_changes = normalize_existing_alert_metrics(alerts)
+    normalization_changed_alerts = normalize_existing_alert_metrics(alerts)
     active_alerts = collect_active_alerts(alerts)
 
     now_dt = datetime.now(timezone.utc)
 
+    changed_alerts: set[str] = set(normalization_changed_alerts)
+
     if not active_alerts:
         summary = build_summary(alerts)
 
-        if normalization_changes and not dry_run:
+        if changed_alerts and not dry_run:
             alerts.sort(key=lambda x: str(x.get("sent_at_utc") or ""))
             save_telegram_alerts(alerts, alerts_path)
 
@@ -642,10 +725,12 @@ def track_outcomes(
             path=outcomes_path,
             dry_run=dry_run,
         )
+
         return {
             "status": "ok",
             "message": "no active alerts",
-            "changed": normalization_changes,
+            "changed": len(changed_alerts),
+            "normalization_changes": len(normalization_changed_alerts),
             "summary": summary,
         }
 
@@ -654,7 +739,6 @@ def track_outcomes(
 
     since_utc = get_tracking_start_time(active_alerts)
 
-    changed_count = normalization_changes
     snapshot_count = 0
 
     for snapshot in iter_relevant_snapshots(
@@ -680,9 +764,10 @@ def track_outcomes(
                 continue
 
             if update_single_alert_from_snapshot(alert, ts=ts, price=price):
-                changed_count += 1
+                changed_alerts.add(alert_key(alert))
 
-    changed_count += apply_expiry(alerts, now_dt=now_dt)
+    expiry_changed_alerts = apply_expiry(alerts, now_dt=now_dt)
+    changed_alerts.update(expiry_changed_alerts)
 
     summary = build_summary(alerts)
 
@@ -702,12 +787,10 @@ def track_outcomes(
         "dry_run": dry_run,
         "snapshot_count": snapshot_count,
         "active_alerts": len(active_alerts),
-        "changed": changed_count,
-        "normalization_changes": normalization_changes,
+        "changed": len(changed_alerts),
+        "normalization_changes": len(normalization_changed_alerts),
         "summary": summary,
     }
-
-
 
 
 # =============================================================================
