@@ -12,29 +12,39 @@ from app.core.settings import settings
 
 
 # =============================================================================
-# DAILY SIGNAL REPORT v1
+# DAILY SIGNAL REPORT v1.1
 # =============================================================================
 # Purpose:
 # - Read signal_outcomes.json produced by app.services.signal_outcome_tracker.
-# - Build lightweight operational report for Telegram/console/dashboard usage.
+# - Build lightweight operational report for console/dashboard.
+# - Build short Telegram-ready daily report.
+# - Optionally read quality_tiers.json for weak-category diagnostics.
 # - No pandas.
 # - No external API calls.
 # - Safe to run manually:
 #
 #   python -m app.services.daily_signal_report
 #
-# Optional:
-#   python -m app.services.daily_signal_report --date 2026-05-14
-#   python -m app.services.daily_signal_report --timezone Europe/Kyiv
+# Telegram mode:
+#
+#   python -m app.services.daily_signal_report --telegram
+#   python -m app.services.daily_signal_report --telegram --date today
+#   python -m app.services.daily_signal_report --telegram --date 2026-05-14
+#
+# JSON mode:
+#
 #   python -m app.services.daily_signal_report --json
 #
 # Notes:
 # - Default mode reports ALL tracked Telegram alerts from signal_outcomes.json.
 # - Use --date YYYY-MM-DD to filter by sent_at_utc converted to selected timezone.
+# - --telegram renders a compact Ukrainian human-facing report.
+# - Technical enum values remain English: TP_HIT, SL_HIT, CAUTION, TIGHT_STOP, etc.
 # =============================================================================
 
 
 SIGNAL_OUTCOMES_PATH = settings.runtime_dir / "stats" / "signal_outcomes.json"
+QUALITY_TIERS_PATH = settings.runtime_dir / "stats" / "quality_tiers.json"
 REPORTS_DIR = settings.runtime_dir / "stats" / "reports"
 
 DEFAULT_TIMEZONE = os.getenv("DAILY_SIGNAL_REPORT_TZ", "Europe/Kyiv")
@@ -65,6 +75,24 @@ FINAL_STATUSES = {
     "EXPIRED_AFTER_ENTRY",
     "MISSED_TARGET_BEFORE_ENTRY",
     "INVALID",
+}
+
+QUALITY_TIER_SEVERITY = {
+    "NO_DATA": 0,
+    "A-GRADE": 1,
+    "INSUFFICIENT_SAMPLE": 2,
+    "OBSERVE": 3,
+    "CAUTION": 4,
+    "LOW_PRIORITY": 5,
+}
+
+QUALITY_TIER_MARKERS = {
+    "A-GRADE": "🟢",
+    "CAUTION": "🟠",
+    "OBSERVE": "🔵",
+    "LOW_PRIORITY": "🔴",
+    "INSUFFICIENT_SAMPLE": "⚪",
+    "NO_DATA": "⚫",
 }
 
 
@@ -133,6 +161,10 @@ def local_date_from_utc(value: Any, tz: ZoneInfo) -> date | None:
     return dt.astimezone(tz).date()
 
 
+def today_in_timezone(tz: ZoneInfo) -> date:
+    return datetime.now(timezone.utc).astimezone(tz).date()
+
+
 def format_pct(value: float | None) -> str:
     if value is None:
         return "n/a"
@@ -149,6 +181,16 @@ def format_float(value: float | None) -> str:
     if value is None:
         return "n/a"
     return f"{value:.2f}"
+
+
+def quality_marker(tier: Any) -> str:
+    tier_text = normalize_text(tier, "NO_DATA")
+    return QUALITY_TIER_MARKERS.get(tier_text, "⚫")
+
+
+def tier_severity(tier: Any) -> int:
+    tier_text = normalize_text(tier, "NO_DATA")
+    return QUALITY_TIER_SEVERITY.get(tier_text, 0)
 
 
 # =============================================================================
@@ -201,6 +243,45 @@ def load_signal_outcomes(path: Path = SIGNAL_OUTCOMES_PATH) -> dict[str, Any]:
     data["signals"] = [x for x in signals if isinstance(x, dict)]
     data.setdefault("summary", {})
     data.setdefault("updated_at_utc", utc_now())
+
+    return data
+
+
+def load_quality_tiers(path: Path = QUALITY_TIERS_PATH) -> dict[str, Any]:
+    if not path.exists():
+        return {
+            "schema_version": "missing",
+            "generated_at_utc": utc_now(),
+            "dimensions": {},
+            "signal_annotations": [],
+            "error": f"File does not exist: {path}",
+        }
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        return {
+            "schema_version": "invalid_json",
+            "generated_at_utc": utc_now(),
+            "dimensions": {},
+            "signal_annotations": [],
+            "error": f"Invalid JSON in {path}: {exc}",
+        }
+
+    if not isinstance(data, dict):
+        return {
+            "schema_version": "invalid_payload",
+            "generated_at_utc": utc_now(),
+            "dimensions": {},
+            "signal_annotations": [],
+            "error": f"Unsupported payload type: {type(data).__name__}",
+        }
+
+    if not isinstance(data.get("dimensions"), dict):
+        data["dimensions"] = {}
+
+    if not isinstance(data.get("signal_annotations"), list):
+        data["signal_annotations"] = []
 
     return data
 
@@ -349,7 +430,7 @@ def build_warnings(report: dict[str, Any]) -> list[str]:
     pending = metrics["pending_or_active"]
 
     if total == 0:
-        warnings.append("No signals in selected scope.")
+        warnings.append("NO_SIGNALS: no signals in selected scope.")
         return warnings
 
     if total < 30:
@@ -395,6 +476,116 @@ def build_warnings(report: dict[str, Any]) -> list[str]:
 
 
 # =============================================================================
+# QUALITY TIER SUMMARY
+# =============================================================================
+
+
+def extract_quality_dimensions(quality_payload: dict[str, Any]) -> dict[str, Any]:
+    dimensions = quality_payload.get("dimensions")
+    if isinstance(dimensions, dict):
+        return dimensions
+    return {}
+
+
+def extract_weak_quality_categories(
+    quality_payload: dict[str, Any],
+    *,
+    preferred_dimensions: tuple[str, ...] = (
+        "stop_quality",
+        "signal_alignment",
+        "scenario",
+        "execution_model",
+        "symbol",
+    ),
+    weak_tiers: set[str] | None = None,
+    max_items: int = 8,
+) -> list[dict[str, Any]]:
+    if weak_tiers is None:
+        weak_tiers = {"LOW_PRIORITY", "CAUTION", "OBSERVE"}
+
+    dimensions = extract_quality_dimensions(quality_payload)
+    categories: list[dict[str, Any]] = []
+
+    for dimension_name in preferred_dimensions:
+        dimension_data = dimensions.get(dimension_name)
+
+        if not isinstance(dimension_data, dict):
+            continue
+
+        for key, item in dimension_data.items():
+            if not isinstance(item, dict):
+                continue
+
+            quality = item.get("quality")
+            metrics = item.get("metrics")
+
+            if not isinstance(quality, dict) or not isinstance(metrics, dict):
+                continue
+
+            tier = normalize_text(quality.get("tier"), "NO_DATA")
+            if tier not in weak_tiers:
+                continue
+
+            categories.append(
+                {
+                    "dimension": dimension_name,
+                    "key": str(key),
+                    "tier": tier,
+                    "confidence": normalize_text(quality.get("confidence")),
+                    "action": normalize_text(quality.get("action")),
+                    "total_alerts": int(metrics.get("total_alerts") or 0),
+                    "tp_hit": int(metrics.get("tp_hit") or 0),
+                    "sl_hit": int(metrics.get("sl_hit") or 0),
+                    "missed_target_before_entry": int(metrics.get("missed_target_before_entry") or 0),
+                    "pending_or_active": int(metrics.get("pending_or_active") or 0),
+                    "winrate": safe_float(metrics.get("winrate")),
+                    "avg_result_R": safe_float(metrics.get("avg_result_R")),
+                }
+            )
+
+    categories.sort(
+        key=lambda x: (
+            -tier_severity(x.get("tier")),
+            -int(x.get("total_alerts") or 0),
+            str(x.get("dimension") or ""),
+            str(x.get("key") or ""),
+        )
+    )
+
+    return categories[:max_items]
+
+
+def extract_quality_tier_counts(quality_payload: dict[str, Any]) -> dict[str, int]:
+    tier_counts = quality_payload.get("tier_counts")
+    if isinstance(tier_counts, dict):
+        return {
+            str(k): int(v)
+            for k, v in tier_counts.items()
+            if isinstance(v, int) or str(v).isdigit()
+        }
+
+    dimensions = extract_quality_dimensions(quality_payload)
+    result: dict[str, int] = {}
+
+    for dimension_data in dimensions.values():
+        if not isinstance(dimension_data, dict):
+            continue
+
+        for item in dimension_data.values():
+            if not isinstance(item, dict):
+                continue
+
+            quality = item.get("quality")
+            if not isinstance(quality, dict):
+                continue
+
+            tier = normalize_text(quality.get("tier"), "NO_DATA")
+            result[tier] = result.get(tier, 0) + 1
+
+    return dict(sorted(result.items(), key=lambda x: x[0]))
+
+
+# =============================================================================
 # REPORT BUILDER
 # =============================================================================
 
@@ -402,9 +593,11 @@ def build_warnings(report: dict[str, Any]) -> list[str]:
 def build_report(
     *,
     payload: dict[str, Any],
+    quality_payload: dict[str, Any] | None,
     report_date: date | None,
     tz: ZoneInfo,
     source_path: Path,
+    quality_path: Path,
 ) -> dict[str, Any]:
     all_signals = payload.get("signals")
     if not isinstance(all_signals, list):
@@ -418,14 +611,24 @@ def build_report(
 
     scope = "all_tracked_alerts" if report_date is None else f"sent_date:{report_date.isoformat()}"
 
+    if quality_payload is None:
+        quality_payload = {
+            "dimensions": {},
+            "signal_annotations": [],
+            "error": "quality payload not loaded",
+        }
+
     report: dict[str, Any] = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "generated_at_utc": utc_now(),
         "timezone": str(tz),
         "scope": scope,
         "source_path": str(source_path),
+        "quality_path": str(quality_path),
         "source_updated_at_utc": payload.get("updated_at_utc"),
+        "quality_generated_at_utc": quality_payload.get("generated_at_utc"),
         "source_error": payload.get("error"),
+        "quality_error": quality_payload.get("error"),
         "metrics": build_basic_metrics(signals),
         "by_symbol": build_group_metrics(signals, "symbol"),
         "by_scenario": build_group_metrics(signals, "scenario"),
@@ -433,6 +636,8 @@ def build_report(
         "by_signal_alignment": build_group_metrics(signals, "signal_alignment"),
         "by_stop_quality": build_group_metrics(signals, "stop_quality"),
         "by_execution_model": build_group_metrics(signals, "execution_model"),
+        "quality_tier_counts": extract_quality_tier_counts(quality_payload),
+        "weak_quality_categories": extract_weak_quality_categories(quality_payload),
     }
 
     report["warnings"] = build_warnings(report)
@@ -441,7 +646,7 @@ def build_report(
 
 
 # =============================================================================
-# TEXT RENDERING
+# FULL TEXT RENDERING
 # =============================================================================
 
 
@@ -500,17 +705,23 @@ def render_text_report(report: dict[str, Any]) -> str:
 
     lines: list[str] = []
 
-    lines.append("📊 Daily Signal Report v1")
+    lines.append("📊 Daily Signal Report v1.1")
     lines.append("=" * 72)
     lines.append(f"Generated UTC: {report.get('generated_at_utc')}")
     lines.append(f"Timezone:      {report.get('timezone')}")
     lines.append(f"Scope:         {report.get('scope')}")
     lines.append(f"Source:        {report.get('source_path')}")
+    lines.append(f"Quality:       {report.get('quality_path')}")
     lines.append(f"Source update: {report.get('source_updated_at_utc')}")
+    lines.append(f"Quality gen:   {report.get('quality_generated_at_utc')}")
     lines.append("")
 
     if report.get("source_error"):
         lines.append(f"⚠️ Source error: {report.get('source_error')}")
+        lines.append("")
+
+    if report.get("quality_error"):
+        lines.append(f"⚠️ Quality error: {report.get('quality_error')}")
         lines.append("")
 
     lines.append("Summary")
@@ -531,6 +742,36 @@ def render_text_report(report: dict[str, Any]) -> str:
     lines.extend(render_group_block("By signal alignment", report.get("by_signal_alignment", {})))
     lines.extend(render_group_block("By stop quality", report.get("by_stop_quality", {})))
     lines.extend(render_group_block("By execution model", report.get("by_execution_model", {})))
+
+    tier_counts = report.get("quality_tier_counts") or {}
+    lines.append("")
+    lines.append("Quality tier counts")
+    lines.append("-" * 72)
+    if tier_counts:
+        for tier, count in sorted(tier_counts.items(), key=lambda x: x[0]):
+            lines.append(f"  - {tier}: {count}")
+    else:
+        lines.append("  - n/a")
+
+    weak_categories = report.get("weak_quality_categories") or []
+    lines.append("")
+    lines.append("Weak quality categories")
+    lines.append("-" * 72)
+    if weak_categories:
+        for item in weak_categories:
+            tier = normalize_text(item.get("tier"), "NO_DATA")
+            dimension = normalize_text(item.get("dimension"))
+            key = normalize_text(item.get("key"))
+            total_cat = int(item.get("total_alerts") or 0)
+            sl_cat = int(item.get("sl_hit") or 0)
+            missed_cat = int(item.get("missed_target_before_entry") or 0)
+            avg_cat = safe_float(item.get("avg_result_R"))
+            lines.append(
+                f"  - {dimension}={key}: tier={tier}, total={total_cat}, "
+                f"SL={sl_cat}, missed={missed_cat}, avgR={format_r(avg_cat)}"
+            )
+    else:
+        lines.append("  - n/a")
 
     warnings = report.get("warnings") or []
     lines.append("")
@@ -554,15 +795,162 @@ def render_text_report(report: dict[str, Any]) -> str:
 
 
 # =============================================================================
+# TELEGRAM TEXT RENDERING
+# =============================================================================
+
+
+def render_telegram_scope(report: dict[str, Any]) -> str:
+    scope = normalize_text(report.get("scope"), "all_tracked_alerts")
+
+    if scope == "all_tracked_alerts":
+        return "усі відстежені сигнали"
+
+    if scope.startswith("sent_date:"):
+        return scope.replace("sent_date:", "дата ")
+
+    return scope
+
+
+def render_telegram_warning(warning: str) -> str:
+    if warning.startswith("LOW_SAMPLE_SIZE"):
+        return "мала вибірка — висновки тільки ранні"
+    if warning.startswith("NO_WINNERS_YET"):
+        return "поки немає TP_HIT при наявних SL_HIT"
+    if warning.startswith("PENDING_ALERTS"):
+        return "є активні/незавершені сигнали"
+    if warning.startswith("TIGHT_STOP_WEAKNESS"):
+        return "TIGHT_STOP показує слабкість"
+    if warning.startswith("NEUTRAL_HTF_WEAKNESS"):
+        return "NEUTRAL_HTF показує слабкість"
+    if warning.startswith("NO_SIGNALS"):
+        return "немає сигналів у вибраному періоді"
+
+    return warning
+
+
+def render_telegram_weak_categories(
+    categories: list[dict[str, Any]],
+    *,
+    max_items: int = 5,
+) -> list[str]:
+    lines: list[str] = []
+
+    if not categories:
+        lines.append("- немає слабких категорій у поточному зрізі")
+        return lines
+
+    for item in categories[:max_items]:
+        tier = normalize_text(item.get("tier"), "NO_DATA")
+        marker = quality_marker(tier)
+        dimension = normalize_text(item.get("dimension"))
+        key = normalize_text(item.get("key"))
+        total = int(item.get("total_alerts") or 0)
+        sl = int(item.get("sl_hit") or 0)
+        missed = int(item.get("missed_target_before_entry") or 0)
+        avg_r = safe_float(item.get("avg_result_R"))
+
+        lines.append(
+            f"- {marker} {dimension}: {key} → {tier} "
+            f"(n={total}, SL={sl}, missed={missed}, avg={format_r(avg_r)})"
+        )
+
+    if len(categories) > max_items:
+        lines.append(f"- ...ще {len(categories) - max_items} категорій")
+
+    return lines
+
+
+def render_telegram_report(report: dict[str, Any]) -> str:
+    metrics = report["metrics"]
+
+    total = int(metrics.get("total_alerts") or 0)
+    tp = int(metrics.get("tp_hit") or 0)
+    sl = int(metrics.get("sl_hit") or 0)
+    missed = int(metrics.get("missed_target_before_entry") or 0)
+    expired = int(metrics.get("expired") or 0)
+    pending = int(metrics.get("pending_or_active") or 0)
+    invalid = int(metrics.get("invalid") or 0)
+
+    winrate = safe_float(metrics.get("winrate"))
+    avg_result_r = safe_float(metrics.get("avg_result_R"))
+    avg_rr = safe_float(metrics.get("avg_rr"))
+    avg_practical_rr = safe_float(metrics.get("avg_practical_rr"))
+
+    tier_counts = report.get("quality_tier_counts") or {}
+    weak_categories = report.get("weak_quality_categories") or {}
+    warnings = report.get("warnings") or []
+
+    lines: list[str] = []
+
+    lines.append("📊 Денний звіт сигналів")
+    lines.append("")
+    lines.append(f"Період: {render_telegram_scope(report)}")
+    lines.append(f"Оновлено: {report.get('generated_at_utc')}")
+    lines.append("")
+    lines.append("Підсумок:")
+    lines.append(f"- Усього сигналів: {total}")
+    lines.append(f"- TP / SL: {tp} / {sl}")
+    lines.append(f"- Missed before entry: {missed}")
+    lines.append(f"- Expired: {expired}")
+    lines.append(f"- Pending / active: {pending}")
+    lines.append(f"- Invalid: {invalid}")
+    lines.append(f"- Winrate TP/SL: {format_pct(winrate)}")
+    lines.append(f"- Avg result: {format_r(avg_result_r)}")
+    lines.append(f"- Avg RR: {format_float(avg_rr)}")
+    lines.append(f"- Avg practical RR: {format_float(avg_practical_rr)}")
+
+    if tier_counts:
+        lines.append("")
+        lines.append("Якість категорій:")
+        for tier, count in sorted(
+            tier_counts.items(),
+            key=lambda item: (-tier_severity(item[0]), item[0]),
+        ):
+            lines.append(f"- {quality_marker(tier)} {tier}: {count}")
+
+    lines.append("")
+    lines.append("Слабкі категорії:")
+    lines.extend(render_telegram_weak_categories(weak_categories))
+
+    if warnings:
+        lines.append("")
+        lines.append("Діагностика:")
+        for warning in warnings[:5]:
+            lines.append(f"- {render_telegram_warning(str(warning))}")
+
+    lines.append("")
+    lines.append("Висновок:")
+    if total == 0:
+        lines.append("Сигналів у вибраному періоді немає. Система продовжує збір даних.")
+    elif tp == 0 and sl > 0:
+        lines.append(
+            "Сигнали поки не блокуємо, але слабкі категорії маркуємо через quality tiers. "
+            "Потрібна більша вибірка перед жорсткою фільтрацією."
+        )
+    elif pending > 0:
+        lines.append(
+            "Є активні сигнали. Остаточний висновок по дню краще робити після їх закриття."
+        )
+    else:
+        lines.append(
+            "Продовжуємо збір статистики. Quality tiers використовуємо як попередження, не як сокиру."
+        )
+
+    return "\n".join(lines)
+
+
+# =============================================================================
 # SAVING
 # =============================================================================
 
 
-def build_report_file_prefix(report: dict[str, Any]) -> str:
+def build_report_file_prefix(report: dict[str, Any], *, telegram: bool = False) -> str:
     scope = str(report.get("scope") or "all").replace(":", "_").replace("/", "_")
     generated = str(report.get("generated_at_utc") or utc_now())
     stamp = generated[:19].replace(":", "-")
-    return f"daily_signal_report_{scope}_{stamp}"
+
+    prefix = "daily_signal_report_telegram" if telegram else "daily_signal_report"
+    return f"{prefix}_{scope}_{stamp}"
 
 
 def save_report_files(
@@ -570,6 +958,7 @@ def save_report_files(
     report: dict[str, Any],
     text: str,
     out_dir: Path = REPORTS_DIR,
+    telegram_text: str | None = None,
 ) -> dict[str, str]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -605,12 +994,32 @@ def save_report_files(
     tmp_latest_json.replace(latest_json)
     tmp_latest_txt.replace(latest_txt)
 
-    return {
+    paths = {
         "json_path": str(json_path),
         "txt_path": str(txt_path),
         "latest_json_path": str(latest_json),
         "latest_txt_path": str(latest_txt),
     }
+
+    if telegram_text is not None:
+        telegram_prefix = build_report_file_prefix(report, telegram=True)
+
+        telegram_txt_path = out_dir / f"{telegram_prefix}.txt"
+        telegram_latest_txt_path = out_dir / "daily_signal_report_telegram_latest.txt"
+
+        tmp_telegram_txt = telegram_txt_path.with_suffix(".txt.tmp")
+        tmp_telegram_latest_txt = telegram_latest_txt_path.with_suffix(".txt.tmp")
+
+        tmp_telegram_txt.write_text(telegram_text, encoding="utf-8")
+        tmp_telegram_latest_txt.write_text(telegram_text, encoding="utf-8")
+
+        tmp_telegram_txt.replace(telegram_txt_path)
+        tmp_telegram_latest_txt.replace(telegram_latest_txt_path)
+
+        paths["telegram_txt_path"] = str(telegram_txt_path)
+        paths["telegram_latest_txt_path"] = str(telegram_latest_txt_path)
+
+    return paths
 
 
 # =============================================================================
@@ -631,6 +1040,13 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--quality-source",
+        type=str,
+        default=str(QUALITY_TIERS_PATH),
+        help="Path to quality_tiers.json.",
+    )
+
+    parser.add_argument(
         "--out-dir",
         type=str,
         default=str(REPORTS_DIR),
@@ -643,6 +1059,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional local report date in YYYY-MM-DD. "
+            "Use 'today' for current date in selected timezone. "
             "If omitted, report includes all tracked alerts."
         ),
     )
@@ -661,6 +1078,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--telegram",
+        action="store_true",
+        help="Print compact Ukrainian Telegram-ready report.",
+    )
+
+    parser.add_argument(
         "--no-save",
         action="store_true",
         help="Do not write report files, only print to console.",
@@ -669,7 +1092,7 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def parse_report_date(value: str | None) -> date | None:
+def parse_report_date(value: str | None, *, tz: ZoneInfo) -> date | None:
     if value is None:
         return None
 
@@ -678,7 +1101,7 @@ def parse_report_date(value: str | None) -> date | None:
         return None
 
     if text.lower() == "today":
-        return date.today()
+        return today_in_timezone(tz)
 
     return date.fromisoformat(text)
 
@@ -687,46 +1110,64 @@ def main() -> None:
     args = parse_args()
 
     source_path = Path(args.source)
+    quality_path = Path(args.quality_source)
     out_dir = Path(args.out_dir)
     tz = get_timezone(args.timezone)
-    report_date = parse_report_date(args.date)
+    report_date = parse_report_date(args.date, tz=tz)
 
     payload = load_signal_outcomes(source_path)
+    quality_payload = load_quality_tiers(quality_path)
 
     report = build_report(
         payload=payload,
+        quality_payload=quality_payload,
         report_date=report_date,
         tz=tz,
         source_path=source_path,
+        quality_path=quality_path,
     )
 
     text = render_text_report(report)
+    telegram_text = render_telegram_report(report)
 
     if not args.no_save:
         paths = save_report_files(
             report=report,
             text=text,
             out_dir=out_dir,
+            telegram_text=telegram_text,
         )
         report["report_files"] = paths
 
-        # Re-render is not needed for text readability, but JSON should include paths.
         if args.json:
             print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+            return
+
+        if args.telegram:
+            print(telegram_text)
+            print("")
+            print("Saved files")
+            print("-" * 72)
+            print(f"Telegram TXT:        {paths.get('telegram_txt_path')}")
+            print(f"Telegram latest TXT: {paths.get('telegram_latest_txt_path')}")
             return
 
         print(text)
         print("")
         print("Saved files")
         print("-" * 72)
-        print(f"JSON:        {paths['json_path']}")
-        print(f"TXT:         {paths['txt_path']}")
-        print(f"Latest JSON: {paths['latest_json_path']}")
-        print(f"Latest TXT:  {paths['latest_txt_path']}")
+        print(f"JSON:                {paths['json_path']}")
+        print(f"TXT:                 {paths['txt_path']}")
+        print(f"Latest JSON:         {paths['latest_json_path']}")
+        print(f"Latest TXT:          {paths['latest_txt_path']}")
+        print(f"Telegram TXT:        {paths.get('telegram_txt_path')}")
+        print(f"Telegram latest TXT: {paths.get('telegram_latest_txt_path')}")
         return
 
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    elif args.telegram:
+        print(telegram_text)
     else:
         print(text)
 
