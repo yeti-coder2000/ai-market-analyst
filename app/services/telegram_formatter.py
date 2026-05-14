@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional
+
+from app.core.settings import settings
 
 
 @dataclass
@@ -15,6 +20,55 @@ class FormattedTelegramMessage:
 
     def render(self) -> str:
         return f"{self.title}\n\n{self.body}".strip()
+
+
+QUALITY_TIERS_PATH = settings.runtime_dir / "stats" / "quality_tiers.json"
+
+QUALITY_TIER_SEVERITY = {
+    "NO_DATA": 0,
+    "A-GRADE": 1,
+    "INSUFFICIENT_SAMPLE": 2,
+    "OBSERVE": 3,
+    "CAUTION": 4,
+    "LOW_PRIORITY": 5,
+}
+
+QUALITY_TIER_MARKERS = {
+    "A-GRADE": "🟢",
+    "CAUTION": "🟠",
+    "OBSERVE": "🔵",
+    "LOW_PRIORITY": "🔴",
+    "INSUFFICIENT_SAMPLE": "⚪",
+    "NO_DATA": "⚫",
+}
+
+QUALITY_DIMENSION_FIELDS: dict[str, tuple[str, ...]] = {
+    "symbol": ("symbol",),
+    "scenario": ("scenario",),
+    "direction": ("direction",),
+    "signal_alignment": ("signal_alignment",),
+    "stop_quality": ("stop_quality",),
+    "execution_model": ("execution_model",),
+    "scenario_alignment": ("scenario", "signal_alignment"),
+    "scenario_stop_quality": ("scenario", "stop_quality"),
+    "symbol_scenario": ("symbol", "scenario"),
+}
+
+QUALITY_DIMENSION_PRIORITY = [
+    "scenario_stop_quality",
+    "scenario_alignment",
+    "symbol_scenario",
+    "stop_quality",
+    "signal_alignment",
+    "scenario",
+    "execution_model",
+    "symbol",
+]
+
+_QUALITY_TIERS_CACHE: dict[str, Any] = {
+    "mtime_ns": None,
+    "payload": None,
+}
 
 
 def _safe_str(value: Any, default: str = "-") -> str:
@@ -41,6 +95,13 @@ def _first_present(*values: Any) -> Any:
             continue
         return value
     return None
+
+
+def _env_bool(name: str, default: bool = True) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _format_price(value: Any) -> str:
@@ -286,6 +347,304 @@ def humanize_execution_model(model: str) -> str:
     return mapping.get(_safe_str(model, "NONE"), _safe_str(model, "None").replace("_", " ").title())
 
 
+# =============================================================================
+# QUALITY TIER HELPERS
+# =============================================================================
+
+
+def _quality_tiers_enabled() -> bool:
+    return _env_bool("ENABLE_TELEGRAM_QUALITY_TIERS", True)
+
+
+def _quality_tiers_path() -> Path:
+    raw = os.getenv("QUALITY_TIERS_PATH")
+    if raw and raw.strip():
+        return Path(raw.strip())
+    return QUALITY_TIERS_PATH
+
+
+def load_quality_tiers_payload() -> dict[str, Any] | None:
+    """
+    Load quality_tiers.json safely.
+
+    This function is intentionally fail-open:
+    if the file does not exist, is invalid, or cannot be read,
+    Telegram formatting continues without quality tier data.
+    """
+    if not _quality_tiers_enabled():
+        return None
+
+    path = _quality_tiers_path()
+
+    try:
+        if not path.exists():
+            return None
+
+        stat = path.stat()
+        mtime_ns = stat.st_mtime_ns
+
+        if (
+            _QUALITY_TIERS_CACHE.get("mtime_ns") == mtime_ns
+            and isinstance(_QUALITY_TIERS_CACHE.get("payload"), dict)
+        ):
+            return _QUALITY_TIERS_CACHE["payload"]
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+
+        if not isinstance(payload, dict):
+            return None
+
+        _QUALITY_TIERS_CACHE["mtime_ns"] = mtime_ns
+        _QUALITY_TIERS_CACHE["payload"] = payload
+
+        return payload
+
+    except Exception:
+        return None
+
+
+def _quality_normalize_text(value: Any, default: str = "UNKNOWN") -> str:
+    text = str(value or "").strip()
+    return text if text else default
+
+
+def _quality_field_value(signal_payload: dict, field: str) -> str:
+    if field == "signal_alignment":
+        alignment = _safe_str(signal_payload.get("signal_alignment"), "")
+        if alignment in {"", "-"}:
+            alignment = infer_signal_alignment(
+                signal_payload.get("direction"),
+                signal_payload.get("htf_bias"),
+            )
+        return _quality_normalize_text(alignment)
+
+    if field == "stop_quality":
+        explicit = _safe_str(signal_payload.get("stop_quality"), "")
+        if explicit not in {"", "-"}:
+            return _quality_normalize_text(explicit.upper())
+
+        inferred, _ = infer_stop_quality(signal_payload)
+        return _quality_normalize_text(inferred)
+
+    if field == "execution_model":
+        return _quality_normalize_text(signal_payload.get("execution_model"), "NONE")
+
+    return _quality_normalize_text(signal_payload.get(field))
+
+
+def _quality_group_key(signal_payload: dict, fields: tuple[str, ...]) -> str:
+    return " | ".join(_quality_field_value(signal_payload, field) for field in fields)
+
+
+def _quality_severity(tier: Any) -> int:
+    return QUALITY_TIER_SEVERITY.get(_safe_str(tier, "NO_DATA"), 0)
+
+
+def _quality_marker(tier: str) -> str:
+    return QUALITY_TIER_MARKERS.get(_safe_str(tier, "NO_DATA"), "⚫")
+
+
+def _find_quality_annotation(
+    *,
+    payload: dict[str, Any],
+    signal_payload: dict,
+) -> dict[str, Any] | None:
+    annotations = payload.get("signal_annotations")
+    if not isinstance(annotations, list):
+        return None
+
+    signal_id = _safe_str(signal_payload.get("signal_id"), "")
+    alert_id = _safe_str(signal_payload.get("alert_id"), "")
+
+    for item in annotations:
+        if not isinstance(item, dict):
+            continue
+
+        item_signal_id = _safe_str(item.get("signal_id"), "")
+        item_alert_id = _safe_str(item.get("alert_id"), "")
+
+        if alert_id not in {"", "-"} and item_alert_id == alert_id:
+            return item
+
+        if signal_id not in {"", "-"} and item_signal_id == signal_id:
+            return item
+
+    return None
+
+
+def _build_quality_from_annotation(annotation: dict[str, Any]) -> dict[str, Any] | None:
+    tier = _safe_str(annotation.get("telegram_quality_tier"), "")
+    if tier in {"", "-"}:
+        return None
+
+    reasons = annotation.get("quality_reasons")
+    flags = annotation.get("quality_flags")
+
+    return {
+        "tier": tier,
+        "confidence": "HISTORICAL_ANNOTATION",
+        "action": "use_operator_awareness",
+        "reasons": reasons if isinstance(reasons, list) else [],
+        "flags": flags if isinstance(flags, list) else [],
+        "source": "signal_annotations",
+    }
+
+
+def _find_dimension_quality_candidates(
+    *,
+    payload: dict[str, Any],
+    signal_payload: dict,
+) -> list[dict[str, Any]]:
+    dimensions = payload.get("dimensions")
+    if not isinstance(dimensions, dict):
+        return []
+
+    candidates: list[dict[str, Any]] = []
+
+    for dimension_name in QUALITY_DIMENSION_PRIORITY:
+        fields = QUALITY_DIMENSION_FIELDS.get(dimension_name)
+        if not fields:
+            continue
+
+        dimension_data = dimensions.get(dimension_name)
+        if not isinstance(dimension_data, dict):
+            continue
+
+        key = _quality_group_key(signal_payload, fields)
+        item = dimension_data.get(key)
+
+        if not isinstance(item, dict):
+            continue
+
+        quality = item.get("quality")
+        if not isinstance(quality, dict):
+            continue
+
+        tier = _safe_str(quality.get("tier"), "")
+        if tier in {"", "-"}:
+            continue
+
+        candidates.append(
+            {
+                "dimension": dimension_name,
+                "key": key,
+                "tier": tier,
+                "confidence": _safe_str(quality.get("confidence"), "UNKNOWN"),
+                "action": _safe_str(quality.get("action"), "UNKNOWN"),
+                "reasons": quality.get("reasons") if isinstance(quality.get("reasons"), list) else [],
+                "flags": quality.get("flags") if isinstance(quality.get("flags"), list) else [],
+                "metrics": item.get("metrics") if isinstance(item.get("metrics"), dict) else {},
+                "source": "dimensions",
+            }
+        )
+
+    return candidates
+
+
+def resolve_signal_quality(signal_payload: dict) -> dict[str, Any] | None:
+    payload = load_quality_tiers_payload()
+    if payload is None:
+        return None
+
+    annotation = _find_quality_annotation(
+        payload=payload,
+        signal_payload=signal_payload,
+    )
+
+    if annotation is not None:
+        quality = _build_quality_from_annotation(annotation)
+        if quality is not None:
+            return quality
+
+    candidates = _find_dimension_quality_candidates(
+        payload=payload,
+        signal_payload=signal_payload,
+    )
+
+    if not candidates:
+        return None
+
+    worst = sorted(
+        candidates,
+        key=lambda item: (
+            -_quality_severity(item.get("tier")),
+            QUALITY_DIMENSION_PRIORITY.index(item["dimension"])
+            if item.get("dimension") in QUALITY_DIMENSION_PRIORITY
+            else 999,
+        ),
+    )[0]
+
+    worst_tier = _safe_str(worst.get("tier"), "NO_DATA")
+
+    reasons: list[str] = []
+    flags: list[str] = []
+
+    for item in candidates:
+        tier = _safe_str(item.get("tier"), "NO_DATA")
+        dimension = _safe_str(item.get("dimension"), "UNKNOWN")
+        key = _safe_str(item.get("key"), "UNKNOWN")
+
+        if tier == worst_tier:
+            reasons.append(f"{dimension}={key} => {tier}")
+
+        item_flags = item.get("flags")
+        if isinstance(item_flags, list):
+            for flag in item_flags:
+                flag_text = str(flag)
+                if flag_text not in flags:
+                    flags.append(flag_text)
+
+    return {
+        "tier": worst_tier,
+        "confidence": _safe_str(worst.get("confidence"), "UNKNOWN"),
+        "action": _safe_str(worst.get("action"), "UNKNOWN"),
+        "reasons": reasons,
+        "flags": flags,
+        "source": "dimension_fallback",
+    }
+
+
+def build_quality_tier_text(signal_payload: dict) -> str | None:
+    quality = resolve_signal_quality(signal_payload)
+    if quality is None:
+        return None
+
+    tier = _safe_str(quality.get("tier"), "NO_DATA")
+    if tier == "NO_DATA":
+        return None
+
+    confidence = _safe_str(quality.get("confidence"), "UNKNOWN")
+    action = _safe_str(quality.get("action"), "UNKNOWN")
+    marker = _quality_marker(tier)
+
+    lines = [
+        f"{marker} Quality tier: {tier}",
+        f"Quality confidence: {confidence}",
+    ]
+
+    if action not in {"", "-", "UNKNOWN"}:
+        lines.append(f"Quality action: {action}")
+
+    reasons = quality.get("reasons")
+    if isinstance(reasons, list) and reasons:
+        lines.append("Quality reason:")
+        for reason in reasons[:3]:
+            lines.append(f"- {reason}")
+
+    flags = quality.get("flags")
+    if isinstance(flags, list) and flags:
+        clean_flags = [str(x) for x in flags if str(x).strip()]
+        if clean_flags:
+            lines.append(f"Quality flags: {', '.join(clean_flags[:5])}")
+
+    return "\n".join(lines)
+
+
+# =============================================================================
+# MESSAGE TEXT
+# =============================================================================
+
+
 def build_reason_text(signal_payload: dict) -> str:
     scenario = _safe_str(signal_payload.get("scenario"), "")
     rationale = _safe_str(signal_payload.get("rationale"), "")
@@ -415,12 +774,21 @@ def format_signal_message(signal_payload: dict) -> FormattedTelegramMessage:
     signal_id = signal_payload.get("signal_id")
     execution_status = _safe_str(signal_payload.get("execution_status"), "NOT_EXECUTABLE")
     alignment_text = build_alignment_text(signal_payload)
+    quality_tier_text = build_quality_tier_text(signal_payload)
     execution_warning = build_execution_warning_text(signal_payload)
 
     title = f"{humanize_stage(stage)} | {symbol} | {direction}"
 
     body_parts = [
         alignment_text,
+    ]
+
+    if quality_tier_text:
+        body_parts.extend([
+            quality_tier_text,
+        ])
+
+    body_parts.extend([
         f"Сценарій: {scenario}",
         (
             f"Ринок: {market_state} | HTF: {htf_bias} | "
@@ -441,7 +809,7 @@ def format_signal_message(signal_payload: dict) -> FormattedTelegramMessage:
         build_action_text(signal_payload),
         "",
         build_levels_text(signal_payload),
-    ]
+    ])
 
     if execution_warning:
         body_parts.extend(["", "Execution warning:", execution_warning])
