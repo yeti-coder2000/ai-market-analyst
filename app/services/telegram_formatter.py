@@ -22,6 +22,11 @@ class FormattedTelegramMessage:
         return f"{self.title}\n\n{self.body}".strip()
 
 
+# =============================================================================
+# QUALITY TIER CONFIG
+# =============================================================================
+
+
 QUALITY_TIERS_PATH = settings.runtime_dir / "stats" / "quality_tiers.json"
 
 QUALITY_TIER_SEVERITY = {
@@ -71,6 +76,11 @@ _QUALITY_TIERS_CACHE: dict[str, Any] = {
 }
 
 
+# =============================================================================
+# BASIC HELPERS
+# =============================================================================
+
+
 def _safe_str(value: Any, default: str = "-") -> str:
     if value is None:
         return default
@@ -107,6 +117,7 @@ def _env_bool(name: str, default: bool = True) -> bool:
 def _format_price(value: Any) -> str:
     if value is None:
         return "не задано"
+
     try:
         num = float(value)
     except (TypeError, ValueError):
@@ -114,8 +125,10 @@ def _format_price(value: Any) -> str:
 
     if abs(num) >= 1000:
         return f"{num:,.2f}".replace(",", " ")
+
     if abs(num) >= 10:
         return f"{num:.2f}"
+
     return f"{num:.5f}"
 
 
@@ -131,11 +144,15 @@ def _format_rr(value: Any) -> str:
         rr = float(value)
     except (TypeError, ValueError):
         return "не задано"
+
     return f"1:{rr:.2f}"
 
 
 def _extract_stage(signal_payload: dict) -> str:
-    stage = _safe_str(signal_payload.get("stage") or signal_payload.get("signal_class"), "")
+    stage = _safe_str(
+        signal_payload.get("stage") or signal_payload.get("signal_class"),
+        "",
+    )
     execution_status = _safe_str(signal_payload.get("execution_status"), "")
     status = _safe_str(signal_payload.get("status"), "")
 
@@ -156,7 +173,13 @@ def _extract_confidence(signal_payload: dict) -> float:
     probability = _safe_float(signal_payload.get("probability"), 0.0)
     if probability is None:
         return 0.0
+
     return float(probability)
+
+
+# =============================================================================
+# HUMANIZATION
+# =============================================================================
 
 
 def humanize_scenario_name(scenario: str) -> str:
@@ -170,6 +193,7 @@ def humanize_scenario_name(scenario: str) -> str:
         "NO_ACTION": "No Action",
         "MARKET_CLOSED": "Market Closed",
     }
+
     return mapping.get(
         _safe_str(scenario, ""),
         _safe_str(scenario, "Unknown Scenario").replace("_", " ").title(),
@@ -186,6 +210,7 @@ def humanize_stage(stage: str) -> str:
         "ACTIVE": "🚨 ACTIVE",
         "RESOLVED": "✅ RESOLVED",
     }
+
     return mapping.get(_safe_str(stage, ""), f"ℹ️ {_safe_str(stage, 'UNKNOWN')}")
 
 
@@ -195,7 +220,11 @@ def humanize_direction(direction: str) -> str:
         "SHORT": "SHORT",
         "NEUTRAL": "NEUTRAL",
     }
-    return mapping.get(_safe_str(direction, "NEUTRAL"), _safe_str(direction, "NEUTRAL"))
+
+    return mapping.get(
+        _safe_str(direction, "NEUTRAL"),
+        _safe_str(direction, "NEUTRAL"),
+    )
 
 
 def humanize_market_state(state: str) -> str:
@@ -205,7 +234,11 @@ def humanize_market_state(state: str) -> str:
         "BALANCE": "Balance",
         "UNKNOWN": "Unknown",
     }
-    return mapping.get(_safe_str(state, "UNKNOWN"), _safe_str(state, "Unknown"))
+
+    return mapping.get(
+        _safe_str(state, "UNKNOWN"),
+        _safe_str(state, "Unknown"),
+    )
 
 
 def humanize_bias(bias: str) -> str:
@@ -214,7 +247,122 @@ def humanize_bias(bias: str) -> str:
         "SHORT": "Bearish",
         "NEUTRAL": "Neutral",
     }
-    return mapping.get(_safe_str(bias, "NEUTRAL"), _safe_str(bias, "Neutral"))
+
+    return mapping.get(
+        _safe_str(bias, "NEUTRAL"),
+        _safe_str(bias, "Neutral"),
+    )
+
+
+def humanize_execution_model(model: str) -> str:
+    mapping = {
+        "LIMIT_ON_RETEST": "Limit on Retest",
+        "STOP_ON_CONFIRMATION": "Stop on Confirmation",
+        "MARKET": "Market",
+        "ZONE_RETEST": "Zone Retest",
+        "NONE": "None",
+    }
+
+    return mapping.get(
+        _safe_str(model, "NONE"),
+        _safe_str(model, "None").replace("_", " ").title(),
+    )
+
+
+def humanize_quality_confidence(confidence: Any) -> str:
+    value = _safe_str(confidence, "UNKNOWN")
+
+    mapping = {
+        "EARLY_DIAGNOSTIC": "рання діагностика",
+        "INSUFFICIENT_SAMPLE": "мала вибірка",
+        "HISTORICAL_ANNOTATION": "оцінка з історичної статистики",
+        "STATISTICAL": "статистично підтверджено",
+        "PARTIAL_SAMPLE": "часткова вибірка",
+        "NO_DATA": "немає даних",
+        "UNKNOWN": "невідомо",
+    }
+
+    text = mapping.get(value, value.replace("_", " ").lower())
+    return f"{text} ({value})"
+
+
+def humanize_quality_action(action: Any) -> str:
+    value = _safe_str(action, "UNKNOWN")
+
+    mapping = {
+        "mark_in_telegram_but_do_not_block": "позначити в Telegram, але не блокувати сигнал",
+        "collect_more_data": "збирати більше статистики",
+        "downgrade_or_suppress_non_critical_telegram_output": "понизити пріоритет або приховувати некритичну видачу",
+        "allow_full_priority": "дати повний пріоритет",
+        "use_operator_awareness": "використати як попередження для оператора",
+        "observe": "спостерігати",
+        "observe_until_more_closed_trades": "спостерігати до більшої кількості закритих угод",
+        "observe_entry_model_quality": "перевіряти якість моделі входу",
+        "do_not_use_for_filtering": "не використовувати для фільтрації",
+        "UNKNOWN": "невідомо",
+    }
+
+    return mapping.get(value, value.replace("_", " ").lower())
+
+
+def humanize_quality_flag(flag: Any) -> str:
+    value = _safe_str(flag, "UNKNOWN")
+
+    mapping = {
+        "LOW_SAMPLE_SIZE": "мала вибірка",
+        "EARLY_NEGATIVE_DIAGNOSTIC": "ранній негативний сигнал статистики",
+        "LOW_CLOSED_SAMPLE": "мало закритих TP/SL результатів",
+        "HAS_PENDING_SIGNALS": "є активні або незавершені сигнали",
+        "UNKNOWN": "невідома позначка",
+    }
+
+    return f"{mapping.get(value, value.replace('_', ' ').lower())} ({value})"
+
+
+def humanize_quality_dimension(dimension: Any) -> str:
+    value = _safe_str(dimension, "UNKNOWN")
+
+    mapping = {
+        "symbol": "актив",
+        "scenario": "сценарій",
+        "direction": "напрям",
+        "signal_alignment": "узгодження з HTF",
+        "stop_quality": "якість стопа",
+        "execution_model": "модель входу",
+        "scenario_alignment": "сценарій + HTF",
+        "scenario_stop_quality": "сценарій + якість стопа",
+        "symbol_scenario": "актив + сценарій",
+    }
+
+    return mapping.get(value, value.replace("_", " "))
+
+
+def humanize_quality_reason(reason: Any) -> str:
+    text = _safe_str(reason, "")
+
+    if not text:
+        return "-"
+
+    # Pattern: stop_quality=TIGHT_STOP => CAUTION
+    if "=>" in text and "=" in text:
+        try:
+            left, tier = text.split("=>", 1)
+            tier = tier.strip()
+
+            dimension, value = left.split("=", 1)
+            dimension = dimension.strip()
+            value = value.strip()
+
+            return f"{humanize_quality_dimension(dimension)}: {value} → {tier}"
+        except ValueError:
+            return text
+
+    return text
+
+
+# =============================================================================
+# ALIGNMENT
+# =============================================================================
 
 
 def infer_signal_alignment(direction: Any, htf_bias: Any) -> str:
@@ -223,12 +371,16 @@ def infer_signal_alignment(direction: Any, htf_bias: Any) -> str:
 
     if direction_text not in {"LONG", "SHORT"}:
         return "NO_DIRECTION"
+
     if htf_text == "NEUTRAL" or not htf_text:
         return "NEUTRAL_HTF"
+
     if htf_text not in {"LONG", "SHORT"}:
         return "UNKNOWN_HTF"
+
     if direction_text == htf_text:
         return "TREND_ALIGNED"
+
     return "COUNTER_TREND"
 
 
@@ -240,7 +392,11 @@ def signal_alignment_marker(alignment: Any) -> str:
         "NO_DIRECTION": "⚫",
         "UNKNOWN_HTF": "⚫",
     }
-    return mapping.get(_safe_str(alignment, "UNKNOWN_HTF").upper(), "⚫")
+
+    return mapping.get(
+        _safe_str(alignment, "UNKNOWN_HTF").upper(),
+        "⚫",
+    )
 
 
 def signal_alignment_label(alignment: Any) -> str:
@@ -251,11 +407,16 @@ def signal_alignment_label(alignment: Any) -> str:
         "NO_DIRECTION": "NO DIRECTION",
         "UNKNOWN_HTF": "UNKNOWN HTF",
     }
-    return mapping.get(_safe_str(alignment, "UNKNOWN_HTF").upper(), "UNKNOWN HTF")
+
+    return mapping.get(
+        _safe_str(alignment, "UNKNOWN_HTF").upper(),
+        "UNKNOWN HTF",
+    )
 
 
 def build_alignment_text(signal_payload: dict) -> str:
     alignment = _safe_str(signal_payload.get("signal_alignment"), "")
+
     if alignment in {"", "-"}:
         alignment = infer_signal_alignment(
             signal_payload.get("direction"),
@@ -270,7 +431,13 @@ def build_alignment_text(signal_payload: dict) -> str:
         signal_payload.get("signal_alignment_label"),
         signal_alignment_label(alignment),
     )
+
     return f"{marker} {label}"
+
+
+# =============================================================================
+# STOP QUALITY / EXECUTION WARNING
+# =============================================================================
 
 
 MIN_STOP_DISTANCE_BY_SYMBOL = {
@@ -293,7 +460,10 @@ MIN_STOP_DISTANCE_BY_SYMBOL = {
 def infer_stop_quality(signal_payload: dict) -> tuple[str, str | None]:
     symbol = _safe_str(signal_payload.get("symbol"), "").upper()
     entry = _safe_float(
-        _first_present(signal_payload.get("entry_reference_price"), signal_payload.get("entry")),
+        _first_present(
+            signal_payload.get("entry_reference_price"),
+            signal_payload.get("entry"),
+        ),
         None,
     )
     stop = _safe_float(
@@ -317,7 +487,11 @@ def infer_stop_quality(signal_payload: dict) -> tuple[str, str | None]:
     if stop_distance < min_stop:
         return (
             "TIGHT_STOP",
-            f"⚠️ TIGHT STOP / RR INFLATED: stop distance {_format_price(stop_distance)} is below practical minimum {_format_price(min_stop)} for {symbol}.",
+            (
+                f"⚠️ TIGHT STOP / RR INFLATED: stop distance "
+                f"{_format_price(stop_distance)} is below practical minimum "
+                f"{_format_price(min_stop)} for {symbol}."
+            ),
         )
 
     return "OK", None
@@ -331,20 +505,11 @@ def build_execution_warning_text(signal_payload: dict) -> str | None:
         return f"⚠️ TIGHT STOP / RR INFLATED: {explicit_reason}"
 
     quality, reason = infer_stop_quality(signal_payload)
+
     if quality == "TIGHT_STOP":
         return reason
+
     return None
-
-
-def humanize_execution_model(model: str) -> str:
-    mapping = {
-        "LIMIT_ON_RETEST": "Limit on Retest",
-        "STOP_ON_CONFIRMATION": "Stop on Confirmation",
-        "MARKET": "Market",
-        "ZONE_RETEST": "Zone Retest",
-        "NONE": "None",
-    }
-    return mapping.get(_safe_str(model, "NONE"), _safe_str(model, "None").replace("_", " ").title())
 
 
 # =============================================================================
@@ -360,6 +525,7 @@ def _quality_tiers_path() -> Path:
     raw = os.getenv("QUALITY_TIERS_PATH")
     if raw and raw.strip():
         return Path(raw.strip())
+
     return QUALITY_TIERS_PATH
 
 
@@ -367,9 +533,12 @@ def load_quality_tiers_payload() -> dict[str, Any] | None:
     """
     Load quality_tiers.json safely.
 
-    This function is intentionally fail-open:
-    if the file does not exist, is invalid, or cannot be read,
-    Telegram formatting continues without quality tier data.
+    Fail-open behavior:
+    - missing file -> no quality block
+    - invalid JSON -> no quality block
+    - read error -> no quality block
+
+    Telegram signal must never fail only because quality_tiers.json is missing.
     """
     if not _quality_tiers_enabled():
         return None
@@ -427,13 +596,19 @@ def _quality_field_value(signal_payload: dict, field: str) -> str:
         return _quality_normalize_text(inferred)
 
     if field == "execution_model":
-        return _quality_normalize_text(signal_payload.get("execution_model"), "NONE")
+        return _quality_normalize_text(
+            signal_payload.get("execution_model"),
+            "NONE",
+        )
 
     return _quality_normalize_text(signal_payload.get(field))
 
 
 def _quality_group_key(signal_payload: dict, fields: tuple[str, ...]) -> str:
-    return " | ".join(_quality_field_value(signal_payload, field) for field in fields)
+    return " | ".join(
+        _quality_field_value(signal_payload, field)
+        for field in fields
+    )
 
 
 def _quality_severity(tier: Any) -> int:
@@ -474,6 +649,7 @@ def _find_quality_annotation(
 
 def _build_quality_from_annotation(annotation: dict[str, Any]) -> dict[str, Any] | None:
     tier = _safe_str(annotation.get("telegram_quality_tier"), "")
+
     if tier in {"", "-"}:
         return None
 
@@ -531,9 +707,21 @@ def _find_dimension_quality_candidates(
                 "tier": tier,
                 "confidence": _safe_str(quality.get("confidence"), "UNKNOWN"),
                 "action": _safe_str(quality.get("action"), "UNKNOWN"),
-                "reasons": quality.get("reasons") if isinstance(quality.get("reasons"), list) else [],
-                "flags": quality.get("flags") if isinstance(quality.get("flags"), list) else [],
-                "metrics": item.get("metrics") if isinstance(item.get("metrics"), dict) else {},
+                "reasons": (
+                    quality.get("reasons")
+                    if isinstance(quality.get("reasons"), list)
+                    else []
+                ),
+                "flags": (
+                    quality.get("flags")
+                    if isinstance(quality.get("flags"), list)
+                    else []
+                ),
+                "metrics": (
+                    item.get("metrics")
+                    if isinstance(item.get("metrics"), dict)
+                    else {}
+                ),
                 "source": "dimensions",
             }
         )
@@ -568,9 +756,11 @@ def resolve_signal_quality(signal_payload: dict) -> dict[str, Any] | None:
         candidates,
         key=lambda item: (
             -_quality_severity(item.get("tier")),
-            QUALITY_DIMENSION_PRIORITY.index(item["dimension"])
-            if item.get("dimension") in QUALITY_DIMENSION_PRIORITY
-            else 999,
+            (
+                QUALITY_DIMENSION_PRIORITY.index(item["dimension"])
+                if item.get("dimension") in QUALITY_DIMENSION_PRIORITY
+                else 999
+            ),
         ),
     )[0]
 
@@ -618,24 +808,29 @@ def build_quality_tier_text(signal_payload: dict) -> str | None:
     marker = _quality_marker(tier)
 
     lines = [
-        f"{marker} Quality tier: {tier}",
-        f"Quality confidence: {confidence}",
+        f"{marker} Рівень якості: {tier}",
+        f"Довіра до оцінки: {humanize_quality_confidence(confidence)}",
     ]
 
     if action not in {"", "-", "UNKNOWN"}:
-        lines.append(f"Quality action: {action}")
+        lines.append(f"Рекомендована дія: {humanize_quality_action(action)}")
 
     reasons = quality.get("reasons")
     if isinstance(reasons, list) and reasons:
-        lines.append("Quality reason:")
+        lines.append("Причина оцінки:")
         for reason in reasons[:3]:
-            lines.append(f"- {reason}")
+            lines.append(f"- {humanize_quality_reason(reason)}")
 
     flags = quality.get("flags")
     if isinstance(flags, list) and flags:
-        clean_flags = [str(x) for x in flags if str(x).strip()]
+        clean_flags = [
+            humanize_quality_flag(x)
+            for x in flags
+            if str(x).strip()
+        ]
+
         if clean_flags:
-            lines.append(f"Quality flags: {', '.join(clean_flags[:5])}")
+            lines.append(f"Позначки якості: {', '.join(clean_flags[:5])}")
 
     return "\n".join(lines)
 
@@ -656,16 +851,28 @@ def build_reason_text(signal_payload: dict) -> str:
         return rationale
 
     if scenario == "TREND_CONTINUATION_SHORT":
-        return "Є ведмежий контекст. Ринок у фазі continuation, але без підтвердженої структури входу."
+        return (
+            "Є ведмежий контекст. Ринок у фазі continuation, "
+            "але без підтвердженої структури входу."
+        )
 
     if scenario == "TREND_CONTINUATION_LONG":
-        return "Є бичачий контекст. Ринок у фазі continuation, але без підтвердженої структури входу."
+        return (
+            "Є бичачий контекст. Ринок у фазі continuation, "
+            "але без підтвердженої структури входу."
+        )
 
     if scenario == "SWEEP_RETURN_LONG":
-        return "Ліквідність знизу зібрана. Є повернення у value і готовність до long-сценарію."
+        return (
+            "Ліквідність знизу зібрана. Є повернення у value "
+            "і готовність до long-сценарію."
+        )
 
     if scenario == "SWEEP_RETURN_SHORT":
-        return "Ліквідність зверху зібрана. Є повернення у value і готовність до short-сценарію."
+        return (
+            "Ліквідність зверху зібрана. Є повернення у value "
+            "і готовність до short-сценарію."
+        )
 
     if reason not in {"-", ""}:
         return reason
@@ -678,6 +885,7 @@ def build_reason_text(signal_payload: dict) -> str:
 
 def build_missing_conditions_text(signal_payload: dict) -> str:
     missing = signal_payload.get("missing_conditions") or []
+
     if not missing:
         return "нічого критичного не бракує"
 
@@ -712,10 +920,19 @@ def build_action_text(signal_payload: dict) -> str:
     if stage == "WATCH":
         if execution_status == "INCOMPLETE":
             return "Сценарій є, але execution ще не зібраний повністю. Без входу."
+
         if scenario.startswith("TREND_CONTINUATION"):
-            return f"Шукати continuation у бік {direction} після імпульсу і structure hold."
+            return (
+                f"Шукати continuation у бік {direction} "
+                "після імпульсу і structure hold."
+            )
+
         if scenario.startswith("SWEEP_RETURN"):
-            return f"Шукати підтвердження входу в бік {direction} після рейду і повернення у value."
+            return (
+                f"Шукати підтвердження входу в бік {direction} "
+                "після рейду і повернення у value."
+            )
+
         return "Тримати фокус на підтвердженні сценарію."
 
     if stage == "READY":
@@ -724,7 +941,11 @@ def build_action_text(signal_payload: dict) -> str:
                 f"Сценарій готовий. Execution model: {execution_model}. "
                 f"Тригер: {trigger_reason}."
             )
-        return f"Сценарій готовий. Execution model: {execution_model}. У фокусі вхід у бік {direction}."
+
+        return (
+            f"Сценарій готовий. Execution model: {execution_model}. "
+            f"У фокусі вхід у бік {direction}."
+        )
 
     if stage == "ACTIVE":
         return f"Ідея активна. Супровід у бік {direction}."
@@ -743,24 +964,29 @@ def build_levels_text(signal_payload: dict) -> str:
     practical_rr = signal_payload.get("practical_rr")
     execution_model = signal_payload.get("execution_model")
     execution_status = signal_payload.get("execution_status")
-    execution_timeframe = signal_payload.get("execution_timeframe")
+    execution_timeframe = _safe_str(signal_payload.get("execution_timeframe"), "")
 
     lines = [
-        f"Execution: {humanize_execution_model(_safe_str(execution_model, 'NONE'))}",
-        f"Execution status: {_safe_str(execution_status, 'NOT_EXECUTABLE')}",
-        f"Entry: {_format_price(entry)}",
-        f"Invalidation: {_format_price(invalidation)}",
-        f"Target: {_format_price(target)}",
+        f"Модель входу: {humanize_execution_model(_safe_str(execution_model, 'NONE'))}",
+        f"Статус виконання: {_safe_str(execution_status, 'NOT_EXECUTABLE')}",
+        f"Вхід: {_format_price(entry)}",
+        f"Інвалідація: {_format_price(invalidation)}",
+        f"Ціль: {_format_price(target)}",
         f"RR: {_format_rr(rr)}",
     ]
 
     if practical_rr is not None and practical_rr != rr:
-        lines.append(f"Practical RR estimate: {_format_rr(practical_rr)}")
+        lines.append(f"Практичний RR: {_format_rr(practical_rr)}")
 
     if execution_timeframe not in {"", "-"}:
-        lines.append(f"TF execution: {_safe_str(execution_timeframe)}")
+        lines.append(f"ТФ виконання: {execution_timeframe}")
 
     return "\n".join(lines)
+
+
+# =============================================================================
+# FORMATTERS
+# =============================================================================
 
 
 def format_signal_message(signal_payload: dict) -> FormattedTelegramMessage:
@@ -772,7 +998,10 @@ def format_signal_message(signal_payload: dict) -> FormattedTelegramMessage:
     market_state = humanize_market_state(signal_payload.get("market_state"))
     htf_bias = humanize_bias(signal_payload.get("htf_bias"))
     signal_id = signal_payload.get("signal_id")
-    execution_status = _safe_str(signal_payload.get("execution_status"), "NOT_EXECUTABLE")
+    execution_status = _safe_str(
+        signal_payload.get("execution_status"),
+        "NOT_EXECUTABLE",
+    )
     alignment_text = build_alignment_text(signal_payload)
     quality_tier_text = build_quality_tier_text(signal_payload)
     execution_warning = build_execution_warning_text(signal_payload)
@@ -784,42 +1013,44 @@ def format_signal_message(signal_payload: dict) -> FormattedTelegramMessage:
     ]
 
     if quality_tier_text:
-        body_parts.extend([
-            quality_tier_text,
-        ])
+        body_parts.append(quality_tier_text)
 
-    body_parts.extend([
-        f"Сценарій: {scenario}",
-        (
-            f"Ринок: {market_state} | HTF: {htf_bias} | "
-            f"Сила: {_format_pct(confidence * 100 if confidence <= 1 else confidence)}"
-        ),
-        "",
-        "Картина:",
-        build_reason_text(signal_payload),
-        "",
-        "Що бракує:" if signal_payload.get("missing_conditions") else "Фокус:",
-        (
-            build_missing_conditions_text(signal_payload)
-            if signal_payload.get("missing_conditions")
-            else build_action_text(signal_payload)
-        ),
-        "",
-        "План:",
-        build_action_text(signal_payload),
-        "",
-        build_levels_text(signal_payload),
-    ])
+    body_parts.extend(
+        [
+            f"Сценарій: {scenario}",
+            (
+                f"Ринок: {market_state} | HTF: {htf_bias} | "
+                f"Сила: {_format_pct(confidence * 100 if confidence <= 1 else confidence)}"
+            ),
+            "",
+            "Картина:",
+            build_reason_text(signal_payload),
+            "",
+            "Що бракує:" if signal_payload.get("missing_conditions") else "Фокус:",
+            (
+                build_missing_conditions_text(signal_payload)
+                if signal_payload.get("missing_conditions")
+                else build_action_text(signal_payload)
+            ),
+            "",
+            "План:",
+            build_action_text(signal_payload),
+            "",
+            build_levels_text(signal_payload),
+        ]
+    )
 
     if execution_warning:
-        body_parts.extend(["", "Execution warning:", execution_warning])
+        body_parts.extend(["", "Попередження по виконанню:", execution_warning])
 
     if stage == "WATCH" and execution_status != "EXECUTABLE":
-        body_parts.extend([
-            "",
-            "Коментар:",
-            "READY ще не підтверджено, бо execution-план неповний.",
-        ])
+        body_parts.extend(
+            [
+                "",
+                "Коментар:",
+                "READY ще не підтверджено, бо execution-план неповний.",
+            ]
+        )
 
     if signal_id:
         body_parts.extend(["", f"ID: {signal_id}"])
@@ -834,7 +1065,10 @@ def format_signal_message(signal_payload: dict) -> FormattedTelegramMessage:
     )
 
 
-def format_resolution_message(signal_payload: dict, resolution_payload: dict) -> FormattedTelegramMessage:
+def format_resolution_message(
+    signal_payload: dict,
+    resolution_payload: dict,
+) -> FormattedTelegramMessage:
     symbol = _safe_str(signal_payload.get("symbol"), "-")
     scenario = humanize_scenario_name(signal_payload.get("scenario"))
     final_status = _safe_str(
@@ -849,7 +1083,10 @@ def format_resolution_message(signal_payload: dict, resolution_payload: dict) ->
 
     body_parts = [
         f"Сценарій: {scenario}",
-        f"Причина: {_safe_str(resolution_payload.get('resolution_reason') or resolution_payload.get('resolution_note'), '-')}",
+        (
+            "Причина: "
+            f"{_safe_str(resolution_payload.get('resolution_reason') or resolution_payload.get('resolution_note'), '-')}"
+        ),
         "",
         f"MFE: {_format_pct(mfe_pct)}",
         f"MAE: {_format_pct(mae_pct)}",
@@ -872,6 +1109,13 @@ def format_cycle_summary_message(summary_payload: dict) -> FormattedTelegramMess
     system_metrics = summary_payload.get("system_metrics", {}) or {}
     signal_metrics = summary_payload.get("signal_metrics", {}) or {}
 
+    avg_confidence = signal_metrics.get("avg_confidence", 0.0)
+    avg_confidence_pct = (
+        avg_confidence * 100
+        if avg_confidence <= 1
+        else avg_confidence
+    )
+
     body_parts = [
         f"Cycles total: {system_metrics.get('cycles_total', 0)}",
         f"Cycles OK: {system_metrics.get('cycles_ok', 0)}",
@@ -881,7 +1125,7 @@ def format_cycle_summary_message(summary_payload: dict) -> FormattedTelegramMess
         f"Validated: {signal_metrics.get('validated_total', 0)}",
         f"Invalidated: {signal_metrics.get('invalidated_total', 0)}",
         f"Expired: {signal_metrics.get('expired_total', 0)}",
-        f"Avg confidence: {_format_pct(signal_metrics.get('avg_confidence', 0.0) * 100 if signal_metrics.get('avg_confidence', 0.0) <= 1 else signal_metrics.get('avg_confidence', 0.0))}",
+        f"Avg confidence: {_format_pct(avg_confidence_pct)}",
         f"Avg RR: {_format_rr(signal_metrics.get('avg_rr'))}",
         f"Avg MFE: {_format_pct(signal_metrics.get('avg_mfe_pct', 0.0))}",
         f"Avg MAE: {_format_pct(signal_metrics.get('avg_mae_pct', 0.0))}",
