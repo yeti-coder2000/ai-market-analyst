@@ -1052,7 +1052,7 @@ class StatefulBatchRunner:
 
             if _env_bool("ENABLE_AUTO_STATISTICS_EXPORT", False):
                 try:
-                    build_and_export_statistics()
+                    # build_and_export_statistics()  # disabled: heavy full-journal rebuild caused Render memory spike
                 except Exception as stats_error:
                     cycle_logger.warning(f"Statistics export failed: {stats_error}")
             else:
