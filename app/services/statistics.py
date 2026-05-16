@@ -725,7 +725,90 @@ def build_signal_records(events: list[dict]) -> list[SignalRecord]:
                     rec.signal_id = signal_id
 
             if rec is None:
-                continue
+                htf_bias = (
+                    _extract_htf_bias(updated_payload, event)
+                    or _extract_htf_bias(payload, event)
+                    or str(context.get("htf_bias") or "")
+                )
+                market_state = (
+                    updated_payload.get("market_state")
+                    or context.get("market_state")
+                    or ""
+                )
+
+                rec = SignalRecord(
+                    signal_id=signal_id,
+                    symbol=symbol if symbol != "UNKNOWN" else event.get("symbol", "-"),
+                    timeframe=event.get("timeframe", "15m"),
+                    cycle_id=cycle_id,
+                    created_at_utc=updated_payload.get(
+                        "created_at_utc",
+                        event.get("ts_utc", ""),
+                    ),
+                    scenario=scenario,
+                    signal_class=updated_payload.get(
+                        "signal_class",
+                        "ENTRY_READY",
+                    ),
+                    direction=direction,
+                    market_state=market_state,
+                    htf_bias=htf_bias,
+                    confidence=_safe_float(
+                        updated_payload.get("confidence"),
+                        0.0,
+                    ) or 0.0,
+                    phase=updated_payload.get("phase"),
+                    status=updated_payload.get("status"),
+                    setup_type=updated_payload.get("setup_type"),
+                    setup_name=updated_payload.get("setup_name"),
+                    dominant_setup=updated_payload.get("dominant_setup"),
+                    alignment_score=_safe_float(
+                        updated_payload.get("alignment_score"),
+                        None,
+                    ),
+                    next_expected_event=updated_payload.get("next_expected_event"),
+                    missing_conditions=_safe_list_str(
+                        updated_payload.get("missing_conditions"),
+                    ),
+                    reason=updated_payload.get("reason"),
+                    rationale=updated_payload.get("rationale"),
+                    execution_quality_reason=_execution_quality_reason(updated_payload),
+                    promotion_blocker=_infer_promotion_blocker(updated_payload),
+                    entry_reference_price=_safe_float(
+                        updated_payload.get("entry_reference_price"),
+                        None,
+                    ),
+                    invalidation_reference_price=_safe_float(
+                        updated_payload.get("invalidation_reference_price"),
+                        None,
+                    ),
+                    target_reference_price=_safe_float(
+                        updated_payload.get("target_reference_price"),
+                        None,
+                    ),
+                    execution_status=updated_payload.get("execution_status"),
+                    execution_model=updated_payload.get("execution_model"),
+                    risk_reward_ratio=_safe_float(
+                        updated_payload.get("risk_reward_ratio"),
+                        None,
+                    ),
+                    stop_distance=_safe_float(
+                        updated_payload.get("stop_distance"),
+                        None,
+                    ),
+                    target_distance=_safe_float(
+                        updated_payload.get("target_distance"),
+                        None,
+                    ),
+                    execution_timeframe=updated_payload.get("execution_timeframe"),
+                    trigger_reason=updated_payload.get("trigger_reason"),
+                    current_stage=updated_payload.get(
+                        "current_stage",
+                        updated_payload.get("signal_class", "ENTRY_READY"),
+                    ),
+                    runner_version=event.get("runner_version"),
+                )
+                records[signal_id] = rec
 
             rec.current_stage = updated_payload.get("signal_class", rec.current_stage)
             rec.signal_class = updated_payload.get("signal_class", rec.signal_class)
@@ -846,7 +929,80 @@ def build_signal_records(events: list[dict]) -> list[SignalRecord]:
                     rec.signal_id = signal_id
 
             if rec is None:
-                continue
+                htf_bias = _extract_htf_bias(payload, event)
+                market_state = payload.get("market_state", "")
+
+                rec = SignalRecord(
+                    signal_id=signal_id,
+                    symbol=symbol if symbol != "UNKNOWN" else event.get("symbol", "-"),
+                    timeframe=event.get("timeframe", "15m"),
+                    cycle_id=cycle_id,
+                    created_at_utc=payload.get(
+                        "created_at_utc",
+                        event.get("ts_utc", ""),
+                    ),
+                    scenario=scenario,
+                    signal_class=payload.get(
+                        "signal_class",
+                        "RESOLVED",
+                    ),
+                    direction=direction,
+                    market_state=market_state,
+                    htf_bias=htf_bias,
+                    confidence=_safe_float(
+                        payload.get("confidence"),
+                        0.0,
+                    ) or 0.0,
+                    phase=payload.get("phase"),
+                    status=payload.get("status"),
+                    setup_type=payload.get("setup_type"),
+                    setup_name=payload.get("setup_name"),
+                    dominant_setup=payload.get("dominant_setup"),
+                    alignment_score=_safe_float(
+                        payload.get("alignment_score"),
+                        None,
+                    ),
+                    next_expected_event=payload.get("next_expected_event"),
+                    missing_conditions=_safe_list_str(payload.get("missing_conditions")),
+                    reason=payload.get("reason"),
+                    rationale=payload.get("rationale"),
+                    execution_quality_reason=_execution_quality_reason(payload),
+                    promotion_blocker=_infer_promotion_blocker(payload),
+                    entry_reference_price=_safe_float(
+                        payload.get("entry_reference_price"),
+                        None,
+                    ),
+                    invalidation_reference_price=_safe_float(
+                        payload.get("invalidation_reference_price"),
+                        None,
+                    ),
+                    target_reference_price=_safe_float(
+                        payload.get("target_reference_price"),
+                        None,
+                    ),
+                    execution_status=payload.get("execution_status"),
+                    execution_model=payload.get("execution_model"),
+                    risk_reward_ratio=_safe_float(
+                        payload.get("risk_reward_ratio"),
+                        None,
+                    ),
+                    stop_distance=_safe_float(
+                        payload.get("stop_distance"),
+                        None,
+                    ),
+                    target_distance=_safe_float(
+                        payload.get("target_distance"),
+                        None,
+                    ),
+                    execution_timeframe=payload.get("execution_timeframe"),
+                    trigger_reason=payload.get("trigger_reason"),
+                    current_stage=payload.get(
+                        "current_stage",
+                        payload.get("signal_class", "RESOLVED"),
+                    ),
+                    runner_version=event.get("runner_version"),
+                )
+                records[signal_id] = rec
 
             rec.signal_class = payload.get("signal_class", rec.signal_class)
             rec.current_stage = payload.get("signal_class", rec.current_stage)
