@@ -1050,6 +1050,13 @@ class StatefulBatchRunner:
             )
 
             if _env_bool("ENABLE_AUTO_STATISTICS_EXPORT", False):
+                try:
+                    build_and_export_statistics()
+                except Exception as stats_error:
+                    cycle_logger.warning(f"Statistics export failed: {stats_error}")
+            else:
+                cycle_logger.info(
+                    "Statistics export skipped. ENABLE_AUTO_STATISTICS_EXPORT=false"
                 )
 
             cycle_logger.info(
