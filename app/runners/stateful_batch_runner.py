@@ -42,7 +42,6 @@ from app.services.radar_journal import (
 )
 from app.services.signal_quality_engine import enrich_payload_with_quality
 from app.services.signal_tracker import SignalTracker, SignalTrackerResult
-from app.services.statistics import build_and_export_statistics
 from app.services.telegram_formatter import format_signal_message
 from app.services.telegram_notifier import build_telegram_notifier
 from app.services.telegram_alert_store import record_telegram_alert
