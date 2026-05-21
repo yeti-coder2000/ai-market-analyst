@@ -46,6 +46,10 @@ from app.services.telegram_formatter import format_signal_message
 from app.services.telegram_notifier import build_telegram_notifier
 from app.services.telegram_alert_store import record_telegram_alert
 from app.storage.cache_store import ParquetCache
+from app.auction.profile_engine import (
+    build_auction_context,
+    auction_context_to_signal_filters,
+)
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
@@ -107,6 +111,30 @@ DEFAULT_INSTRUMENT_PROFILES: list[dict[str, Any]] = [
     {"symbol": Instrument.EURUSD, "priority": 2},
     {"symbol": Instrument.GBPUSD, "priority": 2},
 ]
+
+
+AUCTION_DEFAULT_TICK_SIZE = 0.0001
+
+AUCTION_TICK_SIZE_BY_SYMBOL: dict[str, float] = {
+    "XAUUSD": 0.1,
+    "BTCUSD": 1.0,
+    "ETHUSD": 0.1,
+    "EURUSD": 0.0001,
+    "GBPUSD": 0.0001,
+    "USDJPY": 0.01,
+    "USDCHF": 0.0001,
+    "USDCAD": 0.0001,
+    "AUDUSD": 0.0001,
+    "UKOIL": 0.01,
+    "GER40": 1.0,
+    "NAS100": 1.0,
+    "SPX500": 0.25,
+}
+
+
+def _auction_tick_size(symbol: Instrument | str) -> float:
+    raw = getattr(symbol, "value", symbol)
+    return AUCTION_TICK_SIZE_BY_SYMBOL.get(str(raw), AUCTION_DEFAULT_TICK_SIZE)
 
 
 # =============================================================================
@@ -724,6 +752,9 @@ class StatefulBatchRunner:
             "final_signal": raw.get("final_signal", {}),
             "behavioral_summary": raw.get("behavioral_summary", {}),
             "consistency": raw.get("consistency", {}),
+            "auction_context": raw.get("auction_context") or (raw.get("context", {}) or {}).get("auction", {}).get("context"),
+            "auction_filters": raw.get("auction_filters") or (raw.get("context", {}) or {}).get("auction", {}).get("filters"),
+            "auction_telemetry_mode": raw.get("auction_telemetry_mode") or (raw.get("context", {}) or {}).get("auction", {}).get("telemetry_mode"),
             "meta": raw.get("meta", {}),
         }
         return record
@@ -1049,15 +1080,10 @@ class StatefulBatchRunner:
                 },
             )
 
-            if _env_bool("ENABLE_AUTO_STATISTICS_EXPORT", False):
-                try:
-                    build_and_export_statistics()
-                except Exception as stats_error:
-                    cycle_logger.warning(f"Statistics export failed: {stats_error}")
-            else:
-                cycle_logger.info(
-                    "Statistics export skipped. ENABLE_AUTO_STATISTICS_EXPORT=false"
-                )
+            cycle_logger.info(
+                "Heavy statistics export is disabled in live runner. "
+                "Use app.services.lightweight_statistics_exporter or scheduled reporting jobs."
+            )
 
             cycle_logger.info(
                 f"Batch cycle finished. batch_group={self.batch_group} status={cycle_status} instruments={len(normalized_instruments)} errors={len(cycle_errors)} skipped={skipped_count}"
@@ -1285,6 +1311,9 @@ class StatefulBatchRunner:
                 scenario=analysis["scenario"],
                 final_signal=analysis["final_signal"],
                 refreshed_timeframes=refreshed_timeframes,
+                auction_context=analysis.get("auction_context"),
+                auction_filters=analysis.get("auction_filters"),
+                auction_telemetry_mode=analysis.get("auction_telemetry_mode"),
             )
 
             journal_record["consistency"] = to_jsonable(consistency.to_dict())
@@ -1349,6 +1378,9 @@ class StatefulBatchRunner:
                 "final_signal": to_jsonable(journal_record.get("final_signal")),
                 "behavioral_summary": to_jsonable(journal_record.get("behavioral_summary")),
                 "consistency": to_jsonable(journal_record.get("consistency")),
+                "auction_context": to_jsonable(analysis.get("auction_context")),
+                "auction_filters": to_jsonable(analysis.get("auction_filters")),
+                "auction_telemetry_mode": analysis.get("auction_telemetry_mode", "passive_only"),
             }
 
             write_instrument_analyzed(
@@ -1403,6 +1435,18 @@ class StatefulBatchRunner:
                 scenario_engine_error=scenario_engine_error,
                 scenario_engine_error_type=scenario_engine_error_type,
             )
+            tracker_source_payload["auction_context"] = to_jsonable(analysis.get("auction_context"))
+            tracker_source_payload["auction_filters"] = to_jsonable(analysis.get("auction_filters"))
+            tracker_source_payload["auction_telemetry_mode"] = analysis.get("auction_telemetry_mode", "passive_only")
+
+            tracker_metadata = tracker_source_payload.get("metadata")
+            if not isinstance(tracker_metadata, dict):
+                tracker_metadata = {}
+            tracker_metadata["auction_context"] = to_jsonable(analysis.get("auction_context"))
+            tracker_metadata["auction_filters"] = to_jsonable(analysis.get("auction_filters"))
+            tracker_metadata["auction_telemetry_mode"] = analysis.get("auction_telemetry_mode", "passive_only")
+            tracker_source_payload["metadata"] = tracker_metadata
+
             tracker_source_payload = self._enrich_tracker_payload_with_execution_bridge(
                 payload=tracker_source_payload,
                 context=context,
@@ -1434,7 +1478,13 @@ class StatefulBatchRunner:
                     runner_version=RUNNER_VERSION,
                     symbol=symbol.value,
                     timeframe="15m",
-                    signal_payload={**candidate_payload, "batch_group": self.batch_group},
+                    signal_payload={
+                        **candidate_payload,
+                        "batch_group": self.batch_group,
+                        "auction_context": to_jsonable(analysis.get("auction_context")),
+                        "auction_filters": to_jsonable(analysis.get("auction_filters")),
+                        "auction_telemetry_mode": analysis.get("auction_telemetry_mode", "passive_only"),
+                    },
                 )
 
             if tracker_result.action == "REGISTERED":
@@ -2064,6 +2114,152 @@ class StatefulBatchRunner:
                 raise TwelveDataRateLimitError(text) from error
             raise
 
+    def _prepare_auction_dataframe(self, df: pd.DataFrame | None) -> pd.DataFrame | None:
+        """
+        Convert provider/cache OHLC data into the dataframe shape required by
+        app.auction.profile_engine.
+
+        profile_engine expects explicit columns:
+        timestamp, open, high, low, close, volume(optional)
+
+        Loader data may arrive with a DatetimeIndex, with a named timestamp column,
+        or with provider-specific names. This adapter is intentionally defensive:
+        if it cannot normalize the data, auction telemetry fails closed and does
+        not affect the trading pipeline.
+        """
+        if df is None or df.empty:
+            return None
+
+        out = df.copy()
+
+        lower_columns = {str(col).lower().strip(): col for col in out.columns}
+        has_timestamp_col = any(
+            key in lower_columns
+            for key in ("timestamp", "datetime", "date", "time")
+        )
+
+        if not has_timestamp_col:
+            index_name = out.index.name or "timestamp"
+            out = out.reset_index()
+            if index_name in out.columns:
+                out = out.rename(columns={index_name: "timestamp"})
+            elif "index" in out.columns:
+                out = out.rename(columns={"index": "timestamp"})
+
+        rename_map: dict[Any, str] = {}
+        for col in out.columns:
+            key = str(col).lower().strip()
+            if key in {"timestamp", "datetime", "date", "time"}:
+                rename_map[col] = "timestamp"
+            elif key in {"open", "o"}:
+                rename_map[col] = "open"
+            elif key in {"high", "h"}:
+                rename_map[col] = "high"
+            elif key in {"low", "l"}:
+                rename_map[col] = "low"
+            elif key in {"close", "c"}:
+                rename_map[col] = "close"
+            elif key in {"volume", "vol", "v"}:
+                rename_map[col] = "volume"
+
+        out = out.rename(columns=rename_map)
+
+        required = {"timestamp", "open", "high", "low", "close"}
+        if not required.issubset(set(out.columns)):
+            return None
+
+        cols = ["timestamp", "open", "high", "low", "close"]
+        if "volume" in out.columns:
+            cols.append("volume")
+
+        out = out[cols].copy()
+
+        if "volume" not in out.columns:
+            out["volume"] = 1.0
+
+        return out
+
+    def _build_passive_auction_payload(
+        self,
+        symbol: Instrument,
+        series_by_tf: dict[Timeframe, pd.DataFrame],
+    ) -> dict[str, Any]:
+        """
+        Passive TPO / Market Profile telemetry.
+
+        It is deliberately read-only:
+        - does not alter ScenarioEngine;
+        - does not alter SignalTracker decisions;
+        - does not alter execution;
+        - does not alter Telegram permission;
+        - only enriches journal/snapshot/signal metadata for future statistics.
+        """
+        try:
+            source_df = series_by_tf.get(Timeframe.M15)
+            auction_df = self._prepare_auction_dataframe(source_df)
+
+            if auction_df is None or auction_df.empty:
+                return {
+                    "context": {
+                        "auction_context_available": False,
+                        "reason": "missing_or_unusable_15m_ohlc_dataframe",
+                    },
+                    "filters": {
+                        "auction_context_available": False,
+                        "open_relation": "UNKNOWN",
+                        "auction_bias": "UNKNOWN",
+                        "telegram_modifier": "NEUTRAL",
+                        "confidence_modifier": 0.0,
+                        "reasons": [
+                            "Auction context unavailable: missing or unusable 15m OHLC dataframe."
+                        ],
+                    },
+                    "telemetry_mode": "passive_only",
+                }
+
+            context = build_auction_context(
+                auction_df,
+                symbol=symbol.value,
+                timeframe="15m",
+                tick_size=_auction_tick_size(symbol),
+                value_area_pct=0.70,
+                ib_minutes=60,
+            )
+            filters = auction_context_to_signal_filters(context)
+
+            return {
+                "context": to_jsonable(context.to_dict()),
+                "filters": to_jsonable(filters),
+                "telemetry_mode": "passive_only",
+            }
+
+        except Exception as auction_error:  # noqa: BLE001
+            logger.exception(
+                "Passive auction telemetry failed. symbol=%s error=%s",
+                symbol.value,
+                auction_error,
+            )
+            return {
+                "context": {
+                    "auction_context_available": False,
+                    "auction_context_failed": True,
+                    "error": str(auction_error),
+                    "error_type": type(auction_error).__name__,
+                },
+                "filters": {
+                    "auction_context_available": False,
+                    "auction_filters_failed": True,
+                    "open_relation": "UNKNOWN",
+                    "auction_bias": "UNKNOWN",
+                    "telegram_modifier": "NEUTRAL",
+                    "confidence_modifier": 0.0,
+                    "reasons": [
+                        f"Auction telemetry failed: {type(auction_error).__name__}"
+                    ],
+                },
+                "telemetry_mode": "passive_only",
+            }
+
     def _run_analysis_pipeline(
         self,
         symbol: Instrument,
@@ -2073,12 +2269,16 @@ class StatefulBatchRunner:
         setups = self._run_setups(context)
         scenario = self._run_scenario_engine(context, setups)
         final_signal = self._select_final_signal(context, setups, scenario)
+        auction_payload = self._build_passive_auction_payload(symbol, series_by_tf)
 
         return {
             "context": context,
             "setups": setups,
             "scenario": scenario,
             "final_signal": final_signal,
+            "auction_context": auction_payload.get("context"),
+            "auction_filters": auction_payload.get("filters"),
+            "auction_telemetry_mode": auction_payload.get("telemetry_mode", "passive_only"),
         }
 
     def _build_context(
@@ -2226,6 +2426,9 @@ class StatefulBatchRunner:
         scenario: Any,
         final_signal: Any,
         refreshed_timeframes: list[str],
+        auction_context: dict[str, Any] | None = None,
+        auction_filters: dict[str, Any] | None = None,
+        auction_telemetry_mode: str | None = "passive_only",
     ) -> dict[str, Any]:
         def _enum_value(value: Any) -> Any:
             return getattr(value, "value", value)
@@ -2263,6 +2466,24 @@ class StatefulBatchRunner:
         market_state = extract_context_market_state(context)
         htf_bias = extract_context_htf_bias(context)
         price = extract_context_price(context)
+
+        if not isinstance(auction_context, dict):
+            auction_context = {
+                "auction_context_available": False,
+                "reason": "auction_context_not_provided",
+            }
+
+        if not isinstance(auction_filters, dict):
+            auction_filters = {
+                "auction_context_available": False,
+                "open_relation": "UNKNOWN",
+                "auction_bias": "UNKNOWN",
+                "telegram_modifier": "NEUTRAL",
+                "confidence_modifier": 0.0,
+                "reasons": ["Auction filters unavailable."],
+            }
+
+        auction_telemetry_mode = auction_telemetry_mode or "passive_only"
 
         setup_a = setups[0] if len(setups) > 0 else None
         setup_b = setups[1] if len(setups) > 1 else None
@@ -2331,6 +2552,11 @@ class StatefulBatchRunner:
                     "weekly": to_jsonable(self._safe_attr(context, "weekly_profile")),
                     "daily": to_jsonable(self._safe_attr(context, "daily_profile")),
                 },
+                "auction": {
+                    "context": to_jsonable(auction_context),
+                    "filters": to_jsonable(auction_filters),
+                    "telemetry_mode": auction_telemetry_mode,
+                },
             },
             "setups": {
                 "setup_a": _setup_payload(setup_a) if setup_a else None,
@@ -2370,12 +2596,27 @@ class StatefulBatchRunner:
                 "missing_conditions": missing_conditions,
                 "next_expected_event": next_expected_event,
                 "alignment_score": alignment_score,
+                "auction_note": (
+                    auction_filters.get("reasons", [None])[0]
+                    if isinstance(auction_filters.get("reasons"), list)
+                    and auction_filters.get("reasons")
+                    else None
+                ),
+                "auction_bias": auction_context.get("auction_bias"),
+                "open_relation": auction_context.get("open_relation"),
+                "auction_telegram_modifier": auction_filters.get("telegram_modifier"),
+                "auction_confidence_modifier": auction_filters.get("confidence_modifier"),
+                "auction_telemetry_mode": auction_telemetry_mode,
             },
+            "auction_context": to_jsonable(auction_context),
+            "auction_filters": to_jsonable(auction_filters),
+            "auction_telemetry_mode": auction_telemetry_mode,
             "meta": {
                 "simulation_mode": self.simulation_mode,
                 "batch_group": self.batch_group,
                 "refreshed_timeframes": refreshed_timeframes,
                 "data_source": "cache_only" if not refreshed_timeframes else "mixed_or_api",
+                "auction_telemetry_mode": auction_telemetry_mode,
             },
         }
 
