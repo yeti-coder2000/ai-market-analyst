@@ -53,7 +53,7 @@ from app.auction.profile_engine import (
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.4.5-memory-safe-stats-v1"
+RUNNER_VERSION = "1.4.6-tpo-memory-safe-v1"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -113,22 +113,35 @@ DEFAULT_INSTRUMENT_PROFILES: list[dict[str, Any]] = [
 ]
 
 
-AUCTION_DEFAULT_TICK_SIZE = 0.0001
+# =============================================================================
+# PASSIVE AUCTION / TPO TELEMETRY LIMITS
+# =============================================================================
+#
+# IMPORTANT:
+# profile_engine approximates a volume profile by distributing candle volume
+# across price bins between candle low/high. If we feed thousands of 15m bars
+# with tiny tick sizes, memory can spike on Render. Therefore TPO telemetry is
+# intentionally coarse and bounded. This is a context/statistics layer, not an
+# execution price ladder.
+
+AUCTION_MAX_BARS = int(os.getenv("AUCTION_MAX_BARS", "672"))  # ~7 days of 15m bars
+AUCTION_DEFAULT_TICK_SIZE = 0.001
 
 AUCTION_TICK_SIZE_BY_SYMBOL: dict[str, float] = {
-    "XAUUSD": 0.1,
-    "BTCUSD": 1.0,
-    "ETHUSD": 0.1,
-    "EURUSD": 0.0001,
-    "GBPUSD": 0.0001,
-    "USDJPY": 0.01,
-    "USDCHF": 0.0001,
-    "USDCAD": 0.0001,
-    "AUDUSD": 0.0001,
-    "UKOIL": 0.01,
-    "GER40": 1.0,
-    "NAS100": 1.0,
-    "SPX500": 0.25,
+    # Coarse bins by design: stable telemetry > perfect profile precision.
+    "XAUUSD": 5.0,
+    "BTCUSD": 100.0,
+    "ETHUSD": 10.0,
+    "EURUSD": 0.001,
+    "GBPUSD": 0.001,
+    "USDJPY": 0.10,
+    "USDCHF": 0.001,
+    "USDCAD": 0.001,
+    "AUDUSD": 0.001,
+    "UKOIL": 0.10,
+    "GER40": 10.0,
+    "NAS100": 25.0,
+    "SPX500": 5.0,
 }
 
 
@@ -2174,6 +2187,12 @@ class StatefulBatchRunner:
 
         out = out[cols].copy()
 
+        # Hard memory guard for passive TPO telemetry.
+        # We only need recent auction context; full-history TPO belongs in an
+        # offline audit/export job, not in the live worker.
+        if AUCTION_MAX_BARS > 0 and len(out) > AUCTION_MAX_BARS:
+            out = out.tail(AUCTION_MAX_BARS).copy()
+
         if "volume" not in out.columns:
             out["volume"] = 1.0
 
@@ -2217,18 +2236,27 @@ class StatefulBatchRunner:
                     "telemetry_mode": "passive_only",
                 }
 
+            tick_size = _auction_tick_size(symbol)
             context = build_auction_context(
                 auction_df,
                 symbol=symbol.value,
                 timeframe="15m",
-                tick_size=_auction_tick_size(symbol),
+                tick_size=tick_size,
                 value_area_pct=0.70,
                 ib_minutes=60,
             )
             filters = auction_context_to_signal_filters(context)
 
+            context_payload = to_jsonable(context.to_dict())
+            if isinstance(context_payload, dict):
+                context_payload["auction_context_available"] = True
+                context_payload["bars_used"] = int(len(auction_df))
+                context_payload["max_bars"] = int(AUCTION_MAX_BARS)
+                context_payload["tick_size"] = float(tick_size)
+                context_payload["memory_mode"] = "bounded_recent_history"
+
             return {
-                "context": to_jsonable(context.to_dict()),
+                "context": context_payload,
                 "filters": to_jsonable(filters),
                 "telemetry_mode": "passive_only",
             }
