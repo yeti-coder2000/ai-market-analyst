@@ -4,12 +4,20 @@ from __future__ import annotations
 Multi-group worker for AI Market Analyst.
 
 Runs configured batch groups sequentially:
-1. core
-2. waits GROUP_DELAY_SEC / SECONDARY_GROUP_DELAY_SEC
-3. fx_major
-4. waits again
-5. indices
-6. sleeps until RUN_INTERVAL_SEC window completes
+1. runs TPO context exporter
+2. verifies TPO offline store
+3. core
+4. waits GROUP_DELAY_SEC / SECONDARY_GROUP_DELAY_SEC
+5. fx_major
+6. waits again
+7. indices
+8. sleeps until RUN_INTERVAL_SEC window completes
+
+Important architecture rule:
+- TPO / auction context is calculated by app.services.tpo_context_exporter.
+- Live/stateful workers do NOT calculate TPO.
+- Live/stateful workers only read the offline TPO store:
+  /var/data/runtime/tpo/tpo_latest.json
 
 Telegram trade alerts are NOT generated here.
 They remain inside stateful_batch_runner hard gate:
@@ -21,13 +29,17 @@ ENABLE_TELEGRAM_ADMIN_MESSAGES=true/false
 Default:
 - trade Telegram alerts stay enabled through normal alert pipeline
 - admin boot/stop messages are disabled by default to avoid Telegram spam
+- TPO exporter is required before live batches
 """
 
+import json
 import os
 import signal
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from app.core.instrument_batches import get_batch_symbols, list_available_batches
@@ -76,6 +88,79 @@ def _parse_groups() -> list[str]:
     return groups
 
 
+def _runtime_dir() -> Path:
+    raw = getattr(settings, "runtime_dir", None)
+
+    if raw:
+        return Path(raw)
+
+    return Path("/var/data/runtime")
+
+
+def _tpo_store_path() -> Path:
+    raw = (
+        os.getenv("TPO_CONTEXT_STORE_PATH")
+        or os.getenv("TPO_LATEST_PATH")
+        or os.getenv("TPO_STORE_PATH")
+    )
+
+    if raw:
+        return Path(raw)
+
+    return _runtime_dir() / "tpo" / "tpo_latest.json"
+
+
+def _read_tpo_store_summary(path: Path) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "store_path": str(path),
+        "exists": path.exists(),
+        "size_bytes": None,
+        "exporter_version": None,
+        "updated_at_utc": None,
+        "symbols": None,
+        "errors": None,
+        "read_error": None,
+    }
+
+    if not path.exists():
+        return summary
+
+    try:
+        summary["size_bytes"] = path.stat().st_size
+    except Exception as exc:
+        summary["read_error"] = f"stat_failed: {exc}"
+        return summary
+
+    try:
+        data = json.loads(path.read_text())
+    except Exception as exc:
+        summary["read_error"] = f"json_read_failed: {exc}"
+        return summary
+
+    if isinstance(data, dict):
+        summary["exporter_version"] = data.get("exporter_version")
+        summary["updated_at_utc"] = data.get("updated_at_utc")
+        summary["errors"] = data.get("errors")
+
+        symbols = data.get("symbols")
+        if isinstance(symbols, dict):
+            summary["symbols"] = len(symbols)
+        else:
+            summary["symbols"] = symbols
+
+        contexts = data.get("contexts")
+        if summary["symbols"] is None and isinstance(contexts, dict):
+            summary["symbols"] = len(contexts)
+
+    return summary
+
+
+def _tail_text(value: str | None, max_chars: int = 4000) -> str:
+    if not value:
+        return ""
+    return value[-max_chars:]
+
+
 class GracefulShutdown:
     def __init__(self) -> None:
         self.stop_requested = False
@@ -108,6 +193,7 @@ def _boot_message(groups: list[str], interval_sec: int, delay_sec: int) -> str:
         f"Groups: {', '.join(groups)}\n"
         f"Interval: {interval_sec}s\n"
         f"Delay between groups: {delay_sec}s\n"
+        f"TPO export before groups: ON\n"
         f"Paper mode: {'ON' if getattr(settings, 'paper_mode', True) else 'OFF'}"
     )
 
@@ -117,6 +203,137 @@ def _stop_message() -> str:
         f"<b>{getattr(settings, 'app_name', 'AI Market Analyst')}</b>\n"
         "Multi-group worker stopped."
     )
+
+
+def run_tpo_exporter_once(
+    *,
+    sequence_id: str,
+    timeout_sec: int,
+) -> dict[str, Any]:
+    started = utc_now_iso()
+    t0 = time.monotonic()
+    store_path = _tpo_store_path()
+
+    tpo_logger = bind_logger(
+        logger,
+        component="multi_group_worker",
+        cycle_id=sequence_id,
+        symbol="TPO",
+    )
+
+    summary: dict[str, Any] = {
+        "status": "unknown",
+        "started_at_utc": started,
+        "finished_at_utc": None,
+        "elapsed_sec": None,
+        "returncode": None,
+        "timeout_sec": timeout_sec,
+        "store_path": str(store_path),
+        "store_summary": None,
+        "stdout_tail": "",
+        "stderr_tail": "",
+        "error_message": None,
+    }
+
+    tpo_logger.info(
+        "TPO export started. module=app.services.tpo_context_exporter store_path=%s timeout_sec=%s",
+        store_path,
+        timeout_sec,
+    )
+
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "app.services.tpo_context_exporter"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+
+        summary["returncode"] = completed.returncode
+        summary["stdout_tail"] = _tail_text(completed.stdout)
+        summary["stderr_tail"] = _tail_text(completed.stderr)
+
+        store_summary = _read_tpo_store_summary(store_path)
+        summary["store_summary"] = store_summary
+
+        if completed.returncode != 0:
+            summary["status"] = "failed"
+            summary["error_message"] = (
+                f"tpo_context_exporter_returncode_{completed.returncode}"
+            )
+            tpo_logger.error(
+                "TPO export failed. summary=%s",
+                summary,
+            )
+            return summary
+
+        if not store_summary.get("exists"):
+            summary["status"] = "failed"
+            summary["error_message"] = "tpo_store_missing_after_export"
+            tpo_logger.error(
+                "TPO export finished but store is missing. summary=%s",
+                summary,
+            )
+            return summary
+
+        if not store_summary.get("size_bytes"):
+            summary["status"] = "failed"
+            summary["error_message"] = "tpo_store_empty_after_export"
+            tpo_logger.error(
+                "TPO export finished but store is empty. summary=%s",
+                summary,
+            )
+            return summary
+
+        if store_summary.get("read_error"):
+            summary["status"] = "failed"
+            summary["error_message"] = str(store_summary.get("read_error"))
+            tpo_logger.error(
+                "TPO export finished but store summary failed. summary=%s",
+                summary,
+            )
+            return summary
+
+        summary["status"] = "ok"
+        tpo_logger.info(
+            "TPO export finished successfully. summary=%s",
+            summary,
+        )
+        return summary
+
+    except subprocess.TimeoutExpired as exc:
+        summary["status"] = "failed"
+        summary["error_message"] = f"tpo_export_timeout_after_{timeout_sec}s"
+        summary["stdout_tail"] = _tail_text(
+            exc.stdout.decode() if isinstance(exc.stdout, bytes) else exc.stdout
+        )
+        summary["stderr_tail"] = _tail_text(
+            exc.stderr.decode() if isinstance(exc.stderr, bytes) else exc.stderr
+        )
+
+        tpo_logger.error(
+            "TPO export timeout. summary=%s",
+            summary,
+        )
+        return summary
+
+    except Exception as exc:
+        summary["status"] = "failed"
+        summary["error_message"] = str(exc)
+
+        log_exception(
+            tpo_logger,
+            f"TPO export crashed: {exc}",
+            component="multi_group_worker",
+            cycle_id=sequence_id,
+            symbol="TPO",
+        )
+        return summary
+
+    finally:
+        summary["finished_at_utc"] = utc_now_iso()
+        summary["elapsed_sec"] = round(time.monotonic() - t0, 3)
 
 
 def run_group_once(group: str) -> dict[str, Any]:
@@ -240,6 +457,19 @@ def main() -> int:
         300,
     )
 
+    enable_tpo_export_before_groups = _to_bool(
+        os.getenv("ENABLE_TPO_EXPORT_BEFORE_GROUPS"),
+        True,
+    )
+    tpo_export_required = _to_bool(
+        os.getenv("TPO_EXPORT_REQUIRED"),
+        True,
+    )
+    tpo_export_timeout_sec = _to_int(
+        os.getenv("TPO_EXPORT_TIMEOUT_SEC"),
+        300,
+    )
+
     # General Telegram flag.
     # Keep this enabled if trade alerts must work.
     enable_telegram = _to_bool(
@@ -261,13 +491,17 @@ def main() -> int:
     notifier = TelegramNotifier()
 
     worker_logger.info(
-        "Config groups=%s interval_sec=%s delay_between_groups_sec=%s run_once=%s enable_telegram=%s enable_telegram_admin_messages=%s",
+        "Config groups=%s interval_sec=%s delay_between_groups_sec=%s run_once=%s enable_telegram=%s enable_telegram_admin_messages=%s enable_tpo_export_before_groups=%s tpo_export_required=%s tpo_export_timeout_sec=%s tpo_store_path=%s",
         groups,
         interval_sec,
         delay_between_groups_sec,
         run_once,
         enable_telegram,
         enable_telegram_admin_messages,
+        enable_tpo_export_before_groups,
+        tpo_export_required,
+        tpo_export_timeout_sec,
+        _tpo_store_path(),
     )
 
     try:
@@ -328,17 +562,60 @@ def main() -> int:
                 symbol="-",
             )
 
-        results = run_sequence(
-            groups=groups,
-            delay_between_groups_sec=delay_between_groups_sec,
-            shutdown=shutdown,
-        )
+        tpo_export_summary: dict[str, Any] | None = None
+        tpo_failed = False
+        skip_groups = False
 
-        failed = any(x.get("status") == "failed" for x in results)
+        if enable_tpo_export_before_groups and not shutdown.stop_requested:
+            tpo_export_summary = run_tpo_exporter_once(
+                sequence_id=sequence_id,
+                timeout_sec=tpo_export_timeout_sec,
+            )
+            tpo_failed = tpo_export_summary.get("status") != "ok"
+
+            if tpo_failed:
+                sequence_logger.error(
+                    "TPO export failed before groups. tpo_export_required=%s summary=%s",
+                    tpo_export_required,
+                    tpo_export_summary,
+                )
+
+                if tpo_export_required:
+                    skip_groups = True
+                    sequence_logger.error(
+                        "Skipping live groups because TPO export is required and failed."
+                    )
+            else:
+                sequence_logger.info(
+                    "TPO export OK before groups. summary=%s",
+                    tpo_export_summary,
+                )
+        elif not enable_tpo_export_before_groups:
+            sequence_logger.warning(
+                "TPO export before groups is disabled. Live worker will rely on existing store."
+            )
+
+        if shutdown.stop_requested:
+            break
+
+        if skip_groups:
+            results: list[dict[str, Any]] = []
+        else:
+            results = run_sequence(
+                groups=groups,
+                delay_between_groups_sec=delay_between_groups_sec,
+                shutdown=shutdown,
+            )
+
+        group_failed = any(x.get("status") == "failed" for x in results)
+        failed = group_failed or (tpo_failed and tpo_export_required)
 
         try:
             if failed:
-                heartbeat.mark_cycle_failure(sequence_id, "One or more groups failed")
+                heartbeat.mark_cycle_failure(
+                    sequence_id,
+                    "TPO export failed or one or more groups failed",
+                )
             else:
                 heartbeat.mark_cycle_success(sequence_id)
         except Exception as exc:
@@ -354,7 +631,8 @@ def main() -> int:
         sleep_next = max(0, interval_sec - int(elapsed))
 
         sequence_logger.info(
-            "Sequence finished results=%s elapsed=%.2fs sleep_next=%ss",
+            "Sequence finished tpo_export=%s results=%s elapsed=%.2fs sleep_next=%ss",
+            tpo_export_summary,
             results,
             elapsed,
             sleep_next,
