@@ -46,14 +46,10 @@ from app.services.telegram_formatter import format_signal_message
 from app.services.telegram_notifier import build_telegram_notifier
 from app.services.telegram_alert_store import record_telegram_alert
 from app.storage.cache_store import ParquetCache
-from app.auction.profile_engine import (
-    build_auction_context,
-    auction_context_to_signal_filters,
-)
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.4.6-tpo-memory-safe-v1"
+RUNNER_VERSION = "1.4.7-tpo-store-gated-v1"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -79,6 +75,13 @@ RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
 JOURNAL_FALLBACK_PATH = RUNTIME_DIR / "radar_journal.ndjson"
 SNAPSHOT_FALLBACK_PATH = RUNTIME_DIR / "radar_snapshot_v2.ndjson"
+
+# TPO is intentionally NOT calculated inside the live worker.
+# Live worker only reads precomputed auction context from this store.
+# This prevents Render OOM spikes and keeps signal production stable.
+TPO_STORE_PATH = RUNTIME_DIR / "tpo" / "tpo_latest.json"
+TPO_MAX_STALE_MINUTES = int(os.getenv("TPO_MAX_STALE_MINUTES", "240"))
+TPO_SIGNAL_GATE_ENABLED = _env_bool("TPO_SIGNAL_GATE_ENABLED", True)
 
 
 def safe_append_ndjson(path: Path, payload: dict[str, Any]) -> None:
@@ -1448,17 +1451,11 @@ class StatefulBatchRunner:
                 scenario_engine_error=scenario_engine_error,
                 scenario_engine_error_type=scenario_engine_error_type,
             )
-            tracker_source_payload["auction_context"] = to_jsonable(analysis.get("auction_context"))
-            tracker_source_payload["auction_filters"] = to_jsonable(analysis.get("auction_filters"))
-            tracker_source_payload["auction_telemetry_mode"] = analysis.get("auction_telemetry_mode", "passive_only")
-
-            tracker_metadata = tracker_source_payload.get("metadata")
-            if not isinstance(tracker_metadata, dict):
-                tracker_metadata = {}
-            tracker_metadata["auction_context"] = to_jsonable(analysis.get("auction_context"))
-            tracker_metadata["auction_filters"] = to_jsonable(analysis.get("auction_filters"))
-            tracker_metadata["auction_telemetry_mode"] = analysis.get("auction_telemetry_mode", "passive_only")
-            tracker_source_payload["metadata"] = tracker_metadata
+            tracker_source_payload = self._attach_tpo_policy_to_payload(
+                payload=tracker_source_payload,
+                auction_context=analysis.get("auction_context"),
+                auction_filters=analysis.get("auction_filters"),
+            )
 
             tracker_source_payload = self._enrich_tracker_payload_with_execution_bridge(
                 payload=tracker_source_payload,
@@ -1666,6 +1663,88 @@ class StatefulBatchRunner:
         raw["metadata"] = metadata
 
         return raw
+
+    def _attach_tpo_policy_to_payload(
+        self,
+        *,
+        payload: dict[str, Any],
+        auction_context: dict[str, Any] | None,
+        auction_filters: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Attach TPO context and signal permission without changing lifecycle state."""
+        if not isinstance(payload, dict):
+            return {}
+
+        if not isinstance(auction_context, dict):
+            auction_context = {}
+        if not isinstance(auction_filters, dict):
+            auction_filters = {}
+
+        open_relation = str(
+            auction_filters.get("open_relation")
+            or auction_context.get("open_relation")
+            or "UNKNOWN"
+        ).upper()
+        auction_bias = str(
+            auction_filters.get("auction_bias")
+            or auction_context.get("auction_bias")
+            or "UNKNOWN"
+        ).upper()
+        modifier = str(auction_filters.get("telegram_modifier") or "NEUTRAL").upper()
+        is_stale = bool(auction_filters.get("is_stale") or auction_context.get("is_stale"))
+        available = bool(
+            auction_filters.get("auction_context_available")
+            or auction_context.get("auction_context_available")
+        )
+
+        permission = "NEUTRAL"
+        reason = "tpo_neutral_or_unavailable"
+
+        if TPO_SIGNAL_GATE_ENABLED and available and not is_stale:
+            if open_relation == "INSIDE_VA" or auction_bias == "BALANCE" or modifier == "DOWNGRADE":
+                permission = "RESEARCH_ONLY"
+                reason = "tpo_blocks_battle_signal_inside_value_or_balance"
+            elif open_relation == "OUT_OF_RANGE" and auction_bias == "DIRECTIONAL_IMBALANCE":
+                permission = "ALLOW_BOOST"
+                reason = "tpo_allows_directional_imbalance"
+            elif open_relation == "RANGE":
+                permission = "ALLOW_NEUTRAL"
+                reason = "tpo_allows_range_context_with_confirmation"
+            else:
+                permission = "NEUTRAL"
+                reason = "tpo_context_unclear"
+        elif is_stale:
+            permission = "NEUTRAL"
+            reason = "tpo_stale_no_gate"
+
+        payload["auction_context"] = to_jsonable(auction_context)
+        payload["auction_filters"] = to_jsonable(auction_filters)
+        payload["auction_telemetry_mode"] = "offline_store_read_only"
+        payload["tpo_open_relation"] = open_relation
+        payload["tpo_auction_bias"] = auction_bias
+        payload["tpo_telegram_modifier"] = modifier
+        payload["tpo_confidence_modifier"] = auction_filters.get("confidence_modifier", 0.0)
+        payload["tpo_signal_permission"] = permission
+        payload["tpo_signal_reason"] = reason
+
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata.update(
+            {
+                "auction_context": to_jsonable(auction_context),
+                "auction_filters": to_jsonable(auction_filters),
+                "auction_telemetry_mode": "offline_store_read_only",
+                "tpo_open_relation": open_relation,
+                "tpo_auction_bias": auction_bias,
+                "tpo_telegram_modifier": modifier,
+                "tpo_signal_permission": permission,
+                "tpo_signal_reason": reason,
+                "tpo_signal_gate_enabled": TPO_SIGNAL_GATE_ENABLED,
+            }
+        )
+        payload["metadata"] = metadata
+        return payload
 
     def _enrich_tracker_payload_with_execution_bridge(
         self,
@@ -2204,89 +2283,108 @@ class StatefulBatchRunner:
         series_by_tf: dict[Timeframe, pd.DataFrame],
     ) -> dict[str, Any]:
         """
-        Passive TPO / Market Profile telemetry.
+        Read precomputed TPO / Market Profile telemetry from disk.
 
-        It is deliberately read-only:
-        - does not alter ScenarioEngine;
-        - does not alter SignalTracker decisions;
-        - does not alter execution;
-        - does not alter Telegram permission;
-        - only enriches journal/snapshot/signal metadata for future statistics.
+        IMPORTANT:
+        The live worker must NOT calculate profiles. TPO calculation is an
+        offline/lightweight job. The live worker only reads the latest context
+        and applies signal policy from that context. This prevents Render OOM.
         """
+        del series_by_tf
+
+        unavailable = {
+            "context": {
+                "auction_context_available": False,
+                "tpo_source": "offline_store",
+                "reason": "tpo_store_missing_or_symbol_not_found",
+                "store_path": str(TPO_STORE_PATH),
+            },
+            "filters": {
+                "auction_context_available": False,
+                "open_relation": "UNKNOWN",
+                "auction_bias": "UNKNOWN",
+                "telegram_modifier": "NEUTRAL",
+                "confidence_modifier": 0.0,
+                "reasons": ["TPO context unavailable; live worker kept neutral."],
+            },
+            "telemetry_mode": "offline_store_read_only",
+        }
+
         try:
-            source_df = series_by_tf.get(Timeframe.M15)
-            auction_df = self._prepare_auction_dataframe(source_df)
+            if not TPO_STORE_PATH.exists():
+                return unavailable
 
-            if auction_df is None or auction_df.empty:
-                return {
-                    "context": {
-                        "auction_context_available": False,
-                        "reason": "missing_or_unusable_15m_ohlc_dataframe",
-                    },
-                    "filters": {
-                        "auction_context_available": False,
-                        "open_relation": "UNKNOWN",
-                        "auction_bias": "UNKNOWN",
-                        "telegram_modifier": "NEUTRAL",
-                        "confidence_modifier": 0.0,
-                        "reasons": [
-                            "Auction context unavailable: missing or unusable 15m OHLC dataframe."
-                        ],
-                    },
-                    "telemetry_mode": "passive_only",
-                }
+            raw = json.loads(TPO_STORE_PATH.read_text(encoding="utf-8"))
+            symbols = raw.get("symbols") if isinstance(raw, dict) else None
+            if not isinstance(symbols, dict):
+                return unavailable
 
-            tick_size = _auction_tick_size(symbol)
-            context = build_auction_context(
-                auction_df,
-                symbol=symbol.value,
-                timeframe="15m",
-                tick_size=tick_size,
-                value_area_pct=0.70,
-                ib_minutes=60,
-            )
-            filters = auction_context_to_signal_filters(context)
+            item = symbols.get(symbol.value)
+            if not isinstance(item, dict):
+                return unavailable
 
-            context_payload = to_jsonable(context.to_dict())
-            if isinstance(context_payload, dict):
-                context_payload["auction_context_available"] = True
-                context_payload["bars_used"] = int(len(auction_df))
-                context_payload["max_bars"] = int(AUCTION_MAX_BARS)
-                context_payload["tick_size"] = float(tick_size)
-                context_payload["memory_mode"] = "bounded_recent_history"
+            context_payload = item.get("context")
+            filters_payload = item.get("filters")
+            if not isinstance(context_payload, dict):
+                context_payload = {}
+            if not isinstance(filters_payload, dict):
+                filters_payload = {}
+
+            updated_at = item.get("updated_at_utc") or raw.get("updated_at_utc")
+            stale = False
+            age_minutes = None
+            if updated_at:
+                try:
+                    parsed = datetime.fromisoformat(str(updated_at).replace("Z", "+00:00"))
+                    age_minutes = (datetime.now(UTC) - parsed.astimezone(UTC)).total_seconds() / 60.0
+                    stale = age_minutes > TPO_MAX_STALE_MINUTES
+                except Exception:
+                    stale = True
+
+            context_payload["auction_context_available"] = True
+            context_payload["tpo_source"] = "offline_store"
+            context_payload["updated_at_utc"] = updated_at
+            context_payload["age_minutes"] = round(age_minutes, 2) if age_minutes is not None else None
+            context_payload["is_stale"] = stale
+            context_payload["store_path"] = str(TPO_STORE_PATH)
+
+            filters_payload.setdefault("auction_context_available", True)
+            filters_payload.setdefault("open_relation", context_payload.get("open_relation", "UNKNOWN"))
+            filters_payload.setdefault("auction_bias", context_payload.get("auction_bias", "UNKNOWN"))
+            filters_payload.setdefault("telegram_modifier", "NEUTRAL")
+            filters_payload.setdefault("confidence_modifier", 0.0)
+            filters_payload.setdefault("reasons", [])
+            filters_payload["tpo_source"] = "offline_store"
+            filters_payload["is_stale"] = stale
+
+            if stale:
+                filters_payload["telegram_modifier"] = "NEUTRAL"
+                filters_payload["confidence_modifier"] = 0.0
+                reasons = filters_payload.get("reasons")
+                if not isinstance(reasons, list):
+                    reasons = []
+                reasons.append("TPO context is stale; live worker kept neutral.")
+                filters_payload["reasons"] = reasons
 
             return {
-                "context": context_payload,
-                "filters": to_jsonable(filters),
-                "telemetry_mode": "passive_only",
+                "context": to_jsonable(context_payload),
+                "filters": to_jsonable(filters_payload),
+                "telemetry_mode": "offline_store_read_only",
             }
 
         except Exception as auction_error:  # noqa: BLE001
             logger.exception(
-                "Passive auction telemetry failed. symbol=%s error=%s",
+                "TPO store read failed. symbol=%s error=%s",
                 symbol.value,
                 auction_error,
             )
-            return {
-                "context": {
-                    "auction_context_available": False,
-                    "auction_context_failed": True,
-                    "error": str(auction_error),
-                    "error_type": type(auction_error).__name__,
-                },
-                "filters": {
-                    "auction_context_available": False,
-                    "auction_filters_failed": True,
-                    "open_relation": "UNKNOWN",
-                    "auction_bias": "UNKNOWN",
-                    "telegram_modifier": "NEUTRAL",
-                    "confidence_modifier": 0.0,
-                    "reasons": [
-                        f"Auction telemetry failed: {type(auction_error).__name__}"
-                    ],
-                },
-                "telemetry_mode": "passive_only",
-            }
+            unavailable["context"]["auction_context_failed"] = True
+            unavailable["context"]["error"] = str(auction_error)
+            unavailable["filters"]["reasons"] = [
+                f"TPO store read failed: {type(auction_error).__name__}"
+            ]
+            return unavailable
+
 
     def _run_analysis_pipeline(
         self,
@@ -3080,6 +3178,12 @@ class StatefulBatchRunner:
         target_price = tracked_payload.get("target_reference_price")
         rr = tracked_payload.get("risk_reward_ratio")
 
+        tpo_signal_permission = str(tracked_payload.get("tpo_signal_permission") or "NEUTRAL").upper()
+        tpo_signal_reason = tracked_payload.get("tpo_signal_reason")
+        tpo_open_relation = tracked_payload.get("tpo_open_relation")
+        tpo_auction_bias = tracked_payload.get("tpo_auction_bias")
+        tpo_telegram_modifier = tracked_payload.get("tpo_telegram_modifier")
+
         raw_alert_payload = {
             "schema_version": "2.0",
             "should_alert": True,
@@ -3127,7 +3231,22 @@ class StatefulBatchRunner:
             "previous_signal_class": previous_signal_class or None,
             "previous_execution_status": previous_execution_status or None,
             "tracker_action": tracker_action,
+            "auction_context": tracked_payload.get("auction_context"),
+            "auction_filters": tracked_payload.get("auction_filters"),
+            "auction_telemetry_mode": tracked_payload.get("auction_telemetry_mode"),
+            "tpo_open_relation": tpo_open_relation,
+            "tpo_auction_bias": tpo_auction_bias,
+            "tpo_telegram_modifier": tpo_telegram_modifier,
+            "tpo_signal_permission": tpo_signal_permission,
+            "tpo_signal_reason": tpo_signal_reason,
         }
+
+        if TPO_SIGNAL_GATE_ENABLED and tpo_signal_permission in {"RESEARCH_ONLY", "BLOCK"}:
+            raw_alert_payload["should_alert"] = False
+            raw_alert_payload["telegram_allowed"] = False
+            raw_alert_payload["telegram_block_reason"] = f"blocked_by_tpo:{tpo_signal_permission}:{tpo_signal_reason}"
+            raw_alert_payload["signal_quality_reason"] = raw_alert_payload["telegram_block_reason"]
+            return raw_alert_payload
 
         enriched_payload = enrich_payload_with_quality(raw_alert_payload)
         hard_allowed, hard_reason = _is_telegram_trade_alert_allowed(enriched_payload)
