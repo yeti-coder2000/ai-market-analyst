@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, time, timezone
+from datetime import datetime
 from enum import Enum
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 import pandas as pd
+
+from app.core.session_config import (
+    SessionConfig,
+    compute_session_open_for_timestamp,
+    get_session_config,
+)
 
 
 class OpenRelation(str, Enum):
@@ -49,6 +55,14 @@ class ProfileLevels:
     ib_high: Optional[float] = None
     ib_low: Optional[float] = None
     ib_range: Optional[float] = None
+
+    session_anchor: Optional[str] = None
+    session_timezone: Optional[str] = None
+    session_open_local: Optional[str] = None
+    session_open_utc: Optional[str] = None
+    session_open_kyiv: Optional[str] = None
+    next_session_open_utc: Optional[str] = None
+    primary_logic: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -98,6 +112,17 @@ class AuctionContext:
     ib_extension_up_pct: Optional[float] = None
     ib_extension_down_pct: Optional[float] = None
 
+    session_anchor: Optional[str] = None
+    session_timezone: Optional[str] = None
+    session_open_local: Optional[str] = None
+    session_open_utc: Optional[str] = None
+    session_open_kyiv: Optional[str] = None
+    next_session_open_utc: Optional[str] = None
+    is_primary_session_active: Optional[bool] = None
+    primary_logic: Optional[str] = None
+    secondary_anchors: list[str] = field(default_factory=list)
+    exchange_open_reference: Optional[str] = None
+
     notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -107,12 +132,15 @@ class AuctionContext:
 def _safe_float(value: Any) -> Optional[float]:
     if value is None:
         return None
+
     try:
         v = float(value)
     except (TypeError, ValueError):
         return None
+
     if pd.isna(v):
         return None
+
     return v
 
 
@@ -150,14 +178,86 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _timestamp_to_python_datetime_utc(ts: Any) -> datetime:
+    value = pd.Timestamp(ts)
+
+    if value.tzinfo is None:
+        value = value.tz_localize("UTC")
+    else:
+        value = value.tz_convert("UTC")
+
+    return value.to_pydatetime()
+
+
 def _session_id_from_timestamp(ts: pd.Timestamp) -> str:
+    """
+    Legacy UTC calendar-day session id.
+
+    Kept for backward compatibility, but production TPO should use
+    assign_symbol_sessions(), which respects instrument-specific session opens.
+    """
     return ts.date().isoformat()
 
 
 def assign_daily_sessions(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Legacy daily UTC sessions.
+
+    Kept so older callers do not break. New auction-aware logic should call
+    assign_symbol_sessions().
+    """
     df = _normalize_columns(df)
     df["session_id"] = df["timestamp"].apply(_session_id_from_timestamp)
     return df
+
+
+def assign_symbol_sessions(
+    df: pd.DataFrame,
+    *,
+    symbol: str,
+    session_config: SessionConfig | None = None,
+) -> pd.DataFrame:
+    """
+    Assigns session_id using instrument-specific session opens.
+
+    Examples:
+    - GER40: 09:00 Europe/Berlin
+    - NAS100/SPX500: 09:30 America/New_York
+    - FX majors: 17:00 America/New_York rollover
+    - XAUUSD: 18:00 America/New_York metals/Globex session
+    - BTCUSD/ETHUSD: 00:00 UTC
+    """
+    df = _normalize_columns(df)
+    config = session_config or get_session_config(symbol)
+
+    session_rows: list[dict[str, Any]] = []
+
+    for ts in df["timestamp"]:
+        ts_utc = _timestamp_to_python_datetime_utc(ts)
+        meta = compute_session_open_for_timestamp(ts_utc, config)
+        session_rows.append(meta)
+
+    meta_df = pd.DataFrame(session_rows)
+
+    df["session_id"] = meta_df["current_session_id"].astype(str)
+    df["session_anchor"] = meta_df["session_anchor"]
+    df["session_timezone"] = meta_df["session_timezone"]
+    df["session_open_local"] = meta_df["session_open_local"]
+    df["session_open_utc"] = meta_df["session_open_utc"]
+    df["session_open_kyiv"] = meta_df["session_open_kyiv"]
+    df["next_session_open_utc"] = meta_df["next_session_open_utc"]
+    df["is_primary_session_active"] = meta_df["is_primary_session_active"]
+    df["primary_logic"] = meta_df["primary_logic"]
+    df["secondary_anchors"] = meta_df["secondary_anchors"]
+    df["exchange_open_reference"] = meta_df["exchange_open_reference"]
+
+    return df
+
+
+def _first_value(session_df: pd.DataFrame, column: str) -> Any:
+    if session_df.empty or column not in session_df.columns:
+        return None
+    return session_df[column].iloc[0]
 
 
 def _price_bin(price: float, tick_size: float) -> float:
@@ -346,6 +446,13 @@ def build_session_profile(
         ib_high=ib_high,
         ib_low=ib_low,
         ib_range=ib_range,
+        session_anchor=_first_value(session_df, "session_anchor"),
+        session_timezone=_first_value(session_df, "session_timezone"),
+        session_open_local=_first_value(session_df, "session_open_local"),
+        session_open_utc=_first_value(session_df, "session_open_utc"),
+        session_open_kyiv=_first_value(session_df, "session_open_kyiv"),
+        next_session_open_utc=_first_value(session_df, "next_session_open_utc"),
+        primary_logic=_first_value(session_df, "primary_logic"),
     )
 
 
@@ -354,8 +461,14 @@ def build_profiles_by_session(
     tick_size: float,
     value_area_pct: float = 0.70,
     ib_minutes: int = 60,
+    *,
+    symbol: str | None = None,
+    session_config: SessionConfig | None = None,
 ) -> list[ProfileLevels]:
-    df = assign_daily_sessions(df)
+    if symbol:
+        df = assign_symbol_sessions(df, symbol=symbol, session_config=session_config)
+    else:
+        df = assign_daily_sessions(df)
 
     profiles: list[ProfileLevels] = []
 
@@ -366,6 +479,7 @@ def build_profiles_by_session(
             value_area_pct=value_area_pct,
             ib_minutes=ib_minutes,
         )
+
         if profile is not None:
             profiles.append(profile)
 
@@ -420,6 +534,7 @@ def find_naked_pocs(
 
         if not touched:
             distance = None
+
             if current_price is not None:
                 distance = round(abs(current_price - poc), 10)
 
@@ -463,6 +578,40 @@ def compute_ib_extension(
     return ext_up, ext_down, ext_up_pct, ext_down_pct
 
 
+def _empty_context(
+    *,
+    symbol: str,
+    timeframe: str,
+    note: str,
+    session_config: SessionConfig | None = None,
+) -> AuctionContext:
+    config = session_config or get_session_config(symbol)
+
+    return AuctionContext(
+        symbol=symbol,
+        timeframe=timeframe,
+        current_price=None,
+        current_session_id=None,
+        previous_session_id=None,
+        previous_poc=None,
+        previous_vah=None,
+        previous_val=None,
+        previous_high=None,
+        previous_low=None,
+        current_open=None,
+        open_relation=OpenRelation.UNKNOWN.value,
+        auction_bias=AuctionBias.UNKNOWN.value,
+        nearest_npoc=None,
+        nearest_npoc_distance=None,
+        session_anchor=config.session_anchor,
+        session_timezone=config.timezone,
+        primary_logic=config.primary_logic,
+        secondary_anchors=list(config.secondary_anchors),
+        exchange_open_reference=config.exchange_open_reference,
+        notes=[note],
+    )
+
+
 def build_auction_context(
     df: pd.DataFrame,
     *,
@@ -471,6 +620,7 @@ def build_auction_context(
     tick_size: float,
     value_area_pct: float = 0.70,
     ib_minutes: int = 60,
+    session_config: SessionConfig | None = None,
 ) -> AuctionContext:
     """
     Main read-only auction context builder.
@@ -481,27 +631,21 @@ def build_auction_context(
 
     Output:
     - AuctionContext ready to be added to journal/snapshot as passive diagnostics.
+
+    Important:
+    - Session boundaries are instrument-specific.
+    - Do not use one universal midnight session for every symbol.
     """
-    df = assign_daily_sessions(df)
+    config = session_config or get_session_config(symbol)
+
+    df = assign_symbol_sessions(df, symbol=symbol, session_config=config)
 
     if df.empty:
-        return AuctionContext(
+        return _empty_context(
             symbol=symbol,
             timeframe=timeframe,
-            current_price=None,
-            current_session_id=None,
-            previous_session_id=None,
-            previous_poc=None,
-            previous_vah=None,
-            previous_val=None,
-            previous_high=None,
-            previous_low=None,
-            current_open=None,
-            open_relation=OpenRelation.UNKNOWN.value,
-            auction_bias=AuctionBias.UNKNOWN.value,
-            nearest_npoc=None,
-            nearest_npoc_distance=None,
-            notes=["empty dataframe"],
+            note="empty dataframe",
+            session_config=config,
         )
 
     profiles = build_profiles_by_session(
@@ -509,7 +653,17 @@ def build_auction_context(
         tick_size=tick_size,
         value_area_pct=value_area_pct,
         ib_minutes=ib_minutes,
+        symbol=symbol,
+        session_config=config,
     )
+
+    if not profiles:
+        return _empty_context(
+            symbol=symbol,
+            timeframe=timeframe,
+            note="no valid session profiles",
+            session_config=config,
+        )
 
     current_session_id = str(df["session_id"].iloc[-1])
     current_session_df = df[df["session_id"] == current_session_id]
@@ -531,6 +685,7 @@ def build_auction_context(
     nearest_npoc = naked_pocs[0] if naked_pocs else None
 
     current_profile = None
+
     for profile in profiles:
         if profile.session_id == current_session_id:
             current_profile = profile
@@ -558,6 +713,14 @@ def build_auction_context(
     if nearest_npoc is not None:
         notes.append("Nearest nPOC is available as interest zone, not as standalone entry.")
 
+    session_anchor = _first_value(current_session_df, "session_anchor") or config.session_anchor
+    session_timezone = _first_value(current_session_df, "session_timezone") or config.timezone
+    session_open_local = _first_value(current_session_df, "session_open_local")
+    session_open_utc = _first_value(current_session_df, "session_open_utc")
+    session_open_kyiv = _first_value(current_session_df, "session_open_kyiv")
+    next_session_open_utc = _first_value(current_session_df, "next_session_open_utc")
+    is_primary_session_active = _first_value(current_session_df, "is_primary_session_active")
+
     return AuctionContext(
         symbol=symbol,
         timeframe=timeframe,
@@ -582,6 +745,18 @@ def build_auction_context(
         ib_extension_down=ext_down,
         ib_extension_up_pct=ext_up_pct,
         ib_extension_down_pct=ext_down_pct,
+        session_anchor=session_anchor,
+        session_timezone=session_timezone,
+        session_open_local=session_open_local,
+        session_open_utc=session_open_utc,
+        session_open_kyiv=session_open_kyiv,
+        next_session_open_utc=next_session_open_utc,
+        is_primary_session_active=bool(is_primary_session_active)
+        if is_primary_session_active is not None
+        else None,
+        primary_logic=config.primary_logic,
+        secondary_anchors=list(config.secondary_anchors),
+        exchange_open_reference=config.exchange_open_reference,
         notes=notes,
     )
 
@@ -600,6 +775,11 @@ def auction_context_to_signal_filters(context: AuctionContext) -> dict[str, Any]
         "telegram_modifier": "NEUTRAL",
         "confidence_modifier": 0.0,
         "reasons": [],
+        "session_anchor": context.session_anchor,
+        "session_timezone": context.session_timezone,
+        "session_open_utc": context.session_open_utc,
+        "session_open_kyiv": context.session_open_kyiv,
+        "primary_logic": context.primary_logic,
     }
 
     if context.open_relation == OpenRelation.INSIDE_VA.value:
