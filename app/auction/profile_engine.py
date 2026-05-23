@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 
@@ -10,6 +10,7 @@ import pandas as pd
 from app.core.session_config import (
     SessionConfig,
     compute_session_open_for_timestamp,
+    evaluate_market_state,
     get_session_config,
 )
 
@@ -122,6 +123,15 @@ class AuctionContext:
     primary_logic: Optional[str] = None
     secondary_anchors: list[str] = field(default_factory=list)
     exchange_open_reference: Optional[str] = None
+
+    asset_class: Optional[str] = None
+    market_is_open: Optional[bool] = None
+    market_status: Optional[str] = None
+    market_closed_reason: Optional[str] = None
+    market_data_is_stale: Optional[bool] = None
+    market_data_age_minutes: Optional[float] = None
+    last_bar_timestamp_utc: Optional[str] = None
+    stale_bar_threshold_minutes: Optional[int] = None
 
     notes: list[str] = field(default_factory=list)
 
@@ -257,12 +267,14 @@ def assign_symbol_sessions(
 def _first_value(session_df: pd.DataFrame, column: str) -> Any:
     if session_df.empty or column not in session_df.columns:
         return None
+
     return session_df[column].iloc[0]
 
 
 def _price_bin(price: float, tick_size: float) -> float:
     if tick_size <= 0:
         raise ValueError("tick_size must be > 0")
+
     return round(round(price / tick_size) * tick_size, 10)
 
 
@@ -608,6 +620,14 @@ def _empty_context(
         primary_logic=config.primary_logic,
         secondary_anchors=list(config.secondary_anchors),
         exchange_open_reference=config.exchange_open_reference,
+        asset_class=config.asset_class,
+        market_is_open=False,
+        market_status="NO_DATA",
+        market_closed_reason="no_usable_data",
+        market_data_is_stale=True,
+        market_data_age_minutes=None,
+        last_bar_timestamp_utc=None,
+        stale_bar_threshold_minutes=config.stale_bar_threshold_minutes,
         notes=[note],
     )
 
@@ -634,11 +654,23 @@ def build_auction_context(
 
     Important:
     - Session boundaries are instrument-specific.
+    - Market-open / stale-data guard is applied here.
     - Do not use one universal midnight session for every symbol.
     """
     config = session_config or get_session_config(symbol)
 
     df = assign_symbol_sessions(df, symbol=symbol, session_config=config)
+
+    last_bar_ts_utc = None
+
+    if not df.empty:
+        last_bar_ts_utc = _timestamp_to_python_datetime_utc(df["timestamp"].iloc[-1])
+
+    market_state = evaluate_market_state(
+        now_utc=datetime.now(timezone.utc),
+        last_bar_ts_utc=last_bar_ts_utc,
+        config=config,
+    )
 
     if df.empty:
         return _empty_context(
@@ -704,6 +736,18 @@ def build_auction_context(
 
     notes: list[str] = []
 
+    if market_state.get("market_is_open") is False:
+        notes.append(
+            f"Market is closed: {market_state.get('market_closed_reason')}. "
+            "Auction context is diagnostic only; battle signals should be disabled."
+        )
+
+    if market_state.get("market_data_is_stale") is True:
+        notes.append(
+            f"Market data is stale: age={market_state.get('market_data_age_minutes')} min, "
+            f"threshold={market_state.get('stale_bar_threshold_minutes')} min."
+        )
+
     if open_relation == OpenRelation.INSIDE_VA.value:
         notes.append("Open inside previous value area: balance/open-auction risk is elevated.")
 
@@ -757,6 +801,14 @@ def build_auction_context(
         primary_logic=config.primary_logic,
         secondary_anchors=list(config.secondary_anchors),
         exchange_open_reference=config.exchange_open_reference,
+        asset_class=market_state.get("asset_class"),
+        market_is_open=market_state.get("market_is_open"),
+        market_status=market_state.get("market_status"),
+        market_closed_reason=market_state.get("market_closed_reason"),
+        market_data_is_stale=market_state.get("market_data_is_stale"),
+        market_data_age_minutes=market_state.get("market_data_age_minutes"),
+        last_bar_timestamp_utc=market_state.get("last_bar_timestamp_utc"),
+        stale_bar_threshold_minutes=market_state.get("stale_bar_threshold_minutes"),
         notes=notes,
     )
 
@@ -765,8 +817,8 @@ def auction_context_to_signal_filters(context: AuctionContext) -> dict[str, Any]
     """
     Converts auction context into passive signal-quality hints.
 
-    This function does not block trades by itself. It only produces labels
-    that can later be consumed by Telegram/quality tiers.
+    This function does not execute trades by itself. It produces labels and
+    permissions consumed later by the live worker / Telegram / quality tiers.
     """
     filters: dict[str, Any] = {
         "auction_context_available": True,
@@ -780,6 +832,15 @@ def auction_context_to_signal_filters(context: AuctionContext) -> dict[str, Any]
         "session_open_utc": context.session_open_utc,
         "session_open_kyiv": context.session_open_kyiv,
         "primary_logic": context.primary_logic,
+        "asset_class": context.asset_class,
+        "market_is_open": context.market_is_open,
+        "market_status": context.market_status,
+        "market_closed_reason": context.market_closed_reason,
+        "market_data_is_stale": context.market_data_is_stale,
+        "market_data_age_minutes": context.market_data_age_minutes,
+        "last_bar_timestamp_utc": context.last_bar_timestamp_utc,
+        "stale_bar_threshold_minutes": context.stale_bar_threshold_minutes,
+        "tpo_signal_permission": "UNSET",
     }
 
     if context.open_relation == OpenRelation.INSIDE_VA.value:
@@ -805,5 +866,24 @@ def auction_context_to_signal_filters(context: AuctionContext) -> dict[str, Any]
 
     if context.ib_extension_down_pct is not None and context.ib_extension_down_pct >= 0.5:
         filters["reasons"].append("IB downside extension >= 0.5 IB.")
+
+    if context.market_is_open is False:
+        filters["telegram_modifier"] = "DOWNGRADE"
+        filters["confidence_modifier"] = min(float(filters.get("confidence_modifier", 0.0)), -0.50)
+        filters["tpo_signal_permission"] = "MARKET_CLOSED"
+        filters["reasons"].append(
+            f"Market closed ({context.market_closed_reason}); auction context is diagnostic only."
+        )
+
+    elif context.market_data_is_stale is True:
+        filters["telegram_modifier"] = "DOWNGRADE"
+        filters["confidence_modifier"] = min(float(filters.get("confidence_modifier", 0.0)), -0.50)
+        filters["tpo_signal_permission"] = "STALE_DATA"
+        filters["reasons"].append(
+            f"Stale market data: age={context.market_data_age_minutes} min."
+        )
+
+    elif filters.get("tpo_signal_permission") == "UNSET":
+        filters["tpo_signal_permission"] = "OPEN_FOR_EVALUATION"
 
     return filters
