@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from collections import Counter, defaultdict
+from collections import Counter, deque
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timezone
 from pathlib import Path
@@ -15,14 +15,6 @@ DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 
 def _runtime_dir() -> Path:
-    """
-    Resolve runtime dir safely for both Render and local runs.
-    Priority:
-    1. RUNTIME_DIR env
-    2. settings.runtime_dir
-    3. /var/data/runtime if exists
-    4. local ./runtime
-    """
     raw = os.getenv("RUNTIME_DIR")
     if raw:
         return Path(raw)
@@ -64,9 +56,6 @@ def _parse_dt(value: Any) -> datetime | None:
 def _json_safe(value: Any) -> Any:
     if isinstance(value, Counter):
         return dict(value)
-
-    if isinstance(value, defaultdict):
-        return {k: _json_safe(v) for k, v in value.items()}
 
     if isinstance(value, dict):
         return {str(k): _json_safe(v) for k, v in value.items()}
@@ -135,11 +124,6 @@ def _payload(event: dict[str, Any]) -> dict[str, Any]:
 
 
 def _signal_payload(event: dict[str, Any]) -> dict[str, Any]:
-    """
-    Handles both:
-    - signal_candidate_detected: payload is the signal itself
-    - signal_updated: payload.payload is the signal itself
-    """
     p = _payload(event)
 
     nested = p.get("payload")
@@ -237,9 +221,7 @@ class TpoDailyReportBuilder:
 
         store_report = self._build_store_report(store, store_symbols)
         journal_report = self._build_journal_report()
-
         summary = self._build_summary(store_report, journal_report)
-
         symbol_report = self._build_symbol_report(store_symbols, journal_report)
 
         return TpoDailyReport(
@@ -296,7 +278,7 @@ class TpoDailyReportBuilder:
             auction_bias_counter[auction_bias] += 1
             session_anchor_counter[session_anchor] += 1
 
-            per_symbol[symbol] = {
+            per_symbol[str(symbol)] = {
                 "market_status": market_status,
                 "market_is_open": market_is_open,
                 "market_data_is_stale": market_data_is_stale,
@@ -357,17 +339,24 @@ class TpoDailyReportBuilder:
         provider_error_counter: Counter = Counter()
         telegram_counter: Counter = Counter()
 
-        candidate_count = 0
+        no_symbol_events = 0
+        signal_telemetry_events = 0
+        signal_candidate_detected_events = 0
+        signal_updated_events = 0
+        signal_registered_events = 0
+
         ready_count = 0
         executable_count = 0
         edge_forming_count = 0
         battle_candidate_count = 0
-        suppressed_by_market_closed = 0
+
+        market_closed_instrument_events = 0
+        weekend_skip_fallback_events = 0
         suppressed_by_tpo_downgrade = 0
         stale_context_count = 0
         offline_store_count = 0
 
-        sample_recent_candidates: list[dict[str, Any]] = []
+        latest_candidates: deque[dict[str, Any]] = deque(maxlen=12)
         sample_provider_errors: list[dict[str, Any]] = []
 
         for event in _iter_ndjson(self.journal_path):
@@ -380,10 +369,16 @@ class TpoDailyReportBuilder:
             event_type = str(event.get("event_type") or "UNKNOWN")
             event_type_counter[event_type] += 1
 
-            symbol = str(event.get("symbol") or _payload(event).get("symbol") or "-")
-            symbol_counter[symbol] += 1
-
             p = _payload(event)
+
+            raw_symbol = event.get("symbol") or p.get("symbol")
+            symbol = str(raw_symbol) if raw_symbol not in (None, "") else None
+
+            if symbol:
+                symbol_counter[symbol] += 1
+            else:
+                no_symbol_events += 1
+
             signal = _signal_payload(event)
             meta = _metadata(event)
             ctx = _auction_context(event)
@@ -397,22 +392,31 @@ class TpoDailyReportBuilder:
             if scenario:
                 scenario_counter[str(scenario)] += 1
 
-            if scenario == "MARKET_CLOSED":
-                market_closed_symbols[symbol] += 1
-                suppressed_by_market_closed += 1
-
             reason = _first_non_empty(
                 p.get("reason"),
                 signal.get("reason"),
                 event.get("reason"),
             )
 
+            if scenario == "MARKET_CLOSED":
+                market_closed_instrument_events += 1
+                if symbol:
+                    market_closed_symbols[symbol] += 1
+
             if reason == "WEEKEND_MARKET_CLOSED":
-                weekend_skip_symbols[symbol] += 1
-                suppressed_by_market_closed += 1
+                weekend_skip_fallback_events += 1
+                if symbol:
+                    weekend_skip_symbols[symbol] += 1
 
             if event_type in {"signal_candidate_detected", "signal_registered", "signal_updated"}:
-                candidate_count += 1
+                signal_telemetry_events += 1
+
+                if event_type == "signal_candidate_detected":
+                    signal_candidate_detected_events += 1
+                elif event_type == "signal_updated":
+                    signal_updated_events += 1
+                elif event_type == "signal_registered":
+                    signal_registered_events += 1
 
                 decision = signal.get("decision")
                 signal_class = signal.get("signal_class")
@@ -489,47 +493,50 @@ class TpoDailyReportBuilder:
                 if ctx.get("tpo_source") == "offline_store" or meta.get("auction_telemetry_mode") == "offline_store_read_only":
                     offline_store_count += 1
 
-                if (
-                    signal.get("status") == "READY"
+                is_battle_candidate = (
+                    event_type == "signal_candidate_detected"
+                    and signal.get("status") == "READY"
                     and execution_status == "EXECUTABLE"
                     and tpo_permission not in {"MARKET_CLOSED", "RESEARCH_ONLY", "STALE_DATA", "BLOCKED_BY_CONTEXT"}
                     and tpo_modifier != "DOWNGRADE"
-                ):
+                )
+
+                if is_battle_candidate:
                     battle_candidate_count += 1
 
-                if len(sample_recent_candidates) < 12:
-                    sample_recent_candidates.append(
-                        {
-                            "ts_utc": event.get("ts_utc"),
-                            "event_type": event_type,
-                            "symbol": symbol,
-                            "scenario": signal.get("scenario"),
-                            "decision": signal.get("decision"),
-                            "status": signal.get("status"),
-                            "signal_class": signal.get("signal_class"),
-                            "execution_status": execution_status,
-                            "tpo_permission": tpo_permission,
-                            "tpo_modifier": tpo_modifier,
-                            "open_relation": tpo_open_relation,
-                            "auction_bias": tpo_auction_bias,
-                        }
-                    )
+                latest_candidates.append(
+                    {
+                        "ts_utc": event.get("ts_utc"),
+                        "event_type": event_type,
+                        "symbol": symbol or "SYSTEM",
+                        "scenario": signal.get("scenario"),
+                        "decision": signal.get("decision"),
+                        "status": signal.get("status"),
+                        "signal_class": signal.get("signal_class"),
+                        "execution_status": execution_status,
+                        "tpo_permission": tpo_permission,
+                        "tpo_modifier": tpo_modifier,
+                        "open_relation": tpo_open_relation,
+                        "auction_bias": tpo_auction_bias,
+                    }
+                )
 
             raw = json.dumps(event, ensure_ascii=False)
+
             if (
                 "YFRateLimitError" in raw
                 or "Too Many Requests" in raw
                 or event.get("status") == "error"
                 or "error" in event_type.lower()
             ):
-                provider_error_counter[symbol] += 1
+                provider_error_counter[symbol or "SYSTEM"] += 1
 
                 if len(sample_provider_errors) < 10:
                     sample_provider_errors.append(
                         {
                             "ts_utc": event.get("ts_utc"),
                             "event_type": event_type,
-                            "symbol": symbol,
+                            "symbol": symbol or "SYSTEM",
                             "status": event.get("status"),
                             "snippet": raw[:500],
                         }
@@ -543,6 +550,7 @@ class TpoDailyReportBuilder:
             "window_end_utc": self.end_utc.isoformat(),
             "event_types": _counter_to_sorted_dict(event_type_counter),
             "symbols": _counter_to_sorted_dict(symbol_counter),
+            "system_no_symbol_events": no_symbol_events,
             "scenarios": _counter_to_sorted_dict(scenario_counter),
             "decisions": _counter_to_sorted_dict(decision_counter),
             "signal_classes": _counter_to_sorted_dict(signal_class_counter),
@@ -556,18 +564,24 @@ class TpoDailyReportBuilder:
             "provider_errors": _counter_to_sorted_dict(provider_error_counter),
             "telegram_events": _counter_to_sorted_dict(telegram_counter),
             "counts": {
-                "candidate_events": candidate_count,
+                "signal_telemetry_events": signal_telemetry_events,
+                "signal_candidate_detected_events": signal_candidate_detected_events,
+                "signal_updated_events": signal_updated_events,
+                "signal_registered_events": signal_registered_events,
                 "ready_events": ready_count,
                 "executable_events": executable_count,
                 "edge_forming_events": edge_forming_count,
                 "battle_candidate_events": battle_candidate_count,
-                "suppressed_by_market_closed": suppressed_by_market_closed,
+                "market_closed_instrument_events": market_closed_instrument_events,
+                "weekend_skip_fallback_events": weekend_skip_fallback_events,
+                "market_closed_control_events_total": market_closed_instrument_events + weekend_skip_fallback_events,
                 "suppressed_by_tpo_downgrade": suppressed_by_tpo_downgrade,
                 "stale_context_events": stale_context_count,
                 "offline_store_context_events": offline_store_count,
+                "system_no_symbol_events": no_symbol_events,
             },
             "samples": {
-                "recent_candidates": sample_recent_candidates,
+                "latest_candidates": list(latest_candidates),
                 "provider_errors": sample_provider_errors,
             },
         }
@@ -585,12 +599,17 @@ class TpoDailyReportBuilder:
             "store_symbols_count": store_report.get("symbols_count"),
             "store_errors_count": store_report.get("errors_count"),
             "store_updated_at_utc": store_report.get("updated_at_utc"),
-            "journal_candidate_events": counts.get("candidate_events", 0),
+            "journal_signal_telemetry_events": counts.get("signal_telemetry_events", 0),
+            "journal_signal_candidate_detected_events": counts.get("signal_candidate_detected_events", 0),
+            "journal_signal_updated_events": counts.get("signal_updated_events", 0),
             "journal_battle_candidate_events": counts.get("battle_candidate_events", 0),
-            "journal_suppressed_by_market_closed": counts.get("suppressed_by_market_closed", 0),
+            "journal_market_closed_instrument_events": counts.get("market_closed_instrument_events", 0),
+            "journal_weekend_skip_fallback_events": counts.get("weekend_skip_fallback_events", 0),
+            "journal_market_closed_control_events_total": counts.get("market_closed_control_events_total", 0),
             "journal_suppressed_by_tpo_downgrade": counts.get("suppressed_by_tpo_downgrade", 0),
             "journal_stale_context_events": counts.get("stale_context_events", 0),
             "journal_offline_store_context_events": counts.get("offline_store_context_events", 0),
+            "journal_system_no_symbol_events": counts.get("system_no_symbol_events", 0),
             "market_status_snapshot": store_report.get("market_status", {}),
             "permission_snapshot": store_report.get("tpo_signal_permission", {}),
             "modifier_snapshot": store_report.get("telegram_modifier", {}),
@@ -607,6 +626,9 @@ class TpoDailyReportBuilder:
 
         all_symbols = set(store_per_symbol)
         all_symbols.update(journal_report.get("symbols", {}).keys())
+        all_symbols.discard("-")
+        all_symbols.discard("")
+        all_symbols.discard("None")
 
         for symbol in sorted(all_symbols):
             result[symbol] = {
@@ -643,12 +665,17 @@ def report_to_markdown(report: TpoDailyReport) -> str:
     lines.append(f"- Store symbols: **{summary.get('store_symbols_count')}**")
     lines.append(f"- Store errors: **{summary.get('store_errors_count')}**")
     lines.append(f"- Store updated: `{summary.get('store_updated_at_utc')}`")
-    lines.append(f"- Signal candidate events: **{summary.get('journal_candidate_events')}**")
+    lines.append(f"- Signal telemetry events: **{summary.get('journal_signal_telemetry_events')}**")
+    lines.append(f"- Signal candidate detected events: **{summary.get('journal_signal_candidate_detected_events')}**")
+    lines.append(f"- Signal updated events: **{summary.get('journal_signal_updated_events')}**")
     lines.append(f"- Battle candidate events: **{summary.get('journal_battle_candidate_events')}**")
-    lines.append(f"- Suppressed by market closed: **{summary.get('journal_suppressed_by_market_closed')}**")
+    lines.append(f"- Market closed instrument events: **{summary.get('journal_market_closed_instrument_events')}**")
+    lines.append(f"- Weekend skip fallback events: **{summary.get('journal_weekend_skip_fallback_events')}**")
+    lines.append(f"- Market closed control events total: **{summary.get('journal_market_closed_control_events_total')}**")
     lines.append(f"- Suppressed / downgraded by TPO: **{summary.get('journal_suppressed_by_tpo_downgrade')}**")
     lines.append(f"- Stale context events: **{summary.get('journal_stale_context_events')}**")
     lines.append(f"- Offline store context events: **{summary.get('journal_offline_store_context_events')}**")
+    lines.append(f"- System / no-symbol events: **{summary.get('journal_system_no_symbol_events')}**")
     lines.append("")
 
     lines.append("## TPO Store Snapshot")
@@ -691,6 +718,12 @@ def report_to_markdown(report: TpoDailyReport) -> str:
         lines.append(f"- `{k}`: **{v}**")
 
     lines.append("")
+    lines.append("### Market Closed Control")
+    lines.append(f"- Instrument MARKET_CLOSED events: **{journal.get('counts', {}).get('market_closed_instrument_events', 0)}**")
+    lines.append(f"- Weekend skip fallback events: **{journal.get('counts', {}).get('weekend_skip_fallback_events', 0)}**")
+    lines.append(f"- Total closed-control events: **{journal.get('counts', {}).get('market_closed_control_events_total', 0)}**")
+
+    lines.append("")
     lines.append("### Scenarios")
     for k, v in journal.get("scenarios", {}).items():
         lines.append(f"- `{k}`: **{v}**")
@@ -727,12 +760,12 @@ def report_to_markdown(report: TpoDailyReport) -> str:
         )
 
     lines.append("")
-    lines.append("## Recent Candidate Samples")
+    lines.append("## Latest Candidate Samples")
     lines.append("")
 
-    samples = journal.get("samples", {}).get("recent_candidates", [])
+    samples = journal.get("samples", {}).get("latest_candidates", [])
     if samples:
-        for sample in samples[:12]:
+        for sample in samples:
             lines.append(
                 "- "
                 f"`{sample.get('ts_utc')}` "
@@ -747,6 +780,15 @@ def report_to_markdown(report: TpoDailyReport) -> str:
             )
     else:
         lines.append("- None")
+
+    lines.append("")
+    lines.append("## Report Caveats")
+    lines.append("")
+    lines.append("- Report date uses the selected timezone, so a Kyiv daily report starts at 21:00 UTC on the previous calendar day during UTC+3.")
+    lines.append("- Historical events before the latest deployment can contain older TPO fields or older permissions.")
+    lines.append("- `Signal telemetry events` includes candidate/update/register events; `Signal candidate detected events` is the cleaner count of newly detected candidates.")
+    lines.append("- `Market closed control events total` includes both instrument-level MARKET_CLOSED events and fallback skip events, so it is a control-flow metric, not unique symbols.")
+    lines.append("- `System / no-symbol events` are service/worker events and are excluded from Symbol Snapshot.")
 
     lines.append("")
     lines.append("## Interpretation")
@@ -845,7 +887,7 @@ def main() -> int:
     report = builder.build()
     json_path, md_path = write_report(report, output_dir)
 
-    print(f"[OK] TPO daily report written:")
+    print("[OK] TPO daily report written:")
     print(f"JSON: {json_path}")
     print(f"MD:   {md_path}")
 
