@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 from urllib import error, parse, request
 
+from app.services.battle_permission import apply_battle_permission
 from app.services.telegram_formatter import format_signal_message
 
 
@@ -559,10 +560,65 @@ class TelegramNotifier:
             )
             return False
 
+        # Final battle permission gate.
+        #
+        # EXECUTABLE means the execution plan exists.
+        # BATTLE_READY means the signal is allowed to reach Telegram.
+        #
+        # Research-only / market-closed / stale-data / counter-trend / weak-auction
+        # signals remain available in journal/statistics/reports, but they must not
+        # create Telegram noise.
+        try:
+            normalized_payload = apply_battle_permission(normalized_payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "Battle permission evaluation failed. Telegram alert suppressed for safety. "
+                "symbol=%s alert_type=%s signal_id=%s error=%s",
+                normalized_payload.get("symbol"),
+                alert_type,
+                normalized_payload.get("signal_id"),
+                exc,
+            )
+            return False
+
+        telegram_delivery_mode = str(
+            normalized_payload.get("telegram_delivery_mode") or ""
+        ).strip().upper()
+
+        battle_permission = str(
+            normalized_payload.get("battle_permission") or ""
+        ).strip().upper()
+
+        battle_ready = bool(normalized_payload.get("battle_ready", False))
+        auction_context_score = normalized_payload.get("auction_context_score")
+
+        metadata = normalized_payload.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        battle_blockers = metadata.get("battle_permission_blockers") or []
+        battle_reasons = metadata.get("battle_permission_reasons") or []
+
+        if telegram_delivery_mode != "BATTLE_ALERT" or not battle_ready:
+            logger.info(
+                "Telegram alert suppressed by battle permission. "
+                "symbol=%s alert_type=%s signal_id=%s battle_permission=%s "
+                "delivery_mode=%s score=%s blockers=%s reasons=%s",
+                normalized_payload.get("symbol"),
+                alert_type,
+                normalized_payload.get("signal_id"),
+                battle_permission,
+                telegram_delivery_mode,
+                auction_context_score,
+                battle_blockers,
+                battle_reasons[:5] if isinstance(battle_reasons, list) else battle_reasons,
+            )
+            return False
+
         message = self.format_alert_payload(normalized_payload)
 
         logger.info(
-            "Sending Telegram alert. symbol=%s alert_type=%s signal_id=%s alignment=%s stop_quality=%s practical_rr=%s trade_confidence=%s scenario_probability=%s formatter=%s",
+            "Sending Telegram alert. symbol=%s alert_type=%s signal_id=%s alignment=%s stop_quality=%s practical_rr=%s trade_confidence=%s scenario_probability=%s battle_permission=%s auction_context_score=%s formatter=%s",
             normalized_payload.get("symbol"),
             alert_type,
             normalized_payload.get("signal_id"),
@@ -571,6 +627,8 @@ class TelegramNotifier:
             normalized_payload.get("practical_rr"),
             normalized_payload.get("trade_confidence"),
             normalized_payload.get("scenario_probability"),
+            battle_permission,
+            auction_context_score,
             "ukrainian" if self.config.use_ukrainian_formatter else "legacy_html",
         )
         return self.send_text(message)
@@ -787,26 +845,43 @@ def send_alert_payload(payload: Dict[str, Any]) -> bool:
 if __name__ == "__main__":
     sample_payload = {
         "should_alert": True,
-        "symbol": "AUDUSD",
+        "symbol": "NAS100",
         "signal_class": "READY",
         "alert_type": "ENTRY_READY",
-        "scenario": "SWEEP_RETURN_SHORT",
-        "scenario_type": "SWEEP_RETURN_SHORT",
-        "direction": "SHORT",
+        "scenario": "TREND_CONTINUATION_LONG",
+        "scenario_type": "TREND_CONTINUATION_LONG",
+        "direction": "LONG",
         "confidence": 0.8,
-        "scenario_probability": 0.45,
-        "rationale": "Sweep-return scenario confirmed by setup engine. execution_quality_ok",
-        "market_state": "TRANSITION",
-        "htf_bias": "NEUTRAL",
-        "entry_reference_price": 0.72433,
-        "invalidation_reference_price": 0.72472,
-        "target_reference_price": 0.7232,
+        "scenario_probability": 0.65,
+        "rationale": "Battle-ready directional auction test payload.",
+        "market_state": "TREND",
+        "htf_bias": "LONG",
+        "signal_alignment": "TREND_ALIGNED",
+        "entry_reference_price": 19000.0,
+        "invalidation_reference_price": 18950.0,
+        "target_reference_price": 19150.0,
         "execution_status": "EXECUTABLE",
         "execution_model": "LIMIT_ON_RETEST",
-        "risk_reward_ratio": 2.9,
+        "risk_reward_ratio": 3.0,
+        "practical_rr": 3.0,
+        "stop_quality": "OK",
+        "quality_tier": "GOOD",
         "paper_mode": False,
         "cycle_id": "2026-05-13T12:49:17.416321+00:00",
-        "signal_id": "TEST_AUDUSD_SIGNAL",
+        "signal_id": "TEST_NAS100_BATTLE_READY",
+        "metadata": {
+            "auction_context": {
+                "market_is_open": True,
+                "market_status": "OPEN",
+                "open_relation": "OUT_OF_RANGE",
+                "auction_bias": "DIRECTIONAL_IMBALANCE",
+                "ib_extension_up_pct": 0.7,
+            },
+            "auction_filters": {
+                "tpo_signal_permission": "OPEN_FOR_EVALUATION",
+                "telegram_modifier": "BOOST",
+            },
+        },
     }
 
     notifier = build_telegram_notifier()
