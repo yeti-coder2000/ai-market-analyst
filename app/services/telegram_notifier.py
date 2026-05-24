@@ -1,889 +1,902 @@
 from __future__ import annotations
 
+import argparse
 import json
-import logging
 import os
-import time
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
-from urllib import error, parse, request
-
-from app.services.battle_permission import apply_battle_permission
-from app.services.telegram_formatter import format_signal_message
-
-
-logger = logging.getLogger(__name__)
+from collections import Counter, deque
+from dataclasses import asdict, dataclass
+from datetime import date, datetime, time, timezone
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
 
 
-# =============================================================================
-# TELEGRAM NOTIFIER CONFIG / HELPERS
-# =============================================================================
-
-MIN_STOP_DISTANCE_BY_SYMBOL: dict[str, float] = {
-    "XAUUSD": 15.0,
-    "BTCUSD": 100.0,
-    "ETHUSD": 8.0,
-    "EURUSD": 0.0005,
-    "GBPUSD": 0.0007,
-    "AUDUSD": 0.0005,
-    "USDJPY": 0.08,
-    "USDCHF": 0.0005,
-    "USDCAD": 0.0007,
-    "GER40": 25.0,
-    "NAS100": 35.0,
-    "SPX500": 8.0,
-    "UKOIL": 0.25,
-}
+DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+def _runtime_dir() -> Path:
+    raw = os.getenv("RUNTIME_DIR")
+    if raw:
+        return Path(raw)
 
-
-def _safe_int(value: Any, default: int) -> int:
     try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
+        from app.core.settings import settings
+
+        value = getattr(settings, "runtime_dir", None)
+        if value:
+            return Path(value)
+    except Exception:
+        pass
+
+    render_runtime = Path("/var/data/runtime")
+    if render_runtime.exists():
+        return render_runtime
+
+    return Path("runtime")
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        if value is None:
-            return default
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _safe_float_or_none(value: Any) -> float | None:
-    try:
-        if value is None:
-            return None
-        return float(value)
-    except (TypeError, ValueError):
+def _parse_dt(value: Any) -> datetime | None:
+    if not value:
         return None
 
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except Exception:
+            return None
 
-def _first_present(*values: Any) -> Any:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    return dt.astimezone(timezone.utc)
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Counter):
+        return dict(value)
+
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+
+    if isinstance(value, tuple):
+        return [_json_safe(v) for v in value]
+
+    return value
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _iter_ndjson(path: Path):
+    if not path.exists():
+        return
+
+    with path.open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, 1):
+            line = line.strip()
+
+            if not line:
+                continue
+
+            try:
+                yield json.loads(line)
+            except Exception:
+                yield {
+                    "event_type": "bad_json_line",
+                    "line_no": line_no,
+                    "raw": line[:500],
+                }
+
+
+def _target_window(report_date: date, tz_name: str) -> tuple[datetime, datetime]:
+    tz = ZoneInfo(tz_name)
+
+    start_local = datetime.combine(report_date, time(0, 0), tzinfo=tz)
+    end_local = datetime.combine(report_date, time(23, 59, 59, 999999), tzinfo=tz)
+
+    return start_local.astimezone(timezone.utc), end_local.astimezone(timezone.utc)
+
+
+def _event_in_window(event: dict[str, Any], start_utc: datetime, end_utc: datetime) -> bool:
+    ts = _parse_dt(event.get("ts_utc") or event.get("timestamp") or event.get("created_at_utc"))
+
+    if ts is None:
+        return False
+
+    return start_utc <= ts <= end_utc
+
+
+def _payload(event: dict[str, Any]) -> dict[str, Any]:
+    value = event.get("payload")
+    return value if isinstance(value, dict) else {}
+
+
+def _signal_payload(event: dict[str, Any]) -> dict[str, Any]:
+    p = _payload(event)
+
+    nested = p.get("payload")
+    if isinstance(nested, dict):
+        return nested
+
+    return p
+
+
+def _metadata(event: dict[str, Any]) -> dict[str, Any]:
+    p = _signal_payload(event)
+    meta = p.get("metadata")
+
+    if isinstance(meta, dict):
+        return meta
+
+    return {}
+
+
+def _auction_context(event: dict[str, Any]) -> dict[str, Any]:
+    meta = _metadata(event)
+    ctx = meta.get("auction_context")
+
+    if isinstance(ctx, dict):
+        return ctx
+
+    return {}
+
+
+def _auction_filters(event: dict[str, Any]) -> dict[str, Any]:
+    meta = _metadata(event)
+    filters = meta.get("auction_filters")
+
+    if isinstance(filters, dict):
+        return filters
+
+    return {}
+
+
+def _first_non_empty(*values: Any) -> Any:
     for value in values:
-        if value is None:
-            continue
-        if value == "":
-            continue
-        return value
+        if value not in (None, "", [], {}):
+            return value
     return None
 
 
-def _format_percent(value: Any) -> str:
-    number = _safe_float_or_none(value)
-    if number is None:
-        return "-"
+def _store_symbols(store: dict[str, Any]) -> dict[str, Any]:
+    symbols = store.get("symbols")
 
-    if number <= 1:
-        return f"{number * 100:.0f}%"
+    if isinstance(symbols, dict):
+        return symbols
 
-    return f"{number:.0f}%"
+    return {}
 
 
-def _truncate(text: str, max_len: int) -> str:
-    if len(text) <= max_len:
-        return text
-    if max_len <= 3:
-        return text[:max_len]
-    return text[: max_len - 3] + "..."
-
-
-def _escape_html(text: Any) -> str:
-    if text is None:
-        return "-"
-    s = str(text)
-    return (
-        s.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-
-
-def _normalize_target_zone(value: Any) -> str:
-    if value is None:
-        return "-"
-
-    if isinstance(value, (list, tuple)):
-        cleaned = [str(x).strip() for x in value if str(x).strip()]
-        return ", ".join(_escape_html(x) for x in cleaned) if cleaned else "-"
-
-    if isinstance(value, dict):
-        try:
-            return _escape_html(json.dumps(value, ensure_ascii=False, sort_keys=True))
-        except Exception:
-            return _escape_html(str(value))
-
-    text = str(value).strip()
-    return _escape_html(text) if text else "-"
-
-
-def _normalize_direction(value: Any) -> str:
-    direction = str(value or "NEUTRAL").strip().upper()
-    if direction in {"LONG", "SHORT", "NEUTRAL"}:
-        return direction
-    return "NEUTRAL"
-
-
-def _normalize_htf_bias(value: Any) -> str:
-    htf_bias = str(value or "NEUTRAL").strip().upper()
-    if htf_bias in {"LONG", "SHORT", "NEUTRAL"}:
-        return htf_bias
-    return "NEUTRAL"
-
-
-def _derive_signal_alignment(direction: Any, htf_bias: Any) -> tuple[str, str, str]:
-    d = _normalize_direction(direction)
-    h = _normalize_htf_bias(htf_bias)
-
-    if d not in {"LONG", "SHORT"}:
-        return "NO_DIRECTION", "⚫", "NO DIRECTION"
-
-    if h == "NEUTRAL":
-        return "NEUTRAL_HTF", "⚪", "NEUTRAL HTF"
-
-    if h not in {"LONG", "SHORT"}:
-        return "UNKNOWN_HTF", "⚫", "UNKNOWN HTF"
-
-    if d == h:
-        return "TREND_ALIGNED", "🟢", "TREND-ALIGNED"
-
-    return "COUNTER_TREND", "🔴", "COUNTER-TREND"
-
-
-def _derive_stop_quality(
-    *,
-    symbol: Any,
-    entry: Any,
-    stop: Any,
-    target: Any,
-    rr: Any,
-) -> tuple[str, str, float | None, float | None]:
-    """
-    Returns:
-    - stop_quality
-    - stop_quality_reason
-    - theoretical_rr
-    - practical_rr
-    """
-    symbol_text = str(symbol or "").strip().upper()
-    entry_f = _safe_float_or_none(entry)
-    stop_f = _safe_float_or_none(stop)
-    target_f = _safe_float_or_none(target)
-    rr_f = _safe_float_or_none(rr)
-
-    theoretical_rr = rr_f
-
-    if entry_f is None or stop_f is None or target_f is None:
-        return "UNKNOWN", "missing entry/stop/target", theoretical_rr, None
-
-    stop_distance = abs(entry_f - stop_f)
-    target_distance = abs(target_f - entry_f)
-
-    if stop_distance <= 0:
-        return "INVALID", "stop distance is zero or negative", theoretical_rr, None
-
-    min_stop = MIN_STOP_DISTANCE_BY_SYMBOL.get(symbol_text)
-
-    if min_stop is None:
-        return (
-            "OK",
-            "no instrument-specific practical stop threshold",
-            theoretical_rr,
-            theoretical_rr,
-        )
-
-    if stop_distance < min_stop:
-        practical_rr = round(target_distance / min_stop, 3) if min_stop > 0 else None
-        return (
-            "TIGHT_STOP",
-            f"stop_distance {stop_distance:.5f} below practical_min_stop {min_stop:.5f}",
-            theoretical_rr,
-            practical_rr,
-        )
-
-    return (
-        "OK",
-        f"stop_distance {stop_distance:.5f} >= practical_min_stop {min_stop:.5f}",
-        theoretical_rr,
-        theoretical_rr,
-    )
-
-
-def _infer_alert_type(payload: Dict[str, Any]) -> str:
-    """
-    Infer Telegram alert type from payload state.
-
-    This function is intentionally module-level because both the class method
-    and standalone helper may use it.
-    """
-    explicit = str(payload.get("alert_type", "")).strip().upper()
-    if explicit:
-        return explicit
-
-    signal_class = str(
-        payload.get("signal_class")
-        or payload.get("stage")
-        or payload.get("current_stage")
-        or ""
-    ).strip().upper()
-
-    execution_status = str(payload.get("execution_status") or "").strip().upper()
-
-    if signal_class == "ACTIVE":
-        return "TRIGGERED"
-
-    if signal_class == "READY":
-        return "ENTRY_READY"
-
-    if execution_status == "EXECUTABLE":
-        return "ENTRY_READY"
-
-    if signal_class == "WATCH":
-        return "WATCH_NEW"
-
-    if signal_class == "RESOLVED":
-        resolution = str(payload.get("resolution") or payload.get("resolution_reason") or "").upper()
-        if resolution == "INVALIDATED":
-            return "INVALIDATED"
-
-    return ""
-
-
-def _normalize_alert_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normalize alert payload v3 into Telegram-compatible fields.
-
-    Keeps original keys and adds compatibility aliases expected by both:
-    - legacy HTML formatter
-    - Ukrainian telegram_formatter.py
-
-    Important:
-    - trade_confidence is the value that explains why signal passed the Telegram gate.
-    - scenario_probability is the scenario/background probability and can be lower.
-    - Telegram displays both separately to avoid misleading "Probability: 45%" on READY signals.
-    """
-    normalized = dict(payload)
-
-    alert_type = _infer_alert_type(normalized)
-    if alert_type:
-        normalized["alert_type"] = alert_type
-
-    scenario_value = _first_present(
-        normalized.get("scenario"),
-        normalized.get("scenario_type"),
-        "UNKNOWN",
-    )
-
-    normalized.setdefault("scenario", scenario_value)
-    normalized.setdefault("scenario_type", scenario_value)
-
-    normalized.setdefault(
-        "watch_reason",
-        normalized.get("rationale") or normalized.get("reason") or "-",
-    )
-
-    normalized.setdefault(
-        "trade_confidence",
-        _first_present(
-            normalized.get("confidence"),
-            normalized.get("probability"),
-            normalized.get("trade_probability"),
-            normalized.get("signal_confidence"),
-        ),
-    )
-
-    normalized.setdefault(
-        "scenario_probability",
-        _first_present(
-            normalized.get("scenario_probability"),
-            normalized.get("setup_probability"),
-            normalized.get("scenario_confidence"),
-        ),
-    )
-
-    normalized.setdefault(
-        "invalidation_level",
-        normalized.get("invalidation_reference_price"),
-    )
-
-    if "target_zone" not in normalized:
-        target_for_zone = normalized.get("target_reference_price")
-        normalized["target_zone"] = [target_for_zone] if target_for_zone is not None else []
-
-    direction = normalized.get("direction")
-    htf_bias = normalized.get("htf_bias")
-
-    signal_alignment, signal_alignment_marker, signal_alignment_label = _derive_signal_alignment(
-        direction,
-        htf_bias,
-    )
-
-    normalized.setdefault("signal_alignment", signal_alignment)
-    normalized.setdefault("signal_alignment_marker", signal_alignment_marker)
-    normalized.setdefault("signal_alignment_label", signal_alignment_label)
-
-    entry = _first_present(
-        normalized.get("entry_reference_price"),
-        normalized.get("entry"),
-    )
-    stop = _first_present(
-        normalized.get("invalidation_reference_price"),
-        normalized.get("stop_loss"),
-        normalized.get("stop"),
-        normalized.get("invalidation_level"),
-    )
-    target = _first_present(
-        normalized.get("target_reference_price"),
-        normalized.get("take_profit"),
-        normalized.get("target"),
-    )
-    rr = _first_present(
-        normalized.get("risk_reward_ratio"),
-        normalized.get("rr"),
-        normalized.get("risk_reward"),
-    )
-
-    if entry is not None:
-        normalized.setdefault("entry_reference_price", entry)
-
-    if stop is not None:
-        normalized.setdefault("invalidation_reference_price", stop)
-        normalized.setdefault("stop", stop)
-
-    if target is not None:
-        normalized.setdefault("target_reference_price", target)
-        normalized.setdefault("target", target)
-
-    if rr is not None:
-        normalized.setdefault("risk_reward_ratio", rr)
-
-    stop_quality, stop_quality_reason, theoretical_rr, practical_rr = _derive_stop_quality(
-        symbol=normalized.get("symbol"),
-        entry=entry,
-        stop=stop,
-        target=target,
-        rr=rr,
-    )
-
-    normalized.setdefault("stop_quality", stop_quality)
-    normalized.setdefault("stop_quality_reason", stop_quality_reason)
-    normalized.setdefault("theoretical_rr", theoretical_rr)
-    normalized.setdefault("practical_rr", practical_rr)
-
-    # Formatter compatibility.
-    # telegram_formatter.py uses stage/signal_class and execution_status to render READY/WATCH.
-    if "stage" not in normalized:
-        if str(normalized.get("signal_class") or "").strip():
-            normalized["stage"] = normalized.get("signal_class")
-        elif normalized.get("alert_type") == "ENTRY_READY":
-            normalized["stage"] = "READY"
-
-    if "rationale" not in normalized and normalized.get("watch_reason"):
-        normalized["rationale"] = normalized.get("watch_reason")
-
-    return normalized
+def _counter_to_sorted_dict(counter: Counter) -> dict[str, int]:
+    return dict(sorted(counter.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
 @dataclass
-class TelegramConfig:
-    enabled: bool
-    bot_token: str
-    chat_id: str
-    parse_mode: str = "HTML"
-    disable_web_page_preview: bool = True
-    timeout_seconds: int = 10
-    retries: int = 3
-    retry_delay_seconds: float = 2.0
-    paper_mode_prefix: str = "🧪 PAPER"
-    live_mode_prefix: str = "🚨 LIVE"
-    max_message_length: int = 3900
-    use_ukrainian_formatter: bool = True
-    allowed_alert_types: tuple[str, ...] = (
-        "WATCH_NEW",
-        "WATCH_UPGRADED",
-        "TRIGGERED",
-        "ENTRY_READY",
-        "INVALIDATED",
-    )
+class TpoDailyReport:
+    report_date: str
+    timezone: str
+    generated_at_utc: str
+    runtime_dir: str
+    tpo_store_path: str
+    journal_path: str
+    summary: dict[str, Any]
+    tpo_store: dict[str, Any]
+    journal: dict[str, Any]
+    symbols: dict[str, Any]
 
 
-class TelegramNotifier:
-    """
-    Production-ready Telegram notifier for AI Market Analyst.
+class TpoDailyReportBuilder:
+    def __init__(
+        self,
+        *,
+        report_date: date,
+        timezone_name: str,
+        runtime_dir: Path,
+        tpo_store_path: Path | None = None,
+        journal_path: Path | None = None,
+    ) -> None:
+        self.report_date = report_date
+        self.timezone_name = timezone_name
+        self.runtime_dir = runtime_dir
+        self.tpo_store_path = tpo_store_path or runtime_dir / "tpo" / "tpo_latest.json"
+        self.journal_path = journal_path or runtime_dir / "radar_journal.ndjson"
 
-    Supported interfaces:
-    - send_text(text)
-    - send_admin_message(text)
-    - send_alert(payload)
-    - send_alert_payload(payload)
+        self.start_utc, self.end_utc = _target_window(report_date, timezone_name)
 
-    Compatibility properties:
-    - is_enabled
-    - is_active
-    """
+    def build(self) -> TpoDailyReport:
+        store = _read_json(self.tpo_store_path)
+        store_symbols = _store_symbols(store)
 
-    def __init__(self, config: Optional[TelegramConfig] = None) -> None:
-        self.config = config or TelegramConfig(
-            enabled=_env_bool("TELEGRAM_ENABLED", False),
-            bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
-            chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
-            parse_mode=(os.getenv("TELEGRAM_PARSE_MODE", "HTML").strip() or "HTML"),
-            timeout_seconds=_safe_int(os.getenv("TELEGRAM_TIMEOUT_SECONDS", "10"), 10),
-            retries=_safe_int(os.getenv("TELEGRAM_RETRIES", "3"), 3),
-            retry_delay_seconds=float(os.getenv("TELEGRAM_RETRY_DELAY_SECONDS", "2")),
-            paper_mode_prefix=os.getenv("TELEGRAM_PAPER_PREFIX", "🧪 PAPER").strip() or "🧪 PAPER",
-            live_mode_prefix=os.getenv("TELEGRAM_LIVE_PREFIX", "🚨 LIVE").strip() or "🚨 LIVE",
-            max_message_length=_safe_int(os.getenv("TELEGRAM_MAX_MESSAGE_LENGTH", "3900"), 3900),
-            use_ukrainian_formatter=_env_bool("ENABLE_UKRAINIAN_TELEGRAM_FORMATTER", True),
+        store_report = self._build_store_report(store, store_symbols)
+        journal_report = self._build_journal_report()
+        summary = self._build_summary(store_report, journal_report)
+        symbol_report = self._build_symbol_report(store_symbols, journal_report)
+
+        return TpoDailyReport(
+            report_date=self.report_date.isoformat(),
+            timezone=self.timezone_name,
+            generated_at_utc=datetime.now(timezone.utc).isoformat(),
+            runtime_dir=str(self.runtime_dir),
+            tpo_store_path=str(self.tpo_store_path),
+            journal_path=str(self.journal_path),
+            summary=summary,
+            tpo_store=store_report,
+            journal=journal_report,
+            symbols=symbol_report,
         )
 
-    @property
-    def is_enabled(self) -> bool:
-        return (
-            self.config.enabled
-            and bool(self.config.bot_token)
-            and bool(self.config.chat_id)
-        )
+    def _build_store_report(
+        self,
+        store: dict[str, Any],
+        symbols: dict[str, Any],
+    ) -> dict[str, Any]:
+        market_status_counter: Counter = Counter()
+        market_open_counter: Counter = Counter()
+        stale_counter: Counter = Counter()
+        permission_counter: Counter = Counter()
+        modifier_counter: Counter = Counter()
+        open_relation_counter: Counter = Counter()
+        auction_bias_counter: Counter = Counter()
+        session_anchor_counter: Counter = Counter()
 
-    @property
-    def is_active(self) -> bool:
-        return self.is_enabled
+        per_symbol: dict[str, Any] = {}
 
-    def send_text(self, text: str) -> bool:
-        if not self.is_enabled:
-            logger.info("Telegram notifier disabled or not configured.")
-            return False
+        for symbol, item in symbols.items():
+            if not isinstance(item, dict):
+                continue
 
-        safe_text = _truncate(text, self.config.max_message_length)
-        url = f"https://api.telegram.org/bot{self.config.bot_token}/sendMessage"
+            ctx = item.get("context") if isinstance(item.get("context"), dict) else {}
+            filters = item.get("filters") if isinstance(item.get("filters"), dict) else {}
 
-        payload = {
-            "chat_id": self.config.chat_id,
-            "text": safe_text,
-            "parse_mode": self.config.parse_mode,
-            "disable_web_page_preview": self.config.disable_web_page_preview,
+            market_status = ctx.get("market_status") or "UNKNOWN"
+            market_is_open = ctx.get("market_is_open")
+            market_data_is_stale = ctx.get("market_data_is_stale")
+            permission = filters.get("tpo_signal_permission") or "UNKNOWN"
+            modifier = filters.get("telegram_modifier") or "UNKNOWN"
+            open_relation = ctx.get("open_relation") or filters.get("open_relation") or "UNKNOWN"
+            auction_bias = ctx.get("auction_bias") or filters.get("auction_bias") or "UNKNOWN"
+            session_anchor = ctx.get("session_anchor") or filters.get("session_anchor") or "UNKNOWN"
+
+            market_status_counter[market_status] += 1
+            market_open_counter[str(market_is_open)] += 1
+            stale_counter[str(market_data_is_stale)] += 1
+            permission_counter[permission] += 1
+            modifier_counter[modifier] += 1
+            open_relation_counter[open_relation] += 1
+            auction_bias_counter[auction_bias] += 1
+            session_anchor_counter[session_anchor] += 1
+
+            per_symbol[str(symbol)] = {
+                "market_status": market_status,
+                "market_is_open": market_is_open,
+                "market_data_is_stale": market_data_is_stale,
+                "market_data_age_minutes": ctx.get("market_data_age_minutes"),
+                "last_bar_timestamp_utc": ctx.get("last_bar_timestamp_utc"),
+                "tpo_signal_permission": permission,
+                "telegram_modifier": modifier,
+                "open_relation": open_relation,
+                "auction_bias": auction_bias,
+                "session_anchor": session_anchor,
+                "session_timezone": ctx.get("session_timezone"),
+                "session_open_utc": ctx.get("session_open_utc"),
+                "session_open_kyiv": ctx.get("session_open_kyiv"),
+                "current_session_id": ctx.get("current_session_id"),
+                "previous_session_id": ctx.get("previous_session_id"),
+                "current_price": ctx.get("current_price"),
+                "current_open": ctx.get("current_open"),
+                "nearest_npoc": ctx.get("nearest_npoc"),
+                "nearest_npoc_distance": ctx.get("nearest_npoc_distance"),
+                "ib_extension_up_pct": ctx.get("ib_extension_up_pct"),
+                "ib_extension_down_pct": ctx.get("ib_extension_down_pct"),
+                "notes": ctx.get("notes") or [],
+                "reasons": filters.get("reasons") or [],
+            }
+
+        return {
+            "available": bool(store),
+            "exporter_version": store.get("exporter_version"),
+            "updated_at_utc": store.get("updated_at_utc"),
+            "symbols_count": len(symbols),
+            "errors_count": len(store.get("errors") or []),
+            "errors": store.get("errors") or [],
+            "output": store.get("output"),
+            "market_status": _counter_to_sorted_dict(market_status_counter),
+            "market_is_open": _counter_to_sorted_dict(market_open_counter),
+            "market_data_is_stale": _counter_to_sorted_dict(stale_counter),
+            "tpo_signal_permission": _counter_to_sorted_dict(permission_counter),
+            "telegram_modifier": _counter_to_sorted_dict(modifier_counter),
+            "open_relation": _counter_to_sorted_dict(open_relation_counter),
+            "auction_bias": _counter_to_sorted_dict(auction_bias_counter),
+            "session_anchor": _counter_to_sorted_dict(session_anchor_counter),
+            "per_symbol": per_symbol,
         }
 
-        encoded = parse.urlencode(payload).encode("utf-8")
-        last_error: Optional[Exception] = None
+    def _build_journal_report(self) -> dict[str, Any]:
+        event_type_counter: Counter = Counter()
+        symbol_counter: Counter = Counter()
+        scenario_counter: Counter = Counter()
+        decision_counter: Counter = Counter()
+        signal_class_counter: Counter = Counter()
+        execution_status_counter: Counter = Counter()
+        tpo_permission_counter: Counter = Counter()
+        tpo_modifier_counter: Counter = Counter()
+        tpo_open_relation_counter: Counter = Counter()
+        tpo_auction_bias_counter: Counter = Counter()
+        market_closed_symbols: Counter = Counter()
+        weekend_skip_symbols: Counter = Counter()
+        provider_error_counter: Counter = Counter()
+        telegram_counter: Counter = Counter()
 
-        for attempt in range(1, self.config.retries + 1):
-            try:
-                req = request.Request(url, data=encoded, method="POST")
-                with request.urlopen(req, timeout=self.config.timeout_seconds) as resp:
-                    body = resp.read().decode("utf-8", errors="replace")
+        no_symbol_events = 0
+        signal_telemetry_events = 0
+        signal_candidate_detected_events = 0
+        signal_updated_events = 0
+        signal_registered_events = 0
 
-                    if 200 <= resp.status < 300:
-                        logger.info(
-                            "Telegram message sent successfully. attempt=%s status=%s",
-                            attempt,
-                            resp.status,
-                        )
-                        logger.debug("Telegram response body=%s", body)
-                        return True
+        ready_count = 0
+        executable_count = 0
+        edge_forming_count = 0
+        battle_candidate_count = 0
 
-                    logger.error(
-                        "Telegram send failed. attempt=%s status=%s body=%s",
-                        attempt,
-                        resp.status,
-                        body,
+        market_closed_instrument_events = 0
+        weekend_skip_fallback_events = 0
+        suppressed_by_tpo_downgrade = 0
+        stale_context_count = 0
+        offline_store_count = 0
+
+        latest_candidates: deque[dict[str, Any]] = deque(maxlen=12)
+        sample_provider_errors: list[dict[str, Any]] = []
+
+        for event in _iter_ndjson(self.journal_path):
+            if not isinstance(event, dict):
+                continue
+
+            if not _event_in_window(event, self.start_utc, self.end_utc):
+                continue
+
+            event_type = str(event.get("event_type") or "UNKNOWN")
+            event_type_counter[event_type] += 1
+
+            p = _payload(event)
+
+            raw_symbol = event.get("symbol") or p.get("symbol")
+            symbol = str(raw_symbol) if raw_symbol not in (None, "") else None
+
+            if symbol:
+                symbol_counter[symbol] += 1
+            else:
+                no_symbol_events += 1
+
+            signal = _signal_payload(event)
+            meta = _metadata(event)
+            ctx = _auction_context(event)
+            filters = _auction_filters(event)
+
+            scenario = _first_non_empty(
+                signal.get("scenario"),
+                p.get("scenario"),
+            )
+
+            if scenario:
+                scenario_counter[str(scenario)] += 1
+
+            reason = _first_non_empty(
+                p.get("reason"),
+                signal.get("reason"),
+                event.get("reason"),
+            )
+
+            if scenario == "MARKET_CLOSED":
+                market_closed_instrument_events += 1
+                if symbol:
+                    market_closed_symbols[symbol] += 1
+
+            if reason == "WEEKEND_MARKET_CLOSED":
+                weekend_skip_fallback_events += 1
+                if symbol:
+                    weekend_skip_symbols[symbol] += 1
+
+            if event_type in {"signal_candidate_detected", "signal_registered", "signal_updated"}:
+                signal_telemetry_events += 1
+
+                if event_type == "signal_candidate_detected":
+                    signal_candidate_detected_events += 1
+                elif event_type == "signal_updated":
+                    signal_updated_events += 1
+                elif event_type == "signal_registered":
+                    signal_registered_events += 1
+
+                decision = signal.get("decision")
+                signal_class = signal.get("signal_class")
+                execution_status = _first_non_empty(
+                    signal.get("execution_status"),
+                    meta.get("execution_status"),
+                )
+
+                status = signal.get("status")
+
+                if decision:
+                    decision_counter[str(decision)] += 1
+
+                if signal_class:
+                    signal_class_counter[str(signal_class)] += 1
+
+                if execution_status:
+                    execution_status_counter[str(execution_status)] += 1
+
+                if status == "READY":
+                    ready_count += 1
+
+                if status == "EDGE_FORMING":
+                    edge_forming_count += 1
+
+                if execution_status == "EXECUTABLE":
+                    executable_count += 1
+
+                tpo_permission = _first_non_empty(
+                    meta.get("tpo_signal_permission"),
+                    filters.get("tpo_signal_permission"),
+                )
+
+                tpo_modifier = _first_non_empty(
+                    meta.get("tpo_telegram_modifier"),
+                    filters.get("telegram_modifier"),
+                )
+
+                tpo_open_relation = _first_non_empty(
+                    meta.get("tpo_open_relation"),
+                    ctx.get("open_relation"),
+                    filters.get("open_relation"),
+                )
+
+                tpo_auction_bias = _first_non_empty(
+                    meta.get("tpo_auction_bias"),
+                    ctx.get("auction_bias"),
+                    filters.get("auction_bias"),
+                )
+
+                if tpo_permission:
+                    tpo_permission_counter[str(tpo_permission)] += 1
+
+                if tpo_modifier:
+                    tpo_modifier_counter[str(tpo_modifier)] += 1
+
+                if tpo_open_relation:
+                    tpo_open_relation_counter[str(tpo_open_relation)] += 1
+
+                if tpo_auction_bias:
+                    tpo_auction_bias_counter[str(tpo_auction_bias)] += 1
+
+                if tpo_modifier == "DOWNGRADE" or tpo_permission in {
+                    "MARKET_CLOSED",
+                    "RESEARCH_ONLY",
+                    "STALE_DATA",
+                    "BLOCKED_BY_CONTEXT",
+                }:
+                    suppressed_by_tpo_downgrade += 1
+
+                if ctx.get("is_stale") is True or filters.get("is_stale") is True:
+                    stale_context_count += 1
+
+                if ctx.get("tpo_source") == "offline_store" or meta.get("auction_telemetry_mode") == "offline_store_read_only":
+                    offline_store_count += 1
+
+                is_battle_candidate = (
+                    event_type == "signal_candidate_detected"
+                    and signal.get("status") == "READY"
+                    and execution_status == "EXECUTABLE"
+                    and tpo_permission not in {"MARKET_CLOSED", "RESEARCH_ONLY", "STALE_DATA", "BLOCKED_BY_CONTEXT"}
+                    and tpo_modifier != "DOWNGRADE"
+                )
+
+                if is_battle_candidate:
+                    battle_candidate_count += 1
+
+                latest_candidates.append(
+                    {
+                        "ts_utc": event.get("ts_utc"),
+                        "event_type": event_type,
+                        "symbol": symbol or "SYSTEM",
+                        "scenario": signal.get("scenario"),
+                        "decision": signal.get("decision"),
+                        "status": signal.get("status"),
+                        "signal_class": signal.get("signal_class"),
+                        "execution_status": execution_status,
+                        "tpo_permission": tpo_permission,
+                        "tpo_modifier": tpo_modifier,
+                        "open_relation": tpo_open_relation,
+                        "auction_bias": tpo_auction_bias,
+                    }
+                )
+
+            raw = json.dumps(event, ensure_ascii=False)
+
+            if (
+                "YFRateLimitError" in raw
+                or "Too Many Requests" in raw
+                or event.get("status") == "error"
+                or "error" in event_type.lower()
+            ):
+                provider_error_counter[symbol or "SYSTEM"] += 1
+
+                if len(sample_provider_errors) < 10:
+                    sample_provider_errors.append(
+                        {
+                            "ts_utc": event.get("ts_utc"),
+                            "event_type": event_type,
+                            "symbol": symbol or "SYSTEM",
+                            "status": event.get("status"),
+                            "snippet": raw[:500],
+                        }
                     )
 
-            except error.HTTPError as exc:
-                body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
-                logger.error(
-                    "Telegram HTTPError. attempt=%s/%s code=%s body=%s",
-                    attempt,
-                    self.config.retries,
-                    exc.code,
-                    body,
-                )
-                last_error = exc
+            if "telegram" in event_type.lower():
+                telegram_counter[event_type] += 1
 
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "Telegram send exception. attempt=%s/%s",
-                    attempt,
-                    self.config.retries,
-                )
-                last_error = exc
+        return {
+            "window_start_utc": self.start_utc.isoformat(),
+            "window_end_utc": self.end_utc.isoformat(),
+            "event_types": _counter_to_sorted_dict(event_type_counter),
+            "symbols": _counter_to_sorted_dict(symbol_counter),
+            "system_no_symbol_events": no_symbol_events,
+            "scenarios": _counter_to_sorted_dict(scenario_counter),
+            "decisions": _counter_to_sorted_dict(decision_counter),
+            "signal_classes": _counter_to_sorted_dict(signal_class_counter),
+            "execution_status": _counter_to_sorted_dict(execution_status_counter),
+            "tpo_signal_permission": _counter_to_sorted_dict(tpo_permission_counter),
+            "tpo_telegram_modifier": _counter_to_sorted_dict(tpo_modifier_counter),
+            "tpo_open_relation": _counter_to_sorted_dict(tpo_open_relation_counter),
+            "tpo_auction_bias": _counter_to_sorted_dict(tpo_auction_bias_counter),
+            "market_closed_symbols": _counter_to_sorted_dict(market_closed_symbols),
+            "weekend_skip_symbols": _counter_to_sorted_dict(weekend_skip_symbols),
+            "provider_errors": _counter_to_sorted_dict(provider_error_counter),
+            "telegram_events": _counter_to_sorted_dict(telegram_counter),
+            "counts": {
+                "signal_telemetry_events": signal_telemetry_events,
+                "signal_candidate_detected_events": signal_candidate_detected_events,
+                "signal_updated_events": signal_updated_events,
+                "signal_registered_events": signal_registered_events,
+                "ready_events": ready_count,
+                "executable_events": executable_count,
+                "edge_forming_events": edge_forming_count,
+                "battle_candidate_events": battle_candidate_count,
+                "market_closed_instrument_events": market_closed_instrument_events,
+                "weekend_skip_fallback_events": weekend_skip_fallback_events,
+                "market_closed_control_events_total": market_closed_instrument_events + weekend_skip_fallback_events,
+                "suppressed_by_tpo_downgrade": suppressed_by_tpo_downgrade,
+                "stale_context_events": stale_context_count,
+                "offline_store_context_events": offline_store_count,
+                "system_no_symbol_events": no_symbol_events,
+            },
+            "samples": {
+                "latest_candidates": list(latest_candidates),
+                "provider_errors": sample_provider_errors,
+            },
+        }
 
-            if attempt < self.config.retries:
-                time.sleep(self.config.retry_delay_seconds)
+    def _build_summary(
+        self,
+        store_report: dict[str, Any],
+        journal_report: dict[str, Any],
+    ) -> dict[str, Any]:
+        counts = journal_report.get("counts", {})
 
-        logger.error("Telegram message failed after retries. last_error=%s", last_error)
-        return False
+        return {
+            "status": "ok",
+            "store_available": store_report.get("available"),
+            "store_symbols_count": store_report.get("symbols_count"),
+            "store_errors_count": store_report.get("errors_count"),
+            "store_updated_at_utc": store_report.get("updated_at_utc"),
+            "journal_signal_telemetry_events": counts.get("signal_telemetry_events", 0),
+            "journal_signal_candidate_detected_events": counts.get("signal_candidate_detected_events", 0),
+            "journal_signal_updated_events": counts.get("signal_updated_events", 0),
+            "journal_battle_candidate_events": counts.get("battle_candidate_events", 0),
+            "journal_market_closed_instrument_events": counts.get("market_closed_instrument_events", 0),
+            "journal_weekend_skip_fallback_events": counts.get("weekend_skip_fallback_events", 0),
+            "journal_market_closed_control_events_total": counts.get("market_closed_control_events_total", 0),
+            "journal_suppressed_by_tpo_downgrade": counts.get("suppressed_by_tpo_downgrade", 0),
+            "journal_stale_context_events": counts.get("stale_context_events", 0),
+            "journal_offline_store_context_events": counts.get("offline_store_context_events", 0),
+            "journal_system_no_symbol_events": counts.get("system_no_symbol_events", 0),
+            "market_status_snapshot": store_report.get("market_status", {}),
+            "permission_snapshot": store_report.get("tpo_signal_permission", {}),
+            "modifier_snapshot": store_report.get("telegram_modifier", {}),
+        }
 
-    def send_admin_message(self, text: str) -> bool:
-        return self.send_text(text)
+    def _build_symbol_report(
+        self,
+        store_symbols: dict[str, Any],
+        journal_report: dict[str, Any],
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {}
 
-    def send_alert(self, payload: Dict[str, Any]) -> bool:
-        return self.send_alert_payload(payload)
+        store_per_symbol = self._build_store_report({}, store_symbols).get("per_symbol", {})
 
-    def send_alert_payload(self, payload: Dict[str, Any]) -> bool:
-        if not isinstance(payload, dict):
-            logger.warning("send_alert_payload received non-dict payload.")
-            return False
+        all_symbols = set(store_per_symbol)
+        all_symbols.update(journal_report.get("symbols", {}).keys())
+        all_symbols.discard("-")
+        all_symbols.discard("")
+        all_symbols.discard("None")
 
-        should_alert = bool(payload.get("should_alert", False))
-        if not should_alert:
-            logger.debug("alert_payload.should_alert=False, Telegram send skipped.")
-            return False
+        for symbol in sorted(all_symbols):
+            result[symbol] = {
+                "store": store_per_symbol.get(symbol, {}),
+                "journal_events": journal_report.get("symbols", {}).get(symbol, 0),
+                "market_closed_events": journal_report.get("market_closed_symbols", {}).get(symbol, 0),
+                "weekend_skip_events": journal_report.get("weekend_skip_symbols", {}).get(symbol, 0),
+                "provider_error_events": journal_report.get("provider_errors", {}).get(symbol, 0),
+            }
 
-        normalized_payload = _normalize_alert_payload(payload)
-        alert_type = str(normalized_payload.get("alert_type", "")).strip().upper()
+        return result
 
-        if not alert_type:
-            logger.info(
-                "Alert type missing and could not be inferred. symbol=%s signal_class=%s execution_status=%s",
-                normalized_payload.get("symbol"),
-                normalized_payload.get("signal_class"),
-                normalized_payload.get("execution_status"),
+
+def report_to_markdown(report: TpoDailyReport) -> str:
+    data = asdict(report)
+
+    summary = data["summary"]
+    store = data["tpo_store"]
+    journal = data["journal"]
+    symbols = data["symbols"]
+
+    lines: list[str] = []
+
+    lines.append(f"# 📊 Daily TPO / Auction Telemetry — {report.report_date}")
+    lines.append("")
+    lines.append(f"- Timezone: `{report.timezone}`")
+    lines.append(f"- Generated UTC: `{report.generated_at_utc}`")
+    lines.append(f"- Runtime: `{report.runtime_dir}`")
+    lines.append("")
+
+    lines.append("## Executive Summary")
+    lines.append("")
+    lines.append(f"- TPO store available: **{summary.get('store_available')}**")
+    lines.append(f"- Store symbols: **{summary.get('store_symbols_count')}**")
+    lines.append(f"- Store errors: **{summary.get('store_errors_count')}**")
+    lines.append(f"- Store updated: `{summary.get('store_updated_at_utc')}`")
+    lines.append(f"- Signal telemetry events: **{summary.get('journal_signal_telemetry_events')}**")
+    lines.append(f"- Signal candidate detected events: **{summary.get('journal_signal_candidate_detected_events')}**")
+    lines.append(f"- Signal updated events: **{summary.get('journal_signal_updated_events')}**")
+    lines.append(f"- Battle candidate events: **{summary.get('journal_battle_candidate_events')}**")
+    lines.append(f"- Market closed instrument events: **{summary.get('journal_market_closed_instrument_events')}**")
+    lines.append(f"- Weekend skip fallback events: **{summary.get('journal_weekend_skip_fallback_events')}**")
+    lines.append(f"- Market closed control events total: **{summary.get('journal_market_closed_control_events_total')}**")
+    lines.append(f"- Suppressed / downgraded by TPO: **{summary.get('journal_suppressed_by_tpo_downgrade')}**")
+    lines.append(f"- Stale context events: **{summary.get('journal_stale_context_events')}**")
+    lines.append(f"- Offline store context events: **{summary.get('journal_offline_store_context_events')}**")
+    lines.append(f"- System / no-symbol events: **{summary.get('journal_system_no_symbol_events')}**")
+    lines.append("")
+
+    lines.append("## TPO Store Snapshot")
+    lines.append("")
+    lines.append("### Market Status")
+    for k, v in store.get("market_status", {}).items():
+        lines.append(f"- `{k}`: **{v}**")
+
+    lines.append("")
+    lines.append("### TPO Permissions")
+    for k, v in store.get("tpo_signal_permission", {}).items():
+        lines.append(f"- `{k}`: **{v}**")
+
+    lines.append("")
+    lines.append("### Telegram Modifiers")
+    for k, v in store.get("telegram_modifier", {}).items():
+        lines.append(f"- `{k}`: **{v}**")
+
+    lines.append("")
+    lines.append("### Open Relation")
+    for k, v in store.get("open_relation", {}).items():
+        lines.append(f"- `{k}`: **{v}**")
+
+    lines.append("")
+    lines.append("### Auction Bias")
+    for k, v in store.get("auction_bias", {}).items():
+        lines.append(f"- `{k}`: **{v}**")
+
+    lines.append("")
+    lines.append("## Journal Telemetry")
+    lines.append("")
+
+    lines.append("### TPO Signal Permission")
+    for k, v in journal.get("tpo_signal_permission", {}).items():
+        lines.append(f"- `{k}`: **{v}**")
+
+    lines.append("")
+    lines.append("### TPO Telegram Modifier")
+    for k, v in journal.get("tpo_telegram_modifier", {}).items():
+        lines.append(f"- `{k}`: **{v}**")
+
+    lines.append("")
+    lines.append("### Market Closed Control")
+    lines.append(f"- Instrument MARKET_CLOSED events: **{journal.get('counts', {}).get('market_closed_instrument_events', 0)}**")
+    lines.append(f"- Weekend skip fallback events: **{journal.get('counts', {}).get('weekend_skip_fallback_events', 0)}**")
+    lines.append(f"- Total closed-control events: **{journal.get('counts', {}).get('market_closed_control_events_total', 0)}**")
+
+    lines.append("")
+    lines.append("### Scenarios")
+    for k, v in journal.get("scenarios", {}).items():
+        lines.append(f"- `{k}`: **{v}**")
+
+    lines.append("")
+    lines.append("### Provider Errors")
+    provider_errors = journal.get("provider_errors", {})
+    if provider_errors:
+        for k, v in provider_errors.items():
+            lines.append(f"- `{k}`: **{v}**")
+    else:
+        lines.append("- None")
+
+    lines.append("")
+    lines.append("## Symbol Snapshot")
+    lines.append("")
+    lines.append("| Symbol | Market | Permission | Modifier | Open Relation | Auction Bias | Session | Journal Events | Closed Skips | Provider Errors |")
+    lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+
+    for symbol, item in symbols.items():
+        store_item = item.get("store", {})
+        lines.append(
+            "| "
+            f"{symbol} | "
+            f"{store_item.get('market_status')} | "
+            f"{store_item.get('tpo_signal_permission')} | "
+            f"{store_item.get('telegram_modifier')} | "
+            f"{store_item.get('open_relation')} | "
+            f"{store_item.get('auction_bias')} | "
+            f"{store_item.get('session_anchor')} | "
+            f"{item.get('journal_events')} | "
+            f"{item.get('weekend_skip_events')} | "
+            f"{item.get('provider_error_events')} |"
+        )
+
+    lines.append("")
+    lines.append("## Latest Candidate Samples")
+    lines.append("")
+
+    samples = journal.get("samples", {}).get("latest_candidates", [])
+    if samples:
+        for sample in samples:
+            lines.append(
+                "- "
+                f"`{sample.get('ts_utc')}` "
+                f"{sample.get('symbol')} "
+                f"{sample.get('scenario')} "
+                f"status={sample.get('status')} "
+                f"exec={sample.get('execution_status')} "
+                f"tpo={sample.get('tpo_permission')} "
+                f"modifier={sample.get('tpo_modifier')} "
+                f"open={sample.get('open_relation')} "
+                f"bias={sample.get('auction_bias')}"
             )
-            return False
+    else:
+        lines.append("- None")
 
-        if self.config.allowed_alert_types and alert_type not in self.config.allowed_alert_types:
-            logger.info(
-                "Alert type not allowed for Telegram delivery. alert_type=%s symbol=%s signal_id=%s",
-                alert_type,
-                normalized_payload.get("symbol"),
-                normalized_payload.get("signal_id"),
-            )
-            return False
+    lines.append("")
+    lines.append("## Report Caveats")
+    lines.append("")
+    lines.append("- Report date uses the selected timezone, so a Kyiv daily report starts at 21:00 UTC on the previous calendar day during UTC+3.")
+    lines.append("- Historical events before the latest deployment can contain older TPO fields or older permissions.")
+    lines.append("- `Signal telemetry events` includes candidate/update/register events; `Signal candidate detected events` is the cleaner count of newly detected candidates.")
+    lines.append("- `Market closed control events total` includes both instrument-level MARKET_CLOSED events and fallback skip events, so it is a control-flow metric, not unique symbols.")
+    lines.append("- `System / no-symbol events` are service/worker events and are excluded from Symbol Snapshot.")
 
-        # Final battle permission gate.
-        #
-        # EXECUTABLE means the execution plan exists.
-        # BATTLE_READY means the signal is allowed to reach Telegram.
-        #
-        # Research-only / market-closed / stale-data / counter-trend / weak-auction
-        # signals remain available in journal/statistics/reports, but they must not
-        # create Telegram noise.
-        try:
-            normalized_payload = apply_battle_permission(normalized_payload)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception(
-                "Battle permission evaluation failed. Telegram alert suppressed for safety. "
-                "symbol=%s alert_type=%s signal_id=%s error=%s",
-                normalized_payload.get("symbol"),
-                alert_type,
-                normalized_payload.get("signal_id"),
-                exc,
-            )
-            return False
+    lines.append("")
+    lines.append("## Interpretation")
+    lines.append("")
+    lines.append("- `MARKET_CLOSED` / `MARKET_CLOSED_AND_STALE` має блокувати battle logic.")
+    lines.append("- `INSIDE_VA + BALANCE` має бути research/downgrade, а не бойовий Telegram.")
+    lines.append("- `OUT_OF_RANGE + DIRECTIONAL_IMBALANCE` має сенс тільки якщо market is open і direction aligned with HTF.")
+    lines.append("- `RANGE + RANGE_EXTENSION` допускає оцінку, але не автоматичний battle signal.")
+    lines.append("- nPOC залишається interest zone, не entry.")
 
-        telegram_delivery_mode = str(
-            normalized_payload.get("telegram_delivery_mode") or ""
-        ).strip().upper()
-
-        battle_permission = str(
-            normalized_payload.get("battle_permission") or ""
-        ).strip().upper()
-
-        battle_ready = bool(normalized_payload.get("battle_ready", False))
-        auction_context_score = normalized_payload.get("auction_context_score")
-
-        metadata = normalized_payload.get("metadata")
-        if not isinstance(metadata, dict):
-            metadata = {}
-
-        battle_blockers = metadata.get("battle_permission_blockers") or []
-        battle_reasons = metadata.get("battle_permission_reasons") or []
-
-        if telegram_delivery_mode != "BATTLE_ALERT" or not battle_ready:
-            logger.info(
-                "Telegram alert suppressed by battle permission. "
-                "symbol=%s alert_type=%s signal_id=%s battle_permission=%s "
-                "delivery_mode=%s score=%s blockers=%s reasons=%s",
-                normalized_payload.get("symbol"),
-                alert_type,
-                normalized_payload.get("signal_id"),
-                battle_permission,
-                telegram_delivery_mode,
-                auction_context_score,
-                battle_blockers,
-                battle_reasons[:5] if isinstance(battle_reasons, list) else battle_reasons,
-            )
-            return False
-
-        message = self.format_alert_payload(normalized_payload)
-
-        logger.info(
-            "Sending Telegram alert. symbol=%s alert_type=%s signal_id=%s alignment=%s stop_quality=%s practical_rr=%s trade_confidence=%s scenario_probability=%s battle_permission=%s auction_context_score=%s formatter=%s",
-            normalized_payload.get("symbol"),
-            alert_type,
-            normalized_payload.get("signal_id"),
-            normalized_payload.get("signal_alignment"),
-            normalized_payload.get("stop_quality"),
-            normalized_payload.get("practical_rr"),
-            normalized_payload.get("trade_confidence"),
-            normalized_payload.get("scenario_probability"),
-            battle_permission,
-            auction_context_score,
-            "ukrainian" if self.config.use_ukrainian_formatter else "legacy_html",
-        )
-        return self.send_text(message)
-
-    def format_alert_payload(self, payload: Dict[str, Any]) -> str:
-        payload = _normalize_alert_payload(payload)
-
-        if self.config.use_ukrainian_formatter:
-            try:
-                return self.format_alert_payload_ukrainian(payload)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception(
-                    "Ukrainian telegram_formatter failed. Falling back to legacy HTML formatter. symbol=%s signal_id=%s error=%s",
-                    payload.get("symbol"),
-                    payload.get("signal_id"),
-                    exc,
-                )
-
-        return self.format_alert_payload_legacy_html(payload)
-
-    def format_alert_payload_ukrainian(self, payload: Dict[str, Any]) -> str:
-        """
-        Ukrainian human-facing live alert formatter.
-
-        telegram_formatter.py returns plain text. This notifier still sends messages
-        with parse_mode=HTML by default, so we escape the whole rendered message.
-        Telegram will display it as normal text while keeping line breaks and emojis.
-        """
-        payload = _normalize_alert_payload(payload)
-
-        formatted = format_signal_message(payload)
-        text = formatted.render()
-
-        # Escape for Telegram HTML parse_mode safety.
-        return _truncate(_escape_html(text), self.config.max_message_length)
-
-    def format_alert_payload_legacy_html(self, payload: Dict[str, Any]) -> str:
-        """
-        Legacy HTML formatter.
-
-        Kept as a safe fallback:
-        ENABLE_UKRAINIAN_TELEGRAM_FORMATTER=false
-        """
-        payload = _normalize_alert_payload(payload)
-
-        symbol = _escape_html(payload.get("symbol", "UNKNOWN"))
-        alert_type = _escape_html(payload.get("alert_type", "UNKNOWN"))
-        scenario_type = _escape_html(payload.get("scenario_type", "UNKNOWN"))
-        direction = _escape_html(payload.get("direction", "UNKNOWN"))
-        watch_reason = _escape_html(payload.get("watch_reason", "-"))
-        market_state = _escape_html(payload.get("market_state", "-"))
-        htf_bias = _escape_html(payload.get("htf_bias", "-"))
-        invalidation_level = payload.get("invalidation_level")
-        target_zone = payload.get("target_zone")
-
-        trade_confidence_raw = _first_present(
-            payload.get("trade_confidence"),
-            payload.get("confidence"),
-            payload.get("probability"),
-            payload.get("trade_probability"),
-            payload.get("signal_confidence"),
-        )
-        scenario_probability_raw = payload.get("scenario_probability")
-
-        trade_confidence_pct = _format_percent(trade_confidence_raw)
-        scenario_probability_pct = _format_percent(scenario_probability_raw)
-
-        paper_mode = bool(payload.get("paper_mode", True))
-        cycle_id = _escape_html(payload.get("cycle_id", "-"))
-
-        execution_status = _escape_html(payload.get("execution_status", "-"))
-        execution_model = _escape_html(payload.get("execution_model", "-"))
-        entry_reference_price = payload.get("entry_reference_price")
-        invalidation_reference_price = payload.get("invalidation_reference_price")
-        target_reference_price = payload.get("target_reference_price")
-        risk_reward_ratio = payload.get("risk_reward_ratio")
-        signal_id = _escape_html(payload.get("signal_id", "-"))
-
-        signal_alignment = str(payload.get("signal_alignment") or "UNKNOWN")
-        signal_alignment_marker = str(payload.get("signal_alignment_marker") or "⚫")
-        signal_alignment_label = str(payload.get("signal_alignment_label") or signal_alignment)
-
-        stop_quality = str(payload.get("stop_quality") or "UNKNOWN")
-        stop_quality_reason = str(payload.get("stop_quality_reason") or "")
-        theoretical_rr = payload.get("theoretical_rr")
-        practical_rr = payload.get("practical_rr")
-
-        header = self.config.paper_mode_prefix if paper_mode else self.config.live_mode_prefix
-
-        invalidation_str = (
-            _escape_html(invalidation_level) if invalidation_level is not None else "-"
-        )
-        target_zone_str = _normalize_target_zone(target_zone)
-
-        lines = [
-            f"<b>{header} | {symbol}</b>",
-            f"<b>{_escape_html(signal_alignment_marker)} {_escape_html(signal_alignment_label)}</b>",
-        ]
-
-        if stop_quality == "TIGHT_STOP":
-            lines.append("<b>⚠️ TIGHT STOP / RR INFLATED</b>")
-        elif stop_quality == "INVALID":
-            lines.append("<b>⛔ INVALID STOP GEOMETRY</b>")
-
-        lines.extend(
-            [
-                "",
-                f"<b>Alert:</b> {alert_type}",
-                f"<b>Scenario:</b> {scenario_type}",
-                f"<b>Direction:</b> {direction}",
-                f"<b>Trade confidence:</b> {trade_confidence_pct}",
-            ]
-        )
-
-        if scenario_probability_raw is not None:
-            lines.append(f"<b>Scenario probability:</b> {scenario_probability_pct}")
-
-        lines.extend(
-            [
-                f"<b>Market state:</b> {market_state}",
-                f"<b>HTF bias:</b> {htf_bias}",
-                f"<b>Invalidation:</b> {invalidation_str}",
-                f"<b>Target zone:</b> {target_zone_str}",
-                f"<b>Cycle:</b> {cycle_id}",
-                "",
-                f"<b>Execution status:</b> {execution_status}",
-                f"<b>Execution model:</b> {execution_model}",
-            ]
-        )
-
-        if entry_reference_price is not None:
-            lines.append(f"<b>Entry:</b> {_escape_html(entry_reference_price)}")
-        if invalidation_reference_price is not None:
-            lines.append(f"<b>Stop:</b> {_escape_html(invalidation_reference_price)}")
-        if target_reference_price is not None:
-            lines.append(f"<b>Target:</b> {_escape_html(target_reference_price)}")
-        if risk_reward_ratio is not None:
-            lines.append(f"<b>RR:</b> {_escape_html(risk_reward_ratio)}")
-
-        if practical_rr is not None and theoretical_rr is not None:
-            try:
-                practical_rr_f = float(practical_rr)
-                theoretical_rr_f = float(theoretical_rr)
-
-                if abs(practical_rr_f - theoretical_rr_f) >= 0.05:
-                    lines.append(f"<b>Practical RR:</b> {_escape_html(f'{practical_rr_f:.2f}')}")
-            except (TypeError, ValueError):
-                pass
-        elif practical_rr is not None:
-            try:
-                lines.append(f"<b>Practical RR:</b> {_escape_html(f'{float(practical_rr):.2f}')}")
-            except (TypeError, ValueError):
-                lines.append(f"<b>Practical RR:</b> {_escape_html(practical_rr)}")
-
-        if stop_quality in {"TIGHT_STOP", "INVALID"} and stop_quality_reason:
-            lines.append(f"<b>Stop quality:</b> {_escape_html(stop_quality)}")
-            lines.append(f"<b>Stop note:</b> {_escape_html(stop_quality_reason)}")
-
-        lines.extend(
-            [
-                "",
-                f"<b>Reason:</b> {watch_reason}",
-                "",
-                f"<b>ID:</b> <code>{signal_id}</code>",
-            ]
-        )
-
-        return _truncate("\n".join(lines), self.config.max_message_length)
-
-    def send_startup_message(self, worker_name: str = "main_worker") -> bool:
-        return self.send_text(
-            "\n".join(
-                [
-                    f"<b>🟢 {_escape_html(worker_name)} started</b>",
-                    "",
-                    "<b>Status:</b> online",
-                    "<b>Mode:</b> 24/7 loop",
-                ]
-            )
-        )
-
-    def send_shutdown_message(self, worker_name: str = "main_worker") -> bool:
-        return self.send_text(
-            "\n".join(
-                [
-                    f"<b>🛑 {_escape_html(worker_name)} stopped</b>",
-                    "",
-                    "<b>Status:</b> offline",
-                ]
-            )
-        )
-
-    def send_error_message(self, title: str, details: str) -> bool:
-        return self.send_text(
-            "\n".join(
-                [
-                    f"<b>❌ {_escape_html(title)}</b>",
-                    "",
-                    f"<pre>{_escape_html(_truncate(details, 3000))}</pre>",
-                ]
-            )
-        )
+    return "\n".join(lines)
 
 
-def build_telegram_notifier() -> TelegramNotifier:
-    return TelegramNotifier()
+def write_report(report: TpoDailyReport, output_dir: Path) -> tuple[Path, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    json_path = output_dir / f"tpo_daily_report_{report.report_date}.json"
+    md_path = output_dir / f"tpo_daily_report_{report.report_date}.md"
+
+    json_path.write_text(
+        json.dumps(_json_safe(asdict(report)), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    md_path.write_text(report_to_markdown(report), encoding="utf-8")
+
+    return json_path, md_path
 
 
-def send_alert_payload(payload: Dict[str, Any]) -> bool:
-    notifier = build_telegram_notifier()
-    return notifier.send_alert_payload(payload)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build daily TPO / auction telemetry report.")
+
+    parser.add_argument(
+        "--date",
+        default=None,
+        help="Report date in YYYY-MM-DD. Default: today in selected timezone.",
+    )
+    parser.add_argument(
+        "--timezone",
+        default=os.getenv("DAILY_REPORT_TIMEZONE", DEFAULT_TIMEZONE),
+        help="Report timezone. Default: Europe/Kyiv.",
+    )
+    parser.add_argument(
+        "--runtime-dir",
+        default=None,
+        help="Runtime directory. Default: RUNTIME_DIR/settings.runtime_dir or /var/data/runtime.",
+    )
+    parser.add_argument(
+        "--tpo-store-path",
+        default=None,
+        help="Path to tpo_latest.json.",
+    )
+    parser.add_argument(
+        "--journal-path",
+        default=None,
+        help="Path to radar_journal.ndjson.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help="Output directory. Default: runtime/reports/tpo.",
+    )
+    parser.add_argument(
+        "--print-markdown",
+        action="store_true",
+        help="Print markdown report to stdout.",
+    )
+
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+
+    tz = ZoneInfo(args.timezone)
+
+    if args.date:
+        report_date = datetime.strptime(args.date, "%Y-%m-%d").date()
+    else:
+        report_date = datetime.now(tz).date()
+
+    runtime_dir = Path(args.runtime_dir) if args.runtime_dir else _runtime_dir()
+
+    tpo_store_path = Path(args.tpo_store_path) if args.tpo_store_path else None
+    journal_path = Path(args.journal_path) if args.journal_path else None
+    output_dir = Path(args.output_dir) if args.output_dir else runtime_dir / "reports" / "tpo"
+
+    builder = TpoDailyReportBuilder(
+        report_date=report_date,
+        timezone_name=args.timezone,
+        runtime_dir=runtime_dir,
+        tpo_store_path=tpo_store_path,
+        journal_path=journal_path,
+    )
+
+    report = builder.build()
+    json_path, md_path = write_report(report, output_dir)
+
+    print("[OK] TPO daily report written:")
+    print(f"JSON: {json_path}")
+    print(f"MD:   {md_path}")
+
+    if args.print_markdown:
+        print()
+        print(report_to_markdown(report))
+
+    return 0
 
 
 if __name__ == "__main__":
-    sample_payload = {
-        "should_alert": True,
-        "symbol": "NAS100",
-        "signal_class": "READY",
-        "alert_type": "ENTRY_READY",
-        "scenario": "TREND_CONTINUATION_LONG",
-        "scenario_type": "TREND_CONTINUATION_LONG",
-        "direction": "LONG",
-        "confidence": 0.8,
-        "scenario_probability": 0.65,
-        "rationale": "Battle-ready directional auction test payload.",
-        "market_state": "TREND",
-        "htf_bias": "LONG",
-        "signal_alignment": "TREND_ALIGNED",
-        "entry_reference_price": 19000.0,
-        "invalidation_reference_price": 18950.0,
-        "target_reference_price": 19150.0,
-        "execution_status": "EXECUTABLE",
-        "execution_model": "LIMIT_ON_RETEST",
-        "risk_reward_ratio": 3.0,
-        "practical_rr": 3.0,
-        "stop_quality": "OK",
-        "quality_tier": "GOOD",
-        "paper_mode": False,
-        "cycle_id": "2026-05-13T12:49:17.416321+00:00",
-        "signal_id": "TEST_NAS100_BATTLE_READY",
-        "metadata": {
-            "auction_context": {
-                "market_is_open": True,
-                "market_status": "OPEN",
-                "open_relation": "OUT_OF_RANGE",
-                "auction_bias": "DIRECTIONAL_IMBALANCE",
-                "ib_extension_up_pct": 0.7,
-            },
-            "auction_filters": {
-                "tpo_signal_permission": "OPEN_FOR_EVALUATION",
-                "telegram_modifier": "BOOST",
-            },
-        },
-    }
-
-    notifier = build_telegram_notifier()
-    ok = notifier.send_alert_payload(sample_payload)
-    print(json.dumps({"telegram_sent": ok}, ensure_ascii=False))
+    raise SystemExit(main())
