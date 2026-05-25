@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import gc
 import json
 from datetime import UTC, datetime
@@ -15,7 +16,7 @@ from app.core.instrument_batches import get_batch_symbols
 from app.core.settings import settings
 from app.runners.stateful_batch_runner import _build_loader_for_batch_group, to_jsonable
 
-EXPORTER_VERSION = "tpo-context-exporter-v1"
+EXPORTER_VERSION = "tpo-context-exporter-v1.1-preserve-previous-context"
 DEFAULT_MAX_BARS = 672
 
 TPO_DIR = settings.runtime_dir / "tpo"
@@ -47,6 +48,170 @@ def normalize_symbol(raw: Any) -> Instrument:
         return raw
     value = getattr(raw, "value", raw)
     return Instrument(str(value))
+
+
+def ensure_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if value in (None, "", {}, ()):
+        return []
+    return [value]
+
+
+def load_previous_store(path: Path) -> dict[str, Any]:
+    """
+    Best-effort read of the previous TPO context store.
+
+    The exporter is allowed to run when one provider has a temporary failure
+    (for example yfinance rate limiting ^GDAXI). In that case we preserve the
+    last valid context for the failed symbol and mark it as degraded/stale.
+    """
+    if not path.exists():
+        return {}
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    return data if isinstance(data, dict) else {}
+
+
+def get_previous_symbol_item(previous_store: dict[str, Any], symbol: Instrument) -> dict[str, Any] | None:
+    symbols = previous_store.get("symbols")
+    if not isinstance(symbols, dict):
+        return None
+
+    item = symbols.get(symbol.value)
+    return copy.deepcopy(item) if isinstance(item, dict) else None
+
+
+def mark_context_as_preserved_fallback(
+    *,
+    previous_item: dict[str, Any],
+    symbol: Instrument,
+    group: str,
+    error_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """
+    Preserve the previous context but make it safe.
+
+    Important:
+    - We keep open_relation / auction_bias for visibility and daily reports.
+    - We force stale/provider-error markers and Telegram downgrade.
+    - We force tpo_signal_permission to STALE_DATA so live gate should not
+      allow battle logic from stale provider data.
+    """
+    item = copy.deepcopy(previous_item)
+    previous_item_updated_at = item.get("updated_at_utc")
+    updated_at = now_iso()
+
+    context = item.get("context")
+    if not isinstance(context, dict):
+        context = {}
+        item["context"] = context
+
+    filters = item.get("filters")
+    if not isinstance(filters, dict):
+        filters = {}
+        item["filters"] = filters
+
+    context["auction_context_available"] = bool(context.get("auction_context_available", True))
+    context["tpo_source"] = "offline_exporter_previous_context_fallback"
+    context["fallback_preserved_previous_context"] = True
+    context["provider_error"] = True
+    context["provider_error_group"] = group
+    context["provider_error_type"] = error_payload.get("error_type")
+    context["provider_error_message"] = error_payload.get("error")
+    context["provider_error_at_utc"] = updated_at
+    context["previous_context_updated_at_utc"] = previous_item_updated_at
+    context["market_data_is_stale"] = True
+    context["context_stale"] = True
+    context["market_status"] = "STALE_DATA"
+    context["symbol"] = symbol.value
+
+    existing_reasons = ensure_list(filters.get("reasons"))
+    fallback_reason = (
+        f"Provider error for {symbol.value}; preserved previous TPO context "
+        "as stale/degraded and blocked battle permission."
+    )
+
+    filters["auction_context_available"] = bool(filters.get("auction_context_available", True))
+    filters["tpo_source"] = "offline_exporter_previous_context_fallback"
+    filters["fallback_preserved_previous_context"] = True
+    filters["provider_error"] = True
+    filters["provider_error_type"] = error_payload.get("error_type")
+    filters["provider_error_message"] = error_payload.get("error")
+    filters["market_data_is_stale"] = True
+    filters["context_stale"] = True
+    filters["tpo_signal_permission"] = "STALE_DATA"
+    filters["telegram_modifier"] = "DOWNGRADE"
+    filters["confidence_modifier"] = min(float(filters.get("confidence_modifier") or 0.0), -1.0)
+    filters["reasons"] = [*existing_reasons, fallback_reason]
+
+    item["symbol"] = symbol.value
+    item["updated_at_utc"] = updated_at
+    item["fallback_preserved_previous_context"] = True
+    item["previous_item_updated_at_utc"] = previous_item_updated_at
+    item["provider_error"] = True
+    item["provider_error_group"] = group
+    item["provider_error_type"] = error_payload.get("error_type")
+    item["provider_error_message"] = error_payload.get("error")
+
+    return item
+
+
+def build_provider_error_item(
+    *,
+    symbol: Instrument,
+    group: str,
+    error_payload: dict[str, Any],
+    reason: str | None = None,
+) -> dict[str, Any]:
+    updated_at = now_iso()
+    message = reason or str(error_payload.get("error") or "provider_error")
+
+    return {
+        "symbol": symbol.value,
+        "updated_at_utc": updated_at,
+        "provider_error": True,
+        "provider_error_group": group,
+        "provider_error_type": error_payload.get("error_type"),
+        "provider_error_message": message,
+        "context": {
+            "symbol": symbol.value,
+            "auction_context_available": False,
+            "reason": message,
+            "tpo_source": "offline_exporter_provider_error",
+            "provider_error": True,
+            "provider_error_type": error_payload.get("error_type"),
+            "provider_error_message": message,
+            "provider_error_at_utc": updated_at,
+            "market_data_is_stale": True,
+            "context_stale": True,
+            "market_status": "PROVIDER_ERROR",
+            "open_relation": "UNKNOWN",
+            "auction_bias": "UNKNOWN",
+        },
+        "filters": {
+            "auction_context_available": False,
+            "open_relation": "UNKNOWN",
+            "auction_bias": "UNKNOWN",
+            "tpo_signal_permission": "PROVIDER_ERROR",
+            "telegram_modifier": "DOWNGRADE",
+            "confidence_modifier": -1.0,
+            "provider_error": True,
+            "provider_error_type": error_payload.get("error_type"),
+            "provider_error_message": message,
+            "market_data_is_stale": True,
+            "context_stale": True,
+            "tpo_source": "offline_exporter_provider_error",
+            "reasons": [
+                "TPO exporter could not build current context and no previous context was available.",
+                message,
+            ],
+        },
+    }
 
 
 def prepare_ohlc(df: pd.DataFrame | None, max_bars: int) -> pd.DataFrame | None:
@@ -105,13 +270,21 @@ def build_symbol_tpo(loader: Any, symbol: Instrument, max_bars: int) -> dict[str
                 "auction_context_available": False,
                 "reason": "missing_or_unusable_15m_ohlc_dataframe",
                 "tpo_source": "offline_exporter",
+                "market_data_is_stale": True,
+                "context_stale": True,
+                "market_status": "NO_DATA",
+                "open_relation": "UNKNOWN",
+                "auction_bias": "UNKNOWN",
             },
             "filters": {
                 "auction_context_available": False,
                 "open_relation": "UNKNOWN",
                 "auction_bias": "UNKNOWN",
-                "telegram_modifier": "NEUTRAL",
-                "confidence_modifier": 0.0,
+                "tpo_signal_permission": "NO_DATA",
+                "telegram_modifier": "DOWNGRADE",
+                "confidence_modifier": -1.0,
+                "market_data_is_stale": True,
+                "context_stale": True,
                 "reasons": ["TPO exporter could not build OHLC dataframe."],
             },
         }
@@ -134,10 +307,14 @@ def build_symbol_tpo(loader: Any, symbol: Instrument, max_bars: int) -> dict[str
         context_payload["max_bars"] = int(max_bars)
         context_payload["tick_size"] = float(tick_size)
         context_payload["memory_mode"] = "offline_bounded_recent_history"
+        context_payload["provider_error"] = False
+        context_payload["fallback_preserved_previous_context"] = False
 
     filters_payload = to_jsonable(filters)
     if isinstance(filters_payload, dict):
         filters_payload["tpo_source"] = "offline_exporter"
+        filters_payload["provider_error"] = False
+        filters_payload["fallback_preserved_previous_context"] = False
 
     return {
         "symbol": symbol.value,
@@ -147,16 +324,53 @@ def build_symbol_tpo(loader: Any, symbol: Instrument, max_bars: int) -> dict[str
     }
 
 
+def maybe_preserve_previous_for_unavailable_item(
+    *,
+    item: dict[str, Any],
+    previous_store: dict[str, Any],
+    symbol: Instrument,
+    group: str,
+) -> dict[str, Any]:
+    context = item.get("context") if isinstance(item, dict) else {}
+    if not isinstance(context, dict):
+        return item
+
+    if context.get("auction_context_available") is not False:
+        return item
+
+    previous_item = get_previous_symbol_item(previous_store, symbol)
+    if previous_item is None:
+        return item
+
+    error_payload = {
+        "group": group,
+        "symbol": symbol.value,
+        "error": context.get("reason") or "auction_context_unavailable",
+        "error_type": "AuctionContextUnavailable",
+    }
+
+    return mark_context_as_preserved_fallback(
+        previous_item=previous_item,
+        symbol=symbol,
+        group=group,
+        error_payload=error_payload,
+    )
+
+
 def export_tpo_context(groups: list[str], max_bars: int, output_path: Path) -> dict[str, Any]:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    previous_store = load_previous_store(output_path)
 
     payload: dict[str, Any] = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "exporter_version": EXPORTER_VERSION,
         "updated_at_utc": now_iso(),
         "max_bars": max_bars,
+        "previous_store_loaded": bool(previous_store),
+        "previous_store_updated_at_utc": previous_store.get("updated_at_utc") if previous_store else None,
         "symbols": {},
         "errors": [],
+        "fallbacks": [],
     }
 
     seen: set[str] = set()
@@ -170,30 +384,94 @@ def export_tpo_context(groups: list[str], max_bars: int, output_path: Path) -> d
         raw_symbols = get_batch_symbols(group)
 
         for raw in raw_symbols:
+            symbol_value = str(getattr(raw, "value", raw))
+
             try:
                 symbol = normalize_symbol(raw)
+                symbol_value = symbol.value
+
                 if symbol.value in seen:
                     continue
                 seen.add(symbol.value)
 
                 item = build_symbol_tpo(loader, symbol, max_bars=max_bars)
+                item = maybe_preserve_previous_for_unavailable_item(
+                    item=item,
+                    previous_store=previous_store,
+                    symbol=symbol,
+                    group=group,
+                )
+
                 payload["symbols"][symbol.value] = item
+
+                if item.get("fallback_preserved_previous_context"):
+                    fallback_payload = {
+                        "group": group,
+                        "symbol": symbol.value,
+                        "fallback_type": "previous_context_preserved",
+                        "reason": item.get("provider_error_message"),
+                        "previous_item_updated_at_utc": item.get("previous_item_updated_at_utc"),
+                    }
+                    payload["fallbacks"].append(fallback_payload)
+
                 print(
                     symbol.value,
                     "open=", item.get("context", {}).get("open_relation"),
                     "bias=", item.get("context", {}).get("auction_bias"),
+                    "permission=", item.get("filters", {}).get("tpo_signal_permission"),
                     "modifier=", item.get("filters", {}).get("telegram_modifier"),
+                    "fallback=", bool(item.get("fallback_preserved_previous_context")),
                 )
 
             except Exception as exc:  # noqa: BLE001
                 error_payload = {
                     "group": group,
-                    "symbol": str(getattr(raw, "value", raw)),
+                    "symbol": symbol_value,
                     "error": str(exc),
                     "error_type": type(exc).__name__,
                 }
                 payload["errors"].append(error_payload)
-                print("ERROR", error_payload)
+
+                try:
+                    symbol = normalize_symbol(raw)
+                    previous_item = get_previous_symbol_item(previous_store, symbol)
+
+                    if previous_item is not None:
+                        fallback_item = mark_context_as_preserved_fallback(
+                            previous_item=previous_item,
+                            symbol=symbol,
+                            group=group,
+                            error_payload=error_payload,
+                        )
+                        payload["symbols"][symbol.value] = fallback_item
+                        fallback_payload = {
+                            "group": group,
+                            "symbol": symbol.value,
+                            "fallback_type": "previous_context_preserved",
+                            "reason": str(exc),
+                            "previous_item_updated_at_utc": fallback_item.get("previous_item_updated_at_utc"),
+                        }
+                        payload["fallbacks"].append(fallback_payload)
+
+                        print(
+                            symbol.value,
+                            "open=", fallback_item.get("context", {}).get("open_relation"),
+                            "bias=", fallback_item.get("context", {}).get("auction_bias"),
+                            "permission=", fallback_item.get("filters", {}).get("tpo_signal_permission"),
+                            "modifier=", fallback_item.get("filters", {}).get("telegram_modifier"),
+                            "fallback= True",
+                        )
+                    else:
+                        payload["symbols"][symbol.value] = build_provider_error_item(
+                            symbol=symbol,
+                            group=group,
+                            error_payload=error_payload,
+                        )
+                        print("ERROR", error_payload, "fallback= False no_previous_context")
+
+                except Exception as fallback_exc:  # noqa: BLE001
+                    print("ERROR", error_payload, "fallback_error=", str(fallback_exc))
+
             finally:
                 gc.collect()
 
@@ -220,6 +498,7 @@ def main() -> None:
         "updated_at_utc": payload.get("updated_at_utc"),
         "symbols": len(payload.get("symbols", {})),
         "errors": len(payload.get("errors", [])),
+        "fallbacks": len(payload.get("fallbacks", [])),
         "output": str(args.output),
     }, ensure_ascii=False, indent=2))
 
