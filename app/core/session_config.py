@@ -217,6 +217,47 @@ SESSION_CONFIG: dict[str, SessionConfig] = {
 }
 
 
+# =============================================================================
+# Exchange holiday calendars
+# =============================================================================
+
+# Source policy:
+# - These dates are for US cash equity markets only.
+# - They are used by our US_INDEX_CASH instruments: NAS100 / SPX500.
+# - Futures / commodities may have modified schedules and should not be forced
+#   through this cash-equity calendar unless explicitly configured later.
+#
+# Maintenance note:
+# - Add future years deliberately from official NYSE/Nasdaq calendars.
+# - Keep the reason code stable: "US_HOLIDAY", so downstream code can group it.
+US_EQUITY_MARKET_HOLIDAYS: dict[int, dict[str, str]] = {
+    2026: {
+        "2026-01-01": "NEW_YEARS_DAY",
+        "2026-01-19": "MLK_DAY",
+        "2026-02-16": "WASHINGTONS_BIRTHDAY",
+        "2026-04-03": "GOOD_FRIDAY",
+        "2026-05-25": "MEMORIAL_DAY",
+        "2026-06-19": "JUNETEENTH",
+        "2026-07-03": "INDEPENDENCE_DAY_OBSERVED",
+        "2026-09-07": "LABOR_DAY",
+        "2026-11-26": "THANKSGIVING_DAY",
+        "2026-12-25": "CHRISTMAS_DAY",
+    },
+    2027: {
+        "2027-01-01": "NEW_YEARS_DAY",
+        "2027-01-18": "MLK_DAY",
+        "2027-02-15": "WASHINGTONS_BIRTHDAY",
+        "2027-03-26": "GOOD_FRIDAY",
+        "2027-05-31": "MEMORIAL_DAY",
+        "2027-06-18": "JUNETEENTH_OBSERVED",
+        "2027-07-05": "INDEPENDENCE_DAY_OBSERVED",
+        "2027-09-06": "LABOR_DAY",
+        "2027-11-25": "THANKSGIVING_DAY",
+        "2027-12-24": "CHRISTMAS_DAY_OBSERVED",
+    },
+}
+
+
 def get_session_config(symbol: str) -> SessionConfig:
     key = str(symbol).upper().strip()
 
@@ -246,6 +287,48 @@ def _ensure_utc(value: datetime) -> datetime:
         value = value.replace(tzinfo=timezone.utc)
 
     return value.astimezone(timezone.utc)
+
+
+def _local_date_key(now_utc: datetime, timezone_name: str) -> str:
+    local_dt = now_utc.astimezone(ZoneInfo(timezone_name))
+    return local_dt.date().isoformat()
+
+
+def get_us_equity_holiday_name(now_utc: datetime) -> str | None:
+    """
+    Return a stable holiday identifier for US cash equity markets.
+
+    The lookup is based on America/New_York local date, because US equity
+    session status is determined by the exchange-local calendar.
+    """
+    now_utc = _ensure_utc(now_utc)
+    local_date = _local_date_key(now_utc, "America/New_York")
+    year = int(local_date[:4])
+
+    return US_EQUITY_MARKET_HOLIDAYS.get(year, {}).get(local_date)
+
+
+def _is_us_equity_market_holiday(
+    now_utc: datetime,
+    config: SessionConfig,
+) -> tuple[bool, str | None, str | None]:
+    """
+    Cash US indices use NYSE/Nasdaq cash equity holidays.
+
+    Returns:
+    - is_closed
+    - stable closed reason
+    - specific holiday name
+    """
+    if config.asset_class != "US_INDEX_CASH":
+        return False, None, None
+
+    holiday_name = get_us_equity_holiday_name(now_utc)
+
+    if holiday_name:
+        return True, "US_HOLIDAY", holiday_name
+
+    return False, None, None
 
 
 def compute_session_open_for_timestamp(
@@ -362,6 +445,14 @@ def evaluate_market_state(
     now_utc = _ensure_utc(now_utc)
 
     closed, closed_reason = _is_weekend_closed(now_utc, config)
+    market_holiday_name: str | None = None
+
+    if not closed:
+        holiday_closed, holiday_reason, holiday_name = _is_us_equity_market_holiday(now_utc, config)
+        if holiday_closed:
+            closed = True
+            closed_reason = holiday_reason
+            market_holiday_name = holiday_name
 
     if not closed:
         outside_hours, hours_reason = _is_outside_primary_session_hours(now_utc, config)
@@ -379,7 +470,12 @@ def evaluate_market_state(
     else:
         data_is_stale = True
 
-    if closed and data_is_stale:
+    # Holiday closure is a calendar decision, not a data-latency decision.
+    # Keep market_status clean as MARKET_CLOSED even when the last cash-index
+    # bar is naturally old because the exchange is closed.
+    if closed_reason == "US_HOLIDAY":
+        market_status = "MARKET_CLOSED"
+    elif closed and data_is_stale:
         market_status = "MARKET_CLOSED_AND_STALE"
     elif closed:
         market_status = "MARKET_CLOSED"
@@ -393,6 +489,7 @@ def evaluate_market_state(
         "market_is_open": not closed,
         "market_status": market_status,
         "market_closed_reason": closed_reason,
+        "market_holiday_name": market_holiday_name,
         "market_data_is_stale": data_is_stale,
         "market_data_age_minutes": data_age_minutes,
         "last_bar_timestamp_utc": last_bar_ts_utc.isoformat() if last_bar_ts_utc else None,
