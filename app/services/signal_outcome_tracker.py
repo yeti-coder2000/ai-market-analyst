@@ -15,7 +15,7 @@ from app.services.telegram_alert_store import (
 
 
 # =============================================================================
-# SIGNAL OUTCOME TRACKER v2.0
+# SIGNAL OUTCOME TRACKER v2.1
 # =============================================================================
 # Purpose:
 # - Track real Telegram ENTRY_READY signals from telegram_alerts.json.
@@ -39,6 +39,11 @@ from app.services.telegram_alert_store import (
 # Important:
 # - RESEARCH_COUNTERFACTUAL is not a real trade and not a Telegram alert.
 # - It answers: "What would have happened if this blocked signal had been allowed?"
+#
+# v2.1 changes:
+# - Marks TEST_* / SYNTHETIC_TEST records as SYNTHETIC_TEST.
+# - Keeps synthetic records in signal_outcomes.json for audit.
+# - Excludes synthetic records from production metrics.
 # =============================================================================
 
 
@@ -81,6 +86,10 @@ RESEARCH_BATTLE_PERMISSION_PREFIXES = (
 
 RESEARCH_TRACKING_SCOPE = "RESEARCH_COUNTERFACTUAL"
 TELEGRAM_TRACKING_SCOPE = "TELEGRAM_ALERT"
+SYNTHETIC_TRACKING_SCOPE = "SYNTHETIC_TEST"
+
+SYNTHETIC_SIGNAL_PREFIXES = ("TEST_", "SYNTHETIC_")
+SYNTHETIC_CYCLE_IDS = {"SYNTHETIC_TEST", "TEST"}
 
 MATERIAL_FIELDS = (
     "outcome_status",
@@ -329,6 +338,59 @@ def safe_list(value: Any) -> list[Any]:
     if value in (None, "", {}, ()):  # noqa: PLC1901
         return []
     return [value]
+
+def is_synthetic_record(record: dict[str, Any]) -> bool:
+    """
+    Detect synthetic/test records that must remain auditable but must not enter
+    production statistics.
+    """
+    if not isinstance(record, dict):
+        return False
+
+    explicit = safe_bool(record.get("synthetic_test"), None)
+    if explicit is True:
+        return True
+
+    signal_id = normalize_text(record.get("signal_id")).upper()
+    alert_id = normalize_text(record.get("alert_id")).upper()
+    cycle_id = normalize_text(record.get("cycle_id")).upper()
+    source = normalize_text(record.get("source")).upper()
+
+    if any(signal_id.startswith(prefix) for prefix in SYNTHETIC_SIGNAL_PREFIXES):
+        return True
+
+    if any(alert_id.startswith(prefix) for prefix in SYNTHETIC_SIGNAL_PREFIXES):
+        return True
+
+    if cycle_id in SYNTHETIC_CYCLE_IDS:
+        return True
+
+    if source == SYNTHETIC_TRACKING_SCOPE:
+        return True
+
+    return False
+
+
+def apply_synthetic_flags(record: dict[str, Any]) -> dict[str, Any]:
+    """
+    Mark test records so they are stored for audit but excluded from production
+    winrate / expectancy / Battle Gate statistics.
+    """
+    if not isinstance(record, dict):
+        return record
+
+    if is_synthetic_record(record):
+        record["tracking_scope"] = SYNTHETIC_TRACKING_SCOPE
+        record["synthetic_test"] = True
+        record["exclude_from_metrics"] = True
+        add_note(
+            record,
+            "Synthetic/test record. Kept for audit but excluded from production metrics.",
+        )
+    else:
+        record.setdefault("exclude_from_metrics", False)
+
+    return record
 
 
 # =============================================================================
@@ -919,10 +981,12 @@ def merge_tracking_records(
             alert.setdefault("tracking_scope", TELEGRAM_TRACKING_SCOPE)
             alert.setdefault("source", alert.get("source") or "telegram_alerts")
             alert.setdefault("sent_to_telegram", True)
+            apply_synthetic_flags(alert)
             all_records.append(alert)
 
     for alert in research_alerts:
         if isinstance(alert, dict):
+            apply_synthetic_flags(alert)
             all_records.append(alert)
 
     return all_records
@@ -1121,70 +1185,95 @@ def group_metrics_by_list(alerts: list[dict[str, Any]], group_key: str) -> dict[
     return result
 
 
-def build_summary(alerts: list[dict[str, Any]]) -> dict[str, Any]:
-    total = len(alerts)
+def production_records(alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        alert for alert in alerts
+        if isinstance(alert, dict) and not bool(alert.get("exclude_from_metrics"))
+    ]
 
-    tp = sum(1 for x in alerts if str(x.get("outcome_status") or "").upper() == "TP_HIT")
-    sl = sum(1 for x in alerts if str(x.get("outcome_status") or "").upper() == "SL_HIT")
+
+def build_summary(alerts: list[dict[str, Any]]) -> dict[str, Any]:
+    all_records = [alert for alert in alerts if isinstance(alert, dict)]
+    production = production_records(all_records)
+
+    total_records = len(all_records)
+    production_count = len(production)
+    excluded_count = total_records - production_count
+    synthetic_count = sum(
+        1 for x in all_records
+        if x.get("tracking_scope") == SYNTHETIC_TRACKING_SCOPE
+        or bool(x.get("synthetic_test"))
+    )
+
+    tp = sum(1 for x in production if str(x.get("outcome_status") or "").upper() == "TP_HIT")
+    sl = sum(1 for x in production if str(x.get("outcome_status") or "").upper() == "SL_HIT")
     expired = sum(
-        1 for x in alerts
+        1 for x in production
         if str(x.get("outcome_status") or "").upper() in {"EXPIRED", "EXPIRED_AFTER_ENTRY"}
     )
     missed = sum(
-        1 for x in alerts
+        1 for x in production
         if str(x.get("outcome_status") or "").upper() == "MISSED_TARGET_BEFORE_ENTRY"
     )
     pending = sum(
-        1 for x in alerts
+        1 for x in production
         if str(x.get("outcome_status") or "").upper() in {"PENDING_ENTRY", "ENTRY_TRIGGERED", "ACTIVE", ""}
     )
     research_count = sum(
-        1 for x in alerts
+        1 for x in production
         if x.get("tracking_scope") == RESEARCH_TRACKING_SCOPE
     )
     telegram_count = sum(
-        1 for x in alerts
-        if x.get("tracking_scope") != RESEARCH_TRACKING_SCOPE
+        1 for x in production
+        if x.get("tracking_scope") == TELEGRAM_TRACKING_SCOPE
     )
 
     return {
         "updated_at_utc": utc_now(),
-        "total_alerts": total,
+        # Backward-compatible production counters.
+        "total_alerts": production_count,
         "telegram_alerts": telegram_count,
         "research_counterfactual_alerts": research_count,
+        # Explicit all-record counters.
+        "total_records": total_records,
+        "production_records": production_count,
+        "excluded_from_metrics": excluded_count,
+        "synthetic_test_records": synthetic_count,
         "tp_hit": tp,
         "sl_hit": sl,
         "missed_before_entry": missed,
         "expired": expired,
         "pending_or_active": pending,
-        "winrate": calc_winrate(alerts),
-        "avg_result_R": calc_avg_result_r(alerts),
-        "by_symbol": count_by(alerts, "symbol"),
-        "by_scenario": count_by(alerts, "scenario"),
-        "by_direction": count_by(alerts, "direction"),
-        "by_signal_alignment": count_by(alerts, "signal_alignment"),
-        "by_stop_quality": count_by(alerts, "stop_quality"),
-        "by_outcome_status": count_by(alerts, "outcome_status"),
-        "by_tracking_scope": count_by(alerts, "tracking_scope"),
-        "by_battle_permission": count_by(alerts, "battle_permission"),
-        "by_telegram_delivery_mode": count_by(alerts, "telegram_delivery_mode"),
-        "by_battle_permission_blocker": count_by_list(alerts, "battle_permission_blockers"),
-        "by_open_relation": count_by(alerts, "open_relation"),
-        "by_auction_bias": count_by(alerts, "auction_bias"),
-        "by_tpo_signal_permission": count_by(alerts, "tpo_signal_permission"),
-        "by_tpo_telegram_modifier": count_by(alerts, "tpo_telegram_modifier"),
-        "metrics_by_symbol": group_metrics(alerts, "symbol"),
-        "metrics_by_scenario": group_metrics(alerts, "scenario"),
-        "metrics_by_signal_alignment": group_metrics(alerts, "signal_alignment"),
-        "metrics_by_stop_quality": group_metrics(alerts, "stop_quality"),
-        "metrics_by_tracking_scope": group_metrics(alerts, "tracking_scope"),
-        "metrics_by_battle_permission": group_metrics(alerts, "battle_permission"),
-        "metrics_by_telegram_delivery_mode": group_metrics(alerts, "telegram_delivery_mode"),
-        "metrics_by_battle_permission_blocker": group_metrics_by_list(alerts, "battle_permission_blockers"),
-        "metrics_by_open_relation": group_metrics(alerts, "open_relation"),
-        "metrics_by_auction_bias": group_metrics(alerts, "auction_bias"),
-        "metrics_by_tpo_signal_permission": group_metrics(alerts, "tpo_signal_permission"),
-        "metrics_by_tpo_telegram_modifier": group_metrics(alerts, "tpo_telegram_modifier"),
+        "winrate": calc_winrate(production),
+        "avg_result_R": calc_avg_result_r(production),
+        "by_symbol": count_by(production, "symbol"),
+        "by_scenario": count_by(production, "scenario"),
+        "by_direction": count_by(production, "direction"),
+        "by_signal_alignment": count_by(production, "signal_alignment"),
+        "by_stop_quality": count_by(production, "stop_quality"),
+        "by_outcome_status": count_by(production, "outcome_status"),
+        "by_tracking_scope": count_by(production, "tracking_scope"),
+        "by_tracking_scope_all_records": count_by(all_records, "tracking_scope"),
+        "by_battle_permission": count_by(production, "battle_permission"),
+        "by_telegram_delivery_mode": count_by(production, "telegram_delivery_mode"),
+        "by_battle_permission_blocker": count_by_list(production, "battle_permission_blockers"),
+        "by_open_relation": count_by(production, "open_relation"),
+        "by_auction_bias": count_by(production, "auction_bias"),
+        "by_tpo_signal_permission": count_by(production, "tpo_signal_permission"),
+        "by_tpo_telegram_modifier": count_by(production, "tpo_telegram_modifier"),
+        "metrics_by_symbol": group_metrics(production, "symbol"),
+        "metrics_by_scenario": group_metrics(production, "scenario"),
+        "metrics_by_signal_alignment": group_metrics(production, "signal_alignment"),
+        "metrics_by_stop_quality": group_metrics(production, "stop_quality"),
+        "metrics_by_tracking_scope": group_metrics(production, "tracking_scope"),
+        "metrics_by_tracking_scope_all_records": group_metrics(all_records, "tracking_scope"),
+        "metrics_by_battle_permission": group_metrics(production, "battle_permission"),
+        "metrics_by_telegram_delivery_mode": group_metrics(production, "telegram_delivery_mode"),
+        "metrics_by_battle_permission_blocker": group_metrics_by_list(production, "battle_permission_blockers"),
+        "metrics_by_open_relation": group_metrics(production, "open_relation"),
+        "metrics_by_auction_bias": group_metrics(production, "auction_bias"),
+        "metrics_by_tpo_signal_permission": group_metrics(production, "tpo_signal_permission"),
+        "metrics_by_tpo_telegram_modifier": group_metrics(production, "tpo_telegram_modifier"),
     }
 
 

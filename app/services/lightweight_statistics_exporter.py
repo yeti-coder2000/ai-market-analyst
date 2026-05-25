@@ -20,7 +20,7 @@ BATTLE_PERMISSION_TELEMETRY_PATH = TELEMETRY_DIR / "battle_permission_events.ndj
 SIGNALS_FLAT_JSON_PATH = STATS_DIR / "signals_flat.json"
 DAILY_SUMMARY_PATH = STATS_DIR / "daily_summary.json"
 
-EXPORTER_VERSION = "lightweight-statistics-exporter-v2-battle-permission"
+EXPORTER_VERSION = "lightweight-statistics-exporter-v2.1-battle-permission-synthetic-safe"
 
 
 FINAL_OUTCOMES = {
@@ -37,6 +37,10 @@ SL_STATUS = "SL_HIT"
 
 PRE_BATTLE_GATE_PERMISSION = "PRE_BATTLE_GATE"
 LEGACY_TELEGRAM_DELIVERY_MODE = "LEGACY_TELEGRAM_ALERT"
+SYNTHETIC_TRACKING_SCOPE = "SYNTHETIC_TEST"
+
+SYNTHETIC_SIGNAL_PREFIXES = ("TEST_", "SYNTHETIC_")
+SYNTHETIC_CYCLE_IDS = {"SYNTHETIC_TEST", "TEST"}
 
 
 # =============================================================================
@@ -167,6 +171,55 @@ def first_non_empty(*values: Any) -> Any:
         if value not in (None, "", [], {}):
             return value
     return None
+
+def is_synthetic_record(record: dict[str, Any]) -> bool:
+    if not isinstance(record, dict):
+        return False
+
+    if safe_bool(record.get("synthetic_test"), False):
+        return True
+
+    signal_id = normalize_text(record.get("signal_id")).upper()
+    alert_id = normalize_text(record.get("alert_id")).upper()
+    cycle_id = normalize_text(record.get("cycle_id")).upper()
+    source = normalize_text(record.get("source")).upper()
+    tracking_scope = normalize_text(record.get("tracking_scope")).upper()
+
+    if tracking_scope == SYNTHETIC_TRACKING_SCOPE:
+        return True
+
+    if any(signal_id.startswith(prefix) for prefix in SYNTHETIC_SIGNAL_PREFIXES):
+        return True
+
+    if any(alert_id.startswith(prefix) for prefix in SYNTHETIC_SIGNAL_PREFIXES):
+        return True
+
+    if cycle_id in SYNTHETIC_CYCLE_IDS:
+        return True
+
+    if source == SYNTHETIC_TRACKING_SCOPE:
+        return True
+
+    return False
+
+
+def mark_synthetic_flat(flat: dict[str, Any]) -> dict[str, Any]:
+    if is_synthetic_record(flat):
+        flat["tracking_scope"] = SYNTHETIC_TRACKING_SCOPE
+        flat["synthetic_test"] = True
+        flat["exclude_from_metrics"] = True
+    else:
+        flat["synthetic_test"] = safe_bool(flat.get("synthetic_test"), False)
+        flat["exclude_from_metrics"] = safe_bool(flat.get("exclude_from_metrics"), False)
+
+    return flat
+
+
+def production_records(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        item for item in items
+        if isinstance(item, dict) and not safe_bool(item.get("exclude_from_metrics"), False)
+    ]
 
 
 def parse_dt(value: Any) -> datetime | None:
@@ -580,6 +633,9 @@ def normalize_flat_signal(
         "mae_price": safe_float(item.get("mae_price"), None),
         "last_price": safe_float(item.get("last_price"), None),
         "paper_mode": safe_bool(item.get("paper_mode"), False),
+        "tracking_scope": item.get("tracking_scope"),
+        "synthetic_test": safe_bool(item.get("synthetic_test"), False),
+        "exclude_from_metrics": safe_bool(item.get("exclude_from_metrics"), False),
         "source": item.get("source"),
         "tags": item.get("tags") if isinstance(item.get("tags"), list) else [],
         "notes": item.get("notes") if isinstance(item.get("notes"), list) else [],
@@ -603,6 +659,8 @@ def normalize_flat_signal(
         "market_status": battle_fields["market_status"],
         "updated_at_utc": utc_now_iso(),
     }
+
+    mark_synthetic_flat(flat)
 
     return flat
 
@@ -754,10 +812,24 @@ def compute_signal_summary(items: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def build_daily_summary(flat: list[dict[str, Any]]) -> dict[str, Any]:
-    summary = compute_signal_summary(flat)
+    production = production_records(flat)
+    summary = compute_signal_summary(production)
+
+    summary.update(
+        {
+            "total_records": len(flat),
+            "production_records": len(production),
+            "excluded_from_metrics": len(flat) - len(production),
+            "synthetic_test_records": sum(
+                1 for x in flat
+                if x.get("tracking_scope") == SYNTHETIC_TRACKING_SCOPE
+                or safe_bool(x.get("synthetic_test"), False)
+            ),
+        }
+    )
 
     return {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "exporter_version": EXPORTER_VERSION,
         "updated_at_utc": utc_now_iso(),
         "source_files": {
@@ -767,23 +839,25 @@ def build_daily_summary(flat: list[dict[str, Any]]) -> dict[str, Any]:
             "battle_permission_telemetry": str(BATTLE_PERMISSION_TELEMETRY_PATH),
         },
         "summary": summary,
-        "by_symbol": grouped_metrics(flat, "symbol"),
-        "by_scenario": grouped_metrics(flat, "scenario"),
-        "by_direction": grouped_metrics(flat, "direction"),
-        "by_execution_model": grouped_metrics(flat, "execution_model"),
-        "by_signal_alignment": grouped_metrics(flat, "signal_alignment"),
-        "by_stop_quality": grouped_metrics(flat, "stop_quality"),
+        "by_symbol": grouped_metrics(production, "symbol"),
+        "by_scenario": grouped_metrics(production, "scenario"),
+        "by_direction": grouped_metrics(production, "direction"),
+        "by_execution_model": grouped_metrics(production, "execution_model"),
+        "by_signal_alignment": grouped_metrics(production, "signal_alignment"),
+        "by_stop_quality": grouped_metrics(production, "stop_quality"),
+        "by_tracking_scope": grouped_metrics(production, "tracking_scope"),
+        "by_tracking_scope_all_records": grouped_metrics(flat, "tracking_scope"),
         # Battle Permission / TPO / auction metrics.
-        "by_battle_permission": grouped_metrics(flat, "battle_permission"),
-        "by_telegram_delivery_mode": grouped_metrics(flat, "telegram_delivery_mode"),
-        "by_battle_ready": grouped_metrics(flat, "battle_ready"),
-        "by_battle_permission_source": grouped_metrics(flat, "battle_permission_source"),
-        "by_battle_permission_blocker": grouped_metrics_by_list(flat, "battle_permission_blockers"),
-        "by_open_relation": grouped_metrics(flat, "open_relation"),
-        "by_auction_bias": grouped_metrics(flat, "auction_bias"),
-        "by_tpo_signal_permission": grouped_metrics(flat, "tpo_signal_permission"),
-        "by_tpo_telegram_modifier": grouped_metrics(flat, "tpo_telegram_modifier"),
-        "by_market_status": grouped_metrics(flat, "market_status"),
+        "by_battle_permission": grouped_metrics(production, "battle_permission"),
+        "by_telegram_delivery_mode": grouped_metrics(production, "telegram_delivery_mode"),
+        "by_battle_ready": grouped_metrics(production, "battle_ready"),
+        "by_battle_permission_source": grouped_metrics(production, "battle_permission_source"),
+        "by_battle_permission_blocker": grouped_metrics_by_list(production, "battle_permission_blockers"),
+        "by_open_relation": grouped_metrics(production, "open_relation"),
+        "by_auction_bias": grouped_metrics(production, "auction_bias"),
+        "by_tpo_signal_permission": grouped_metrics(production, "tpo_signal_permission"),
+        "by_tpo_telegram_modifier": grouped_metrics(production, "tpo_telegram_modifier"),
+        "by_market_status": grouped_metrics(production, "market_status"),
     }
 
 
@@ -805,11 +879,15 @@ def export_lightweight_statistics() -> dict[str, Any]:
         "signals_flat_path": str(SIGNALS_FLAT_JSON_PATH),
         "daily_summary_path": str(DAILY_SUMMARY_PATH),
         "records_count": len(flat),
+        "production_records": summary["summary"].get("production_records"),
+        "excluded_from_metrics": summary["summary"].get("excluded_from_metrics"),
         "summary": summary["summary"],
         "battle_metrics": {
             "by_battle_permission": summary.get("by_battle_permission", {}),
             "by_telegram_delivery_mode": summary.get("by_telegram_delivery_mode", {}),
             "by_battle_permission_blocker": summary.get("by_battle_permission_blocker", {}),
+            "by_tracking_scope": summary.get("by_tracking_scope", {}),
+            "by_tracking_scope_all_records": summary.get("by_tracking_scope_all_records", {}),
         },
     }
 
