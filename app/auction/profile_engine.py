@@ -128,6 +128,7 @@ class AuctionContext:
     market_is_open: Optional[bool] = None
     market_status: Optional[str] = None
     market_closed_reason: Optional[str] = None
+    market_holiday_name: Optional[str] = None
     market_data_is_stale: Optional[bool] = None
     market_data_age_minutes: Optional[float] = None
     last_bar_timestamp_utc: Optional[str] = None
@@ -624,6 +625,7 @@ def _empty_context(
         market_is_open=False,
         market_status="NO_DATA",
         market_closed_reason="no_usable_data",
+        market_holiday_name=None,
         market_data_is_stale=True,
         market_data_age_minutes=None,
         last_bar_timestamp_utc=None,
@@ -737,10 +739,18 @@ def build_auction_context(
     notes: list[str] = []
 
     if market_state.get("market_is_open") is False:
-        notes.append(
-            f"Market is closed: {market_state.get('market_closed_reason')}. "
-            "Auction context is diagnostic only; battle signals should be disabled."
-        )
+        closed_reason = market_state.get("market_closed_reason")
+        holiday_name = market_state.get("market_holiday_name")
+        if holiday_name:
+            notes.append(
+                f"Market is closed: {closed_reason} ({holiday_name}). "
+                "Auction context is diagnostic only; battle signals should be disabled."
+            )
+        else:
+            notes.append(
+                f"Market is closed: {closed_reason}. "
+                "Auction context is diagnostic only; battle signals should be disabled."
+            )
 
     if market_state.get("market_data_is_stale") is True:
         notes.append(
@@ -805,6 +815,7 @@ def build_auction_context(
         market_is_open=market_state.get("market_is_open"),
         market_status=market_state.get("market_status"),
         market_closed_reason=market_state.get("market_closed_reason"),
+        market_holiday_name=market_state.get("market_holiday_name"),
         market_data_is_stale=market_state.get("market_data_is_stale"),
         market_data_age_minutes=market_state.get("market_data_age_minutes"),
         last_bar_timestamp_utc=market_state.get("last_bar_timestamp_utc"),
@@ -836,6 +847,7 @@ def auction_context_to_signal_filters(context: AuctionContext) -> dict[str, Any]
         "market_is_open": context.market_is_open,
         "market_status": context.market_status,
         "market_closed_reason": context.market_closed_reason,
+        "market_holiday_name": context.market_holiday_name,
         "market_data_is_stale": context.market_data_is_stale,
         "market_data_age_minutes": context.market_data_age_minutes,
         "last_bar_timestamp_utc": context.last_bar_timestamp_utc,
@@ -871,9 +883,14 @@ def auction_context_to_signal_filters(context: AuctionContext) -> dict[str, Any]
         filters["telegram_modifier"] = "DOWNGRADE"
         filters["confidence_modifier"] = min(float(filters.get("confidence_modifier", 0.0)), -0.50)
         filters["tpo_signal_permission"] = "MARKET_CLOSED"
-        filters["reasons"].append(
-            f"Market closed ({context.market_closed_reason}); auction context is diagnostic only."
-        )
+        if context.market_holiday_name:
+            filters["reasons"].append(
+                f"Market closed ({context.market_closed_reason}: {context.market_holiday_name}); auction context is diagnostic only."
+            )
+        else:
+            filters["reasons"].append(
+                f"Market closed ({context.market_closed_reason}); auction context is diagnostic only."
+            )
 
     elif context.market_data_is_stale is True:
         filters["telegram_modifier"] = "DOWNGRADE"
