@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,10 +15,12 @@ from app.services.telegram_alert_store import (
 
 
 # =============================================================================
-# SIGNAL OUTCOME TRACKER v1.2
+# SIGNAL OUTCOME TRACKER v2.0
 # =============================================================================
 # Purpose:
 # - Track real Telegram ENTRY_READY signals from telegram_alerts.json.
+# - Track blocked/suppressed executable Battle Permission events as
+#   RESEARCH_COUNTERFACTUAL records.
 # - Use existing radar_snapshot_v2.ndjson prices.
 # - No external API calls.
 # - No pandas.
@@ -26,20 +28,26 @@ from app.services.telegram_alert_store import (
 #
 #   python -m app.services.signal_outcome_tracker
 #
-# v1.2 changes:
-# - Fixed idempotent changed-counter.
-# - last_checked_at_utc / last_price are operational fields and do NOT count
-#   as material outcome changes.
-# - changed now means: number of alerts with real material outcome changes.
+# v2.0 changes:
+# - Reads runtime/telemetry/battle_permission_events.ndjson.
+# - Converts blocked EXECUTABLE signals with entry/stop/target into research
+#   outcome records.
+# - Keeps telegram_alerts.json clean: only real Telegram alerts are saved there.
+# - Writes both real and research records into signal_outcomes.json so
+#   lightweight_statistics_exporter can calculate metrics by battle_permission.
 #
-# v1 limitations:
-# - Uses snapshot price points, not candle high/low.
-# - Best for first operational tracking, not final-grade backtest.
+# Important:
+# - RESEARCH_COUNTERFACTUAL is not a real trade and not a Telegram alert.
+# - It answers: "What would have happened if this blocked signal had been allowed?"
 # =============================================================================
 
 
 SNAPSHOT_PATH = settings.runtime_dir / "radar_snapshot_v2.ndjson"
-SIGNAL_OUTCOMES_PATH = settings.runtime_dir / "stats" / "signal_outcomes.json"
+STATS_DIR = settings.runtime_dir / "stats"
+TELEMETRY_DIR = settings.runtime_dir / "telemetry"
+
+SIGNAL_OUTCOMES_PATH = STATS_DIR / "signal_outcomes.json"
+BATTLE_PERMISSION_EVENTS_PATH = TELEMETRY_DIR / "battle_permission_events.ndjson"
 
 FINAL_STATUSES = {
     "TP_HIT",
@@ -60,9 +68,20 @@ ACTIVE_STATUSES = {
 
 DEFAULT_EXPIRY_HOURS = 24
 
+BATTLE_READY_PERMISSION = "BATTLE_READY"
 
-# Fields that represent real outcome/statistical state.
-# Operational heartbeat fields like last_checked_at_utc / last_price are excluded.
+RESEARCH_TELEGRAM_DELIVERY_MODES = {
+    "RESEARCH_ALERT",
+    "SUPPRESS",
+}
+
+RESEARCH_BATTLE_PERMISSION_PREFIXES = (
+    "BLOCKED_BY_",
+)
+
+RESEARCH_TRACKING_SCOPE = "RESEARCH_COUNTERFACTUAL"
+TELEGRAM_TRACKING_SCOPE = "TELEGRAM_ALERT"
+
 MATERIAL_FIELDS = (
     "outcome_status",
     "outcome_error",
@@ -84,11 +103,6 @@ MATERIAL_FIELDS = (
 )
 
 
-# =============================================================================
-# BASIC HELPERS
-# =============================================================================
-
-
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -107,7 +121,7 @@ def parse_utc(value: Any) -> datetime | None:
         if dt.tzinfo is None:
             return dt.replace(tzinfo=timezone.utc)
 
-        return dt
+        return dt.astimezone(timezone.utc)
     except Exception:
         return None
 
@@ -122,6 +136,24 @@ def safe_float(value: Any) -> float | None:
         return None
 
 
+def safe_bool(value: Any, default: bool | None = None) -> bool | None:
+    if isinstance(value, bool):
+        return value
+
+    if value is None:
+        return default
+
+    text = str(value).strip().lower()
+
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+
+    return default
+
+
 def normalize_symbol(value: Any) -> str:
     return str(value or "").strip().upper()
 
@@ -131,6 +163,12 @@ def normalize_direction(value: Any) -> str:
     if direction in {"LONG", "SHORT"}:
         return direction
     return "UNKNOWN"
+
+
+def normalize_text(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    return str(value).strip()
 
 
 def ensure_parent_dir(path: Path) -> None:
@@ -146,10 +184,6 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 def calc_risk_distance(entry: float, stop: float) -> float:
     return abs(entry - stop)
-
-
-def calc_target_distance(entry: float, target: float) -> float:
-    return abs(target - entry)
 
 
 def calc_result_r(alert: dict[str, Any], price: float) -> float | None:
@@ -182,8 +216,9 @@ def get_alert_expiry(alert: dict[str, Any]) -> datetime | None:
     if sent_at is None:
         return None
 
-    # Current live alerts normally carry expires_at_utc.
-    # Keep fallback conservative: no implicit expiry if not provided.
+    if alert.get("tracking_scope") == RESEARCH_TRACKING_SCOPE:
+        return sent_at + timedelta(hours=DEFAULT_EXPIRY_HOURS)
+
     return None
 
 
@@ -232,14 +267,6 @@ def add_note(alert: dict[str, Any], note: str) -> None:
 
 
 def normalize_existing_alert_metrics(alerts: list[dict[str, Any]]) -> set[str]:
-    """
-    Repair old outcome records.
-
-    v1 could produce negative MFE_R/MAE_R when entry and SL were detected
-    on the same snapshot. Excursions are distances and cannot be negative.
-
-    Returns alert keys that were materially changed.
-    """
     changed_alerts: set[str] = set()
 
     for alert in alerts:
@@ -271,6 +298,225 @@ def normalize_existing_alert_metrics(alerts: list[dict[str, Any]]) -> set[str]:
             changed_alerts.add(alert_key(alert))
 
     return changed_alerts
+
+
+def read_ndjson(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+
+    rows: list[dict[str, Any]] = []
+
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+
+            try:
+                item = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+            if isinstance(item, dict):
+                rows.append(item)
+
+    return rows
+
+
+def safe_list(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if value in (None, "", {}, ()):  # noqa: PLC1901
+        return []
+    return [value]
+
+
+# =============================================================================
+# BATTLE PERMISSION RESEARCH RECORDS
+# =============================================================================
+
+
+def is_research_battle_event(event: dict[str, Any]) -> bool:
+    if not isinstance(event, dict):
+        return False
+
+    if event.get("event_type") != "battle_permission_evaluated":
+        return False
+
+    battle_permission = normalize_text(event.get("battle_permission")).upper()
+    delivery_mode = normalize_text(event.get("telegram_delivery_mode")).upper()
+
+    if battle_permission == BATTLE_READY_PERMISSION:
+        return False
+
+    if event.get("sent_to_telegram") is True:
+        return False
+
+    if delivery_mode not in RESEARCH_TELEGRAM_DELIVERY_MODES:
+        return False
+
+    if not battle_permission.startswith(RESEARCH_BATTLE_PERMISSION_PREFIXES):
+        return False
+
+    execution_status = normalize_text(event.get("execution_status")).upper()
+    if execution_status != "EXECUTABLE":
+        return False
+
+    return True
+
+
+def validate_battle_event_execution_plan(event: dict[str, Any]) -> tuple[bool, str]:
+    required = [
+        "signal_id",
+        "symbol",
+        "direction",
+        "entry_reference_price",
+        "invalidation_reference_price",
+        "target_reference_price",
+        "ts_utc",
+    ]
+
+    for key in required:
+        if event.get(key) in (None, ""):
+            return False, f"missing {key}"
+
+    direction = normalize_direction(event.get("direction"))
+    if direction not in {"LONG", "SHORT"}:
+        return False, f"invalid direction {direction}"
+
+    entry = safe_float(event.get("entry_reference_price"))
+    stop = safe_float(event.get("invalidation_reference_price"))
+    target = safe_float(event.get("target_reference_price"))
+
+    if entry is None or stop is None or target is None:
+        return False, "invalid entry/stop/target"
+
+    if calc_risk_distance(entry, stop) <= 0:
+        return False, "invalid zero risk distance"
+
+    return True, "ok"
+
+
+def research_alert_id(event: dict[str, Any]) -> str:
+    signal_id = str(event.get("signal_id") or "")
+    ts_raw = str(event.get("ts_utc") or "")
+    ts_safe = ts_raw.replace(":", "-").replace("+", "_").replace(".", "_")
+    return f"RESEARCH_{signal_id}_{ts_safe}"
+
+
+def build_research_alert_from_battle_event(event: dict[str, Any]) -> dict[str, Any] | None:
+    if not is_research_battle_event(event):
+        return None
+
+    valid, _reason = validate_battle_event_execution_plan(event)
+    if not valid:
+        return None
+
+    sent_at = event.get("ts_utc") or utc_now()
+    rr = safe_float(event.get("risk_reward_ratio"))
+    practical_rr = safe_float(event.get("practical_rr"))
+
+    alert = {
+        "schema_version": "research-counterfactual-v1",
+        "tracking_scope": RESEARCH_TRACKING_SCOPE,
+        "source": "battle_permission_events",
+        "alert_id": research_alert_id(event),
+        "signal_id": event.get("signal_id"),
+        "cycle_id": event.get("cycle_id"),
+        "symbol": event.get("symbol"),
+        "instrument": event.get("instrument") or event.get("symbol"),
+        "timeframe": event.get("timeframe") or event.get("execution_timeframe") or "15m",
+        "sent_at_utc": sent_at,
+        "created_at_utc": sent_at,
+        "alert_type": event.get("alert_type") or "RESEARCH_COUNTERFACTUAL",
+        "signal_class": event.get("signal_class"),
+        "status": event.get("status"),
+        "scenario": event.get("scenario") or event.get("scenario_type"),
+        "scenario_type": event.get("scenario_type") or event.get("scenario"),
+        "direction": event.get("direction"),
+        "htf_bias": event.get("htf_bias"),
+        "signal_alignment": event.get("signal_alignment"),
+        "market_state": event.get("market_state"),
+        "confidence": safe_float(event.get("confidence")),
+        "probability": safe_float(event.get("probability")),
+        "execution_status": event.get("execution_status"),
+        "execution_model": event.get("execution_model"),
+        "execution_timeframe": event.get("execution_timeframe"),
+        "trigger_reason": event.get("trigger_reason"),
+        "entry_reference_price": safe_float(event.get("entry_reference_price")),
+        "invalidation_reference_price": safe_float(event.get("invalidation_reference_price")),
+        "target_reference_price": safe_float(event.get("target_reference_price")),
+        "risk_reward_ratio": rr if rr is not None else practical_rr,
+        "theoretical_rr": safe_float(event.get("theoretical_rr")),
+        "practical_rr": practical_rr,
+        "stop_distance": safe_float(event.get("stop_distance")),
+        "target_distance": safe_float(event.get("target_distance")),
+        "stop_quality": event.get("stop_quality"),
+        "stop_quality_reason": event.get("stop_quality_reason"),
+        "paper_mode": True,
+        "battle_permission": event.get("battle_permission"),
+        "telegram_delivery_mode": event.get("telegram_delivery_mode"),
+        "battle_ready": safe_bool(event.get("battle_ready")),
+        "sent_to_telegram": safe_bool(event.get("sent_to_telegram"), False),
+        "telegram_sent": safe_bool(event.get("sent_to_telegram"), False),
+        "auction_context_score": safe_float(event.get("auction_context_score")),
+        "battle_permission_blockers": safe_list(event.get("battle_permission_blockers")),
+        "battle_permission_reasons": safe_list(event.get("battle_permission_reasons")),
+        "battle_permission_modifiers": safe_list(event.get("battle_permission_modifiers")),
+        "open_relation": event.get("open_relation"),
+        "auction_bias": event.get("auction_bias"),
+        "tpo_signal_permission": event.get("tpo_signal_permission"),
+        "tpo_telegram_modifier": event.get("tpo_telegram_modifier"),
+        "market_is_open": safe_bool(event.get("market_is_open")),
+        "market_status": event.get("market_status"),
+        "session_anchor": event.get("session_anchor"),
+        "session_timezone": event.get("session_timezone"),
+        "session_open_utc": event.get("session_open_utc"),
+        "current_session_id": event.get("current_session_id"),
+        "nearest_npoc": safe_float(event.get("nearest_npoc")),
+        "nearest_npoc_distance": safe_float(event.get("nearest_npoc_distance")),
+        "ib_extension_up_pct": safe_float(event.get("ib_extension_up_pct")),
+        "ib_extension_down_pct": safe_float(event.get("ib_extension_down_pct")),
+        "entry_triggered": False,
+        "tp_hit": False,
+        "sl_hit": False,
+        "expired": False,
+        "outcome_status": "PENDING_ENTRY",
+        "result_R": None,
+        "mfe_R": None,
+        "mfe_price": None,
+        "mae_R": None,
+        "mae_price": None,
+        "notes": [
+            "Research counterfactual generated from suppressed Battle Permission event.",
+            "Not a real Telegram alert and not a real trade.",
+        ],
+    }
+
+    return alert
+
+
+def load_research_counterfactual_alerts(
+    path: Path = BATTLE_PERMISSION_EVENTS_PATH,
+) -> list[dict[str, Any]]:
+    events = read_ndjson(path)
+
+    alerts: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for event in events:
+        alert = build_research_alert_from_battle_event(event)
+        if alert is None:
+            continue
+
+        key = str(alert.get("alert_id") or alert.get("signal_id") or "")
+        if not key or key in seen_ids:
+            continue
+
+        seen_ids.add(key)
+        alerts.append(alert)
+
+    return alerts
 
 
 # =============================================================================
@@ -354,17 +600,6 @@ def iter_relevant_snapshots(
 
 
 def should_trigger_entry(alert: dict[str, Any], price: float) -> bool:
-    """
-    Entry trigger logic v1.
-
-    Most current Telegram ENTRY_READY signals use LIMIT_ON_RETEST.
-    For limit-on-retest:
-    - LONG entry triggers when price retraces down to entry or lower.
-    - SHORT entry triggers when price retraces up to entry or higher.
-
-    For other/unknown execution models, v1 still uses the same conservative
-    trigger logic because alerts carry an explicit entry_reference_price.
-    """
     direction = normalize_direction(alert.get("direction"))
     entry = safe_float(alert.get("entry_reference_price"))
 
@@ -413,14 +648,6 @@ def is_sl_hit(alert: dict[str, Any], price: float) -> bool:
 
 
 def is_target_reached_before_entry(alert: dict[str, Any], price: float) -> bool:
-    """
-    Detect missed move before limit entry.
-
-    Example:
-    - LONG limit entry is below current price.
-    - Price goes directly to target without retracing to entry.
-    - We mark it as MISSED_TARGET_BEFORE_ENTRY instead of fake TP.
-    """
     return is_tp_hit(alert, price)
 
 
@@ -445,7 +672,6 @@ def update_mfe_mae(alert: dict[str, Any], price: float) -> None:
     else:
         return
 
-    # Excursions are distances. They cannot be negative.
     favorable = max(0.0, favorable)
     adverse = max(0.0, adverse)
 
@@ -568,13 +794,6 @@ def update_single_alert_from_snapshot(
     ts: datetime,
     price: float,
 ) -> bool:
-    """
-    Returns True only if alert had a material outcome/statistical change.
-
-    Important:
-    - last_checked_at_utc and last_price are operational tracking fields.
-    - They are updated for observability but do not count as material changes.
-    """
     if is_final(alert):
         return False
 
@@ -588,7 +807,6 @@ def update_single_alert_from_snapshot(
         alert["last_price"] = price
         return has_material_change(before, alert)
 
-    # Operational heartbeat, not counted as material change.
     alert["last_checked_at_utc"] = ts.isoformat()
     alert["last_price"] = price
 
@@ -596,8 +814,6 @@ def update_single_alert_from_snapshot(
     entry_triggered_on_this_snapshot = False
 
     if not entry_triggered:
-        # If target is reached before limit entry, this is a missed move,
-        # not a real TP.
         if is_target_reached_before_entry(alert, price):
             mark_missed_target_before_entry(alert, ts=ts, price=price)
             return has_material_change(before, alert)
@@ -610,8 +826,6 @@ def update_single_alert_from_snapshot(
     if entry_triggered:
         update_mfe_mae(alert, price)
 
-        # Conservative order:
-        # SL first avoids over-crediting ambiguous snapshot moves.
         if is_sl_hit(alert, price):
             if entry_triggered_on_this_snapshot:
                 add_note(
@@ -659,8 +873,6 @@ def get_tracking_start_time(active_alerts: list[dict[str, Any]]) -> datetime | N
     times: list[datetime] = []
 
     for alert in active_alerts:
-        # Re-scan from sent_at for correctness.
-        # This is slower than last_checked_at_utc but safer while tracker is young.
         sent_at = parse_utc(alert.get("sent_at_utc"))
         if sent_at is not None:
             times.append(sent_at)
@@ -696,87 +908,92 @@ def apply_expiry(alerts: list[dict[str, Any]], *, now_dt: datetime) -> set[str]:
     return changed_alerts
 
 
+def merge_tracking_records(
+    telegram_alerts: list[dict[str, Any]],
+    research_alerts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    all_records: list[dict[str, Any]] = []
+
+    for alert in telegram_alerts:
+        if isinstance(alert, dict):
+            alert.setdefault("tracking_scope", TELEGRAM_TRACKING_SCOPE)
+            alert.setdefault("source", alert.get("source") or "telegram_alerts")
+            alert.setdefault("sent_to_telegram", True)
+            all_records.append(alert)
+
+    for alert in research_alerts:
+        if isinstance(alert, dict):
+            all_records.append(alert)
+
+    return all_records
+
+
 def track_outcomes(
     *,
     alerts_path: Path = DEFAULT_TELEGRAM_ALERTS_JSON_PATH,
     snapshot_path: Path = SNAPSHOT_PATH,
     outcomes_path: Path = SIGNAL_OUTCOMES_PATH,
+    battle_events_path: Path = BATTLE_PERMISSION_EVENTS_PATH,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    alerts = load_telegram_alerts(alerts_path)
+    telegram_alerts = load_telegram_alerts(alerts_path)
+    research_alerts = load_research_counterfactual_alerts(battle_events_path)
 
-    normalization_changed_alerts = normalize_existing_alert_metrics(alerts)
-    active_alerts = collect_active_alerts(alerts)
+    normalization_changed_alerts = normalize_existing_alert_metrics(telegram_alerts)
+
+    all_records = merge_tracking_records(telegram_alerts, research_alerts)
+    active_alerts = collect_active_alerts(all_records)
 
     now_dt = datetime.now(timezone.utc)
 
     changed_alerts: set[str] = set(normalization_changed_alerts)
-
-    if not active_alerts:
-        summary = build_summary(alerts)
-
-        if changed_alerts and not dry_run:
-            alerts.sort(key=lambda x: str(x.get("sent_at_utc") or ""))
-            save_telegram_alerts(alerts, alerts_path)
-
-        write_outcomes_report(
-            alerts=alerts,
-            summary=summary,
-            path=outcomes_path,
-            dry_run=dry_run,
-        )
-
-        return {
-            "status": "ok",
-            "message": "no active alerts",
-            "changed": len(changed_alerts),
-            "normalization_changes": len(normalization_changed_alerts),
-            "summary": summary,
-        }
-
-    symbols = {normalize_symbol(x.get("symbol")) for x in active_alerts}
-    symbols = {x for x in symbols if x}
-
-    since_utc = get_tracking_start_time(active_alerts)
-
     snapshot_count = 0
 
-    for snapshot in iter_relevant_snapshots(
-        snapshot_path=snapshot_path,
-        symbols=symbols,
-        since_utc=since_utc,
-    ):
-        snapshot_count += 1
+    if active_alerts:
+        symbols = {normalize_symbol(x.get("symbol")) for x in active_alerts}
+        symbols = {x for x in symbols if x}
 
-        symbol = snapshot["symbol"]
-        ts = snapshot["ts"]
-        price = snapshot["price"]
+        since_utc = get_tracking_start_time(active_alerts)
 
-        for alert in active_alerts:
-            if is_final(alert):
-                continue
+        for snapshot in iter_relevant_snapshots(
+            snapshot_path=snapshot_path,
+            symbols=symbols,
+            since_utc=since_utc,
+        ):
+            snapshot_count += 1
 
-            if normalize_symbol(alert.get("symbol")) != symbol:
-                continue
+            symbol = snapshot["symbol"]
+            ts = snapshot["ts"]
+            price = snapshot["price"]
 
-            sent_at = parse_utc(alert.get("sent_at_utc"))
-            if sent_at is not None and ts < sent_at:
-                continue
+            for alert in active_alerts:
+                if is_final(alert):
+                    continue
 
-            if update_single_alert_from_snapshot(alert, ts=ts, price=price):
-                changed_alerts.add(alert_key(alert))
+                if normalize_symbol(alert.get("symbol")) != symbol:
+                    continue
 
-    expiry_changed_alerts = apply_expiry(alerts, now_dt=now_dt)
+                sent_at = parse_utc(alert.get("sent_at_utc"))
+                if sent_at is not None and ts < sent_at:
+                    continue
+
+                if update_single_alert_from_snapshot(alert, ts=ts, price=price):
+                    changed_alerts.add(alert_key(alert))
+
+    expiry_changed_alerts = apply_expiry(all_records, now_dt=now_dt)
     changed_alerts.update(expiry_changed_alerts)
 
-    summary = build_summary(alerts)
+    summary = build_summary(all_records)
 
     if not dry_run:
-        alerts.sort(key=lambda x: str(x.get("sent_at_utc") or ""))
-        save_telegram_alerts(alerts, alerts_path)
+        if normalization_changed_alerts or any(
+            alert_key(x) in changed_alerts for x in telegram_alerts
+        ):
+            telegram_alerts.sort(key=lambda x: str(x.get("sent_at_utc") or ""))
+            save_telegram_alerts(telegram_alerts, alerts_path)
 
     write_outcomes_report(
-        alerts=alerts,
+        alerts=all_records,
         summary=summary,
         path=outcomes_path,
         dry_run=dry_run,
@@ -787,6 +1004,8 @@ def track_outcomes(
         "dry_run": dry_run,
         "snapshot_count": snapshot_count,
         "active_alerts": len(active_alerts),
+        "telegram_alerts": len(telegram_alerts),
+        "research_counterfactual_alerts": len(research_alerts),
         "changed": len(changed_alerts),
         "normalization_changes": len(normalization_changed_alerts),
         "summary": summary,
@@ -804,6 +1023,27 @@ def count_by(alerts: list[dict[str, Any]], key: str) -> dict[str, int]:
     for alert in alerts:
         value = str(alert.get(key) or "UNKNOWN")
         out[value] = out.get(value, 0) + 1
+
+    return dict(sorted(out.items(), key=lambda x: x[0]))
+
+
+def count_by_list(alerts: list[dict[str, Any]], key: str, empty_label: str = "NONE") -> dict[str, int]:
+    out: dict[str, int] = {}
+
+    for alert in alerts:
+        value = alert.get(key)
+
+        if isinstance(value, list):
+            if not value:
+                out[empty_label] = out.get(empty_label, 0) + 1
+            else:
+                for item in value:
+                    label = str(item or empty_label)
+                    out[label] = out.get(label, 0) + 1
+            continue
+
+        label = str(value or empty_label)
+        out[label] = out.get(label, 0) + 1
 
     return dict(sorted(out.items(), key=lambda x: x[0]))
 
@@ -854,6 +1094,33 @@ def group_metrics(alerts: list[dict[str, Any]], group_key: str) -> dict[str, Any
     return result
 
 
+def group_metrics_by_list(alerts: list[dict[str, Any]], group_key: str) -> dict[str, Any]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+
+    for alert in alerts:
+        value = alert.get(group_key)
+
+        if isinstance(value, list):
+            keys = [str(x) for x in value if str(x).strip()] or ["NONE"]
+        else:
+            keys = [str(value or "NONE")]
+
+        for key in keys:
+            grouped.setdefault(key, []).append(alert)
+
+    result: dict[str, Any] = {}
+
+    for key, items in sorted(grouped.items(), key=lambda x: x[0]):
+        result[key] = {
+            "count": len(items),
+            "outcome_status": count_by(items, "outcome_status"),
+            "winrate": calc_winrate(items),
+            "avg_result_R": calc_avg_result_r(items),
+        }
+
+    return result
+
+
 def build_summary(alerts: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(alerts)
 
@@ -863,16 +1130,31 @@ def build_summary(alerts: list[dict[str, Any]]) -> dict[str, Any]:
         1 for x in alerts
         if str(x.get("outcome_status") or "").upper() in {"EXPIRED", "EXPIRED_AFTER_ENTRY"}
     )
+    missed = sum(
+        1 for x in alerts
+        if str(x.get("outcome_status") or "").upper() == "MISSED_TARGET_BEFORE_ENTRY"
+    )
     pending = sum(
         1 for x in alerts
-        if str(x.get("outcome_status") or "").upper() in {"PENDING_ENTRY", "ENTRY_TRIGGERED", ""}
+        if str(x.get("outcome_status") or "").upper() in {"PENDING_ENTRY", "ENTRY_TRIGGERED", "ACTIVE", ""}
+    )
+    research_count = sum(
+        1 for x in alerts
+        if x.get("tracking_scope") == RESEARCH_TRACKING_SCOPE
+    )
+    telegram_count = sum(
+        1 for x in alerts
+        if x.get("tracking_scope") != RESEARCH_TRACKING_SCOPE
     )
 
     return {
         "updated_at_utc": utc_now(),
         "total_alerts": total,
+        "telegram_alerts": telegram_count,
+        "research_counterfactual_alerts": research_count,
         "tp_hit": tp,
         "sl_hit": sl,
+        "missed_before_entry": missed,
         "expired": expired,
         "pending_or_active": pending,
         "winrate": calc_winrate(alerts),
@@ -883,10 +1165,26 @@ def build_summary(alerts: list[dict[str, Any]]) -> dict[str, Any]:
         "by_signal_alignment": count_by(alerts, "signal_alignment"),
         "by_stop_quality": count_by(alerts, "stop_quality"),
         "by_outcome_status": count_by(alerts, "outcome_status"),
+        "by_tracking_scope": count_by(alerts, "tracking_scope"),
+        "by_battle_permission": count_by(alerts, "battle_permission"),
+        "by_telegram_delivery_mode": count_by(alerts, "telegram_delivery_mode"),
+        "by_battle_permission_blocker": count_by_list(alerts, "battle_permission_blockers"),
+        "by_open_relation": count_by(alerts, "open_relation"),
+        "by_auction_bias": count_by(alerts, "auction_bias"),
+        "by_tpo_signal_permission": count_by(alerts, "tpo_signal_permission"),
+        "by_tpo_telegram_modifier": count_by(alerts, "tpo_telegram_modifier"),
         "metrics_by_symbol": group_metrics(alerts, "symbol"),
         "metrics_by_scenario": group_metrics(alerts, "scenario"),
         "metrics_by_signal_alignment": group_metrics(alerts, "signal_alignment"),
         "metrics_by_stop_quality": group_metrics(alerts, "stop_quality"),
+        "metrics_by_tracking_scope": group_metrics(alerts, "tracking_scope"),
+        "metrics_by_battle_permission": group_metrics(alerts, "battle_permission"),
+        "metrics_by_telegram_delivery_mode": group_metrics(alerts, "telegram_delivery_mode"),
+        "metrics_by_battle_permission_blocker": group_metrics_by_list(alerts, "battle_permission_blockers"),
+        "metrics_by_open_relation": group_metrics(alerts, "open_relation"),
+        "metrics_by_auction_bias": group_metrics(alerts, "auction_bias"),
+        "metrics_by_tpo_signal_permission": group_metrics(alerts, "tpo_signal_permission"),
+        "metrics_by_tpo_telegram_modifier": group_metrics(alerts, "tpo_telegram_modifier"),
     }
 
 
@@ -903,7 +1201,7 @@ def write_outcomes_report(
     ensure_parent_dir(path)
 
     payload = {
-        "schema_version": "1.0",
+        "schema_version": "2.0-research-counterfactual",
         "updated_at_utc": utc_now(),
         "summary": summary,
         "signals": alerts,
@@ -915,11 +1213,6 @@ def write_outcomes_report(
         encoding="utf-8",
     )
     tmp_path.replace(path)
-
-
-# =============================================================================
-# CLI
-# =============================================================================
 
 
 def main() -> None:
