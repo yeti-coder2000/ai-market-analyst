@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.0"
+BRIEFING_VERSION = "daily-market-briefing-v1.1-session-scoped"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -46,6 +46,65 @@ MISSED = "MISSED_TARGET_BEFORE_ENTRY"
 EXPIRED = "EXPIRED"
 INVALID = "INVALID"
 
+
+
+# Session-scoped reporting rules.
+#
+# Morning/London reports should not list NY cash/risk-session assets as active
+# focus instruments. They are reported later in the NY +1h report.
+# Holiday warning remains global because it is specifically designed to warn
+# about closed exchanges before the trading day starts.
+MORNING_SESSION_SYMBOLS: tuple[str, ...] = (
+    "GER40",
+    "XAUUSD",
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "USDCHF",
+    "AUDUSD",
+    "BTCUSD",
+    "ETHUSD",
+)
+
+LONDON_SESSION_SYMBOLS: tuple[str, ...] = MORNING_SESSION_SYMBOLS
+
+NY_SESSION_SYMBOLS: tuple[str, ...] = (
+    "NAS100",
+    "SPX500",
+    "UKOIL",
+    "XAUUSD",
+    "USDCAD",
+    "BTCUSD",
+    "ETHUSD",
+)
+
+GLOBAL_SYMBOL_ORDER: tuple[str, ...] = (
+    "GER40",
+    "NAS100",
+    "SPX500",
+    "UKOIL",
+    "XAUUSD",
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "USDCHF",
+    "USDCAD",
+    "AUDUSD",
+    "BTCUSD",
+    "ETHUSD",
+)
+
+REPORT_SCOPE_LABELS: dict[str, str] = {
+    "morning": "London / morning focus only. NY cash/risk-session assets are deferred to the NY +1h report.",
+    "morning_briefing": "London / morning focus only. NY cash/risk-session assets are deferred to the NY +1h report.",
+    "london": "London +1h focus only. NY cash/risk-session assets are excluded here.",
+    "london_1h": "London +1h focus only. NY cash/risk-session assets are excluded here.",
+    "ny": "New York +1h focus only. Morning/London-only assets are excluded here.",
+    "ny_1h": "New York +1h focus only. Morning/London-only assets are excluded here.",
+    "new_york": "New York +1h focus only. Morning/London-only assets are excluded here.",
+    "holiday_warning": "Global holiday/market-closure warning. All relevant instruments may be shown.",
+    "pre_market": "Global holiday/market-closure warning. All relevant instruments may be shown.",
+}
 
 BUILTIN_HIGH_IMPACT_EVENTS: list[dict[str, Any]] = [
     {
@@ -441,8 +500,12 @@ def _yesterday_metric(timezone_name: str, target_date: date) -> tuple[dict[str, 
     return _metric_from_records([]), "no_stats_available"
 
 
+def _normalize_report_type(report_type: str) -> str:
+    return str(report_type or "morning").strip().lower()
+
+
 def _section_header_for_type(report_type: str) -> str:
-    r = report_type.lower().strip()
+    r = _normalize_report_type(report_type)
     if r in {"morning", "morning_briefing"}:
         return "🌅 Morning Market Briefing"
     if r in {"london_1h", "london"}:
@@ -454,7 +517,41 @@ def _section_header_for_type(report_type: str) -> str:
     return "📡 Market Intelligence Report"
 
 
-def _build_market_status_section(tpo: dict[str, Any]) -> BriefingSection:
+def _symbol_scope_for_report(report_type: str) -> tuple[str, ...]:
+    r = _normalize_report_type(report_type)
+
+    if r in {"morning", "morning_briefing"}:
+        return MORNING_SESSION_SYMBOLS
+
+    if r in {"london", "london_1h"}:
+        return LONDON_SESSION_SYMBOLS
+
+    if r in {"ny", "ny_1h", "new_york"}:
+        return NY_SESSION_SYMBOLS
+
+    return GLOBAL_SYMBOL_ORDER
+
+
+def _scope_label_for_report(report_type: str) -> str:
+    return REPORT_SCOPE_LABELS.get(
+        _normalize_report_type(report_type),
+        "Report-specific instrument scope.",
+    )
+
+
+def _sort_symbols_by_scope(symbols: list[str], report_type: str) -> list[str]:
+    scope = list(_symbol_scope_for_report(report_type))
+    rank = {sym: idx for idx, sym in enumerate(scope)}
+    return sorted(symbols, key=lambda x: (rank.get(x, 10_000), x))
+
+
+def _filter_symbols_for_report(symbols: list[str], report_type: str) -> list[str]:
+    scope = set(_symbol_scope_for_report(report_type))
+    filtered = [str(s).strip().upper() for s in symbols if str(s).strip().upper() in scope]
+    return _sort_symbols_by_scope(filtered, report_type)
+
+
+def _build_market_status_section(tpo: dict[str, Any], report_type: str) -> BriefingSection:
     symbols = tpo.get("symbols") if isinstance(tpo, dict) else {}
     symbols = symbols if isinstance(symbols, dict) else {}
     section = BriefingSection("🗓 Markets / holidays / provider state")
@@ -463,12 +560,18 @@ def _build_market_status_section(tpo: dict[str, Any]) -> BriefingSection:
         section.lines.append("No TPO store symbols available.")
         return section
 
+    scope = set(_symbol_scope_for_report(report_type))
+    section.lines.append(f"Scope: {_scope_label_for_report(report_type)}")
+
     closed_holidays: list[str] = []
     closed_regular: list[str] = []
     stale_or_degraded: list[str] = []
     open_symbols: list[str] = []
 
-    for sym, item in sorted(symbols.items()):
+    for sym in _sort_symbols_by_scope([str(x).upper() for x in symbols.keys()], report_type):
+        if sym not in scope:
+            continue
+        item = symbols.get(sym)
         if not isinstance(item, dict):
             continue
         ctx = item.get("context") if isinstance(item.get("context"), dict) else {}
@@ -516,7 +619,7 @@ def _build_market_status_section(tpo: dict[str, Any]) -> BriefingSection:
     return section
 
 
-def _build_high_impact_section(target_date: date, timezone_name: str) -> BriefingSection:
+def _build_high_impact_section(target_date: date, timezone_name: str, report_type: str) -> BriefingSection:
     events = load_high_impact_events(target_date)
     section = BriefingSection("🔴 High-impact news today")
 
@@ -531,7 +634,11 @@ def _build_high_impact_section(target_date: date, timezone_name: str) -> Briefin
         impact = str(e.get("impact") or "HIGH").upper()
         title = e.get("title") or "Unnamed event"
         symbols = e.get("symbols")
-        symbols_text = ", ".join(symbols) if isinstance(symbols, list) else str(symbols or "-")
+        if isinstance(symbols, list):
+            scoped_symbols = _filter_symbols_for_report(symbols, report_type)
+            symbols_text = ", ".join(scoped_symbols) if scoped_symbols else "-"
+        else:
+            symbols_text = str(symbols or "-")
         note = e.get("note")
         line = f"• {local_time} — {currency} {impact}: {title}"
         if symbols_text and symbols_text != "-":
@@ -616,13 +723,8 @@ def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str) -> Briefi
         section.lines.append("No TPO symbols available.")
         return section
 
-    rt = report_type.lower()
-    if rt in {"ny", "ny_1h", "new_york"}:
-        watch = ["NAS100", "SPX500", "UKOIL", "XAUUSD", "EURUSD", "GBPUSD", "BTCUSD", "ETHUSD"]
-    elif rt in {"london", "london_1h"}:
-        watch = ["GER40", "UKOIL", "XAUUSD", "EURUSD", "GBPUSD", "USDCHF", "BTCUSD", "ETHUSD"]
-    else:
-        watch = ["GER40", "NAS100", "SPX500", "UKOIL", "XAUUSD", "EURUSD", "GBPUSD", "BTCUSD", "ETHUSD"]
+    watch = list(_symbol_scope_for_report(report_type))
+    section.lines.append(f"Scope: {_scope_label_for_report(report_type)}")
 
     for sym in watch:
         item = symbols.get(sym)
@@ -679,6 +781,7 @@ def _build_focus_section(report_type: str) -> BriefingSection:
         section.lines.extend(
             [
                 "Start with permission, not prediction.",
+                "Morning report is London/morning focused; NY cash/risk assets are handled in the NY +1h report.",
                 "Do not trade MARKET_CLOSED / STALE_DATA / DOWNGRADE as battle alerts.",
                 "Prefer trend-aligned executable setups; counter-trend remains research unless extremely clean.",
             ]
@@ -693,7 +796,8 @@ def _build_focus_section(report_type: str) -> BriefingSection:
     elif rt in {"ny", "ny_1h", "new_york"}:
         section.lines.extend(
             [
-                "NY +1h: do not chase first impulse; require auction acceptance and Battle Gate permission.",
+                "NY +1h: focus on NAS100/SPX500/UKOIL/XAUUSD/USDCAD/risk assets only; exclude London-only assets.",
+                "Do not chase first impulse; require auction acceptance and Battle Gate permission.",
                 "High-impact news windows can invalidate early structure. Wait for post-news confirmation.",
             ]
         )
@@ -732,8 +836,8 @@ def build_briefing_report(
         },
     )
 
-    report.sections.append(_build_market_status_section(tpo))
-    report.sections.append(_build_high_impact_section(target_date, tz_name))
+    report.sections.append(_build_market_status_section(tpo, report_type))
+    report.sections.append(_build_high_impact_section(target_date, tz_name, report_type))
 
     if report_type.lower() in {"morning", "morning_briefing", "holiday_warning", "pre_market"}:
         report.sections.append(_build_yesterday_section(target_date, tz_name))
