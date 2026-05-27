@@ -5,11 +5,16 @@ Scheduled Telegram reporting worker for AI Market Analyst.
 
 Runs independently from the trading/signal worker.
 
-Default schedule in Europe/Kyiv:
-- holiday_warning: 07:15
-- morning:         08:00
-- london_1h:       11:05
-- ny_1h:           17:35
+Production schedule in Europe/Kyiv:
+- morning_combined: 11:05
+- ny_1h:            17:35
+
+Weekend policy:
+- By default, Saturday/Sunday full London/NY reporting is skipped.
+- Optional guarded crypto-only/health report can be enabled with:
+    ENABLE_WEEKEND_CRYPTO_ONLY_REPORT=true
+    REPORT_TYPE_WEEKEND_CRYPTO=crypto_health
+    REPORT_TIME_WEEKEND_CRYPTO=11:05
 
 Each report is sent once per local date. State is stored in:
   runtime/reporting/daily_reporting_state.json
@@ -36,7 +41,7 @@ except Exception:  # pragma: no cover
 from app.services.telegram_daily_reporter import send_daily_report
 
 
-WORKER_VERSION = "daily-reporting-worker-v1.0"
+WORKER_VERSION = "daily-reporting-worker-v1.1-two-reports-weekend-safe"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 
@@ -52,7 +57,7 @@ def _env_int(name: str, default: int) -> int:
     if raw is None or str(raw).strip() == "":
         return default
     try:
-        return int(raw)
+        return int(str(raw).strip())
     except ValueError:
         return default
 
@@ -85,7 +90,13 @@ def _load_state() -> dict[str, Any]:
     p = _state_path()
     try:
         if p.exists():
-            return json.loads(p.read_text(encoding="utf-8"))
+            loaded = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                sent = loaded.get("sent")
+                if not isinstance(sent, dict):
+                    loaded["sent"] = {}
+                loaded["version"] = WORKER_VERSION
+                return loaded
     except Exception:
         pass
     return {"version": WORKER_VERSION, "sent": {}}
@@ -94,7 +105,13 @@ def _load_state() -> dict[str, Any]:
 def _save_state(state: dict[str, Any]) -> None:
     p = _state_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    state["version"] = WORKER_VERSION
+    state["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
+
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(p)
 
 
 def _parse_hhmm(raw: str, default: str) -> dtime:
@@ -112,31 +129,50 @@ class ScheduledReport:
     report_type: str
     hhmm: str
     refresh_tpo: bool = False
+    weekend_only: bool = False
 
 
-def _schedule() -> list[ScheduledReport]:
+def _is_weekend(now_local: datetime) -> bool:
+    return now_local.weekday() >= 5
+
+
+def _weekday_schedule() -> list[ScheduledReport]:
     return [
         ScheduledReport(
-            "holiday_warning",
-            os.getenv("REPORT_TIME_HOLIDAY_WARNING", "07:15"),
-            refresh_tpo=False,
-        ),
-        ScheduledReport(
-            "morning",
-            os.getenv("REPORT_TIME_MORNING", "08:00"),
-            refresh_tpo=False,
-        ),
-        ScheduledReport(
-            "london_1h",
-            os.getenv("REPORT_TIME_LONDON_1H", "11:05"),
-            refresh_tpo=False,
+            "morning_combined",
+            os.getenv("REPORT_TIME_MORNING_COMBINED", "11:05"),
+            refresh_tpo=_env_bool("REPORT_REFRESH_TPO_MORNING_COMBINED", False),
         ),
         ScheduledReport(
             "ny_1h",
             os.getenv("REPORT_TIME_NY_1H", "17:35"),
-            refresh_tpo=False,
+            refresh_tpo=_env_bool("REPORT_REFRESH_TPO_NY_1H", False),
         ),
     ]
+
+
+def _weekend_schedule() -> list[ScheduledReport]:
+    if not _env_bool("ENABLE_WEEKEND_CRYPTO_ONLY_REPORT", False):
+        return []
+
+    return [
+        ScheduledReport(
+            os.getenv("REPORT_TYPE_WEEKEND_CRYPTO", "crypto_health"),
+            os.getenv("REPORT_TIME_WEEKEND_CRYPTO", "11:05"),
+            refresh_tpo=_env_bool("REPORT_REFRESH_TPO_WEEKEND_CRYPTO", False),
+            weekend_only=True,
+        )
+    ]
+
+
+def _schedule(now_local: datetime | None = None) -> list[ScheduledReport]:
+    timezone_name = os.getenv("REPORT_TIMEZONE", DEFAULT_TIMEZONE)
+    current = now_local or datetime.now(timezone.utc).astimezone(ZoneInfo(timezone_name))
+
+    if _is_weekend(current):
+        return _weekend_schedule()
+
+    return _weekday_schedule()
 
 
 class Shutdown:
@@ -152,6 +188,11 @@ class Shutdown:
         self.requested = True
 
 
+def _state_key(now_local: datetime, scheduled: ScheduledReport) -> str:
+    day_key = now_local.date().isoformat()
+    return f"{day_key}:{scheduled.report_type}"
+
+
 def _should_send(now_local: datetime, scheduled: ScheduledReport, state: dict[str, Any]) -> bool:
     target = _parse_hhmm(scheduled.hhmm, scheduled.hhmm)
     target_dt = now_local.replace(hour=target.hour, minute=target.minute, second=0, microsecond=0)
@@ -159,55 +200,70 @@ def _should_send(now_local: datetime, scheduled: ScheduledReport, state: dict[st
     if now_local < target_dt:
         return False
 
-    day_key = now_local.date().isoformat()
     sent = state.get("sent")
     if not isinstance(sent, dict):
         return True
 
-    key = f"{day_key}:{scheduled.report_type}"
-    return key not in sent
+    return _state_key(now_local, scheduled) not in sent
 
 
-def _mark_sent(now_local: datetime, scheduled: ScheduledReport, result: dict[str, Any], state: dict[str, Any]) -> None:
+def _mark_sent(
+    now_local: datetime,
+    scheduled: ScheduledReport,
+    result: dict[str, Any],
+    state: dict[str, Any],
+) -> None:
     sent = state.setdefault("sent", {})
     if not isinstance(sent, dict):
         state["sent"] = sent = {}
 
-    day_key = now_local.date().isoformat()
-    key = f"{day_key}:{scheduled.report_type}"
-
-    sent[key] = {
+    sent[_state_key(now_local, scheduled)] = {
         "report_type": scheduled.report_type,
         "scheduled_time": scheduled.hhmm,
         "sent_at_local": now_local.isoformat(),
+        "weekend_only": scheduled.weekend_only,
         "result": result,
     }
-    state["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
     _save_state(state)
 
 
-def run_due_reports_once(*, dry_run: bool = False) -> list[dict[str, Any]]:
-    timezone_name = os.getenv("REPORT_TIMEZONE", DEFAULT_TIMEZONE)
-    now_local = datetime.now(timezone.utc).astimezone(ZoneInfo(timezone_name))
+def run_due_reports_once(
+    *,
+    dry_run: bool = False,
+    timezone_name: str | None = None,
+) -> list[dict[str, Any]]:
+    tz_name = timezone_name or os.getenv("REPORT_TIMEZONE", DEFAULT_TIMEZONE)
+    now_local = datetime.now(timezone.utc).astimezone(ZoneInfo(tz_name))
     state = _load_state()
     results: list[dict[str, Any]] = []
 
-    for scheduled in _schedule():
+    for scheduled in _schedule(now_local):
         if not _should_send(now_local, scheduled, state):
             continue
 
-        result = send_daily_report(
-            report_type=scheduled.report_type,
-            report_date=now_local.date().isoformat(),
-            timezone_name=timezone_name,
-            dry_run=dry_run,
-            refresh=True,
-            include_tpo_refresh=scheduled.refresh_tpo,
-        ).to_dict()
+        try:
+            result = send_daily_report(
+                report_type=scheduled.report_type,
+                report_date=now_local.date().isoformat(),
+                timezone_name=tz_name,
+                dry_run=dry_run,
+                refresh=True,
+                include_tpo_refresh=scheduled.refresh_tpo,
+            ).to_dict()
+        except Exception as exc:
+            result = {
+                "version": WORKER_VERSION,
+                "status": "error",
+                "report_type": scheduled.report_type,
+                "report_date": now_local.date().isoformat(),
+                "telegram_sent": False,
+                "dry_run": dry_run,
+                "error_message": f"{type(exc).__name__}: {exc}",
+            }
 
         results.append(result)
 
-        if result.get("status") == "ok":
+        if not dry_run and result.get("status") == "ok":
             _mark_sent(now_local, scheduled, result, state)
 
     return results
@@ -235,32 +291,36 @@ def main() -> int:
             refresh=True,
             include_tpo_refresh=_env_bool("REPORT_REFRESH_TPO", False),
         )
-        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2), flush=True)
         return 0 if result.status == "ok" else 1
 
     shutdown = Shutdown()
     shutdown.install()
 
+    startup_now_local = datetime.now(timezone.utc).astimezone(ZoneInfo(args.timezone))
     print(
         json.dumps(
             {
                 "version": WORKER_VERSION,
                 "status": "started",
                 "timezone": args.timezone,
-                "schedule": [s.__dict__ for s in _schedule()],
+                "schedule": [s.__dict__ for s in _schedule(startup_now_local)],
                 "state_path": str(_state_path()),
                 "dry_run": args.dry_run,
                 "run_once": args.run_once,
+                "weekend_mode": _is_weekend(startup_now_local),
+                "weekend_crypto_only_enabled": _env_bool("ENABLE_WEEKEND_CRYPTO_ONLY_REPORT", False),
             },
             ensure_ascii=False,
             indent=2,
-        )
+        ),
+        flush=True,
     )
 
     while not shutdown.requested:
-        results = run_due_reports_once(dry_run=args.dry_run)
+        results = run_due_reports_once(dry_run=args.dry_run, timezone_name=args.timezone)
         if results:
-            print(json.dumps({"sent_reports": results}, ensure_ascii=False, indent=2))
+            print(json.dumps({"sent_reports": results}, ensure_ascii=False, indent=2), flush=True)
 
         if args.run_once:
             break
@@ -270,7 +330,7 @@ def main() -> int:
                 break
             time.sleep(1)
 
-    print(json.dumps({"version": WORKER_VERSION, "status": "stopped"}, ensure_ascii=False))
+    print(json.dumps({"version": WORKER_VERSION, "status": "stopped"}, ensure_ascii=False), flush=True)
     return 0
 
 
