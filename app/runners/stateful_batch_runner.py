@@ -49,7 +49,7 @@ from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.4.7-tpo-store-gated-v1"
+RUNNER_VERSION = "1.4.8-tpo-context-preserve-v1"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -1475,6 +1475,24 @@ class StatefulBatchRunner:
                 cycle_id=cycle_id,
             )
 
+            # SignalTracker normalizes and persists lifecycle payloads. Some
+            # normalizer paths may drop non-core fields, so we re-attach the
+            # current TPO / auction policy after tracking and before journal,
+            # alert building, and statistics exporters consume the payload.
+            if isinstance(tracker_result.payload, dict):
+                tracker_result.payload = self._attach_tpo_policy_to_payload(
+                    payload=tracker_result.payload,
+                    auction_context=analysis.get("auction_context"),
+                    auction_filters=analysis.get("auction_filters"),
+                )
+
+            if isinstance(tracker_result.previous_payload, dict):
+                tracker_result.previous_payload = self._attach_tpo_policy_to_payload(
+                    payload=tracker_result.previous_payload,
+                    auction_context=analysis.get("auction_context"),
+                    auction_filters=analysis.get("auction_filters"),
+                )
+
             candidate_payload = tracker_result.payload
             if candidate_payload.get("signal_class") in {
                 "SCENARIO_FORMING",
@@ -1671,7 +1689,20 @@ class StatefulBatchRunner:
         auction_context: dict[str, Any] | None,
         auction_filters: dict[str, Any] | None,
     ) -> dict[str, Any]:
-        """Attach TPO context and signal permission without changing lifecycle state."""
+        """
+        Attach TPO / auction context to a signal payload without changing
+        lifecycle state.
+
+        This method is intentionally defensive because the upstream TPO store
+        and the downstream Battle Gate/statistics layer use slightly different
+        field names. The live runner must preserve both contracts:
+
+        - auction_filters.tpo_signal_permission / tpo_telegram_modifier for
+          reporting/statistics;
+        - payload-level tpo_signal_permission / tpo_telegram_modifier for
+          Battle Gate and Telegram telemetry;
+        - metadata.* mirrors for downstream normalizers that read metadata only.
+        """
         if not isinstance(payload, dict):
             return {}
 
@@ -1680,61 +1711,197 @@ class StatefulBatchRunner:
         if not isinstance(auction_filters, dict):
             auction_filters = {}
 
+        # Work on copies so we do not mutate the analysis snapshot object
+        # accidentally.
+        context_payload = to_jsonable(auction_context)
+        filters_payload = to_jsonable(auction_filters)
+        if not isinstance(context_payload, dict):
+            context_payload = {}
+        if not isinstance(filters_payload, dict):
+            filters_payload = {}
+
+        def first_non_empty(*values: Any, default: Any = None) -> Any:
+            for value in values:
+                if value is None:
+                    continue
+                if isinstance(value, str) and value.strip() == "":
+                    continue
+                return value
+            return default
+
         open_relation = str(
-            auction_filters.get("open_relation")
-            or auction_context.get("open_relation")
-            or "UNKNOWN"
+            first_non_empty(
+                filters_payload.get("open_relation"),
+                filters_payload.get("tpo_open_relation"),
+                context_payload.get("open_relation"),
+                context_payload.get("tpo_open_relation"),
+                default="UNKNOWN",
+            )
         ).upper()
+
         auction_bias = str(
-            auction_filters.get("auction_bias")
-            or auction_context.get("auction_bias")
-            or "UNKNOWN"
+            first_non_empty(
+                filters_payload.get("auction_bias"),
+                filters_payload.get("tpo_auction_bias"),
+                context_payload.get("auction_bias"),
+                context_payload.get("tpo_auction_bias"),
+                default="UNKNOWN",
+            )
         ).upper()
-        modifier = str(auction_filters.get("telegram_modifier") or "NEUTRAL").upper()
-        is_stale = bool(auction_filters.get("is_stale") or auction_context.get("is_stale"))
-        available = bool(
-            auction_filters.get("auction_context_available")
-            or auction_context.get("auction_context_available")
+
+        market_status = str(
+            first_non_empty(
+                filters_payload.get("market_status"),
+                filters_payload.get("market_state"),
+                context_payload.get("market_status"),
+                context_payload.get("market_state"),
+                default="UNKNOWN",
+            )
+        ).upper()
+
+        market_holiday_name = first_non_empty(
+            filters_payload.get("market_holiday_name"),
+            context_payload.get("market_holiday_name"),
         )
 
-        permission = "NEUTRAL"
-        reason = "tpo_neutral_or_unavailable"
+        modifier = str(
+            first_non_empty(
+                filters_payload.get("tpo_telegram_modifier"),
+                filters_payload.get("telegram_modifier"),
+                filters_payload.get("modifier"),
+                context_payload.get("tpo_telegram_modifier"),
+                context_payload.get("telegram_modifier"),
+                default="NEUTRAL",
+            )
+        ).upper()
 
-        if TPO_SIGNAL_GATE_ENABLED and available and not is_stale:
-            if open_relation == "INSIDE_VA" or auction_bias == "BALANCE" or modifier == "DOWNGRADE":
-                permission = "RESEARCH_ONLY"
-                reason = "tpo_blocks_battle_signal_inside_value_or_balance"
-            elif open_relation == "OUT_OF_RANGE" and auction_bias == "DIRECTIONAL_IMBALANCE":
-                permission = "ALLOW_BOOST"
-                reason = "tpo_allows_directional_imbalance"
-            elif open_relation == "RANGE":
-                permission = "ALLOW_NEUTRAL"
-                reason = "tpo_allows_range_context_with_confirmation"
-            else:
-                permission = "NEUTRAL"
-                reason = "tpo_context_unclear"
-        elif is_stale:
+        is_stale = bool(filters_payload.get("is_stale") or context_payload.get("is_stale"))
+        available = bool(
+            filters_payload.get("auction_context_available")
+            or context_payload.get("auction_context_available")
+        )
+
+        store_permission = first_non_empty(
+            filters_payload.get("tpo_signal_permission"),
+            filters_payload.get("signal_permission"),
+            filters_payload.get("permission"),
+            context_payload.get("tpo_signal_permission"),
+            context_payload.get("signal_permission"),
+            context_payload.get("permission"),
+        )
+
+        if store_permission is not None:
+            permission = str(store_permission).upper()
+            reason = str(
+                first_non_empty(
+                    filters_payload.get("tpo_signal_reason"),
+                    filters_payload.get("signal_reason"),
+                    filters_payload.get("reason"),
+                    context_payload.get("tpo_signal_reason"),
+                    context_payload.get("signal_reason"),
+                    context_payload.get("reason"),
+                    default="tpo_permission_from_offline_store",
+                )
+            )
+        else:
+            # Fallback for legacy TPO store snapshots that do not yet contain
+            # explicit tpo_signal_permission.
             permission = "NEUTRAL"
-            reason = "tpo_stale_no_gate"
+            reason = "tpo_neutral_or_unavailable"
 
-        payload["auction_context"] = to_jsonable(auction_context)
-        payload["auction_filters"] = to_jsonable(auction_filters)
+            if market_status in {"MARKET_CLOSED", "CLOSED"}:
+                permission = "MARKET_CLOSED"
+                reason = "tpo_market_closed"
+            elif market_status == "STALE_DATA" or is_stale:
+                permission = "STALE_DATA"
+                reason = "tpo_stale_data"
+            elif not available:
+                permission = "NO_DATA"
+                reason = "tpo_context_unavailable"
+            elif TPO_SIGNAL_GATE_ENABLED:
+                if open_relation == "INSIDE_VA" or auction_bias == "BALANCE" or modifier == "DOWNGRADE":
+                    permission = "RESEARCH_ONLY"
+                    reason = "tpo_blocks_battle_signal_inside_value_or_balance"
+                elif open_relation in {"OUT_OF_RANGE", "RANGE"}:
+                    permission = "OPEN_FOR_EVALUATION"
+                    reason = "tpo_open_for_evaluation"
+                else:
+                    permission = "OPEN_FOR_EVALUATION"
+                    reason = "tpo_context_available"
+
+        confidence_modifier = first_non_empty(
+            filters_payload.get("confidence_modifier"),
+            context_payload.get("confidence_modifier"),
+            default=0.0,
+        )
+
+        auction_context_score = first_non_empty(
+            filters_payload.get("auction_context_score"),
+            context_payload.get("auction_context_score"),
+            payload.get("auction_context_score"),
+            default=0.0,
+        )
+
+        # Normalize the nested filters contract as well. Downstream telemetry
+        # reads both metadata.auction_filters.* and payload-level fields.
+        filters_payload["auction_context_available"] = available
+        filters_payload["open_relation"] = open_relation
+        filters_payload["auction_bias"] = auction_bias
+        filters_payload["market_status"] = market_status
+        filters_payload["tpo_signal_permission"] = permission
+        filters_payload["tpo_telegram_modifier"] = modifier
+        filters_payload["telegram_modifier"] = modifier
+        filters_payload["confidence_modifier"] = confidence_modifier
+        filters_payload["auction_context_score"] = auction_context_score
+        filters_payload["is_stale"] = is_stale
+        filters_payload.setdefault("tpo_source", context_payload.get("tpo_source", "offline_store"))
+
+        context_payload["auction_context_available"] = available
+        context_payload["open_relation"] = open_relation
+        context_payload["auction_bias"] = auction_bias
+        context_payload["market_status"] = market_status
+        context_payload["tpo_signal_permission"] = permission
+        context_payload["tpo_telegram_modifier"] = modifier
+        context_payload["telegram_modifier"] = modifier
+        context_payload["auction_context_score"] = auction_context_score
+        context_payload["is_stale"] = is_stale
+        context_payload.setdefault("tpo_source", filters_payload.get("tpo_source", "offline_store"))
+
+        if market_holiday_name:
+            filters_payload["market_holiday_name"] = market_holiday_name
+            context_payload["market_holiday_name"] = market_holiday_name
+
+        payload["auction_context"] = context_payload
+        payload["auction_filters"] = filters_payload
         payload["auction_telemetry_mode"] = "offline_store_read_only"
+
+        # Keep both old and new field names for compatibility.
+        payload["open_relation"] = open_relation
+        payload["auction_bias"] = auction_bias
+        payload["market_status"] = market_status
+        payload["auction_context_score"] = auction_context_score
         payload["tpo_open_relation"] = open_relation
         payload["tpo_auction_bias"] = auction_bias
         payload["tpo_telegram_modifier"] = modifier
-        payload["tpo_confidence_modifier"] = auction_filters.get("confidence_modifier", 0.0)
+        payload["tpo_confidence_modifier"] = confidence_modifier
         payload["tpo_signal_permission"] = permission
         payload["tpo_signal_reason"] = reason
+        if market_holiday_name:
+            payload["market_holiday_name"] = market_holiday_name
 
         metadata = payload.get("metadata")
         if not isinstance(metadata, dict):
             metadata = {}
+
         metadata.update(
             {
-                "auction_context": to_jsonable(auction_context),
-                "auction_filters": to_jsonable(auction_filters),
+                "auction_context": context_payload,
+                "auction_filters": filters_payload,
                 "auction_telemetry_mode": "offline_store_read_only",
+                "open_relation": open_relation,
+                "auction_bias": auction_bias,
+                "market_status": market_status,
+                "auction_context_score": auction_context_score,
                 "tpo_open_relation": open_relation,
                 "tpo_auction_bias": auction_bias,
                 "tpo_telegram_modifier": modifier,
@@ -1743,8 +1910,12 @@ class StatefulBatchRunner:
                 "tpo_signal_gate_enabled": TPO_SIGNAL_GATE_ENABLED,
             }
         )
+        if market_holiday_name:
+            metadata["market_holiday_name"] = market_holiday_name
+
         payload["metadata"] = metadata
         return payload
+
 
     def _enrich_tracker_payload_with_execution_bridge(
         self,
