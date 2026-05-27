@@ -29,7 +29,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.2-ukrainian-session-scoped"
+BRIEFING_VERSION = "daily-market-briefing-v1.3-ukrainian-open-behavior"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -180,6 +180,78 @@ AUCTION_BIAS_UK: dict[str, str] = {
     "OPEN_TEST_DRIVE": "open test drive",
     "OPEN_REJECTION_REVERSE": "open rejection reverse",
     "UNKNOWN": "невідомо",
+}
+
+OPEN_CONTEXT_UK: dict[str, str] = {
+    "OPEN_INSIDE_VA": "всередині VA",
+    "OPEN_IN_RANGE": "у межах діапазону",
+    "OPEN_OUT_OF_RANGE": "поза діапазоном",
+    "UNKNOWN": "невідомо",
+}
+
+OPEN_BEHAVIOR_UK: dict[str, str] = {
+    "OPEN_DRIVE": "open drive",
+    "OPEN_TEST_DRIVE": "open test drive",
+    "OPEN_REJECTION_REVERSE": "rejection reverse",
+    "OPEN_AUCTION": "open auction",
+    "UNCONFIRMED": "не підтверджено",
+}
+
+ENTRY_MODEL_HINT_UK: dict[str, str] = {
+    "NO_ENTRY_MODEL": "немає моделі входу",
+    "NO_DIRECTIONAL_ENTRY_MODEL": "немає directional-моделі",
+    "ROTATION_ONLY_IF_LTF_CONFIRMED": "ротація тільки після LTF-підтвердження",
+    "PULLBACK_CONTINUATION": "pullback continuation",
+    "PULLBACK_OR_FAILED_ACCEPTANCE_RETEST": "pullback або failed acceptance retest",
+    "FAILED_ACCEPTANCE_RETEST": "failed acceptance retest",
+    "SWEEP_RECLAIM_BOS_RETEST": "sweep → reclaim → BOS → retest",
+    "WAIT_FOR_ACCEPTANCE_OR_REJECTION": "чекати acceptance або rejection",
+}
+
+STOP_MODEL_HINT_UK: dict[str, str] = {
+    "NO_STOP_MODEL": "немає моделі стопа",
+    "BEHIND_SWEEP_EXTREME": "за sweep extreme",
+    "BEHIND_PULLBACK_STRUCTURE_OR_IB_EDGE": "за pullback-структурою або IB edge",
+    "BEYOND_FAILED_ACCEPTANCE_ZONE": "за зоною failed acceptance",
+    "BEYOND_TEST_ZONE_OR_PULLBACK_STRUCTURE": "за test zone або pullback-структурою",
+    "BEYOND_VALUE_EDGE_OR_STRUCTURE": "за value edge або структурою",
+    "BEYOND_VALUE_EDGE": "за value edge",
+}
+
+BATTLE_BIAS_HINT_UK: dict[str, str] = {
+    "BOOST_IF_HTF_ALIGNED_AND_EXECUTABLE": "BOOST якщо HTF aligned і EXECUTABLE",
+    "ALLOW_IF_HTF_ALIGNED_AND_LTF_CONFIRMED": "дозвіл тільки при HTF alignment + LTF confirmation",
+    "RESEARCH_COUNTERTREND_UNLESS_LTF_CONFIRMED": "countertrend research до LTF-підтвердження",
+    "RESEARCH_UNTIL_ACCEPTANCE_CONFIRMED": "research до підтвердження acceptance",
+    "DOWNGRADE_NO_DIRECTIONAL_BATTLE": "DOWNGRADE: без directional battle",
+    "RESEARCH_ONLY": "тільки research",
+    "BLOCK": "блок",
+}
+
+ZONE_TYPE_UK: dict[str, str] = {
+    "POC": "POC",
+    "NPOC": "nPOC",
+    "VAH": "VAH",
+    "VAL": "VAL",
+    "PREVIOUS_HIGH": "попередній high",
+    "PREVIOUS_LOW": "попередній low",
+}
+
+ZONE_ROLE_UK: dict[str, str] = {
+    "MAGNET": "магніт / зона інтересу",
+    "REACTION_ZONE": "зона реакції",
+    "INVALIDATION_ZONE": "зона invalidation",
+    "TARGET_ZONE": "цільова зона",
+    "REFERENCE_ZONE": "орієнтир",
+    "UNKNOWN": "невідомо",
+}
+
+ZONE_REACTION_UK: dict[str, str] = {
+    "REJECTED": "відхилено",
+    "ACCEPTED": "прийнято",
+    "SWEPT": "знято ліквідність",
+    "UNCONFIRMED": "не підтверджено",
+    "NONE": "немає",
 }
 
 OUTCOME_UK: dict[str, str] = {
@@ -375,6 +447,70 @@ def _open_relation_label(value: Any) -> str:
 
 def _auction_bias_label(value: Any) -> str:
     return _label(value, AUCTION_BIAS_UK)
+
+
+def _open_context_label(value: Any) -> str:
+    return _label(value, OPEN_CONTEXT_UK)
+
+
+def _open_behavior_label(value: Any) -> str:
+    return _label(value, OPEN_BEHAVIOR_UK)
+
+
+def _entry_hint_label(value: Any) -> str:
+    return _label_plain(value, ENTRY_MODEL_HINT_UK)
+
+
+def _stop_hint_label(value: Any) -> str:
+    return _label_plain(value, STOP_MODEL_HINT_UK)
+
+
+def _battle_hint_label(value: Any) -> str:
+    return _label_plain(value, BATTLE_BIAS_HINT_UK)
+
+
+def _zone_type_label(value: Any) -> str:
+    return _label_plain(value, ZONE_TYPE_UK)
+
+
+def _zone_role_label(value: Any) -> str:
+    return _label_plain(value, ZONE_ROLE_UK)
+
+
+def _zone_reaction_label(value: Any) -> str:
+    return _label_plain(value, ZONE_REACTION_UK)
+
+
+def _confidence_pct(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "-"
+    if number <= 1:
+        return f"{number * 100:.0f}%"
+    return f"{number:.0f}%"
+
+
+def _primary_zone_text(zone: Any) -> str:
+    if not isinstance(zone, dict) or not zone:
+        return "-"
+
+    zone_type = _zone_type_label(zone.get("zone_type"))
+    role = _zone_role_label(zone.get("role"))
+    reaction = _zone_reaction_label(zone.get("reaction"))
+    price = _fmt_num(zone.get("price"), 5)
+    distance = _fmt_num(zone.get("distance"), 5)
+
+    parts = [zone_type]
+    if price != "-":
+        parts.append(f"ціна={price}")
+    if distance != "-":
+        parts.append(f"відстань={distance}")
+    if role != "-":
+        parts.append(f"роль={role}")
+    if reaction not in {"-", "не підтверджено"}:
+        parts.append(f"реакція={reaction}")
+    return ", ".join(parts)
 
 
 def _translate_note(note: Any) -> str:
@@ -895,6 +1031,7 @@ def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str) -> Briefi
 
     watch = list(_symbol_scope_for_report(report_type))
     section.lines.append(f"Фокус: {_scope_label_for_report(report_type)}")
+    section.lines.append("POC / nPOC / VAH / VAL = зони інтересу, не самостійний сигнал входу.")
 
     for sym in watch:
         item = symbols.get(sym)
@@ -904,6 +1041,7 @@ def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str) -> Briefi
 
         ctx = item.get("context") if isinstance(item.get("context"), dict) else {}
         filters = item.get("filters") if isinstance(item.get("filters"), dict) else {}
+        open_behavior_payload = item.get("open_behavior") if isinstance(item.get("open_behavior"), dict) else {}
 
         open_relation = ctx.get("open_relation") or filters.get("open_relation")
         auction_bias = ctx.get("auction_bias") or filters.get("auction_bias")
@@ -911,12 +1049,66 @@ def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str) -> Briefi
         permission = filters.get("tpo_signal_permission") or ctx.get("tpo_signal_permission")
         modifier = filters.get("telegram_modifier") or filters.get("tpo_telegram_modifier") or ctx.get("tpo_telegram_modifier")
 
-        line = (
-            f"• {sym}: {_open_relation_label(open_relation)} / {_auction_bias_label(auction_bias)}; "
-            f"ринок={_status_label(market_status)}; "
-            f"дозвіл={_permission_label(permission)}; "
-            f"пріоритет={_modifier_label(modifier)}"
+        open_context = (
+            ctx.get("open_context")
+            or filters.get("open_context")
+            or open_behavior_payload.get("open_context")
         )
+        open_behavior = (
+            ctx.get("open_behavior")
+            or filters.get("open_behavior")
+            or open_behavior_payload.get("open_behavior")
+        )
+        behavior_confidence = (
+            ctx.get("open_behavior_confidence")
+            or filters.get("open_behavior_confidence")
+            or open_behavior_payload.get("open_behavior_confidence")
+        )
+        entry_hint = (
+            ctx.get("entry_model_hint")
+            or filters.get("entry_model_hint")
+            or open_behavior_payload.get("entry_model_hint")
+        )
+        stop_hint = (
+            ctx.get("stop_model_hint")
+            or filters.get("stop_model_hint")
+            or open_behavior_payload.get("stop_model_hint")
+        )
+        battle_hint = (
+            ctx.get("battle_bias_hint")
+            or filters.get("battle_bias_hint")
+            or open_behavior_payload.get("battle_bias_hint")
+        )
+        primary_zone = (
+            ctx.get("primary_interest_zone")
+            or open_behavior_payload.get("primary_interest_zone")
+        )
+
+        context_text = _open_context_label(open_context) if open_context else _open_relation_label(open_relation)
+        behavior_text = _open_behavior_label(open_behavior) if open_behavior else _auction_bias_label(auction_bias)
+        confidence_text = _confidence_pct(behavior_confidence)
+
+        line = f"• {sym}: {context_text} → {behavior_text}"
+        if confidence_text != "-":
+            line += f" ({confidence_text})"
+
+        line += (
+            f"; ринок={_status_label(market_status)}"
+            f"; дозвіл={_permission_label(permission)}"
+            f"; пріоритет={_modifier_label(modifier)}"
+        )
+
+        if primary_zone:
+            line += f"; зона={_primary_zone_text(primary_zone)}"
+
+        if entry_hint:
+            line += f"; модель={_entry_hint_label(entry_hint)}"
+
+        if stop_hint:
+            line += f"; стоп={_stop_hint_label(stop_hint)}"
+
+        if battle_hint:
+            line += f"; режим={_battle_hint_label(battle_hint)}"
 
         reason = ctx.get("market_closed_reason")
         holiday = ctx.get("market_holiday_name")
@@ -924,6 +1116,11 @@ def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str) -> Briefi
             line += f"; причина={_raw(reason)}"
         if holiday:
             line += f"; свято={_raw(holiday)}"
+
+        warnings = open_behavior_payload.get("warnings")
+        if isinstance(warnings, list) and warnings:
+            compact_warnings = ", ".join(str(x) for x in warnings[:2])
+            line += f"; warnings={compact_warnings}"
 
         section.lines.append(line)
 
@@ -967,6 +1164,7 @@ def _build_focus_section(report_type: str) -> BriefingSection:
         section.lines.extend(
             [
                 "Починаємо з дозволу, а не з прогнозу.",
+                "Пайплайн рішення: HTF → open context → first hour → open behavior → zone → LTF model → stop → Battle Gate.",
                 "Ранковий звіт фокусується на London / morning. NY cash/risk-активи обробляються у звіті NY +1h.",
                 "MARKET_CLOSED / STALE_DATA / DOWNGRADE не розглядаються як бойові Telegram-сигнали.",
                 "Перевага тільки trend-aligned EXECUTABLE setups; counter-trend залишається research-only, якщо структура не ідеальна.",
@@ -983,7 +1181,8 @@ def _build_focus_section(report_type: str) -> BriefingSection:
         section.lines.extend(
             [
                 "NY +1h: фокус тільки на NAS100 / SPX500 / UKOIL / XAUUSD / USDCAD / risk assets.",
-                "Не наздоганяємо перший імпульс. Потрібні auction acceptance і дозвіл Battle Gate.",
+                "Не наздоганяємо перший імпульс. Потрібні auction acceptance, open behavior і дозвіл Battle Gate.",
+                "POC/nPOC — зона інтересу, не кнопка входу. Вхід тільки після LTF-моделі 5m–15m.",
                 "Вікна high-impact news можуть зламати ранню структуру. Чекаємо post-news confirmation.",
             ]
         )
