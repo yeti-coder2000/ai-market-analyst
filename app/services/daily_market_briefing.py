@@ -10,11 +10,8 @@ Read-only reporting layer:
 - TPO / auction snapshot
 - provider/data issues
 
-Runtime inputs:
-- runtime/tpo/tpo_latest.json
-- runtime/stats/daily_summary.json
-- runtime/stats/signal_outcomes.json
-- runtime/calendar/high_impact_events.json (optional)
+Human-facing Telegram output is Ukrainian.
+Internal status/enums/JSON fields remain English and stable.
 """
 
 import html
@@ -32,7 +29,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.1-session-scoped"
+BRIEFING_VERSION = "daily-market-briefing-v1.2-ukrainian-session-scoped"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -47,13 +44,10 @@ EXPIRED = "EXPIRED"
 INVALID = "INVALID"
 
 
+# =============================================================================
+# SESSION-SCOPED REPORTING RULES
+# =============================================================================
 
-# Session-scoped reporting rules.
-#
-# Morning/London reports should not list NY cash/risk-session assets as active
-# focus instruments. They are reported later in the NY +1h report.
-# Holiday warning remains global because it is specifically designed to warn
-# about closed exchanges before the trading day starts.
 MORNING_SESSION_SYMBOLS: tuple[str, ...] = (
     "GER40",
     "XAUUSD",
@@ -94,16 +88,17 @@ GLOBAL_SYMBOL_ORDER: tuple[str, ...] = (
     "ETHUSD",
 )
 
-REPORT_SCOPE_LABELS: dict[str, str] = {
-    "morning": "London / morning focus only. NY cash/risk-session assets are deferred to the NY +1h report.",
-    "morning_briefing": "London / morning focus only. NY cash/risk-session assets are deferred to the NY +1h report.",
-    "london": "London +1h focus only. NY cash/risk-session assets are excluded here.",
-    "london_1h": "London +1h focus only. NY cash/risk-session assets are excluded here.",
-    "ny": "New York +1h focus only. Morning/London-only assets are excluded here.",
-    "ny_1h": "New York +1h focus only. Morning/London-only assets are excluded here.",
-    "new_york": "New York +1h focus only. Morning/London-only assets are excluded here.",
-    "holiday_warning": "Global holiday/market-closure warning. All relevant instruments may be shown.",
-    "pre_market": "Global holiday/market-closure warning. All relevant instruments may be shown.",
+REPORT_SCOPE_LABELS_UK: dict[str, str] = {
+    "morning": "London / ранкова сесія. NY cash/risk-активи винесені у звіт NY +1h.",
+    "morning_briefing": "London / ранкова сесія. NY cash/risk-активи винесені у звіт NY +1h.",
+    "morning_combined": "London + ранковий брифінг. NY cash/risk-активи винесені у звіт NY +1h.",
+    "london": "London +1h. NY cash/risk-активи тут не показуються як активний фокус.",
+    "london_1h": "London +1h. NY cash/risk-активи тут не показуються як активний фокус.",
+    "ny": "New York +1h. London-only активи тут не показуються як активний фокус.",
+    "ny_1h": "New York +1h. London-only активи тут не показуються як активний фокус.",
+    "new_york": "New York +1h. London-only активи тут не показуються як активний фокус.",
+    "holiday_warning": "Глобальне попередження про свята / закриті ринки. Можуть показуватись усі релевантні інструменти.",
+    "pre_market": "Глобальне попередження про свята / закриті ринки. Можуть показуватись усі релевантні інструменти.",
 }
 
 BUILTIN_HIGH_IMPACT_EVENTS: list[dict[str, Any]] = [
@@ -130,6 +125,81 @@ BUILTIN_HIGH_IMPACT_EVENTS: list[dict[str, Any]] = [
         "source": "builtin",
     },
 ]
+
+
+# =============================================================================
+# UKRAINIAN HUMAN-FACING LABELS
+# =============================================================================
+
+MARKET_STATUS_UK: dict[str, str] = {
+    "OPEN": "відкритий",
+    "STALE_DATA": "застарілі дані",
+    "MARKET_CLOSED": "ринок закритий",
+    "CLOSED": "закрито",
+    "NO_DATA": "немає даних",
+    "PROVIDER_ERROR": "помилка провайдера",
+}
+
+PERMISSION_UK: dict[str, str] = {
+    "OPEN_FOR_EVALUATION": "можна оцінювати",
+    "STALE_DATA": "застарілі дані",
+    "MARKET_CLOSED": "ринок закритий",
+    "NO_DATA": "немає даних",
+    "PROVIDER_ERROR": "помилка провайдера",
+    "RESEARCH_ONLY": "тільки research",
+    "BLOCKED_BY_CONTEXT": "заблоковано контекстом",
+    "BLOCKED_BY_AUCTION": "заблоковано аукціоном",
+    "ALLOW_BOOST": "дозволено з підсиленням",
+    "ALLOW_NEUTRAL": "дозволено нейтрально",
+    "NEUTRAL": "нейтрально",
+}
+
+MODIFIER_UK: dict[str, str] = {
+    "BOOST": "посилений контекст",
+    "NEUTRAL": "нейтрально",
+    "DOWNGRADE": "знижений пріоритет",
+    "BLOCK": "блок",
+}
+
+OPEN_RELATION_UK: dict[str, str] = {
+    "INSIDE_VA": "всередині VA",
+    "OPEN_INSIDE_VA": "всередині VA",
+    "RANGE": "у межах діапазону",
+    "OPEN_IN_RANGE": "у межах діапазону",
+    "OUT_OF_RANGE": "поза діапазоном",
+    "OPEN_OUT_OF_RANGE": "поза діапазоном",
+    "UNKNOWN": "невідомо",
+}
+
+AUCTION_BIAS_UK: dict[str, str] = {
+    "BALANCE": "баланс",
+    "RANGE_EXTENSION": "розширення діапазону",
+    "DIRECTIONAL_IMBALANCE": "направлений дисбаланс",
+    "OPEN_AUCTION": "відкритий аукціон",
+    "OPEN_DRIVE": "open drive",
+    "OPEN_TEST_DRIVE": "open test drive",
+    "OPEN_REJECTION_REVERSE": "open rejection reverse",
+    "UNKNOWN": "невідомо",
+}
+
+OUTCOME_UK: dict[str, str] = {
+    "TP_HIT": "TP",
+    "SL_HIT": "SL",
+    "MISSED_TARGET_BEFORE_ENTRY": "пропущено до входу",
+    "EXPIRED": "прострочено",
+    "INVALID": "невалідно",
+    "PENDING_ENTRY": "очікує входу",
+    "ENTRY_TRIGGERED": "вхід активовано",
+}
+
+COMMON_NOTE_UK: dict[str, str] = {
+    "US consumer confidence can move USD, gold, US indices and risk sentiment.": (
+        "Споживча довіра США може рухати USD, золото, індекси США та risk sentiment."
+    ),
+    "Inflation/growth cluster. Avoid treating pre-release structure as stable direction.": (
+        "Кластер інфляції / зростання. До релізу не вважати структуру стабільним напрямком."
+    ),
+}
 
 
 @dataclass
@@ -178,7 +248,9 @@ def _safe_read_json(path: Path, default: Any) -> Any:
 
 def _safe_write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
 
 
 def _get_path(env_name: str, default_relative: Path) -> Path:
@@ -256,6 +328,73 @@ def _esc(value: Any) -> str:
     return html.escape(str(value), quote=False)
 
 
+def _raw(value: Any, default: str = "-") -> str:
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def _upper(value: Any, default: str = "-") -> str:
+    text = _raw(value, default)
+    return text.upper() if text != default else default
+
+
+def _label(value: Any, mapping: dict[str, str], default: str = "-") -> str:
+    raw = _upper(value, default)
+    if raw == default:
+        return default
+    translated = mapping.get(raw)
+    if translated:
+        return f"{translated} ({raw})"
+    return raw
+
+
+def _label_plain(value: Any, mapping: dict[str, str], default: str = "-") -> str:
+    raw = _upper(value, default)
+    if raw == default:
+        return default
+    return mapping.get(raw, raw)
+
+
+def _status_label(value: Any) -> str:
+    return _label(value, MARKET_STATUS_UK)
+
+
+def _permission_label(value: Any) -> str:
+    return _label(value, PERMISSION_UK)
+
+
+def _modifier_label(value: Any) -> str:
+    return _label(value, MODIFIER_UK)
+
+
+def _open_relation_label(value: Any) -> str:
+    return _label(value, OPEN_RELATION_UK)
+
+
+def _auction_bias_label(value: Any) -> str:
+    return _label(value, AUCTION_BIAS_UK)
+
+
+def _translate_note(note: Any) -> str:
+    text = _raw(note, "")
+    if not text:
+        return ""
+    return COMMON_NOTE_UK.get(text, text)
+
+
+def _translate_outcomes_dict(value: Any) -> str:
+    if not isinstance(value, dict) or not value:
+        return "{}"
+
+    parts: list[str] = []
+    for key, count in value.items():
+        label = _label_plain(key, OUTCOME_UK, str(key))
+        parts.append(f"{label}: {count}")
+    return "{" + ", ".join(parts) + "}"
+
+
 def _local_dt_from_event(event: dict[str, Any], report_timezone: str) -> str:
     event_date = str(event.get("date") or "").strip()
     event_time = str(event.get("time") or "").strip()
@@ -274,8 +413,8 @@ def _local_dt_from_event(event: dict[str, Any], report_timezone: str) -> str:
             time(hour=hour, minute=minute),
             tzinfo=ZoneInfo(event_tz),
         )
-        kyiv_event = local_event.astimezone(_tz(report_timezone))
-        return kyiv_event.strftime("%H:%M %Z")
+        report_event = local_event.astimezone(_tz(report_timezone))
+        return report_event.strftime("%H:%M %Z")
     except Exception:
         return f"{event_date} {event_time} {event_tz}"
 
@@ -506,21 +645,21 @@ def _normalize_report_type(report_type: str) -> str:
 
 def _section_header_for_type(report_type: str) -> str:
     r = _normalize_report_type(report_type)
-    if r in {"morning", "morning_briefing"}:
-        return "🌅 Morning Market Briefing"
+    if r in {"morning", "morning_briefing", "morning_combined"}:
+        return "🌅 Ранковий ринковий брифінг"
     if r in {"london_1h", "london"}:
-        return "🇬🇧 London +1h Market Report"
+        return "🇬🇧 Звіт London +1 година"
     if r in {"ny_1h", "ny", "new_york"}:
-        return "🇺🇸 New York +1h Market Report"
+        return "🇺🇸 Звіт NY +1 година"
     if r in {"holiday_warning", "pre_market"}:
-        return "🗓 Market Holiday / Risk Warning"
-    return "📡 Market Intelligence Report"
+        return "🗓 Попередження про свята / ризики ринку"
+    return "📡 Ринкова аналітична доповідь"
 
 
 def _symbol_scope_for_report(report_type: str) -> tuple[str, ...]:
     r = _normalize_report_type(report_type)
 
-    if r in {"morning", "morning_briefing"}:
+    if r in {"morning", "morning_briefing", "morning_combined"}:
         return MORNING_SESSION_SYMBOLS
 
     if r in {"london", "london_1h"}:
@@ -533,9 +672,9 @@ def _symbol_scope_for_report(report_type: str) -> tuple[str, ...]:
 
 
 def _scope_label_for_report(report_type: str) -> str:
-    return REPORT_SCOPE_LABELS.get(
+    return REPORT_SCOPE_LABELS_UK.get(
         _normalize_report_type(report_type),
-        "Report-specific instrument scope.",
+        "Фокус конкретного звіту.",
     )
 
 
@@ -551,17 +690,42 @@ def _filter_symbols_for_report(symbols: list[str], report_type: str) -> list[str
     return _sort_symbols_by_scope(filtered, report_type)
 
 
+def _market_line(
+    *,
+    sym: str,
+    market_status: Any,
+    permission: Any,
+    modifier: Any,
+    reason: Any = None,
+    holiday: Any = None,
+    fallback: bool = False,
+    provider_error: bool = False,
+) -> str:
+    parts = [
+        f"{sym}: {_status_label(market_status)}",
+        f"дозвіл={_permission_label(permission)}",
+        f"пріоритет={_modifier_label(modifier)}",
+    ]
+    if reason:
+        parts.append(f"причина={_raw(reason)}")
+    if holiday:
+        parts.append(f"свято={_raw(holiday)}")
+    if fallback or provider_error:
+        parts.append("provider fallback / резервний режим")
+    return " / ".join(parts)
+
+
 def _build_market_status_section(tpo: dict[str, Any], report_type: str) -> BriefingSection:
     symbols = tpo.get("symbols") if isinstance(tpo, dict) else {}
     symbols = symbols if isinstance(symbols, dict) else {}
-    section = BriefingSection("🗓 Markets / holidays / provider state")
+    section = BriefingSection("🗓 Ринки / свята / стан даних")
 
     if not symbols:
-        section.lines.append("No TPO store symbols available.")
+        section.lines.append("Немає доступних символів у TPO store.")
         return section
 
     scope = set(_symbol_scope_for_report(report_type))
-    section.lines.append(f"Scope: {_scope_label_for_report(report_type)}")
+    section.lines.append(f"Фокус: {_scope_label_for_report(report_type)}")
 
     closed_holidays: list[str] = []
     closed_regular: list[str] = []
@@ -580,17 +744,20 @@ def _build_market_status_section(tpo: dict[str, Any], report_type: str) -> Brief
         reason = ctx.get("market_closed_reason")
         holiday = ctx.get("market_holiday_name")
         permission = filters.get("tpo_signal_permission")
-        modifier = filters.get("telegram_modifier")
-        fallback = item.get("fallback_preserved_previous_context")
-        provider_error = ctx.get("provider_error")
+        modifier = filters.get("telegram_modifier") or filters.get("tpo_telegram_modifier")
+        fallback = bool(item.get("fallback_preserved_previous_context") or filters.get("fallback_preserved_previous_context"))
+        provider_error = bool(ctx.get("provider_error") or filters.get("provider_error"))
 
-        text = f"{sym}: {market_status} / permission={permission or '-'} / modifier={modifier or '-'}"
-        if reason:
-            text += f" / reason={reason}"
-        if holiday:
-            text += f" / holiday={holiday}"
-        if fallback or provider_error:
-            text += " / provider_fallback"
+        text = _market_line(
+            sym=sym,
+            market_status=market_status,
+            permission=permission,
+            modifier=modifier,
+            reason=reason,
+            holiday=holiday,
+            fallback=fallback,
+            provider_error=provider_error,
+        )
 
         if reason == "US_HOLIDAY" or holiday:
             closed_holidays.append(text)
@@ -602,30 +769,30 @@ def _build_market_status_section(tpo: dict[str, Any], report_type: str) -> Brief
             open_symbols.append(text)
 
     if closed_holidays:
-        section.lines.append("Holiday closed:")
+        section.lines.append("🗓 Закрито через свято:")
         section.lines.extend([f"• {x}" for x in closed_holidays[:10]])
     if closed_regular:
-        section.lines.append("Session closed:")
+        section.lines.append("🔒 Сесія закрита:")
         section.lines.extend([f"• {x}" for x in closed_regular[:10]])
     if stale_or_degraded:
-        section.lines.append("Stale / degraded:")
+        section.lines.append("⚠️ Застарілі або деградовані дані:")
         section.lines.extend([f"• {x}" for x in stale_or_degraded[:10]])
     if open_symbols:
-        section.lines.append("Open for evaluation:")
+        section.lines.append("✅ Відкрито для оцінки:")
         section.lines.extend([f"• {x}" for x in open_symbols[:10]])
-    if not section.lines:
-        section.lines.append("No market status issues detected.")
+    if len(section.lines) == 1:
+        section.lines.append("Критичних проблем зі станом ринку не виявлено.")
 
     return section
 
 
 def _build_high_impact_section(target_date: date, timezone_name: str, report_type: str) -> BriefingSection:
     events = load_high_impact_events(target_date)
-    section = BriefingSection("🔴 High-impact news today")
+    section = BriefingSection("🔴 Важливі новини сьогодні")
 
     if not events:
-        section.lines.append("No HIGH/RED events configured for today.")
-        section.lines.append("Calendar source: runtime/calendar/high_impact_events.json or built-in fallback.")
+        section.lines.append("На сьогодні не налаштовано HIGH/RED подій.")
+        section.lines.append("Джерело календаря: runtime/calendar/high_impact_events.json або вбудований fallback.")
         return section
 
     for e in events[:12]:
@@ -639,34 +806,35 @@ def _build_high_impact_section(target_date: date, timezone_name: str, report_typ
             symbols_text = ", ".join(scoped_symbols) if scoped_symbols else "-"
         else:
             symbols_text = str(symbols or "-")
-        note = e.get("note")
+        note = _translate_note(e.get("note"))
+
         line = f"• {local_time} — {currency} {impact}: {title}"
         if symbols_text and symbols_text != "-":
-            line += f" | watch: {symbols_text}"
+            line += f" | активи під увагою: {symbols_text}"
         section.lines.append(line)
         if note:
-            section.lines.append(f"  Note: {note}")
+            section.lines.append(f"  Коментар: {note}")
     return section
 
 
 def _build_yesterday_section(target_date: date, timezone_name: str) -> BriefingSection:
     metric, source = _yesterday_metric(timezone_name, target_date)
     yday = (target_date - timedelta(days=1)).isoformat()
-    section = BriefingSection(f"📊 Yesterday performance — {yday}")
+    section = BriefingSection(f"📊 Підсумок вчора — {yday}")
 
     total = metric.get("total")
     if not total:
-        section.lines.append(f"No yesterday-specific closed records found. source={source}")
+        section.lines.append(f"Немає закритих записів саме за вчора. Джерело: {source}")
         return section
 
     section.lines.extend(
         [
-            f"Signals: {total}",
-            f"TP/SL/Missed/Expired/Pending: {metric.get('tp', 0)} / {metric.get('sl', 0)} / {metric.get('missed', 0)} / {metric.get('expired', 0)} / {metric.get('pending', 0)}",
-            f"Winrate TP/SL: {_fmt_pct(metric.get('winrate'))}",
-            f"Avg result: {_fmt_num(metric.get('avg_result_R'), 4)}R",
-            f"Avg RR / practical RR: {_fmt_num(metric.get('avg_rr'), 2)} / {_fmt_num(metric.get('avg_practical_rr'), 2)}",
-            f"Source: {source}",
+            f"Сигналів: {total}",
+            f"TP / SL / пропущено / прострочено / активні: {metric.get('tp', 0)} / {metric.get('sl', 0)} / {metric.get('missed', 0)} / {metric.get('expired', 0)} / {metric.get('pending', 0)}",
+            f"Winrate по TP/SL: {_fmt_pct(metric.get('winrate'))}",
+            f"Середній результат: {_fmt_num(metric.get('avg_result_R'), 4)}R",
+            f"Середній RR / практичний RR: {_fmt_num(metric.get('avg_rr'), 2)} / {_fmt_num(metric.get('avg_practical_rr'), 2)}",
+            f"Джерело: {source}",
         ]
     )
     return section
@@ -674,9 +842,9 @@ def _build_yesterday_section(target_date: date, timezone_name: str) -> BriefingS
 
 def _build_statistics_section() -> BriefingSection:
     summary = load_daily_summary()
-    section = BriefingSection("🛡 Battle / production statistics")
+    section = BriefingSection("🛡 Бойова / production-статистика")
     if not isinstance(summary, dict) or not summary:
-        section.lines.append("No daily_summary.json available.")
+        section.lines.append("Немає daily_summary.json.")
         return section
 
     s = summary.get("summary") if isinstance(summary.get("summary"), dict) else {}
@@ -685,72 +853,85 @@ def _build_statistics_section() -> BriefingSection:
     section.lines.extend(
         [
             f"Exporter: {summary.get('exporter_version', '-')}",
-            f"Production records: {s.get('production_records', s.get('total_signals', '-'))}",
-            f"Synthetic excluded: {s.get('synthetic_test_records', s.get('excluded_from_metrics', '-'))}",
-            f"TP/SL/Missed: {s.get('tp_hit', '-')} / {s.get('sl_hit', '-')} / {s.get('missed_before_entry', '-')}",
-            f"Winrate TP/SL: {_fmt_pct(s.get('winrate_tp_sl'))}",
-            f"Avg result: {_fmt_num(s.get('avg_result_R'), 4)}R",
-            f"Avg RR / practical RR: {_fmt_num(s.get('avg_rr'), 2)} / {_fmt_num(s.get('avg_practical_rr'), 2)}",
+            f"Production-записи: {s.get('production_records', s.get('total_signals', '-'))}",
+            f"Синтетичні тести виключено: {s.get('synthetic_test_records', s.get('excluded_from_metrics', '-'))}",
+            f"TP / SL / пропущено до входу: {s.get('tp_hit', '-')} / {s.get('sl_hit', '-')} / {s.get('missed_before_entry', '-')}",
+            f"Winrate по TP/SL: {_fmt_pct(s.get('winrate_tp_sl'))}",
+            f"Середній результат: {_fmt_num(s.get('avg_result_R'), 4)}R",
+            f"Середній RR / практичний RR: {_fmt_num(s.get('avg_rr'), 2)} / {_fmt_num(s.get('avg_practical_rr'), 2)}",
         ]
     )
 
     by_permission = battle_metrics.get("by_battle_permission")
     if isinstance(by_permission, dict) and by_permission:
-        section.lines.append("Battle permission groups:")
+        section.lines.append("Групи Battle Permission:")
         for key, value in list(by_permission.items())[:8]:
             if not isinstance(value, dict):
                 continue
             section.lines.append(
-                f"• {key}: signals={value.get('total_signals', '-')} WR={_fmt_pct(value.get('winrate_tp_sl'))} avgR={_fmt_num(value.get('avg_result_R'), 4)}"
+                f"• {key}: сигналів={value.get('total_signals', '-')} WR={_fmt_pct(value.get('winrate_tp_sl'))} avgR={_fmt_num(value.get('avg_result_R'), 4)}"
             )
 
     by_scope_all = battle_metrics.get("by_tracking_scope_all_records")
     if isinstance(by_scope_all, dict) and by_scope_all:
-        section.lines.append("Tracking scope all records:")
+        section.lines.append("Усі записи за tracking scope:")
         for key, value in list(by_scope_all.items())[:8]:
             if not isinstance(value, dict):
                 continue
-            section.lines.append(f"• {key}: signals={value.get('total_signals', '-')}, outcomes={value.get('by_outcome_status', {})}")
+            outcomes = _translate_outcomes_dict(value.get("by_outcome_status"))
+            section.lines.append(f"• {key}: сигналів={value.get('total_signals', '-')}, результати={outcomes}")
+
     return section
 
 
 def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str) -> BriefingSection:
-    section = BriefingSection("🧠 TPO / auction snapshot")
+    section = BriefingSection("🧠 TPO / аукціонний контекст")
     symbols = tpo.get("symbols") if isinstance(tpo, dict) else {}
     symbols = symbols if isinstance(symbols, dict) else {}
 
     if not symbols:
-        section.lines.append("No TPO symbols available.")
+        section.lines.append("Немає доступних TPO-символів.")
         return section
 
     watch = list(_symbol_scope_for_report(report_type))
-    section.lines.append(f"Scope: {_scope_label_for_report(report_type)}")
+    section.lines.append(f"Фокус: {_scope_label_for_report(report_type)}")
 
     for sym in watch:
         item = symbols.get(sym)
         if not isinstance(item, dict):
-            section.lines.append(f"• {sym}: MISSING")
+            section.lines.append(f"• {sym}: немає даних у TPO store")
             continue
+
         ctx = item.get("context") if isinstance(item.get("context"), dict) else {}
         filters = item.get("filters") if isinstance(item.get("filters"), dict) else {}
+
+        open_relation = ctx.get("open_relation") or filters.get("open_relation")
+        auction_bias = ctx.get("auction_bias") or filters.get("auction_bias")
+        market_status = ctx.get("market_status") or filters.get("market_status")
+        permission = filters.get("tpo_signal_permission") or ctx.get("tpo_signal_permission")
+        modifier = filters.get("telegram_modifier") or filters.get("tpo_telegram_modifier") or ctx.get("tpo_telegram_modifier")
+
         line = (
-            f"• {sym}: {ctx.get('open_relation', '-')}/{ctx.get('auction_bias', '-')}; "
-            f"market={ctx.get('market_status', '-')}; "
-            f"permission={filters.get('tpo_signal_permission', '-')}; "
-            f"modifier={filters.get('telegram_modifier', '-')}"
+            f"• {sym}: {_open_relation_label(open_relation)} / {_auction_bias_label(auction_bias)}; "
+            f"ринок={_status_label(market_status)}; "
+            f"дозвіл={_permission_label(permission)}; "
+            f"пріоритет={_modifier_label(modifier)}"
         )
+
         reason = ctx.get("market_closed_reason")
         holiday = ctx.get("market_holiday_name")
         if reason:
-            line += f"; reason={reason}"
+            line += f"; причина={_raw(reason)}"
         if holiday:
-            line += f"; holiday={holiday}"
+            line += f"; свято={_raw(holiday)}"
+
         section.lines.append(line)
+
     return section
 
 
 def _build_provider_section(tpo: dict[str, Any]) -> BriefingSection:
-    section = BriefingSection("🧯 Provider / data issues")
+    section = BriefingSection("🧯 Проблеми з даними / провайдерами")
     errors = tpo.get("errors") if isinstance(tpo, dict) else []
     fallbacks = tpo.get("fallbacks") if isinstance(tpo, dict) else []
     if not isinstance(errors, list):
@@ -759,50 +940,55 @@ def _build_provider_section(tpo: dict[str, Any]) -> BriefingSection:
         fallbacks = []
 
     symbols = tpo.get("symbols") if isinstance(tpo, dict) and isinstance(tpo.get("symbols"), dict) else {}
-    section.lines.append(f"TPO symbols: {len(symbols)}")
-    section.lines.append(f"Errors: {len(errors)}")
-    section.lines.append(f"Fallbacks: {len(fallbacks)}")
+    section.lines.append(f"TPO-символів: {len(symbols)}")
+    section.lines.append(f"Помилок: {len(errors)}")
+    section.lines.append(f"Fallback-режимів: {len(fallbacks)}")
 
     for err in errors[:5]:
         if isinstance(err, dict):
-            section.lines.append(f"• error {err.get('symbol', '-')}: {err.get('error_type', '-')}: {err.get('error', '-')}")
+            section.lines.append(
+                f"• помилка {err.get('symbol', '-')}: {err.get('error_type', '-')}: {err.get('error', '-')}"
+            )
     for fb in fallbacks[:5]:
         if isinstance(fb, dict):
-            section.lines.append(f"• fallback {fb.get('symbol', '-')}: {fb.get('reason', fb.get('error_type', '-'))}")
+            section.lines.append(
+                f"• fallback {fb.get('symbol', '-')}: {fb.get('reason', fb.get('error_type', '-'))}"
+            )
     if len(section.lines) == 3 and not errors and not fallbacks:
-        section.lines.append("No provider issues in latest TPO export.")
+        section.lines.append("У latest TPO export немає проблем з провайдерами.")
     return section
 
 
 def _build_focus_section(report_type: str) -> BriefingSection:
-    section = BriefingSection("🎯 Operating focus")
+    section = BriefingSection("🎯 Операційний фокус")
     rt = report_type.lower().strip()
-    if rt in {"morning", "morning_briefing", "holiday_warning", "pre_market"}:
+
+    if rt in {"morning", "morning_briefing", "morning_combined", "holiday_warning", "pre_market"}:
         section.lines.extend(
             [
-                "Start with permission, not prediction.",
-                "Morning report is London/morning focused; NY cash/risk assets are handled in the NY +1h report.",
-                "Do not trade MARKET_CLOSED / STALE_DATA / DOWNGRADE as battle alerts.",
-                "Prefer trend-aligned executable setups; counter-trend remains research unless extremely clean.",
+                "Починаємо з дозволу, а не з прогнозу.",
+                "Ранковий звіт фокусується на London / morning. NY cash/risk-активи обробляються у звіті NY +1h.",
+                "MARKET_CLOSED / STALE_DATA / DOWNGRADE не розглядаються як бойові Telegram-сигнали.",
+                "Перевага тільки trend-aligned EXECUTABLE setups; counter-trend залишається research-only, якщо структура не ідеальна.",
             ]
         )
     elif rt in {"london", "london_1h"}:
         section.lines.extend(
             [
-                "London +1h: check FX/XAU/GER40 acceptance and IB behavior.",
-                "Inside VA = research/downgrade; OUT_OF_RANGE only matters if market is open and HTF-aligned.",
+                "London +1h: перевіряємо acceptance, IB behavior та реакцію FX / XAU / GER40.",
+                "Inside VA = research / downgrade. OUT_OF_RANGE має значення тільки якщо ринок відкритий і є HTF alignment.",
             ]
         )
     elif rt in {"ny", "ny_1h", "new_york"}:
         section.lines.extend(
             [
-                "NY +1h: focus on NAS100/SPX500/UKOIL/XAUUSD/USDCAD/risk assets only; exclude London-only assets.",
-                "Do not chase first impulse; require auction acceptance and Battle Gate permission.",
-                "High-impact news windows can invalidate early structure. Wait for post-news confirmation.",
+                "NY +1h: фокус тільки на NAS100 / SPX500 / UKOIL / XAUUSD / USDCAD / risk assets.",
+                "Не наздоганяємо перший імпульс. Потрібні auction acceptance і дозвіл Battle Gate.",
+                "Вікна high-impact news можуть зламати ранню структуру. Чекаємо post-news confirmation.",
             ]
         )
     else:
-        section.lines.append("Use Battle Gate output as final Telegram permission.")
+        section.lines.append("Battle Gate — фінальний дозвіл для Telegram.")
     return section
 
 
@@ -819,9 +1005,10 @@ def build_briefing_report(
 
     tpo = load_tpo_store()
     daily_summary = load_daily_summary()
+    normalized_type = _normalize_report_type(report_type)
 
     report = BriefingReport(
-        report_type=report_type,
+        report_type=normalized_type,
         report_date=target_date.isoformat(),
         timezone=tz_name,
         generated_at_utc=now_utc.isoformat(),
@@ -836,16 +1023,16 @@ def build_briefing_report(
         },
     )
 
-    report.sections.append(_build_market_status_section(tpo, report_type))
-    report.sections.append(_build_high_impact_section(target_date, tz_name, report_type))
+    report.sections.append(_build_market_status_section(tpo, normalized_type))
+    report.sections.append(_build_high_impact_section(target_date, tz_name, normalized_type))
 
-    if report_type.lower() in {"morning", "morning_briefing", "holiday_warning", "pre_market"}:
+    if normalized_type in {"morning", "morning_briefing", "morning_combined", "holiday_warning", "pre_market"}:
         report.sections.append(_build_yesterday_section(target_date, tz_name))
 
     report.sections.append(_build_statistics_section())
-    report.sections.append(_build_tpo_snapshot_section(tpo, report_type))
+    report.sections.append(_build_tpo_snapshot_section(tpo, normalized_type))
     report.sections.append(_build_provider_section(tpo))
-    report.sections.append(_build_focus_section(report_type))
+    report.sections.append(_build_focus_section(normalized_type))
     return report
 
 
@@ -853,8 +1040,8 @@ def render_briefing_text(report: BriefingReport) -> str:
     header = _section_header_for_type(report.report_type)
     lines = [
         f"<b>{_esc(header)} — {_esc(report.report_date)}</b>",
-        f"Generated: {_esc(report.generated_at_local)}",
-        f"Version: {_esc(report.version)}",
+        f"Згенеровано: {_esc(report.generated_at_local)}",
+        f"Версія: {_esc(report.version)}",
         "",
     ]
     for section in report.sections:
