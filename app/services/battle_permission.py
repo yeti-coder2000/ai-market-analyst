@@ -4,6 +4,14 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any
 
+try:
+    from app.services.battle_gate_open_behavior_policy import evaluate_open_behavior_policy
+except Exception:  # pragma: no cover
+    evaluate_open_behavior_policy = None  # type: ignore[assignment]
+
+
+BATTLE_PERMISSION_VERSION = "battle-permission-v1.1-v2-shadow-open-behavior"
+
 
 class BattlePermission(str, Enum):
     BATTLE_READY = "BATTLE_READY"
@@ -50,6 +58,18 @@ class BattlePermissionResult:
     practical_rr: float | None = None
     stop_quality: str | None = None
     quality_tier: str | None = None
+
+    # Battle Gate v2 shadow-mode fields.
+    # Legacy Battle Gate remains the execution authority for now.
+    battle_gate_v2_decision: str | None = None
+    battle_gate_v2_risk_mode: str | None = None
+    battle_gate_v2_battle_allowed: bool | None = None
+    battle_gate_v2_should_suppress_telegram: bool | None = None
+    battle_gate_v2_score_delta: float | None = None
+    battle_gate_v2_reasons: list[str] = field(default_factory=list)
+    battle_gate_v2_blockers: list[str] = field(default_factory=list)
+    battle_gate_v2_modifiers: list[str] = field(default_factory=list)
+    battle_gate_v2_error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -171,6 +191,42 @@ def _extract_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _evaluate_v2_shadow(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Evaluate Battle Gate v2 policy in shadow mode.
+
+    This must never break legacy Battle Gate.
+    If v2 policy import/evaluation fails, legacy gate still works and we attach an error marker.
+    """
+    if evaluate_open_behavior_policy is None:
+        return {
+            "decision": None,
+            "risk_mode": None,
+            "battle_allowed": None,
+            "should_suppress_telegram": None,
+            "score_delta": None,
+            "reasons": [],
+            "blockers": [],
+            "modifiers": [],
+            "error": "battle_gate_open_behavior_policy_import_failed",
+        }
+
+    try:
+        return evaluate_open_behavior_policy(payload)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "decision": None,
+            "risk_mode": None,
+            "battle_allowed": None,
+            "should_suppress_telegram": None,
+            "score_delta": None,
+            "reasons": [],
+            "blockers": [],
+            "modifiers": [],
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
 def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
     payload = _extract_payload(raw_payload)
 
@@ -211,7 +267,9 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
             payload,
             "metadata.tpo_telegram_modifier",
             "metadata.auction_filters.telegram_modifier",
+            "metadata.auction_filters.tpo_telegram_modifier",
             "auction_filters.telegram_modifier",
+            "auction_filters.tpo_telegram_modifier",
             "telegram_modifier",
             "tpo_telegram_modifier",
         )
@@ -447,9 +505,55 @@ def calculate_auction_context_score(inputs: dict[str, Any]) -> tuple[int, list[s
     return score, reasons
 
 
+def _build_result(
+    *,
+    inputs: dict[str, Any],
+    auction_score: int,
+    reasons: list[str],
+    blockers: list[str],
+    modifiers: list[str],
+    battle_permission: str,
+    telegram_delivery_mode: str,
+    battle_ready: bool,
+    v2_policy: dict[str, Any],
+) -> BattlePermissionResult:
+    return BattlePermissionResult(
+        battle_permission=battle_permission,
+        telegram_delivery_mode=telegram_delivery_mode,
+        battle_ready=battle_ready,
+        auction_context_score=auction_score,
+        reasons=reasons,
+        blockers=blockers,
+        modifiers=modifiers,
+        market_is_open=inputs.get("market_is_open"),
+        market_status=inputs.get("market_status"),
+        tpo_signal_permission=inputs.get("tpo_signal_permission"),
+        tpo_telegram_modifier=inputs.get("tpo_telegram_modifier"),
+        open_relation=inputs.get("open_relation"),
+        auction_bias=inputs.get("auction_bias"),
+        direction=inputs.get("direction"),
+        htf_bias=inputs.get("htf_bias"),
+        signal_alignment=inputs.get("signal_alignment"),
+        execution_status=inputs.get("execution_status"),
+        practical_rr=inputs.get("practical_rr"),
+        stop_quality=inputs.get("stop_quality"),
+        quality_tier=inputs.get("quality_tier"),
+        battle_gate_v2_decision=v2_policy.get("decision"),
+        battle_gate_v2_risk_mode=v2_policy.get("risk_mode"),
+        battle_gate_v2_battle_allowed=v2_policy.get("battle_allowed"),
+        battle_gate_v2_should_suppress_telegram=v2_policy.get("should_suppress_telegram"),
+        battle_gate_v2_score_delta=v2_policy.get("score_delta"),
+        battle_gate_v2_reasons=list(v2_policy.get("reasons") or []),
+        battle_gate_v2_blockers=list(v2_policy.get("blockers") or []),
+        battle_gate_v2_modifiers=list(v2_policy.get("modifiers") or []),
+        battle_gate_v2_error=v2_policy.get("error"),
+    )
+
+
 def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionResult:
     inputs = extract_battle_inputs(raw_payload)
     auction_score, score_reasons = calculate_auction_context_score(inputs)
+    v2_policy = _evaluate_v2_shadow(inputs.get("payload") if isinstance(inputs.get("payload"), dict) else raw_payload)
 
     reasons: list[str] = list(score_reasons)
     blockers: list[str] = []
@@ -459,8 +563,6 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
     market_status = inputs.get("market_status")
     tpo_signal_permission = inputs.get("tpo_signal_permission")
     tpo_telegram_modifier = inputs.get("tpo_telegram_modifier")
-    open_relation = inputs.get("open_relation")
-    auction_bias = inputs.get("auction_bias")
     direction = inputs.get("direction")
     htf_bias = inputs.get("htf_bias")
     signal_alignment = inputs.get("signal_alignment")
@@ -475,366 +577,229 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
     # 1. Absolute market / data blockers.
     if market_is_open is False or market_status in {"MARKET_CLOSED", "MARKET_CLOSED_AND_STALE"}:
         blockers.append("market_closed")
-        return BattlePermissionResult(
-            battle_permission=BattlePermission.BLOCKED_BY_MARKET_CLOSED.value,
-            telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
-            battle_ready=False,
-            auction_context_score=auction_score,
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
             reasons=reasons + ["market is closed; battle signal disabled"],
             blockers=blockers,
             modifiers=modifiers,
-            market_is_open=market_is_open,
-            market_status=market_status,
-            tpo_signal_permission=tpo_signal_permission,
-            tpo_telegram_modifier=tpo_telegram_modifier,
-            open_relation=open_relation,
-            auction_bias=auction_bias,
-            direction=direction,
-            htf_bias=htf_bias,
-            signal_alignment=signal_alignment,
-            execution_status=execution_status,
-            practical_rr=practical_rr,
-            stop_quality=stop_quality,
-            quality_tier=quality_tier,
+            battle_permission=BattlePermission.BLOCKED_BY_MARKET_CLOSED.value,
+            telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
         )
 
     if market_status == "STALE_DATA" or tpo_signal_permission == "STALE_DATA":
         blockers.append("stale_data")
-        return BattlePermissionResult(
-            battle_permission=BattlePermission.BLOCKED_BY_STALE_DATA.value,
-            telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
-            battle_ready=False,
-            auction_context_score=auction_score,
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
             reasons=reasons + ["market data is stale; battle signal disabled"],
             blockers=blockers,
             modifiers=modifiers,
-            market_is_open=market_is_open,
-            market_status=market_status,
-            tpo_signal_permission=tpo_signal_permission,
-            tpo_telegram_modifier=tpo_telegram_modifier,
-            open_relation=open_relation,
-            auction_bias=auction_bias,
-            direction=direction,
-            htf_bias=htf_bias,
-            signal_alignment=signal_alignment,
-            execution_status=execution_status,
-            practical_rr=practical_rr,
-            stop_quality=stop_quality,
-            quality_tier=quality_tier,
+            battle_permission=BattlePermission.BLOCKED_BY_STALE_DATA.value,
+            telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
         )
 
     # 2. TPO / auction research blockers.
     if tpo_signal_permission in {"MARKET_CLOSED", "RESEARCH_ONLY", "BLOCKED_BY_CONTEXT", "BLOCKED_BY_AUCTION"}:
-        blockers.append(f"tpo_permission_{tpo_signal_permission.lower()}")
-        return BattlePermissionResult(
-            battle_permission=BattlePermission.RESEARCH_ONLY.value,
-            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
-            battle_ready=False,
-            auction_context_score=auction_score,
+        blockers.append(f"tpo_permission_{str(tpo_signal_permission).lower()}")
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
             reasons=reasons + [f"TPO permission is {tpo_signal_permission}; battle signal disabled"],
             blockers=blockers,
             modifiers=modifiers,
-            market_is_open=market_is_open,
-            market_status=market_status,
-            tpo_signal_permission=tpo_signal_permission,
-            tpo_telegram_modifier=tpo_telegram_modifier,
-            open_relation=open_relation,
-            auction_bias=auction_bias,
-            direction=direction,
-            htf_bias=htf_bias,
-            signal_alignment=signal_alignment,
-            execution_status=execution_status,
-            practical_rr=practical_rr,
-            stop_quality=stop_quality,
-            quality_tier=quality_tier,
+            battle_permission=BattlePermission.RESEARCH_ONLY.value,
+            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
         )
 
     if tpo_telegram_modifier == "DOWNGRADE":
         blockers.append("tpo_downgrade")
-        return BattlePermissionResult(
-            battle_permission=BattlePermission.RESEARCH_ONLY.value,
-            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
-            battle_ready=False,
-            auction_context_score=auction_score,
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
             reasons=reasons + ["TPO telegram modifier is DOWNGRADE; research only"],
             blockers=blockers,
             modifiers=modifiers,
-            market_is_open=market_is_open,
-            market_status=market_status,
-            tpo_signal_permission=tpo_signal_permission,
-            tpo_telegram_modifier=tpo_telegram_modifier,
-            open_relation=open_relation,
-            auction_bias=auction_bias,
-            direction=direction,
-            htf_bias=htf_bias,
-            signal_alignment=signal_alignment,
-            execution_status=execution_status,
-            practical_rr=practical_rr,
-            stop_quality=stop_quality,
-            quality_tier=quality_tier,
+            battle_permission=BattlePermission.RESEARCH_ONLY.value,
+            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
         )
 
     # 3. Technical readiness.
     if status not in {"READY", "ENTRY_READY", "EXECUTABLE"}:
         blockers.append("not_ready_status")
-        return BattlePermissionResult(
-            battle_permission=BattlePermission.NOT_READY.value,
-            telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
-            battle_ready=False,
-            auction_context_score=auction_score,
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
             reasons=reasons + [f"status={status}; not a battle-ready signal"],
             blockers=blockers,
             modifiers=modifiers,
-            market_is_open=market_is_open,
-            market_status=market_status,
-            tpo_signal_permission=tpo_signal_permission,
-            tpo_telegram_modifier=tpo_telegram_modifier,
-            open_relation=open_relation,
-            auction_bias=auction_bias,
-            direction=direction,
-            htf_bias=htf_bias,
-            signal_alignment=signal_alignment,
-            execution_status=execution_status,
-            practical_rr=practical_rr,
-            stop_quality=stop_quality,
-            quality_tier=quality_tier,
+            battle_permission=BattlePermission.NOT_READY.value,
+            telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
         )
 
     if execution_status != "EXECUTABLE":
         blockers.append("execution_not_executable")
-        return BattlePermissionResult(
-            battle_permission=BattlePermission.BLOCKED_BY_EXECUTION.value,
-            telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
-            battle_ready=False,
-            auction_context_score=auction_score,
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
             reasons=reasons + [f"execution_status={execution_status}; not executable"],
             blockers=blockers,
             modifiers=modifiers,
-            market_is_open=market_is_open,
-            market_status=market_status,
-            tpo_signal_permission=tpo_signal_permission,
-            tpo_telegram_modifier=tpo_telegram_modifier,
-            open_relation=open_relation,
-            auction_bias=auction_bias,
-            direction=direction,
-            htf_bias=htf_bias,
-            signal_alignment=signal_alignment,
-            execution_status=execution_status,
-            practical_rr=practical_rr,
-            stop_quality=stop_quality,
-            quality_tier=quality_tier,
+            battle_permission=BattlePermission.BLOCKED_BY_EXECUTION.value,
+            telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
         )
 
     # 4. HTF alignment.
     if not _direction_matches_htf(direction, htf_bias):
         blockers.append("direction_not_aligned_with_htf")
-        return BattlePermissionResult(
-            battle_permission=BattlePermission.BLOCKED_BY_HTF.value,
-            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
-            battle_ready=False,
-            auction_context_score=auction_score,
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
             reasons=reasons + [f"direction={direction} not aligned with htf_bias={htf_bias}"],
             blockers=blockers,
             modifiers=modifiers,
-            market_is_open=market_is_open,
-            market_status=market_status,
-            tpo_signal_permission=tpo_signal_permission,
-            tpo_telegram_modifier=tpo_telegram_modifier,
-            open_relation=open_relation,
-            auction_bias=auction_bias,
-            direction=direction,
-            htf_bias=htf_bias,
-            signal_alignment=signal_alignment,
-            execution_status=execution_status,
-            practical_rr=practical_rr,
-            stop_quality=stop_quality,
-            quality_tier=quality_tier,
+            battle_permission=BattlePermission.BLOCKED_BY_HTF.value,
+            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
         )
 
     if signal_alignment == "COUNTER_TREND":
         blockers.append("counter_trend")
-        return BattlePermissionResult(
-            battle_permission=BattlePermission.BLOCKED_BY_HTF.value,
-            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
-            battle_ready=False,
-            auction_context_score=auction_score,
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
             reasons=reasons + ["signal_alignment=COUNTER_TREND; battle signal disabled"],
             blockers=blockers,
             modifiers=modifiers,
-            market_is_open=market_is_open,
-            market_status=market_status,
-            tpo_signal_permission=tpo_signal_permission,
-            tpo_telegram_modifier=tpo_telegram_modifier,
-            open_relation=open_relation,
-            auction_bias=auction_bias,
-            direction=direction,
-            htf_bias=htf_bias,
-            signal_alignment=signal_alignment,
-            execution_status=execution_status,
-            practical_rr=practical_rr,
-            stop_quality=stop_quality,
-            quality_tier=quality_tier,
+            battle_permission=BattlePermission.BLOCKED_BY_HTF.value,
+            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
         )
 
     # 5. RR / stop / quality.
     if practical_rr is None or practical_rr < 2.0:
         blockers.append("practical_rr_below_2")
-        return BattlePermissionResult(
-            battle_permission=BattlePermission.BLOCKED_BY_RR.value,
-            telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
-            battle_ready=False,
-            auction_context_score=auction_score,
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
             reasons=reasons + [f"practical_rr={practical_rr}; minimum is 2.0"],
             blockers=blockers,
             modifiers=modifiers,
-            market_is_open=market_is_open,
-            market_status=market_status,
-            tpo_signal_permission=tpo_signal_permission,
-            tpo_telegram_modifier=tpo_telegram_modifier,
-            open_relation=open_relation,
-            auction_bias=auction_bias,
-            direction=direction,
-            htf_bias=htf_bias,
-            signal_alignment=signal_alignment,
-            execution_status=execution_status,
-            practical_rr=practical_rr,
-            stop_quality=stop_quality,
-            quality_tier=quality_tier,
+            battle_permission=BattlePermission.BLOCKED_BY_RR.value,
+            telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
         )
 
     if stop_quality == "TIGHT_STOP":
         blockers.append("tight_stop")
-        return BattlePermissionResult(
-            battle_permission=BattlePermission.BLOCKED_BY_STOP_QUALITY.value,
-            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
-            battle_ready=False,
-            auction_context_score=auction_score,
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
             reasons=reasons + ["stop_quality=TIGHT_STOP; battle signal disabled"],
             blockers=blockers,
             modifiers=modifiers,
-            market_is_open=market_is_open,
-            market_status=market_status,
-            tpo_signal_permission=tpo_signal_permission,
-            tpo_telegram_modifier=tpo_telegram_modifier,
-            open_relation=open_relation,
-            auction_bias=auction_bias,
-            direction=direction,
-            htf_bias=htf_bias,
-            signal_alignment=signal_alignment,
-            execution_status=execution_status,
-            practical_rr=practical_rr,
-            stop_quality=stop_quality,
-            quality_tier=quality_tier,
+            battle_permission=BattlePermission.BLOCKED_BY_STOP_QUALITY.value,
+            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
         )
 
     if quality_tier in {"DANGER", "BLOCK", "FAIL"}:
         blockers.append("quality_tier_blocked")
-        return BattlePermissionResult(
-            battle_permission=BattlePermission.BLOCKED_BY_QUALITY.value,
-            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
-            battle_ready=False,
-            auction_context_score=auction_score,
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
             reasons=reasons + [f"quality_tier={quality_tier}; battle signal disabled"],
             blockers=blockers,
             modifiers=modifiers,
-            market_is_open=market_is_open,
-            market_status=market_status,
-            tpo_signal_permission=tpo_signal_permission,
-            tpo_telegram_modifier=tpo_telegram_modifier,
-            open_relation=open_relation,
-            auction_bias=auction_bias,
-            direction=direction,
-            htf_bias=htf_bias,
-            signal_alignment=signal_alignment,
-            execution_status=execution_status,
-            practical_rr=practical_rr,
-            stop_quality=stop_quality,
-            quality_tier=quality_tier,
+            battle_permission=BattlePermission.BLOCKED_BY_QUALITY.value,
+            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
         )
 
     if quality_tier == "CAUTION" and market_state == "TRANSITION" and scenario in {"SWEEP_RETURN_LONG", "SWEEP_RETURN_SHORT"}:
         blockers.append("caution_transition_sweep_return")
-        return BattlePermissionResult(
-            battle_permission=BattlePermission.RESEARCH_ONLY.value,
-            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
-            battle_ready=False,
-            auction_context_score=auction_score,
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
             reasons=reasons + ["CAUTION + TRANSITION + SWEEP_RETURN; research only"],
             blockers=blockers,
             modifiers=modifiers,
-            market_is_open=market_is_open,
-            market_status=market_status,
-            tpo_signal_permission=tpo_signal_permission,
-            tpo_telegram_modifier=tpo_telegram_modifier,
-            open_relation=open_relation,
-            auction_bias=auction_bias,
-            direction=direction,
-            htf_bias=htf_bias,
-            signal_alignment=signal_alignment,
-            execution_status=execution_status,
-            practical_rr=practical_rr,
-            stop_quality=stop_quality,
-            quality_tier=quality_tier,
+            battle_permission=BattlePermission.RESEARCH_ONLY.value,
+            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
         )
 
     # 6. Auction score final gate.
     if auction_score < 3:
         blockers.append("auction_context_score_below_3")
-        return BattlePermissionResult(
-            battle_permission=BattlePermission.BLOCKED_BY_AUCTION.value,
-            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
-            battle_ready=False,
-            auction_context_score=auction_score,
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
             reasons=reasons + [f"auction_context_score={auction_score}; minimum is 3"],
             blockers=blockers,
             modifiers=modifiers,
-            market_is_open=market_is_open,
-            market_status=market_status,
-            tpo_signal_permission=tpo_signal_permission,
-            tpo_telegram_modifier=tpo_telegram_modifier,
-            open_relation=open_relation,
-            auction_bias=auction_bias,
-            direction=direction,
-            htf_bias=htf_bias,
-            signal_alignment=signal_alignment,
-            execution_status=execution_status,
-            practical_rr=practical_rr,
-            stop_quality=stop_quality,
-            quality_tier=quality_tier,
+            battle_permission=BattlePermission.BLOCKED_BY_AUCTION.value,
+            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
         )
 
     # 7. Battle ready.
     if tpo_telegram_modifier == "BOOST":
         modifiers.append("tpo_boost")
 
-    return BattlePermissionResult(
-        battle_permission=BattlePermission.BATTLE_READY.value,
-        telegram_delivery_mode=TelegramDeliveryMode.BATTLE_ALERT.value,
-        battle_ready=True,
-        auction_context_score=auction_score,
+    return _build_result(
+        inputs=inputs,
+        auction_score=auction_score,
         reasons=reasons + ["all battle permission checks passed"],
         blockers=blockers,
         modifiers=modifiers,
-        market_is_open=market_is_open,
-        market_status=market_status,
-        tpo_signal_permission=tpo_signal_permission,
-        tpo_telegram_modifier=tpo_telegram_modifier,
-        open_relation=open_relation,
-        auction_bias=auction_bias,
-        direction=direction,
-        htf_bias=htf_bias,
-        signal_alignment=signal_alignment,
-        execution_status=execution_status,
-        practical_rr=practical_rr,
-        stop_quality=stop_quality,
-        quality_tier=quality_tier,
+        battle_permission=BattlePermission.BATTLE_READY.value,
+        telegram_delivery_mode=TelegramDeliveryMode.BATTLE_ALERT.value,
+        battle_ready=True,
+        v2_policy=v2_policy,
     )
+
+
+def _attach_v2_shadow_fields_to_metadata(metadata: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    metadata["battle_gate_v2_decision"] = result.get("battle_gate_v2_decision")
+    metadata["battle_gate_v2_risk_mode"] = result.get("battle_gate_v2_risk_mode")
+    metadata["battle_gate_v2_battle_allowed"] = result.get("battle_gate_v2_battle_allowed")
+    metadata["battle_gate_v2_should_suppress_telegram"] = result.get("battle_gate_v2_should_suppress_telegram")
+    metadata["battle_gate_v2_score_delta"] = result.get("battle_gate_v2_score_delta")
+    metadata["battle_gate_v2_reasons"] = result.get("battle_gate_v2_reasons") or []
+    metadata["battle_gate_v2_blockers"] = result.get("battle_gate_v2_blockers") or []
+    metadata["battle_gate_v2_modifiers"] = result.get("battle_gate_v2_modifiers") or []
+    metadata["battle_gate_v2_error"] = result.get("battle_gate_v2_error")
+    return metadata
 
 
 def apply_battle_permission(raw_payload: dict[str, Any]) -> dict[str, Any]:
     """
     Returns a copy of payload enriched with final battle permission fields.
     Does not mutate the input payload.
+
+    Battle Gate v2 is currently attached in shadow mode:
+    - legacy battle_permission / telegram_delivery_mode remain authoritative;
+    - v2 fields are added for telemetry/statistics comparison.
     """
     payload = dict(raw_payload)
     result = evaluate_battle_permission(payload).to_dict()
@@ -850,11 +815,26 @@ def apply_battle_permission(raw_payload: dict[str, Any]) -> dict[str, Any]:
     metadata["battle_permission_reasons"] = result["reasons"]
     metadata["battle_permission_blockers"] = result["blockers"]
     metadata["battle_permission_modifiers"] = result["modifiers"]
+    metadata["battle_permission_version"] = BATTLE_PERMISSION_VERSION
+
+    metadata = _attach_v2_shadow_fields_to_metadata(metadata, result)
 
     payload["metadata"] = metadata
     payload["battle_permission"] = result["battle_permission"]
     payload["telegram_delivery_mode"] = result["telegram_delivery_mode"]
     payload["battle_ready"] = result["battle_ready"]
     payload["auction_context_score"] = result["auction_context_score"]
+    payload["battle_permission_version"] = BATTLE_PERMISSION_VERSION
+
+    # Root-level v2 fields are useful for journal, telemetry and flat statistics.
+    payload["battle_gate_v2_decision"] = result.get("battle_gate_v2_decision")
+    payload["battle_gate_v2_risk_mode"] = result.get("battle_gate_v2_risk_mode")
+    payload["battle_gate_v2_battle_allowed"] = result.get("battle_gate_v2_battle_allowed")
+    payload["battle_gate_v2_should_suppress_telegram"] = result.get("battle_gate_v2_should_suppress_telegram")
+    payload["battle_gate_v2_score_delta"] = result.get("battle_gate_v2_score_delta")
+    payload["battle_gate_v2_reasons"] = result.get("battle_gate_v2_reasons") or []
+    payload["battle_gate_v2_blockers"] = result.get("battle_gate_v2_blockers") or []
+    payload["battle_gate_v2_modifiers"] = result.get("battle_gate_v2_modifiers") or []
+    payload["battle_gate_v2_error"] = result.get("battle_gate_v2_error")
 
     return payload
