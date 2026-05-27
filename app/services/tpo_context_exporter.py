@@ -15,8 +15,9 @@ from app.core.enums import Instrument, Timeframe
 from app.core.instrument_batches import get_batch_symbols
 from app.core.settings import settings
 from app.runners.stateful_batch_runner import _build_loader_for_batch_group, to_jsonable
+from app.services.tpo_open_behavior_classifier import attach_open_behavior_to_tpo_item
 
-EXPORTER_VERSION = "tpo-context-exporter-v1.1-preserve-previous-context"
+EXPORTER_VERSION = "tpo-context-exporter-v1.2-open-behavior"
 DEFAULT_MAX_BARS = 672
 
 TPO_DIR = settings.runtime_dir / "tpo"
@@ -214,6 +215,82 @@ def build_provider_error_item(
     }
 
 
+def attach_open_behavior_safely(item: dict[str, Any], symbol: Instrument) -> dict[str, Any]:
+    """
+    Attach open behavior classification to a TPO symbol item.
+
+    This is deliberately best-effort:
+    - exporter must keep writing tpo_latest.json even if the classifier fails;
+    - failures are mirrored into context/filters as UNCONFIRMED/BLOCK;
+    - TPO remains a context layer, not an entry trigger.
+    """
+    if not isinstance(item, dict):
+        return item
+
+    try:
+        return attach_open_behavior_to_tpo_item(item)
+    except Exception as exc:  # noqa: BLE001
+        updated_at = now_iso()
+        message = f"{type(exc).__name__}: {exc}"
+
+        output = copy.deepcopy(item)
+
+        context = output.get("context")
+        if not isinstance(context, dict):
+            context = {}
+            output["context"] = context
+
+        filters = output.get("filters")
+        if not isinstance(filters, dict):
+            filters = {}
+            output["filters"] = filters
+
+        fallback_behavior = {
+            "open_context": "UNKNOWN",
+            "open_behavior": "UNCONFIRMED",
+            "open_behavior_confidence": 0.0,
+            "first_hour_activity": {},
+            "interest_zones": [],
+            "primary_interest_zone": None,
+            "entry_model_hint": "NO_ENTRY_MODEL",
+            "stop_model_hint": "NO_STOP_MODEL",
+            "battle_bias_hint": "BLOCK",
+            "reason": f"Open behavior classifier failed for {symbol.value}.",
+            "warnings": ["open_behavior_classifier_error"],
+            "error": message,
+        }
+
+        output["open_behavior"] = fallback_behavior
+        output["open_behavior_error"] = message
+        output["open_behavior_error_at_utc"] = updated_at
+
+        context["open_context"] = fallback_behavior["open_context"]
+        context["open_behavior"] = fallback_behavior["open_behavior"]
+        context["open_behavior_confidence"] = fallback_behavior["open_behavior_confidence"]
+        context["entry_model_hint"] = fallback_behavior["entry_model_hint"]
+        context["stop_model_hint"] = fallback_behavior["stop_model_hint"]
+        context["battle_bias_hint"] = fallback_behavior["battle_bias_hint"]
+        context["open_behavior_reason"] = fallback_behavior["reason"]
+        context["open_behavior_error"] = message
+        context["open_behavior_error_at_utc"] = updated_at
+
+        filters["open_context"] = fallback_behavior["open_context"]
+        filters["open_behavior"] = fallback_behavior["open_behavior"]
+        filters["open_behavior_confidence"] = fallback_behavior["open_behavior_confidence"]
+        filters["entry_model_hint"] = fallback_behavior["entry_model_hint"]
+        filters["stop_model_hint"] = fallback_behavior["stop_model_hint"]
+        filters["battle_bias_hint"] = fallback_behavior["battle_bias_hint"]
+        filters["open_behavior_error"] = message
+
+        existing_reasons = ensure_list(filters.get("reasons"))
+        filters["reasons"] = [
+            *existing_reasons,
+            f"Open behavior classifier failed: {message}",
+        ]
+
+        return output
+
+
 def prepare_ohlc(df: pd.DataFrame | None, max_bars: int) -> pd.DataFrame | None:
     if df is None or df.empty:
         return None
@@ -362,7 +439,7 @@ def export_tpo_context(groups: list[str], max_bars: int, output_path: Path) -> d
     previous_store = load_previous_store(output_path)
 
     payload: dict[str, Any] = {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "exporter_version": EXPORTER_VERSION,
         "updated_at_utc": now_iso(),
         "max_bars": max_bars,
@@ -401,6 +478,7 @@ def export_tpo_context(groups: list[str], max_bars: int, output_path: Path) -> d
                     symbol=symbol,
                     group=group,
                 )
+                item = attach_open_behavior_safely(item, symbol)
 
                 payload["symbols"][symbol.value] = item
 
@@ -420,6 +498,9 @@ def export_tpo_context(groups: list[str], max_bars: int, output_path: Path) -> d
                     "bias=", item.get("context", {}).get("auction_bias"),
                     "permission=", item.get("filters", {}).get("tpo_signal_permission"),
                     "modifier=", item.get("filters", {}).get("telegram_modifier"),
+                    "open_context=", item.get("filters", {}).get("open_context"),
+                    "open_behavior=", item.get("filters", {}).get("open_behavior"),
+                    "entry_hint=", item.get("filters", {}).get("entry_model_hint"),
                     "fallback=", bool(item.get("fallback_preserved_previous_context")),
                 )
 
@@ -443,6 +524,7 @@ def export_tpo_context(groups: list[str], max_bars: int, output_path: Path) -> d
                             group=group,
                             error_payload=error_payload,
                         )
+                        fallback_item = attach_open_behavior_safely(fallback_item, symbol)
                         payload["symbols"][symbol.value] = fallback_item
                         fallback_payload = {
                             "group": group,
@@ -459,15 +541,26 @@ def export_tpo_context(groups: list[str], max_bars: int, output_path: Path) -> d
                             "bias=", fallback_item.get("context", {}).get("auction_bias"),
                             "permission=", fallback_item.get("filters", {}).get("tpo_signal_permission"),
                             "modifier=", fallback_item.get("filters", {}).get("telegram_modifier"),
+                            "open_context=", fallback_item.get("filters", {}).get("open_context"),
+                            "open_behavior=", fallback_item.get("filters", {}).get("open_behavior"),
+                            "entry_hint=", fallback_item.get("filters", {}).get("entry_model_hint"),
                             "fallback= True",
                         )
                     else:
-                        payload["symbols"][symbol.value] = build_provider_error_item(
+                        provider_error_item = build_provider_error_item(
                             symbol=symbol,
                             group=group,
                             error_payload=error_payload,
                         )
-                        print("ERROR", error_payload, "fallback= False no_previous_context")
+                        provider_error_item = attach_open_behavior_safely(provider_error_item, symbol)
+                        payload["symbols"][symbol.value] = provider_error_item
+                        print(
+                            "ERROR",
+                            error_payload,
+                            "open_context=", provider_error_item.get("filters", {}).get("open_context"),
+                            "open_behavior=", provider_error_item.get("filters", {}).get("open_behavior"),
+                            "fallback= False no_previous_context",
+                        )
 
                 except Exception as fallback_exc:  # noqa: BLE001
                     print("ERROR", error_payload, "fallback_error=", str(fallback_exc))
