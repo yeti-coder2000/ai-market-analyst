@@ -29,7 +29,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.3-ukrainian-open-behavior"
+BRIEFING_VERSION = "daily-market-briefing-v1.4-ukrainian-operational-brief"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -743,7 +743,32 @@ def _metric_from_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _yesterday_metric(timezone_name: str, target_date: date) -> tuple[dict[str, Any], str]:
+def _record_is_battle_alert(record: dict[str, Any]) -> bool:
+    tracking_scope = str(record.get("tracking_scope") or "").upper()
+    delivery_mode = str(record.get("telegram_delivery_mode") or "").upper()
+    if tracking_scope == "TELEGRAM_ALERT":
+        return True
+    if delivery_mode == "BATTLE_ALERT":
+        return True
+    if bool(record.get("sent_to_telegram")) and delivery_mode not in {"RESEARCH_ALERT", "SUPPRESS"}:
+        return True
+    return False
+
+
+def _record_is_research_counterfactual(record: dict[str, Any]) -> bool:
+    tracking_scope = str(record.get("tracking_scope") or "").upper()
+    delivery_mode = str(record.get("telegram_delivery_mode") or "").upper()
+    v2_risk_mode = str(record.get("battle_gate_v2_risk_mode") or "").upper()
+    if tracking_scope == "RESEARCH_COUNTERFACTUAL":
+        return True
+    if delivery_mode == "RESEARCH_ALERT":
+        return True
+    if v2_risk_mode == "RESEARCH_COUNTERFACTUAL":
+        return True
+    return False
+
+
+def _yesterday_grouped_metrics(timezone_name: str, target_date: date) -> tuple[dict[str, Any], str]:
     outcomes = load_signal_outcomes()
     records = _production_records(_signals_from_outcomes(outcomes))
 
@@ -751,28 +776,56 @@ def _yesterday_metric(timezone_name: str, target_date: date) -> tuple[dict[str, 
     dated = [r for r in records if _record_local_date(r, timezone_name) == yesterday]
 
     if dated:
-        return _metric_from_records(dated), "signal_outcomes_by_yesterday_date"
+        battle = [r for r in dated if _record_is_battle_alert(r)]
+        research = [r for r in dated if _record_is_research_counterfactual(r)]
+        other = [r for r in dated if r not in battle and r not in research]
+        return {
+            "battle": _metric_from_records(battle),
+            "research": _metric_from_records(research),
+            "other": _metric_from_records(other),
+            "all": _metric_from_records(dated),
+        }, "signal_outcomes_by_yesterday_date"
 
     summary = load_daily_summary()
-    s = summary.get("summary") if isinstance(summary, dict) else {}
-    if isinstance(s, dict) and s:
-        metric = {
-            "total": s.get("total_signals"),
-            "tp": s.get("tp_hit"),
-            "sl": s.get("sl_hit"),
-            "missed": s.get("missed_before_entry"),
-            "expired": s.get("expired"),
-            "invalid": s.get("invalid"),
-            "pending": s.get("pending_or_active"),
-            "closed_tp_sl": s.get("closed_tp_sl"),
-            "winrate": s.get("winrate_tp_sl"),
-            "avg_result_R": s.get("avg_result_R"),
-            "avg_rr": s.get("avg_rr"),
-            "avg_practical_rr": s.get("avg_practical_rr"),
-        }
-        return metric, "daily_summary_latest_fallback"
+    battle_metrics = summary.get("battle_metrics") if isinstance(summary, dict) else {}
+    by_scope = battle_metrics.get("by_tracking_scope_all_records") if isinstance(battle_metrics, dict) else {}
 
-    return _metric_from_records([]), "no_stats_available"
+    if isinstance(by_scope, dict) and by_scope:
+        def _metric_from_summary_bucket(key: str) -> dict[str, Any]:
+            b = by_scope.get(key) if isinstance(by_scope.get(key), dict) else {}
+            return {
+                "total": b.get("total_signals", 0),
+                "tp": b.get("tp_hit", 0),
+                "sl": b.get("sl_hit", 0),
+                "missed": b.get("missed_before_entry", 0),
+                "expired": b.get("expired", 0),
+                "invalid": b.get("invalid", 0),
+                "pending": b.get("pending_or_active", 0),
+                "closed_tp_sl": b.get("closed_tp_sl", 0),
+                "winrate": b.get("winrate_tp_sl"),
+                "avg_result_R": b.get("avg_result_R"),
+                "avg_rr": b.get("avg_rr"),
+                "avg_practical_rr": b.get("avg_practical_rr"),
+            }
+
+        return {
+            "battle": _metric_from_summary_bucket("TELEGRAM_ALERT"),
+            "research": _metric_from_summary_bucket("RESEARCH_COUNTERFACTUAL"),
+            "other": _metric_from_records([]),
+            "all": _metric_from_records([]),
+        }, "daily_summary_tracking_scope_fallback"
+
+    return {
+        "battle": _metric_from_records([]),
+        "research": _metric_from_records([]),
+        "other": _metric_from_records([]),
+        "all": _metric_from_records([]),
+    }, "no_stats_available"
+
+
+def _yesterday_metric(timezone_name: str, target_date: date) -> tuple[dict[str, Any], str]:
+    grouped, source = _yesterday_grouped_metrics(timezone_name, target_date)
+    return grouped.get("all", _metric_from_records([])), source
 
 
 def _normalize_report_type(report_type: str) -> str:
@@ -782,7 +835,7 @@ def _normalize_report_type(report_type: str) -> str:
 def _section_header_for_type(report_type: str) -> str:
     r = _normalize_report_type(report_type)
     if r in {"morning", "morning_briefing", "morning_combined"}:
-        return "🌅 Ранковий ринковий брифінг"
+        return "🌅 Ранковий брифінг"
     if r in {"london_1h", "london"}:
         return "🇬🇧 Звіт London +1 година"
     if r in {"ny_1h", "ny", "new_york"}:
@@ -924,55 +977,59 @@ def _build_market_status_section(tpo: dict[str, Any], report_type: str) -> Brief
 
 def _build_high_impact_section(target_date: date, timezone_name: str, report_type: str) -> BriefingSection:
     events = load_high_impact_events(target_date)
-    section = BriefingSection("🔴 Важливі новини сьогодні")
+    section = BriefingSection("🔴 Ризик дня")
 
     if not events:
-        section.lines.append("На сьогодні не налаштовано HIGH/RED подій.")
-        section.lines.append("Джерело календаря: runtime/calendar/high_impact_events.json або вбудований fallback.")
+        section.lines.append("HIGH/RED подій на сьогодні не налаштовано.")
         return section
 
-    for e in events[:12]:
+    for e in events[:4]:
         local_time = _local_dt_from_event(e, timezone_name)
         currency = e.get("currency") or "-"
         impact = str(e.get("impact") or "HIGH").upper()
         title = e.get("title") or "Unnamed event"
-        symbols = e.get("symbols")
-        if isinstance(symbols, list):
-            scoped_symbols = _filter_symbols_for_report(symbols, report_type)
-            symbols_text = ", ".join(scoped_symbols) if scoped_symbols else "-"
-        else:
-            symbols_text = str(symbols or "-")
         note = _translate_note(e.get("note"))
-
-        line = f"• {local_time} — {currency} {impact}: {title}"
-        if symbols_text and symbols_text != "-":
-            line += f" | активи під увагою: {symbols_text}"
-        section.lines.append(line)
+        section.lines.append(f"• {local_time} — {currency} {impact}: {title}")
         if note:
-            section.lines.append(f"  Коментар: {note}")
+            section.lines.append(f"  {note}")
     return section
 
 
 def _build_yesterday_section(target_date: date, timezone_name: str) -> BriefingSection:
-    metric, source = _yesterday_metric(timezone_name, target_date)
+    grouped, source = _yesterday_grouped_metrics(timezone_name, target_date)
     yday = (target_date - timedelta(days=1)).isoformat()
-    section = BriefingSection(f"📊 Підсумок вчора — {yday}")
+    section = BriefingSection(f"📊 Вчора — {yday}")
 
-    total = metric.get("total")
-    if not total:
-        section.lines.append(f"Немає закритих записів саме за вчора. Джерело: {source}")
-        return section
+    battle = grouped.get("battle", {}) if isinstance(grouped, dict) else {}
+    research = grouped.get("research", {}) if isinstance(grouped, dict) else {}
+    all_metric = grouped.get("all", {}) if isinstance(grouped, dict) else {}
 
-    section.lines.extend(
-        [
-            f"Сигналів: {total}",
-            f"TP / SL / пропущено / прострочено / активні: {metric.get('tp', 0)} / {metric.get('sl', 0)} / {metric.get('missed', 0)} / {metric.get('expired', 0)} / {metric.get('pending', 0)}",
-            f"Winrate по TP/SL: {_fmt_pct(metric.get('winrate'))}",
-            f"Середній результат: {_fmt_num(metric.get('avg_result_R'), 4)}R",
-            f"Середній RR / практичний RR: {_fmt_num(metric.get('avg_rr'), 2)} / {_fmt_num(metric.get('avg_practical_rr'), 2)}",
-            f"Джерело: {source}",
-        ]
-    )
+    battle_total = int(battle.get("total") or 0)
+    research_total = int(research.get("total") or 0)
+
+    if battle_total:
+        section.lines.append(
+            f"Battle alerts: {battle_total} | TP/SL: {battle.get('tp', 0)}/{battle.get('sl', 0)} | WR: {_fmt_pct(battle.get('winrate'))} | avgR: {_fmt_num(battle.get('avg_result_R'), 4)}R"
+        )
+    else:
+        section.lines.append("Battle alerts: 0 | бойовий winrate не рахуємо")
+
+    if research_total:
+        section.lines.append(
+            f"Research/counterfactual: {research_total} | TP/SL: {research.get('tp', 0)}/{research.get('sl', 0)} | WR: {_fmt_pct(research.get('winrate'))} | avgR: {_fmt_num(research.get('avg_result_R'), 4)}R"
+        )
+    else:
+        section.lines.append("Research/counterfactual: 0")
+
+    all_total = int(all_metric.get("total") or 0)
+    if all_total and not battle_total and research_total:
+        section.lines.append("Висновок: вчора працювали research-моделі; не трактувати це як бойовий winrate.")
+    elif research_total and (research.get("tp", 0) or 0) == 0 and (research.get("sl", 0) or 0) > 0:
+        section.lines.append("Висновок: research-моделі токсичні; не піднімати без v2 gate + LTF confirmation.")
+    elif battle_total:
+        section.lines.append("Висновок: оцінювати окремо battle-якість, не змішувати з research.")
+
+    section.lines.append(f"Джерело: {source}")
     return section
 
 
@@ -1020,8 +1077,86 @@ def _build_statistics_section() -> BriefingSection:
     return section
 
 
+
+def _compact_zone_text(zone: Any) -> str:
+    if not isinstance(zone, dict) or not zone:
+        return "-"
+    zone_type = _zone_type_label(zone.get("zone_type"))
+    if zone_type == "-":
+        return "-"
+    if str(zone.get("zone_type") or "").upper() == "NPOC":
+        return f"{zone_type} interest zone, не entry"
+    return zone_type
+
+
+def _brief_symbol_context(item: dict[str, Any]) -> dict[str, Any]:
+    ctx = item.get("context") if isinstance(item.get("context"), dict) else {}
+    filters = item.get("filters") if isinstance(item.get("filters"), dict) else {}
+    ob = item.get("open_behavior") if isinstance(item.get("open_behavior"), dict) else {}
+
+    market_status = _upper(ctx.get("market_status") or filters.get("market_status"), "UNKNOWN")
+    permission = _upper(filters.get("tpo_signal_permission") or ctx.get("tpo_signal_permission"), "UNKNOWN")
+    modifier = _upper(filters.get("telegram_modifier") or filters.get("tpo_telegram_modifier") or ctx.get("tpo_telegram_modifier"), "NEUTRAL")
+    open_context = _upper(ctx.get("open_context") or filters.get("open_context") or ob.get("open_context"), "UNKNOWN")
+    open_behavior = _upper(ctx.get("open_behavior") or filters.get("open_behavior") or ob.get("open_behavior"), "UNKNOWN")
+    entry_hint = _upper(ctx.get("entry_model_hint") or filters.get("entry_model_hint") or ob.get("entry_model_hint"), "NO_ENTRY_MODEL")
+    battle_hint = _upper(ctx.get("battle_bias_hint") or filters.get("battle_bias_hint") or ob.get("battle_bias_hint"), "RESEARCH_ONLY")
+    primary_zone = ctx.get("primary_interest_zone") or ob.get("primary_interest_zone")
+    warnings = ob.get("warnings") if isinstance(ob.get("warnings"), list) else []
+
+    return {
+        "market_status": market_status,
+        "permission": permission,
+        "modifier": modifier,
+        "open_context": open_context,
+        "open_behavior": open_behavior,
+        "entry_hint": entry_hint,
+        "battle_hint": battle_hint,
+        "primary_zone": primary_zone,
+        "warnings": warnings,
+        "fallback": bool(item.get("fallback_preserved_previous_context") or filters.get("fallback_preserved_previous_context")),
+    }
+
+
+def _brief_verdict(sym: str, data: dict[str, Any]) -> tuple[str, str]:
+    market_status = data["market_status"]
+    permission = data["permission"]
+    modifier = data["modifier"]
+    open_behavior = data["open_behavior"]
+    entry_hint = data["entry_hint"]
+    battle_hint = data["battle_hint"]
+    zone = _compact_zone_text(data.get("primary_zone"))
+
+    if data.get("fallback") or market_status in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"} or permission in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"}:
+        return "NO_TRADE", f"• {sym} — {market_status}"
+
+    if market_status.startswith("MARKET_CLOSED") or permission == "MARKET_CLOSED":
+        return "NO_TRADE", f"• {sym} — MARKET_CLOSED"
+
+    if modifier == "DOWNGRADE":
+        reason = open_behavior if open_behavior not in {"UNKNOWN", "-"} else "DOWNGRADE"
+        return "NO_TRADE", f"• {sym} — {reason} + DOWNGRADE"
+
+    if open_behavior in {"OPEN_DRIVE", "OPEN_TEST_DRIVE"}:
+        detail = "чекати LTF model"
+        if zone != "-":
+            detail = f"{zone} | чекати LTF model"
+        return "WATCH", f"• {sym} — {open_behavior} | {detail}"
+
+    if open_behavior == "OPEN_REJECTION_REVERSE":
+        return "WATCH", f"• {sym} — OPEN_REJECTION_REVERSE | тільки research до чистої LTF-моделі"
+
+    if open_behavior in {"OPEN_AUCTION", "UNCONFIRMED", "UNKNOWN"}:
+        return "NO_TRADE", f"• {sym} — {open_behavior}"
+
+    if entry_hint in {"NO_ENTRY_MODEL", "NO_DIRECTIONAL_ENTRY_MODEL"} or battle_hint in {"RESEARCH_ONLY", "DOWNGRADE_NO_DIRECTIONAL_BATTLE"}:
+        return "NO_TRADE", f"• {sym} — no directional model"
+
+    return "WATCH", f"• {sym} — {open_behavior} | чекати LTF confirmation"
+
+
 def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str) -> BriefingSection:
-    section = BriefingSection("🧠 TPO / аукціонний контекст")
+    section = BriefingSection("📌 Стан ринку")
     symbols = tpo.get("symbols") if isinstance(tpo, dict) else {}
     symbols = symbols if isinstance(symbols, dict) else {}
 
@@ -1029,100 +1164,36 @@ def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str) -> Briefi
         section.lines.append("Немає доступних TPO-символів.")
         return section
 
-    watch = list(_symbol_scope_for_report(report_type))
-    section.lines.append(f"Фокус: {_scope_label_for_report(report_type)}")
-    section.lines.append("POC / nPOC / VAH / VAL = зони інтересу, не самостійний сигнал входу.")
+    watch_symbols = list(_symbol_scope_for_report(report_type))
+    no_trade: list[str] = []
+    watch: list[str] = []
+    missing: list[str] = []
 
-    for sym in watch:
+    for sym in watch_symbols:
         item = symbols.get(sym)
         if not isinstance(item, dict):
-            section.lines.append(f"• {sym}: немає даних у TPO store")
+            missing.append(f"• {sym} — немає даних")
             continue
 
-        ctx = item.get("context") if isinstance(item.get("context"), dict) else {}
-        filters = item.get("filters") if isinstance(item.get("filters"), dict) else {}
-        open_behavior_payload = item.get("open_behavior") if isinstance(item.get("open_behavior"), dict) else {}
+        bucket, line = _brief_verdict(sym, _brief_symbol_context(item))
+        if bucket == "WATCH":
+            watch.append(line)
+        else:
+            no_trade.append(line)
 
-        open_relation = ctx.get("open_relation") or filters.get("open_relation")
-        auction_bias = ctx.get("auction_bias") or filters.get("auction_bias")
-        market_status = ctx.get("market_status") or filters.get("market_status")
-        permission = filters.get("tpo_signal_permission") or ctx.get("tpo_signal_permission")
-        modifier = filters.get("telegram_modifier") or filters.get("tpo_telegram_modifier") or ctx.get("tpo_telegram_modifier")
+    if no_trade:
+        section.lines.append("NO TRADE:")
+        section.lines.extend(no_trade[:8])
 
-        open_context = (
-            ctx.get("open_context")
-            or filters.get("open_context")
-            or open_behavior_payload.get("open_context")
-        )
-        open_behavior = (
-            ctx.get("open_behavior")
-            or filters.get("open_behavior")
-            or open_behavior_payload.get("open_behavior")
-        )
-        behavior_confidence = (
-            ctx.get("open_behavior_confidence")
-            or filters.get("open_behavior_confidence")
-            or open_behavior_payload.get("open_behavior_confidence")
-        )
-        entry_hint = (
-            ctx.get("entry_model_hint")
-            or filters.get("entry_model_hint")
-            or open_behavior_payload.get("entry_model_hint")
-        )
-        stop_hint = (
-            ctx.get("stop_model_hint")
-            or filters.get("stop_model_hint")
-            or open_behavior_payload.get("stop_model_hint")
-        )
-        battle_hint = (
-            ctx.get("battle_bias_hint")
-            or filters.get("battle_bias_hint")
-            or open_behavior_payload.get("battle_bias_hint")
-        )
-        primary_zone = (
-            ctx.get("primary_interest_zone")
-            or open_behavior_payload.get("primary_interest_zone")
-        )
+    if watch:
+        section.lines.append("WATCH:")
+        section.lines.extend(watch[:8])
+    else:
+        section.lines.append("WATCH: немає чистих кандидатів без LTF confirmation")
 
-        context_text = _open_context_label(open_context) if open_context else _open_relation_label(open_relation)
-        behavior_text = _open_behavior_label(open_behavior) if open_behavior else _auction_bias_label(auction_bias)
-        confidence_text = _confidence_pct(behavior_confidence)
-
-        line = f"• {sym}: {context_text} → {behavior_text}"
-        if confidence_text != "-":
-            line += f" ({confidence_text})"
-
-        line += (
-            f"; ринок={_status_label(market_status)}"
-            f"; дозвіл={_permission_label(permission)}"
-            f"; пріоритет={_modifier_label(modifier)}"
-        )
-
-        if primary_zone:
-            line += f"; зона={_primary_zone_text(primary_zone)}"
-
-        if entry_hint:
-            line += f"; модель={_entry_hint_label(entry_hint)}"
-
-        if stop_hint:
-            line += f"; стоп={_stop_hint_label(stop_hint)}"
-
-        if battle_hint:
-            line += f"; режим={_battle_hint_label(battle_hint)}"
-
-        reason = ctx.get("market_closed_reason")
-        holiday = ctx.get("market_holiday_name")
-        if reason:
-            line += f"; причина={_raw(reason)}"
-        if holiday:
-            line += f"; свято={_raw(holiday)}"
-
-        warnings = open_behavior_payload.get("warnings")
-        if isinstance(warnings, list) and warnings:
-            compact_warnings = ", ".join(str(x) for x in warnings[:2])
-            line += f"; warnings={compact_warnings}"
-
-        section.lines.append(line)
+    if missing:
+        section.lines.append("DATA MISSING:")
+        section.lines.extend(missing[:5])
 
     return section
 
@@ -1157,33 +1228,30 @@ def _build_provider_section(tpo: dict[str, Any]) -> BriefingSection:
 
 
 def _build_focus_section(report_type: str) -> BriefingSection:
-    section = BriefingSection("🎯 Операційний фокус")
+    section = BriefingSection("🧠 Правило дня")
     rt = report_type.lower().strip()
 
     if rt in {"morning", "morning_briefing", "morning_combined", "holiday_warning", "pre_market"}:
         section.lines.extend(
             [
-                "Починаємо з дозволу, а не з прогнозу.",
-                "Пайплайн рішення: HTF → open context → first hour → open behavior → zone → LTF model → stop → Battle Gate.",
-                "Ранковий звіт фокусується на London / morning. NY cash/risk-активи обробляються у звіті NY +1h.",
-                "MARKET_CLOSED / STALE_DATA / DOWNGRADE не розглядаються як бойові Telegram-сигнали.",
-                "Перевага тільки trend-aligned EXECUTABLE setups; counter-trend залишається research-only, якщо структура не ідеальна.",
+                "POC/nPOC = зона інтересу, не кнопка входу.",
+                "Battle тільки після HTF alignment + LTF 5m–15m model + stop + RR.",
+                "До high-impact news не вважати ранню структуру стабільною.",
             ]
         )
     elif rt in {"london", "london_1h"}:
         section.lines.extend(
             [
-                "London +1h: перевіряємо acceptance, IB behavior та реакцію FX / XAU / GER40.",
-                "Inside VA = research / downgrade. OUT_OF_RANGE має значення тільки якщо ринок відкритий і є HTF alignment.",
+                "London +1h: acceptance / rejection важливіші за прогноз.",
+                "Inside VA = research. Directional battle тільки після LTF-моделі.",
             ]
         )
     elif rt in {"ny", "ny_1h", "new_york"}:
         section.lines.extend(
             [
-                "NY +1h: фокус тільки на NAS100 / SPX500 / UKOIL / XAUUSD / USDCAD / risk assets.",
-                "Не наздоганяємо перший імпульс. Потрібні auction acceptance, open behavior і дозвіл Battle Gate.",
-                "POC/nPOC — зона інтересу, не кнопка входу. Вхід тільки після LTF-моделі 5m–15m.",
-                "Вікна high-impact news можуть зламати ранню структуру. Чекаємо post-news confirmation.",
+                "NY +1h: не наздоганяємо перший імпульс.",
+                "Потрібні open behavior + LTF model + stop + Battle Gate.",
+                "POC/nPOC = зона інтересу, не entry trigger.",
             ]
         )
     else:
@@ -1222,15 +1290,19 @@ def build_briefing_report(
         },
     )
 
-    report.sections.append(_build_market_status_section(tpo, normalized_type))
     report.sections.append(_build_high_impact_section(target_date, tz_name, normalized_type))
+    report.sections.append(_build_tpo_snapshot_section(tpo, normalized_type))
 
     if normalized_type in {"morning", "morning_briefing", "morning_combined", "holiday_warning", "pre_market"}:
         report.sections.append(_build_yesterday_section(target_date, tz_name))
 
-    report.sections.append(_build_statistics_section())
-    report.sections.append(_build_tpo_snapshot_section(tpo, normalized_type))
-    report.sections.append(_build_provider_section(tpo))
+    # Provider details remain available in JSON artifacts. Telegram stays operational and concise.
+    provider_section = _build_provider_section(tpo)
+    if any(line.startswith("Помилок: ") and not line.endswith("0") for line in provider_section.lines) or any(
+        line.startswith("Fallback-режимів: ") and not line.endswith("0") for line in provider_section.lines
+    ):
+        report.sections.append(provider_section)
+
     report.sections.append(_build_focus_section(normalized_type))
     return report
 
