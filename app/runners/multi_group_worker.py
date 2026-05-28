@@ -4,7 +4,7 @@ from __future__ import annotations
 Multi-group worker for AI Market Analyst.
 
 Runs configured batch groups sequentially:
-1. runs TPO context exporter
+1. refreshes TPO context exporter only when offline store is stale/missing
 2. verifies TPO offline store
 3. core
 4. waits GROUP_DELAY_SEC / SECONDARY_GROUP_DELAY_SEC
@@ -29,7 +29,7 @@ ENABLE_TELEGRAM_ADMIN_MESSAGES=true/false
 Default:
 - trade Telegram alerts stay enabled through normal alert pipeline
 - admin boot/stop messages are disabled by default to avoid Telegram spam
-- TPO exporter is required before live batches
+- TPO exporter is required before live batches, but can be throttled when the store is fresh
 """
 
 import json
@@ -115,6 +115,8 @@ def _read_tpo_store_summary(path: Path) -> dict[str, Any]:
         "store_path": str(path),
         "exists": path.exists(),
         "size_bytes": None,
+        "mtime_utc": None,
+        "age_sec": None,
         "exporter_version": None,
         "updated_at_utc": None,
         "symbols": None,
@@ -126,7 +128,13 @@ def _read_tpo_store_summary(path: Path) -> dict[str, Any]:
         return summary
 
     try:
-        summary["size_bytes"] = path.stat().st_size
+        stat = path.stat()
+        summary["size_bytes"] = stat.st_size
+        summary["mtime_utc"] = datetime.fromtimestamp(
+            stat.st_mtime,
+            tz=timezone.utc,
+        ).isoformat()
+        summary["age_sec"] = round(max(0.0, time.time() - stat.st_mtime), 3)
     except Exception as exc:
         summary["read_error"] = f"stat_failed: {exc}"
         return summary
@@ -153,6 +161,41 @@ def _read_tpo_store_summary(path: Path) -> dict[str, Any]:
             summary["symbols"] = len(contexts)
 
     return summary
+
+
+def _should_run_tpo_export(
+    *,
+    store_path: Path,
+    min_age_sec: int,
+) -> tuple[bool, dict[str, Any], str]:
+    """
+    Decide whether the TPO exporter should run.
+
+    If min_age_sec <= 0, throttling is disabled and exporter always runs.
+    If the existing store is fresh, readable and non-empty, the exporter is skipped.
+    """
+    store_summary = _read_tpo_store_summary(store_path)
+
+    if min_age_sec <= 0:
+        return True, store_summary, "throttle_disabled"
+
+    if not store_summary.get("exists"):
+        return True, store_summary, "store_missing"
+
+    if not store_summary.get("size_bytes"):
+        return True, store_summary, "store_empty"
+
+    if store_summary.get("read_error"):
+        return True, store_summary, "store_read_error"
+
+    age_sec = store_summary.get("age_sec")
+    if age_sec is None:
+        return True, store_summary, "store_age_unknown"
+
+    if float(age_sec) >= float(min_age_sec):
+        return True, store_summary, "store_stale"
+
+    return False, store_summary, "store_fresh"
 
 
 def _tail_text(value: str | None, max_chars: int = 4000) -> str:
@@ -469,6 +512,10 @@ def main() -> int:
         os.getenv("TPO_EXPORT_TIMEOUT_SEC"),
         300,
     )
+    tpo_export_min_age_sec = _to_int(
+        os.getenv("TPO_EXPORT_MIN_AGE_SEC"),
+        3600,
+    )
 
     # General Telegram flag.
     # Keep this enabled if trade alerts must work.
@@ -491,7 +538,7 @@ def main() -> int:
     notifier = TelegramNotifier()
 
     worker_logger.info(
-        "Config groups=%s interval_sec=%s delay_between_groups_sec=%s run_once=%s enable_telegram=%s enable_telegram_admin_messages=%s enable_tpo_export_before_groups=%s tpo_export_required=%s tpo_export_timeout_sec=%s tpo_store_path=%s",
+        "Config groups=%s interval_sec=%s delay_between_groups_sec=%s run_once=%s enable_telegram=%s enable_telegram_admin_messages=%s enable_tpo_export_before_groups=%s tpo_export_required=%s tpo_export_timeout_sec=%s tpo_export_min_age_sec=%s tpo_store_path=%s",
         groups,
         interval_sec,
         delay_between_groups_sec,
@@ -501,6 +548,7 @@ def main() -> int:
         enable_tpo_export_before_groups,
         tpo_export_required,
         tpo_export_timeout_sec,
+        tpo_export_min_age_sec,
         _tpo_store_path(),
     )
 
@@ -567,29 +615,65 @@ def main() -> int:
         skip_groups = False
 
         if enable_tpo_export_before_groups and not shutdown.stop_requested:
-            tpo_export_summary = run_tpo_exporter_once(
-                sequence_id=sequence_id,
-                timeout_sec=tpo_export_timeout_sec,
+            should_export_tpo, existing_tpo_summary, export_reason = _should_run_tpo_export(
+                store_path=_tpo_store_path(),
+                min_age_sec=tpo_export_min_age_sec,
             )
-            tpo_failed = tpo_export_summary.get("status") != "ok"
 
-            if tpo_failed:
-                sequence_logger.error(
-                    "TPO export failed before groups. tpo_export_required=%s summary=%s",
-                    tpo_export_required,
+            if not should_export_tpo:
+                tpo_export_summary = {
+                    "status": "skipped_fresh_store",
+                    "started_at_utc": utc_now_iso(),
+                    "finished_at_utc": utc_now_iso(),
+                    "elapsed_sec": 0.0,
+                    "returncode": None,
+                    "timeout_sec": tpo_export_timeout_sec,
+                    "min_age_sec": tpo_export_min_age_sec,
+                    "store_path": str(_tpo_store_path()),
+                    "store_summary": existing_tpo_summary,
+                    "stdout_tail": "",
+                    "stderr_tail": "",
+                    "error_message": None,
+                    "skip_reason": export_reason,
+                }
+                tpo_failed = False
+                sequence_logger.info(
+                    "TPO store fresh; skipping export. min_age_sec=%s age_sec=%s summary=%s",
+                    tpo_export_min_age_sec,
+                    existing_tpo_summary.get("age_sec"),
                     tpo_export_summary,
                 )
-
-                if tpo_export_required:
-                    skip_groups = True
-                    sequence_logger.error(
-                        "Skipping live groups because TPO export is required and failed."
-                    )
             else:
                 sequence_logger.info(
-                    "TPO export OK before groups. summary=%s",
-                    tpo_export_summary,
+                    "TPO export required. reason=%s min_age_sec=%s store_summary=%s",
+                    export_reason,
+                    tpo_export_min_age_sec,
+                    existing_tpo_summary,
                 )
+
+                tpo_export_summary = run_tpo_exporter_once(
+                    sequence_id=sequence_id,
+                    timeout_sec=tpo_export_timeout_sec,
+                )
+                tpo_failed = tpo_export_summary.get("status") != "ok"
+
+                if tpo_failed:
+                    sequence_logger.error(
+                        "TPO export failed before groups. tpo_export_required=%s summary=%s",
+                        tpo_export_required,
+                        tpo_export_summary,
+                    )
+
+                    if tpo_export_required:
+                        skip_groups = True
+                        sequence_logger.error(
+                            "Skipping live groups because TPO export is required and failed."
+                        )
+                else:
+                    sequence_logger.info(
+                        "TPO export OK before groups. summary=%s",
+                        tpo_export_summary,
+                    )
         elif not enable_tpo_export_before_groups:
             sequence_logger.warning(
                 "TPO export before groups is disabled. Live worker will rely on existing store."
