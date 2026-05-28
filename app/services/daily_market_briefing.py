@@ -29,7 +29,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.4-ukrainian-operational-brief"
+BRIEFING_VERSION = "daily-market-briefing-v1.5-ukrainian-operational-observe"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -1127,30 +1127,43 @@ def _brief_verdict(sym: str, data: dict[str, Any]) -> tuple[str, str]:
     battle_hint = data["battle_hint"]
     zone = _compact_zone_text(data.get("primary_zone"))
 
+    # NO TRADE is reserved only for real blockers: stale/closed/no data/provider error/downshift/block.
     if data.get("fallback") or market_status in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"} or permission in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"}:
         return "NO_TRADE", f"• {sym} — {market_status}"
 
     if market_status.startswith("MARKET_CLOSED") or permission == "MARKET_CLOSED":
         return "NO_TRADE", f"• {sym} — MARKET_CLOSED"
 
-    if modifier == "DOWNGRADE":
-        reason = open_behavior if open_behavior not in {"UNKNOWN", "-"} else "DOWNGRADE"
+    if modifier == "DOWNGRADE" or permission in {"BLOCKED_BY_CONTEXT", "BLOCKED_BY_AUCTION"} or battle_hint in {"DOWNGRADE_NO_DIRECTIONAL_BATTLE", "BLOCK"}:
+        reason = open_behavior if open_behavior not in {"UNKNOWN", "-"} else (permission if permission not in {"UNKNOWN", "-"} else "DOWNGRADE")
         return "NO_TRADE", f"• {sym} — {reason} + DOWNGRADE"
 
+    # WATCH means there is a behavior candidate, but still no entry without 5m–15m confirmation.
     if open_behavior in {"OPEN_DRIVE", "OPEN_TEST_DRIVE"}:
         detail = "чекати LTF model"
         if zone != "-":
-            detail = f"{zone} | чекати LTF model"
+            detail = f"зона: {zone} | чекати LTF model"
         return "WATCH", f"• {sym} — {open_behavior} | {detail}"
 
     if open_behavior == "OPEN_REJECTION_REVERSE":
-        return "WATCH", f"• {sym} — OPEN_REJECTION_REVERSE | тільки research до чистої LTF-моделі"
+        detail = "тільки research до чистої LTF-моделі"
+        if zone != "-":
+            detail = f"зона: {zone} | {detail}"
+        return "WATCH", f"• {sym} — OPEN_REJECTION_REVERSE | {detail}"
 
-    if open_behavior in {"OPEN_AUCTION", "UNCONFIRMED", "UNKNOWN"}:
-        return "NO_TRADE", f"• {sym} — {open_behavior}"
+    # OPEN_AUCTION without DOWNGRADE is not a full no-trade state.
+    # It means observe rotations only; no directional battle.
+    if open_behavior == "OPEN_AUCTION":
+        detail = "тільки ротації"
+        if zone != "-":
+            detail = f"зона: {zone} | тільки ротації"
+        return "OBSERVE", f"• {sym} — OPEN_AUCTION | {detail}"
 
-    if entry_hint in {"NO_ENTRY_MODEL", "NO_DIRECTIONAL_ENTRY_MODEL"} or battle_hint in {"RESEARCH_ONLY", "DOWNGRADE_NO_DIRECTIONAL_BATTLE"}:
-        return "NO_TRADE", f"• {sym} — no directional model"
+    if open_behavior in {"UNCONFIRMED", "UNKNOWN"}:
+        return "OBSERVE", f"• {sym} — {open_behavior} | чекати ясності"
+
+    if entry_hint in {"NO_ENTRY_MODEL", "NO_DIRECTIONAL_ENTRY_MODEL"} or battle_hint in {"RESEARCH_ONLY"}:
+        return "OBSERVE", f"• {sym} — no directional model | спостерігати"
 
     return "WATCH", f"• {sym} — {open_behavior} | чекати LTF confirmation"
 
@@ -1167,6 +1180,7 @@ def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str) -> Briefi
     watch_symbols = list(_symbol_scope_for_report(report_type))
     no_trade: list[str] = []
     watch: list[str] = []
+    observe: list[str] = []
     missing: list[str] = []
 
     for sym in watch_symbols:
@@ -1178,6 +1192,8 @@ def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str) -> Briefi
         bucket, line = _brief_verdict(sym, _brief_symbol_context(item))
         if bucket == "WATCH":
             watch.append(line)
+        elif bucket == "OBSERVE":
+            observe.append(line)
         else:
             no_trade.append(line)
 
@@ -1191,6 +1207,10 @@ def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str) -> Briefi
     else:
         section.lines.append("WATCH: немає чистих кандидатів без LTF confirmation")
 
+    if observe:
+        section.lines.append("OBSERVE:")
+        section.lines.extend(observe[:8])
+
     if missing:
         section.lines.append("DATA MISSING:")
         section.lines.extend(missing[:5])
@@ -1199,7 +1219,7 @@ def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str) -> Briefi
 
 
 def _build_provider_section(tpo: dict[str, Any]) -> BriefingSection:
-    section = BriefingSection("🧯 Проблеми з даними / провайдерами")
+    section = BriefingSection("🧯 Дані")
     errors = tpo.get("errors") if isinstance(tpo, dict) else []
     fallbacks = tpo.get("fallbacks") if isinstance(tpo, dict) else []
     if not isinstance(errors, list):
@@ -1207,23 +1227,28 @@ def _build_provider_section(tpo: dict[str, Any]) -> BriefingSection:
     if not isinstance(fallbacks, list):
         fallbacks = []
 
-    symbols = tpo.get("symbols") if isinstance(tpo, dict) and isinstance(tpo.get("symbols"), dict) else {}
-    section.lines.append(f"TPO-символів: {len(symbols)}")
-    section.lines.append(f"Помилок: {len(errors)}")
-    section.lines.append(f"Fallback-режимів: {len(fallbacks)}")
+    if not errors and not fallbacks:
+        section.lines.append("Критичних проблем з даними немає.")
+        return section
+
+    seen: set[str] = set()
 
     for err in errors[:5]:
-        if isinstance(err, dict):
-            section.lines.append(
-                f"• помилка {err.get('symbol', '-')}: {err.get('error_type', '-')}: {err.get('error', '-')}"
-            )
+        if not isinstance(err, dict):
+            continue
+        sym = str(err.get("symbol") or "-")
+        seen.add(sym)
+        err_type = str(err.get("error_type") or "provider_error")
+        section.lines.append(f"• {sym} — {err_type} → STALE_DATA / fallback / NO TRADE")
+
     for fb in fallbacks[:5]:
-        if isinstance(fb, dict):
-            section.lines.append(
-                f"• fallback {fb.get('symbol', '-')}: {fb.get('reason', fb.get('error_type', '-'))}"
-            )
-    if len(section.lines) == 3 and not errors and not fallbacks:
-        section.lines.append("У latest TPO export немає проблем з провайдерами.")
+        if not isinstance(fb, dict):
+            continue
+        sym = str(fb.get("symbol") or "-")
+        if sym in seen:
+            continue
+        section.lines.append(f"• {sym} — fallback → STALE_DATA / NO TRADE")
+
     return section
 
 
