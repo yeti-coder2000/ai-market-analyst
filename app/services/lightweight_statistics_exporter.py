@@ -20,7 +20,7 @@ BATTLE_PERMISSION_TELEMETRY_PATH = TELEMETRY_DIR / "battle_permission_events.ndj
 SIGNALS_FLAT_JSON_PATH = STATS_DIR / "signals_flat.json"
 DAILY_SUMMARY_PATH = STATS_DIR / "daily_summary.json"
 
-EXPORTER_VERSION = "lightweight-statistics-exporter-v2.1-battle-permission-synthetic-safe"
+EXPORTER_VERSION = "lightweight-statistics-exporter-v2.2-tpo-open-behavior-battle-gate-v2"
 
 
 FINAL_OUTCOMES = {
@@ -388,55 +388,300 @@ def find_battle_event(
 # =============================================================================
 
 
+def as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def append_candidate(candidates: list[dict[str, Any]], value: Any) -> None:
+    if isinstance(value, dict) and value:
+        candidates.append(value)
+
+
+def collect_nested_candidates(item: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Collect likely containers where TPO / auction / Battle Gate fields can live.
+
+    The project evolved over several stages, so older records may store fields at
+    root level, while newer records may store them under metadata, context,
+    filters, alert_payload, auction_context, auction_filters or battle_gate_v2.
+    The exporter must be tolerant and read all known locations.
+    """
+    candidates: list[dict[str, Any]] = []
+    append_candidate(candidates, item)
+
+    metadata = as_dict(item.get("metadata"))
+    context = as_dict(item.get("context"))
+    filters = as_dict(item.get("filters"))
+    alert_payload = as_dict(item.get("alert_payload"))
+    payload = as_dict(item.get("payload"))
+
+    for container in (metadata, context, filters, alert_payload, payload):
+        append_candidate(candidates, container)
+
+    for container in (metadata, context, filters, alert_payload, payload):
+        for key in (
+            "metadata",
+            "context",
+            "filters",
+            "auction_context",
+            "auction_filters",
+            "tpo_context",
+            "tpo_filters",
+            "open_behavior",
+            "open_behavior_context",
+            "battle_gate_v2",
+            "battle_gate",
+            "battle_permission",
+            "signal",
+            "alert",
+        ):
+            append_candidate(candidates, container.get(key))
+
+    # One more shallow pass catches structures such as
+    # metadata.alert_payload.context or payload.metadata.auction_filters.
+    shallow = list(candidates)
+    for container in shallow:
+        for key in (
+            "metadata",
+            "context",
+            "filters",
+            "auction_context",
+            "auction_filters",
+            "tpo_context",
+            "tpo_filters",
+            "open_behavior",
+            "open_behavior_context",
+            "battle_gate_v2",
+            "battle_gate",
+            "battle_permission",
+            "signal",
+            "alert",
+        ):
+            append_candidate(candidates, as_dict(container).get(key))
+
+    # Keep order but remove duplicate dict identities.
+    unique: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for candidate in candidates:
+        marker = id(candidate)
+        if marker not in seen:
+            unique.append(candidate)
+            seen.add(marker)
+
+    return unique
+
+
+def pick_from_candidates(candidates: list[dict[str, Any]], *keys: str) -> Any:
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        for key in keys:
+            value = candidate.get(key)
+            if value not in (None, "", [], {}):
+                return value
+    return None
+
+
+def normalize_zone(zone: Any) -> dict[str, Any]:
+    if not isinstance(zone, dict):
+        return {
+            "zone_type": None,
+            "price": None,
+            "distance": None,
+            "role": None,
+            "reaction": None,
+            "reason": None,
+        }
+
+    return {
+        "zone_type": first_non_empty(zone.get("zone_type"), zone.get("type"), zone.get("name")),
+        "price": safe_float(first_non_empty(zone.get("price"), zone.get("level")), None),
+        "distance": safe_float(zone.get("distance"), None),
+        "role": first_non_empty(zone.get("role"), zone.get("zone_role")),
+        "reaction": first_non_empty(zone.get("reaction"), zone.get("status")),
+        "reason": zone.get("reason"),
+    }
+
+
 def extract_tpo_fields_from_item(item: dict[str, Any]) -> dict[str, Any]:
-    metadata = item.get("metadata")
-    if not isinstance(metadata, dict):
-        metadata = {}
+    candidates = collect_nested_candidates(item)
 
-    auction_context = metadata.get("auction_context")
-    if not isinstance(auction_context, dict):
-        auction_context = {}
-
-    auction_filters = metadata.get("auction_filters")
-    if not isinstance(auction_filters, dict):
-        auction_filters = {}
+    primary_zone_raw = pick_from_candidates(
+        candidates,
+        "primary_interest_zone",
+        "interest_zone",
+        "zone",
+        "reaction_zone",
+        "nearest_npoc",
+        "npoc_zone",
+    )
+    primary_zone = normalize_zone(primary_zone_raw)
 
     return {
         "open_relation": first_non_empty(
-            item.get("open_relation"),
-            item.get("tpo_open_relation"),
-            metadata.get("tpo_open_relation"),
-            auction_context.get("open_relation"),
-            auction_filters.get("open_relation"),
+            pick_from_candidates(
+                candidates,
+                "open_relation",
+                "tpo_open_relation",
+                "open_type",
+                "auction_open_relation",
+            )
         ),
         "auction_bias": first_non_empty(
-            item.get("auction_bias"),
-            item.get("tpo_auction_bias"),
-            metadata.get("tpo_auction_bias"),
-            auction_context.get("auction_bias"),
-            auction_filters.get("auction_bias"),
+            pick_from_candidates(
+                candidates,
+                "auction_bias",
+                "tpo_auction_bias",
+                "auction_type",
+                "open_auction_bias",
+            )
         ),
         "tpo_signal_permission": first_non_empty(
-            item.get("tpo_signal_permission"),
-            metadata.get("tpo_signal_permission"),
-            auction_filters.get("tpo_signal_permission"),
+            pick_from_candidates(
+                candidates,
+                "tpo_signal_permission",
+                "signal_permission",
+                "permission",
+                "auction_signal_permission",
+                "market_permission",
+                "tpo_permission",
+            )
         ),
         "tpo_telegram_modifier": first_non_empty(
-            item.get("tpo_telegram_modifier"),
-            metadata.get("tpo_telegram_modifier"),
-            auction_filters.get("telegram_modifier"),
+            pick_from_candidates(
+                candidates,
+                "tpo_telegram_modifier",
+                "telegram_modifier",
+                "modifier",
+                "auction_modifier",
+                "permission_modifier",
+                "tpo_modifier",
+            )
         ),
         "market_is_open": first_non_empty(
-            item.get("market_is_open"),
-            auction_context.get("market_is_open"),
-            auction_filters.get("market_is_open"),
+            pick_from_candidates(
+                candidates,
+                "market_is_open",
+                "is_market_open",
+                "open",
+            )
         ),
         "market_status": first_non_empty(
-            item.get("market_status"),
-            auction_context.get("market_status"),
-            auction_filters.get("market_status"),
+            pick_from_candidates(
+                candidates,
+                "market_status",
+                "market",
+                "market_state_status",
+            )
+        ),
+        "open_context": first_non_empty(
+            pick_from_candidates(
+                candidates,
+                "open_context",
+                "tpo_open_context",
+                "open_context_type",
+            )
+        ),
+        "open_behavior": first_non_empty(
+            pick_from_candidates(
+                candidates,
+                "open_behavior",
+                "tpo_open_behavior",
+                "open_behavior_type",
+            )
+        ),
+        "open_behavior_confidence": safe_float(
+            pick_from_candidates(
+                candidates,
+                "open_behavior_confidence",
+                "behavior_confidence",
+                "confidence_open_behavior",
+            ),
+            None,
+        ),
+        "entry_model_hint": first_non_empty(
+            pick_from_candidates(
+                candidates,
+                "entry_model_hint",
+                "entry_hint",
+                "tpo_entry_model_hint",
+                "entry_model",
+            )
+        ),
+        "stop_model_hint": first_non_empty(
+            pick_from_candidates(
+                candidates,
+                "stop_model_hint",
+                "stop_hint",
+                "tpo_stop_model_hint",
+                "stop_model",
+            )
+        ),
+        "battle_bias_hint": first_non_empty(
+            pick_from_candidates(
+                candidates,
+                "battle_bias_hint",
+                "battle_hint",
+                "tpo_battle_bias_hint",
+                "battle_mode_hint",
+            )
+        ),
+        "primary_interest_zone": primary_zone_raw if isinstance(primary_zone_raw, dict) else None,
+        "interest_zone_type": primary_zone["zone_type"],
+        "interest_zone_price": primary_zone["price"],
+        "interest_zone_distance": primary_zone["distance"],
+        "interest_zone_role": primary_zone["role"],
+        "interest_zone_reaction": primary_zone["reaction"],
+        "interest_zone_reason": primary_zone["reason"],
+    }
+
+
+def extract_battle_gate_v2_fields_from_item(item: dict[str, Any]) -> dict[str, Any]:
+    candidates = collect_nested_candidates(item)
+
+    return {
+        "battle_gate_v2_decision": first_non_empty(
+            pick_from_candidates(candidates, "battle_gate_v2_decision", "v2_decision", "decision")
+        ),
+        "battle_gate_v2_risk_mode": first_non_empty(
+            pick_from_candidates(candidates, "battle_gate_v2_risk_mode", "v2_risk_mode", "risk_mode")
+        ),
+        "battle_gate_v2_battle_allowed": safe_optional_bool(
+            pick_from_candidates(candidates, "battle_gate_v2_battle_allowed", "v2_battle_allowed", "battle_allowed")
+        ),
+        "battle_gate_v2_should_suppress_telegram": safe_optional_bool(
+            pick_from_candidates(
+                candidates,
+                "battle_gate_v2_should_suppress_telegram",
+                "v2_should_suppress_telegram",
+                "should_suppress_telegram",
+            )
+        ),
+        "battle_gate_v2_score_delta": safe_float(
+            pick_from_candidates(candidates, "battle_gate_v2_score_delta", "v2_score_delta", "score_delta"),
+            None,
+        ),
+        "battle_gate_v2_reasons": normalize_list(
+            pick_from_candidates(candidates, "battle_gate_v2_reasons", "v2_reasons", "reasons")
+        ),
+        "battle_gate_v2_blockers": normalize_list(
+            pick_from_candidates(candidates, "battle_gate_v2_blockers", "v2_blockers", "blockers")
+        ),
+        "battle_gate_v2_modifiers": normalize_list(
+            pick_from_candidates(candidates, "battle_gate_v2_modifiers", "v2_modifiers", "modifiers")
+        ),
+        "battle_gate_v2_error": first_non_empty(
+            pick_from_candidates(candidates, "battle_gate_v2_error", "v2_error", "error")
         ),
     }
+
+
+def merge_prefer_primary(primary: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(fallback)
+    for key, value in primary.items():
+        if value not in (None, "", [], {}):
+            merged[key] = value
+    return merged
 
 
 def extract_battle_fields(
@@ -449,17 +694,52 @@ def extract_battle_fields(
     - If a battle telemetry event exists, use it as source of truth.
     - If no battle event exists, classify the signal as PRE_BATTLE_GATE / LEGACY.
       This prevents mixing old Telegram alerts with the new Battle Gate era.
+    - TPO/Open Behavior/Battle Gate v2 fields are extracted from both the signal
+      record and the telemetry event with broad backward-compatible aliases.
     """
     tpo_fields = extract_tpo_fields_from_item(item)
+    v2_fields = extract_battle_gate_v2_fields_from_item(item)
 
     if isinstance(battle_event, dict):
-        blockers = normalize_list(battle_event.get("battle_permission_blockers"))
-        reasons = normalize_list(battle_event.get("battle_permission_reasons"))
-        modifiers = normalize_list(battle_event.get("battle_permission_modifiers"))
+        event_tpo_fields = extract_tpo_fields_from_item(battle_event)
+        event_v2_fields = extract_battle_gate_v2_fields_from_item(battle_event)
+
+        tpo_fields = merge_prefer_primary(event_tpo_fields, tpo_fields)
+        v2_fields = merge_prefer_primary(event_v2_fields, v2_fields)
+
+        blockers = normalize_list(
+            first_non_empty(
+                battle_event.get("battle_permission_blockers"),
+                battle_event.get("blockers"),
+                v2_fields.get("battle_gate_v2_blockers"),
+            )
+        )
+        reasons = normalize_list(
+            first_non_empty(
+                battle_event.get("battle_permission_reasons"),
+                battle_event.get("reasons"),
+                v2_fields.get("battle_gate_v2_reasons"),
+            )
+        )
+        modifiers = normalize_list(
+            first_non_empty(
+                battle_event.get("battle_permission_modifiers"),
+                battle_event.get("modifiers"),
+                v2_fields.get("battle_gate_v2_modifiers"),
+            )
+        )
 
         return {
-            "battle_permission": battle_event.get("battle_permission") or "UNKNOWN",
-            "telegram_delivery_mode": battle_event.get("telegram_delivery_mode") or "UNKNOWN",
+            "battle_permission": first_non_empty(
+                battle_event.get("battle_permission"),
+                battle_event.get("permission"),
+                "UNKNOWN",
+            ),
+            "telegram_delivery_mode": first_non_empty(
+                battle_event.get("telegram_delivery_mode"),
+                battle_event.get("delivery_mode"),
+                "UNKNOWN",
+            ),
             "battle_ready": safe_optional_bool(battle_event.get("battle_ready")),
             "sent_to_telegram": safe_optional_bool(battle_event.get("sent_to_telegram")),
             "auction_context_score": safe_float(battle_event.get("auction_context_score"), None),
@@ -469,18 +749,8 @@ def extract_battle_fields(
             "battle_permission_event_found": True,
             "battle_permission_event_ts_utc": battle_event.get("ts_utc"),
             "battle_permission_source": battle_event.get("source") or "battle_permission_telemetry",
-            "open_relation": first_non_empty(battle_event.get("open_relation"), tpo_fields.get("open_relation")),
-            "auction_bias": first_non_empty(battle_event.get("auction_bias"), tpo_fields.get("auction_bias")),
-            "tpo_signal_permission": first_non_empty(
-                battle_event.get("tpo_signal_permission"),
-                tpo_fields.get("tpo_signal_permission"),
-            ),
-            "tpo_telegram_modifier": first_non_empty(
-                battle_event.get("tpo_telegram_modifier"),
-                tpo_fields.get("tpo_telegram_modifier"),
-            ),
-            "market_is_open": first_non_empty(battle_event.get("market_is_open"), tpo_fields.get("market_is_open")),
-            "market_status": first_non_empty(battle_event.get("market_status"), tpo_fields.get("market_status")),
+            **tpo_fields,
+            **v2_fields,
         }
 
     was_sent = first_non_empty(
@@ -501,14 +771,9 @@ def extract_battle_fields(
         "battle_permission_event_found": False,
         "battle_permission_event_ts_utc": None,
         "battle_permission_source": "legacy_no_battle_telemetry",
-        "open_relation": tpo_fields.get("open_relation"),
-        "auction_bias": tpo_fields.get("auction_bias"),
-        "tpo_signal_permission": tpo_fields.get("tpo_signal_permission"),
-        "tpo_telegram_modifier": tpo_fields.get("tpo_telegram_modifier"),
-        "market_is_open": tpo_fields.get("market_is_open"),
-        "market_status": tpo_fields.get("market_status"),
+        **tpo_fields,
+        **v2_fields,
     }
-
 
 # =============================================================================
 # Flat records
@@ -563,7 +828,7 @@ def normalize_flat_signal(
     battle_fields = extract_battle_fields(item, battle_event)
 
     flat = {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "exporter_version": EXPORTER_VERSION,
         "signal_id": signal_id,
         "alert_id": item.get("alert_id"),
@@ -657,6 +922,28 @@ def normalize_flat_signal(
         "tpo_telegram_modifier": battle_fields["tpo_telegram_modifier"],
         "market_is_open": battle_fields["market_is_open"],
         "market_status": battle_fields["market_status"],
+        "open_context": battle_fields["open_context"],
+        "open_behavior": battle_fields["open_behavior"],
+        "open_behavior_confidence": battle_fields["open_behavior_confidence"],
+        "entry_model_hint": battle_fields["entry_model_hint"],
+        "stop_model_hint": battle_fields["stop_model_hint"],
+        "battle_bias_hint": battle_fields["battle_bias_hint"],
+        "primary_interest_zone": battle_fields["primary_interest_zone"],
+        "interest_zone_type": battle_fields["interest_zone_type"],
+        "interest_zone_price": battle_fields["interest_zone_price"],
+        "interest_zone_distance": battle_fields["interest_zone_distance"],
+        "interest_zone_role": battle_fields["interest_zone_role"],
+        "interest_zone_reaction": battle_fields["interest_zone_reaction"],
+        "interest_zone_reason": battle_fields["interest_zone_reason"],
+        "battle_gate_v2_decision": battle_fields["battle_gate_v2_decision"],
+        "battle_gate_v2_risk_mode": battle_fields["battle_gate_v2_risk_mode"],
+        "battle_gate_v2_battle_allowed": battle_fields["battle_gate_v2_battle_allowed"],
+        "battle_gate_v2_should_suppress_telegram": battle_fields["battle_gate_v2_should_suppress_telegram"],
+        "battle_gate_v2_score_delta": battle_fields["battle_gate_v2_score_delta"],
+        "battle_gate_v2_reasons": battle_fields["battle_gate_v2_reasons"],
+        "battle_gate_v2_blockers": battle_fields["battle_gate_v2_blockers"],
+        "battle_gate_v2_modifiers": battle_fields["battle_gate_v2_modifiers"],
+        "battle_gate_v2_error": battle_fields["battle_gate_v2_error"],
         "updated_at_utc": utc_now_iso(),
     }
 
@@ -858,6 +1145,22 @@ def build_daily_summary(flat: list[dict[str, Any]]) -> dict[str, Any]:
         "by_tpo_signal_permission": grouped_metrics(production, "tpo_signal_permission"),
         "by_tpo_telegram_modifier": grouped_metrics(production, "tpo_telegram_modifier"),
         "by_market_status": grouped_metrics(production, "market_status"),
+        "by_open_context": grouped_metrics(production, "open_context"),
+        "by_open_behavior": grouped_metrics(production, "open_behavior"),
+        "by_entry_model_hint": grouped_metrics(production, "entry_model_hint"),
+        "by_stop_model_hint": grouped_metrics(production, "stop_model_hint"),
+        "by_battle_bias_hint": grouped_metrics(production, "battle_bias_hint"),
+        "by_interest_zone_type": grouped_metrics(production, "interest_zone_type"),
+        "by_interest_zone_role": grouped_metrics(production, "interest_zone_role"),
+        "by_battle_gate_v2_decision": grouped_metrics(production, "battle_gate_v2_decision"),
+        "by_battle_gate_v2_risk_mode": grouped_metrics(production, "battle_gate_v2_risk_mode"),
+        "by_battle_gate_v2_battle_allowed": grouped_metrics(production, "battle_gate_v2_battle_allowed"),
+        "by_battle_gate_v2_should_suppress_telegram": grouped_metrics(
+            production,
+            "battle_gate_v2_should_suppress_telegram",
+        ),
+        "by_battle_gate_v2_blocker": grouped_metrics_by_list(production, "battle_gate_v2_blockers"),
+        "by_battle_gate_v2_modifier": grouped_metrics_by_list(production, "battle_gate_v2_modifiers"),
     }
 
 
@@ -888,6 +1191,14 @@ def export_lightweight_statistics() -> dict[str, Any]:
             "by_battle_permission_blocker": summary.get("by_battle_permission_blocker", {}),
             "by_tracking_scope": summary.get("by_tracking_scope", {}),
             "by_tracking_scope_all_records": summary.get("by_tracking_scope_all_records", {}),
+            "by_open_context": summary.get("by_open_context", {}),
+            "by_open_behavior": summary.get("by_open_behavior", {}),
+            "by_entry_model_hint": summary.get("by_entry_model_hint", {}),
+            "by_stop_model_hint": summary.get("by_stop_model_hint", {}),
+            "by_battle_gate_v2_decision": summary.get("by_battle_gate_v2_decision", {}),
+            "by_battle_gate_v2_risk_mode": summary.get("by_battle_gate_v2_risk_mode", {}),
+            "by_battle_gate_v2_battle_allowed": summary.get("by_battle_gate_v2_battle_allowed", {}),
+            "by_battle_gate_v2_blocker": summary.get("by_battle_gate_v2_blocker", {}),
         },
     }
 
