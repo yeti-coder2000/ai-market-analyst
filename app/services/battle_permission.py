@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+import json
+import os
+from pathlib import Path
 from typing import Any
 
 try:
@@ -10,7 +13,7 @@ except Exception:  # pragma: no cover
     evaluate_open_behavior_policy = None  # type: ignore[assignment]
 
 
-BATTLE_PERMISSION_VERSION = "battle-permission-v1.1-v2-shadow-open-behavior"
+BATTLE_PERMISSION_VERSION = "battle-permission-v1.2-tpo-open-behavior-v2-telemetry"
 
 
 class BattlePermission(str, Enum):
@@ -50,6 +53,18 @@ class BattlePermissionResult:
     tpo_telegram_modifier: str | None = None
     open_relation: str | None = None
     auction_bias: str | None = None
+
+    # TPO/open-behavior context fields.
+    open_context: str | None = None
+    open_behavior: str | None = None
+    open_behavior_confidence: float | None = None
+    entry_model_hint: str | None = None
+    stop_model_hint: str | None = None
+    battle_bias_hint: str | None = None
+    primary_interest_zone: dict[str, Any] | None = None
+    interest_zone_type: str | None = None
+    interest_zone_price: float | None = None
+    interest_zone_role: str | None = None
 
     direction: str | None = None
     htf_bias: str | None = None
@@ -191,6 +206,289 @@ def _extract_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+_TPO_STORE_CACHE: dict[str, Any] = {
+    "path": None,
+    "mtime": None,
+    "data": None,
+}
+
+
+def _first_non_empty(*values: Any) -> Any:
+    for value in values:
+        if value not in (None, "", [], {}):
+            return value
+    return None
+
+
+def _set_if_missing(target: dict[str, Any], key: str, value: Any) -> None:
+    if value in (None, "", [], {}):
+        return
+    if target.get(key) in (None, "", [], {}):
+        target[key] = value
+
+
+def _resolve_tpo_store_path() -> Path:
+    """
+    Resolve TPO store path without requiring settings import.
+
+    Priority:
+    1. TPO_STORE_PATH env.
+    2. RUNTIME_DIR env + /tpo/tpo_latest.json.
+    3. /var/data/runtime/tpo/tpo_latest.json on Render.
+    4. runtime/tpo/tpo_latest.json locally.
+    """
+    explicit = os.getenv("TPO_STORE_PATH")
+    if explicit:
+        return Path(explicit)
+
+    runtime_dir = os.getenv("RUNTIME_DIR")
+    if runtime_dir:
+        return Path(runtime_dir) / "tpo" / "tpo_latest.json"
+
+    render_path = Path("/var/data/runtime/tpo/tpo_latest.json")
+    if render_path.exists():
+        return render_path
+
+    return Path("runtime/tpo/tpo_latest.json")
+
+
+def _load_tpo_store() -> dict[str, Any] | None:
+    """
+    Load tpo_latest.json with mtime cache.
+
+    The store is small enough to read when changed, but this avoids parsing it
+    for every signal during a busy cycle.
+    """
+    path = _resolve_tpo_store_path()
+
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+
+    cached_path = _TPO_STORE_CACHE.get("path")
+    cached_mtime = _TPO_STORE_CACHE.get("mtime")
+
+    if cached_path == str(path) and cached_mtime == stat.st_mtime:
+        data = _TPO_STORE_CACHE.get("data")
+        return data if isinstance(data, dict) else None
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+
+    if not isinstance(data, dict):
+        return None
+
+    _TPO_STORE_CACHE["path"] = str(path)
+    _TPO_STORE_CACHE["mtime"] = stat.st_mtime
+    _TPO_STORE_CACHE["data"] = data
+    return data
+
+
+def _extract_primary_interest_zone(*sources: Any) -> dict[str, Any] | None:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+
+        zone = source.get("primary_interest_zone")
+        if isinstance(zone, dict) and zone:
+            return dict(zone)
+
+        zone = source.get("interest_zone")
+        if isinstance(zone, dict) and zone:
+            return dict(zone)
+
+    return None
+
+
+def _get_symbol_tpo_record(symbol: str | None) -> dict[str, Any] | None:
+    if not symbol:
+        return None
+
+    store = _load_tpo_store()
+    if not isinstance(store, dict):
+        return None
+
+    symbols = store.get("symbols")
+    if not isinstance(symbols, dict):
+        return None
+
+    exact = symbols.get(symbol)
+    if isinstance(exact, dict):
+        return exact
+
+    upper_symbol = str(symbol).upper()
+    for key, value in symbols.items():
+        if str(key).upper() == upper_symbol and isinstance(value, dict):
+            return value
+
+    return None
+
+
+def _enrich_payload_with_tpo_store(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Attach TPO/open-behavior fields from tpo_latest.json when the signal payload
+    does not already contain them.
+
+    This is intentionally defensive:
+    - it never fails the gate if the store is missing/bad;
+    - it does not overwrite already-present signal fields;
+    - it keeps Battle Gate v2 in shadow mode but makes its inputs visible to
+      payload/metadata/telemetry/statistics.
+    """
+    enriched = dict(payload)
+
+    metadata = enriched.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    else:
+        metadata = dict(metadata)
+
+    symbol = _deep_get(
+        enriched,
+        "symbol",
+        "instrument",
+        "metadata.symbol",
+        "metadata.instrument",
+    )
+    symbol = str(symbol).upper() if symbol not in (None, "", [], {}) else None
+
+    record = _get_symbol_tpo_record(symbol)
+    if not isinstance(record, dict):
+        enriched["metadata"] = metadata
+        return enriched
+
+    context = record.get("context")
+    if not isinstance(context, dict):
+        context = {}
+
+    filters = record.get("filters")
+    if not isinstance(filters, dict):
+        filters = {}
+
+    open_behavior_record = record.get("open_behavior")
+    if not isinstance(open_behavior_record, dict):
+        open_behavior_record = {}
+
+    primary_zone = _extract_primary_interest_zone(open_behavior_record, context, filters, record)
+
+    values = {
+        "market_status": _first_non_empty(
+            context.get("market_status"),
+            filters.get("market_status"),
+            record.get("market_status"),
+        ),
+        "market_is_open": _first_non_empty(
+            context.get("market_is_open"),
+            filters.get("market_is_open"),
+            record.get("market_is_open"),
+        ),
+        "tpo_signal_permission": _first_non_empty(
+            context.get("tpo_signal_permission"),
+            filters.get("tpo_signal_permission"),
+            filters.get("signal_permission"),
+            record.get("tpo_signal_permission"),
+            record.get("signal_permission"),
+        ),
+        "tpo_telegram_modifier": _first_non_empty(
+            context.get("tpo_telegram_modifier"),
+            filters.get("tpo_telegram_modifier"),
+            filters.get("telegram_modifier"),
+            record.get("tpo_telegram_modifier"),
+            record.get("telegram_modifier"),
+        ),
+        "telegram_modifier": _first_non_empty(
+            filters.get("telegram_modifier"),
+            context.get("telegram_modifier"),
+            record.get("telegram_modifier"),
+        ),
+        "open_relation": _first_non_empty(
+            context.get("open_relation"),
+            filters.get("open_relation"),
+            record.get("open_relation"),
+        ),
+        "auction_bias": _first_non_empty(
+            context.get("auction_bias"),
+            filters.get("auction_bias"),
+            record.get("auction_bias"),
+        ),
+        "open_context": _first_non_empty(
+            context.get("open_context"),
+            open_behavior_record.get("open_context"),
+            record.get("open_context"),
+        ),
+        "open_behavior": _first_non_empty(
+            context.get("open_behavior"),
+            open_behavior_record.get("open_behavior"),
+            record.get("open_behavior") if not isinstance(record.get("open_behavior"), dict) else None,
+        ),
+        "open_behavior_confidence": _first_non_empty(
+            context.get("open_behavior_confidence"),
+            open_behavior_record.get("open_behavior_confidence"),
+            open_behavior_record.get("confidence"),
+            record.get("open_behavior_confidence"),
+        ),
+        "entry_model_hint": _first_non_empty(
+            context.get("entry_model_hint"),
+            open_behavior_record.get("entry_model_hint"),
+            record.get("entry_model_hint"),
+        ),
+        "stop_model_hint": _first_non_empty(
+            context.get("stop_model_hint"),
+            open_behavior_record.get("stop_model_hint"),
+            record.get("stop_model_hint"),
+        ),
+        "battle_bias_hint": _first_non_empty(
+            context.get("battle_bias_hint"),
+            open_behavior_record.get("battle_bias_hint"),
+            record.get("battle_bias_hint"),
+        ),
+        "nearest_npoc_distance": _first_non_empty(
+            context.get("nearest_npoc_distance"),
+            filters.get("nearest_npoc_distance"),
+            record.get("nearest_npoc_distance"),
+        ),
+        "ib_extension_up_pct": _first_non_empty(
+            context.get("ib_extension_up_pct"),
+            filters.get("ib_extension_up_pct"),
+            record.get("ib_extension_up_pct"),
+        ),
+        "ib_extension_down_pct": _first_non_empty(
+            context.get("ib_extension_down_pct"),
+            filters.get("ib_extension_down_pct"),
+            record.get("ib_extension_down_pct"),
+        ),
+        "accepted_back_inside_value": _first_non_empty(
+            context.get("accepted_back_inside_value"),
+            filters.get("accepted_back_inside_value"),
+            record.get("accepted_back_inside_value"),
+        ),
+    }
+
+    for key, value in values.items():
+        _set_if_missing(enriched, key, value)
+        _set_if_missing(metadata, key, value)
+
+    if primary_zone:
+        _set_if_missing(enriched, "primary_interest_zone", primary_zone)
+        _set_if_missing(metadata, "primary_interest_zone", primary_zone)
+
+        _set_if_missing(enriched, "interest_zone_type", primary_zone.get("zone_type"))
+        _set_if_missing(metadata, "interest_zone_type", primary_zone.get("zone_type"))
+
+        _set_if_missing(enriched, "interest_zone_price", primary_zone.get("price"))
+        _set_if_missing(metadata, "interest_zone_price", primary_zone.get("price"))
+
+        _set_if_missing(enriched, "interest_zone_role", primary_zone.get("role"))
+        _set_if_missing(metadata, "interest_zone_role", primary_zone.get("role"))
+
+    enriched["metadata"] = metadata
+    return enriched
+
+
+
 def _evaluate_v2_shadow(payload: dict[str, Any]) -> dict[str, Any]:
     """
     Evaluate Battle Gate v2 policy in shadow mode.
@@ -228,7 +526,7 @@ def _evaluate_v2_shadow(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
-    payload = _extract_payload(raw_payload)
+    payload = _enrich_payload_with_tpo_store(_extract_payload(raw_payload))
 
     market_is_open = _as_bool(
         _deep_get(
@@ -256,9 +554,19 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
         _deep_get(
             payload,
             "metadata.tpo_signal_permission",
+            "metadata.signal_permission",
             "metadata.auction_filters.tpo_signal_permission",
+            "metadata.auction_filters.signal_permission",
+            "metadata.filters.tpo_signal_permission",
+            "metadata.filters.signal_permission",
+            "filters.tpo_signal_permission",
+            "filters.signal_permission",
+            "context.tpo_signal_permission",
+            "context.signal_permission",
             "auction_filters.tpo_signal_permission",
+            "auction_filters.signal_permission",
             "tpo_signal_permission",
+            "signal_permission",
         )
     )
 
@@ -266,8 +574,15 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
         _deep_get(
             payload,
             "metadata.tpo_telegram_modifier",
+            "metadata.telegram_modifier",
             "metadata.auction_filters.telegram_modifier",
             "metadata.auction_filters.tpo_telegram_modifier",
+            "metadata.filters.telegram_modifier",
+            "metadata.filters.tpo_telegram_modifier",
+            "filters.telegram_modifier",
+            "filters.tpo_telegram_modifier",
+            "context.telegram_modifier",
+            "context.tpo_telegram_modifier",
             "auction_filters.telegram_modifier",
             "auction_filters.tpo_telegram_modifier",
             "telegram_modifier",
@@ -279,8 +594,13 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
         _deep_get(
             payload,
             "metadata.tpo_open_relation",
+            "metadata.open_relation",
             "metadata.auction_context.open_relation",
             "metadata.auction_filters.open_relation",
+            "metadata.context.open_relation",
+            "metadata.filters.open_relation",
+            "context.open_relation",
+            "filters.open_relation",
             "auction_context.open_relation",
             "auction_filters.open_relation",
             "open_relation",
@@ -291,11 +611,136 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
         _deep_get(
             payload,
             "metadata.tpo_auction_bias",
+            "metadata.auction_bias",
             "metadata.auction_context.auction_bias",
             "metadata.auction_filters.auction_bias",
+            "metadata.context.auction_bias",
+            "metadata.filters.auction_bias",
+            "context.auction_bias",
+            "filters.auction_bias",
             "auction_context.auction_bias",
             "auction_filters.auction_bias",
             "auction_bias",
+        )
+    )
+
+    open_context = _as_upper(
+        _deep_get(
+            payload,
+            "metadata.open_context",
+            "metadata.context.open_context",
+            "metadata.open_behavior.open_context",
+            "context.open_context",
+            "open_behavior.open_context",
+            "open_context",
+        )
+    )
+
+    open_behavior = _as_upper(
+        _deep_get(
+            payload,
+            "metadata.open_behavior",
+            "metadata.context.open_behavior",
+            "metadata.open_behavior.open_behavior",
+            "context.open_behavior",
+            "open_behavior.open_behavior",
+            "open_behavior",
+        )
+    )
+
+    open_behavior_confidence = _as_float(
+        _deep_get(
+            payload,
+            "metadata.open_behavior_confidence",
+            "metadata.context.open_behavior_confidence",
+            "metadata.open_behavior.open_behavior_confidence",
+            "metadata.open_behavior.confidence",
+            "context.open_behavior_confidence",
+            "open_behavior.open_behavior_confidence",
+            "open_behavior.confidence",
+            "open_behavior_confidence",
+        )
+    )
+
+    entry_model_hint = _as_upper(
+        _deep_get(
+            payload,
+            "metadata.entry_model_hint",
+            "metadata.context.entry_model_hint",
+            "metadata.open_behavior.entry_model_hint",
+            "context.entry_model_hint",
+            "open_behavior.entry_model_hint",
+            "entry_model_hint",
+        )
+    )
+
+    stop_model_hint = _as_upper(
+        _deep_get(
+            payload,
+            "metadata.stop_model_hint",
+            "metadata.context.stop_model_hint",
+            "metadata.open_behavior.stop_model_hint",
+            "context.stop_model_hint",
+            "open_behavior.stop_model_hint",
+            "stop_model_hint",
+        )
+    )
+
+    battle_bias_hint = _as_upper(
+        _deep_get(
+            payload,
+            "metadata.battle_bias_hint",
+            "metadata.context.battle_bias_hint",
+            "metadata.open_behavior.battle_bias_hint",
+            "context.battle_bias_hint",
+            "open_behavior.battle_bias_hint",
+            "battle_bias_hint",
+        )
+    )
+
+    primary_interest_zone = _deep_get(
+        payload,
+        "metadata.primary_interest_zone",
+        "metadata.open_behavior.primary_interest_zone",
+        "open_behavior.primary_interest_zone",
+        "primary_interest_zone",
+    )
+    if not isinstance(primary_interest_zone, dict):
+        primary_interest_zone = None
+
+    interest_zone_type = _as_upper(
+        _deep_get(
+            payload,
+            "metadata.interest_zone_type",
+            "metadata.primary_interest_zone.zone_type",
+            "metadata.open_behavior.primary_interest_zone.zone_type",
+            "open_behavior.primary_interest_zone.zone_type",
+            "primary_interest_zone.zone_type",
+            "interest_zone_type",
+        )
+    )
+
+    interest_zone_price = _as_float(
+        _deep_get(
+            payload,
+            "metadata.interest_zone_price",
+            "metadata.primary_interest_zone.price",
+            "metadata.open_behavior.primary_interest_zone.price",
+            "open_behavior.primary_interest_zone.price",
+            "primary_interest_zone.price",
+            "interest_zone_price",
+        )
+    )
+
+    interest_zone_role = _as_upper(
+        _deep_get(
+            payload,
+            "metadata.interest_zone_role",
+            "metadata.primary_interest_zone.role",
+            "metadata.open_behavior.primary_interest_zone.role",
+            "open_behavior.primary_interest_zone.role",
+            "primary_interest_zone.role",
+            "interest_zone_role",
         )
     )
 
@@ -437,6 +882,16 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
         "tpo_telegram_modifier": tpo_telegram_modifier,
         "open_relation": open_relation,
         "auction_bias": auction_bias,
+        "open_context": open_context,
+        "open_behavior": open_behavior,
+        "open_behavior_confidence": open_behavior_confidence,
+        "entry_model_hint": entry_model_hint,
+        "stop_model_hint": stop_model_hint,
+        "battle_bias_hint": battle_bias_hint,
+        "primary_interest_zone": primary_interest_zone,
+        "interest_zone_type": interest_zone_type,
+        "interest_zone_price": interest_zone_price,
+        "interest_zone_role": interest_zone_role,
         "direction": direction,
         "htf_bias": htf_bias,
         "signal_alignment": signal_alignment,
@@ -531,6 +986,16 @@ def _build_result(
         tpo_telegram_modifier=inputs.get("tpo_telegram_modifier"),
         open_relation=inputs.get("open_relation"),
         auction_bias=inputs.get("auction_bias"),
+        open_context=inputs.get("open_context"),
+        open_behavior=inputs.get("open_behavior"),
+        open_behavior_confidence=inputs.get("open_behavior_confidence"),
+        entry_model_hint=inputs.get("entry_model_hint"),
+        stop_model_hint=inputs.get("stop_model_hint"),
+        battle_bias_hint=inputs.get("battle_bias_hint"),
+        primary_interest_zone=inputs.get("primary_interest_zone"),
+        interest_zone_type=inputs.get("interest_zone_type"),
+        interest_zone_price=inputs.get("interest_zone_price"),
+        interest_zone_role=inputs.get("interest_zone_role"),
         direction=inputs.get("direction"),
         htf_bias=inputs.get("htf_bias"),
         signal_alignment=inputs.get("signal_alignment"),
@@ -779,6 +1244,29 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
     )
 
 
+
+def _attach_tpo_open_behavior_fields_to_metadata(metadata: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    metadata["market_is_open"] = result.get("market_is_open")
+    metadata["market_status"] = result.get("market_status")
+    metadata["tpo_signal_permission"] = result.get("tpo_signal_permission")
+    metadata["tpo_telegram_modifier"] = result.get("tpo_telegram_modifier")
+    metadata["open_relation"] = result.get("open_relation")
+    metadata["auction_bias"] = result.get("auction_bias")
+
+    metadata["open_context"] = result.get("open_context")
+    metadata["open_behavior"] = result.get("open_behavior")
+    metadata["open_behavior_confidence"] = result.get("open_behavior_confidence")
+    metadata["entry_model_hint"] = result.get("entry_model_hint")
+    metadata["stop_model_hint"] = result.get("stop_model_hint")
+    metadata["battle_bias_hint"] = result.get("battle_bias_hint")
+    metadata["primary_interest_zone"] = result.get("primary_interest_zone")
+    metadata["interest_zone_type"] = result.get("interest_zone_type")
+    metadata["interest_zone_price"] = result.get("interest_zone_price")
+    metadata["interest_zone_role"] = result.get("interest_zone_role")
+
+    return metadata
+
+
 def _attach_v2_shadow_fields_to_metadata(metadata: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
     metadata["battle_gate_v2_decision"] = result.get("battle_gate_v2_decision")
     metadata["battle_gate_v2_risk_mode"] = result.get("battle_gate_v2_risk_mode")
@@ -817,6 +1305,7 @@ def apply_battle_permission(raw_payload: dict[str, Any]) -> dict[str, Any]:
     metadata["battle_permission_modifiers"] = result["modifiers"]
     metadata["battle_permission_version"] = BATTLE_PERMISSION_VERSION
 
+    metadata = _attach_tpo_open_behavior_fields_to_metadata(metadata, result)
     metadata = _attach_v2_shadow_fields_to_metadata(metadata, result)
 
     payload["metadata"] = metadata
@@ -825,6 +1314,24 @@ def apply_battle_permission(raw_payload: dict[str, Any]) -> dict[str, Any]:
     payload["battle_ready"] = result["battle_ready"]
     payload["auction_context_score"] = result["auction_context_score"]
     payload["battle_permission_version"] = BATTLE_PERMISSION_VERSION
+
+    # Root-level TPO/open-behavior fields are useful for journal, telemetry and flat statistics.
+    payload["market_is_open"] = result.get("market_is_open")
+    payload["market_status"] = result.get("market_status")
+    payload["tpo_signal_permission"] = result.get("tpo_signal_permission")
+    payload["tpo_telegram_modifier"] = result.get("tpo_telegram_modifier")
+    payload["open_relation"] = result.get("open_relation")
+    payload["auction_bias"] = result.get("auction_bias")
+    payload["open_context"] = result.get("open_context")
+    payload["open_behavior"] = result.get("open_behavior")
+    payload["open_behavior_confidence"] = result.get("open_behavior_confidence")
+    payload["entry_model_hint"] = result.get("entry_model_hint")
+    payload["stop_model_hint"] = result.get("stop_model_hint")
+    payload["battle_bias_hint"] = result.get("battle_bias_hint")
+    payload["primary_interest_zone"] = result.get("primary_interest_zone")
+    payload["interest_zone_type"] = result.get("interest_zone_type")
+    payload["interest_zone_price"] = result.get("interest_zone_price")
+    payload["interest_zone_role"] = result.get("interest_zone_role")
 
     # Root-level v2 fields are useful for journal, telemetry and flat statistics.
     payload["battle_gate_v2_decision"] = result.get("battle_gate_v2_decision")
