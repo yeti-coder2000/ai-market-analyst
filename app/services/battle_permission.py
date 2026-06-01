@@ -13,7 +13,7 @@ except Exception:  # pragma: no cover
     evaluate_open_behavior_policy = None  # type: ignore[assignment]
 
 
-BATTLE_PERMISSION_VERSION = "battle-permission-v1.3-v2-neutral-otd-authoritative"
+BATTLE_PERMISSION_VERSION = "battle-permission-v1.4-v2-neutral-otd-bridge-fixed"
 
 
 class BattlePermission(str, Enum):
@@ -206,56 +206,27 @@ def _v2_allows_neutral_open_test_drive_transition(
     """
     Authoritative narrow override for the legacy HTF gate.
 
-    OPEN_TEST_DRIVE with HTF NEUTRAL is a valid transition model:
-    balance/accumulation -> directional distribution.
+    Important implementation detail:
+    battle_permission.extract_battle_inputs() may not always carry raw TPO fields
+    such as open_behavior/open_context from the original payload. Therefore this
+    helper must not re-derive the OPEN_TEST_DRIVE + HTF NEUTRAL context from
+    legacy inputs. Battle Gate v2 already evaluates the raw payload and returns
+    TRANSITION_CANDIDATE only for that exact model.
 
-    This does NOT bypass hard blockers:
-    - market/data/TPO permission blockers are evaluated before this override;
-    - status/execution blockers are evaluated before this override;
-    - RR/stop/quality checks are still evaluated after this override.
-
-    The override only prevents legacy from misclassifying NEUTRAL HTF as HTF conflict.
+    So this bridge trusts the v2 decision, while legacy hard blockers remain
+    enforced elsewhere in apply_battle_permission().
     """
-    open_behavior = _as_upper(inputs.get("open_behavior"))
-    htf_bias = _normalize_direction(inputs.get("htf_bias"))
-    direction = _normalize_direction(inputs.get("direction"))
-    execution_status = _as_upper(inputs.get("execution_status"))
-    practical_rr = _as_float(inputs.get("practical_rr"))
-    stop_quality = _as_upper(inputs.get("stop_quality"))
-
     decision = _as_upper(v2_policy.get("decision"))
     risk_mode = _as_upper(v2_policy.get("risk_mode"))
     battle_allowed = _as_bool(v2_policy.get("battle_allowed"))
+    should_suppress = _as_bool(v2_policy.get("should_suppress_telegram"))
 
-    if open_behavior != "OPEN_TEST_DRIVE":
-        return False
-
-    if not _is_neutral_htf(htf_bias):
-        return False
-
-    if direction not in {"LONG", "SHORT"}:
-        return False
-
-    if decision not in {"ALLOW", "ALLOW_WITH_CAUTION"}:
-        return False
-
-    if battle_allowed is not True:
-        return False
-
-    if risk_mode not in {"TRANSITION_CANDIDATE", "BATTLE_CANDIDATE", "CAUTION_BATTLE_CANDIDATE"}:
-        return False
-
-    if execution_status != "EXECUTABLE":
-        return False
-
-    if practical_rr is None or practical_rr < 2.0:
-        return False
-
-    if not _is_valid_stop_quality_for_battle(stop_quality):
-        return False
-
-    return True
-
+    return (
+        battle_allowed is True
+        and should_suppress is not True
+        and decision in {"ALLOW", "ALLOW_WITH_CAUTION"}
+        and risk_mode == "TRANSITION_CANDIDATE"
+    )
 
 def _extract_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """
