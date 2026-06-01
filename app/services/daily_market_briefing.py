@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.6-finnhub-economic-calendar"
+BRIEFING_VERSION = "daily-market-briefing-v1.7-finnhub-filtered-risk-calendar"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -162,6 +162,10 @@ AFFECTED_SYMBOLS_BY_CURRENCY: dict[str, list[str]] = {
     "AUD": ["AUDUSD", "XAUUSD"],
     "CNY": ["XAUUSD", "AUDUSD", "NAS100", "SPX500", "BTCUSD", "ETHUSD"],
 }
+
+
+RELEVANT_RISK_CURRENCIES: set[str] = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "CNY"}
+UNKNOWN_CURRENCY_VALUES: set[str] = {"", "-", "UNKNOWN", "NONE", "NULL", "N/A"}
 
 HIGH_IMPACT_KEYWORDS: tuple[str, ...] = (
     "NFP",
@@ -1373,14 +1377,71 @@ def _build_market_status_section(tpo: dict[str, Any], report_type: str) -> Brief
     return section
 
 
+
+def _calendar_currency(event: dict[str, Any]) -> str:
+    return str(event.get("currency") or "-").strip().upper()
+
+
+def _calendar_symbols(event: dict[str, Any]) -> list[str]:
+    value = event.get("symbols")
+    if not isinstance(value, list):
+        return []
+    return [str(x).strip().upper() for x in value if str(x).strip()]
+
+
+def _is_unmapped_high_impact_event(event: dict[str, Any]) -> bool:
+    """
+    Some providers return globally tagged HIGH events with no currency and no symbol mapping
+    (for example currency='-' / symbols=[]). Keep them out of the main red-risk block
+    unless explicitly enabled, because they are not actionable for our trading universe.
+    """
+    currency = _calendar_currency(event)
+    symbols = _calendar_symbols(event)
+    if symbols:
+        return False
+    return currency in UNKNOWN_CURRENCY_VALUES
+
+
+def _show_unmapped_high_impact_events() -> bool:
+    return str(os.getenv("ECONOMIC_CALENDAR_SHOW_UNMAPPED_HIGH_IMPACT", "false")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _filter_actionable_high_impact_events(events: list[dict[str, Any]], report_type: str) -> tuple[list[dict[str, Any]], int]:
+    """Return events suitable for the Telegram risk block and number of hidden unmapped events."""
+    actionable: list[dict[str, Any]] = []
+    hidden_unmapped = 0
+    show_unmapped = _show_unmapped_high_impact_events()
+
+    for event in events:
+        if _is_unmapped_high_impact_event(event) and not show_unmapped:
+            hidden_unmapped += 1
+            continue
+
+        # If provider gave a recognized currency but no symbols, try a last-resort mapping here.
+        # This keeps the risk block useful even when provider data is incomplete.
+        currency = _calendar_currency(event)
+        if not _calendar_symbols(event) and currency in RELEVANT_RISK_CURRENCIES:
+            enriched = dict(event)
+            enriched["symbols"] = _affected_symbols(currency, str(event.get("title") or event.get("event") or ""))
+            event = enriched
+
+        actionable.append(event)
+
+    return actionable, hidden_unmapped
+
 def _build_high_impact_section(target_date: date, timezone_name: str, report_type: str) -> BriefingSection:
     calendar = load_high_impact_calendar(target_date)
-    events = calendar.events
+    raw_events = calendar.events
+    events, hidden_unmapped = _filter_actionable_high_impact_events(raw_events, report_type)
     section = BriefingSection("🔴 Ризик дня")
 
     if not events:
         if calendar.status == "EMPTY":
             section.lines.append("HIGH/RED подій за підключеним календарем не знайдено.")
+            section.lines.append(f"Джерело: {calendar.source}.")
+        elif raw_events and hidden_unmapped:
+            section.lines.append("HIGH/RED подій для нашого торгового фокусу не знайдено.")
+            section.lines.append(f"Приховано невизначених provider-подій без валюти/активів: {hidden_unmapped}.")
             section.lines.append(f"Джерело: {calendar.source}.")
         else:
             section.lines.append("Календар high-impact news не завантажений / provider unavailable.")
@@ -1393,6 +1454,9 @@ def _build_high_impact_section(target_date: date, timezone_name: str, report_typ
     if calendar.status == "FALLBACK":
         section.lines.append("⚠️ Основний календар недоступний; використовується static fallback.")
         section.lines.append("Це може бути неповний список подій.")
+
+    if hidden_unmapped:
+        section.lines.append(f"ℹ️ Приховано provider-подій без валюти/активів: {hidden_unmapped}.")
 
     for e in events[:5]:
         local_time = _local_dt_from_event(e, timezone_name)
@@ -1822,4 +1886,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main()
