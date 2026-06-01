@@ -13,7 +13,7 @@ except Exception:  # pragma: no cover
     evaluate_open_behavior_policy = None  # type: ignore[assignment]
 
 
-BATTLE_PERMISSION_VERSION = "battle-permission-v1.2-tpo-open-behavior-v2-telemetry"
+BATTLE_PERMISSION_VERSION = "battle-permission-v1.3-v2-neutral-otd-authoritative"
 
 
 class BattlePermission(str, Enum):
@@ -185,6 +185,76 @@ def _direction_matches_htf(direction: str | None, htf_bias: str | None) -> bool:
     htf_bias = _normalize_direction(htf_bias)
 
     return direction in {"LONG", "SHORT"} and direction == htf_bias
+
+
+def _is_neutral_htf(value: str | None) -> bool:
+    normalized = _normalize_direction(value)
+    return normalized in {None, "", "NEUTRAL", "NONE", "FLAT", "NO_TRADE"}
+
+
+def _is_valid_stop_quality_for_battle(stop_quality: str | None) -> bool:
+    if stop_quality in {None, "", "TIGHT_STOP", "BAD", "WEAK", "NO_STOP", "NONE"}:
+        return False
+    return True
+
+
+def _v2_allows_neutral_open_test_drive_transition(
+    *,
+    inputs: dict[str, Any],
+    v2_policy: dict[str, Any],
+) -> bool:
+    """
+    Authoritative narrow override for the legacy HTF gate.
+
+    OPEN_TEST_DRIVE with HTF NEUTRAL is a valid transition model:
+    balance/accumulation -> directional distribution.
+
+    This does NOT bypass hard blockers:
+    - market/data/TPO permission blockers are evaluated before this override;
+    - status/execution blockers are evaluated before this override;
+    - RR/stop/quality checks are still evaluated after this override.
+
+    The override only prevents legacy from misclassifying NEUTRAL HTF as HTF conflict.
+    """
+    open_behavior = _as_upper(inputs.get("open_behavior"))
+    htf_bias = _normalize_direction(inputs.get("htf_bias"))
+    direction = _normalize_direction(inputs.get("direction"))
+    execution_status = _as_upper(inputs.get("execution_status"))
+    practical_rr = _as_float(inputs.get("practical_rr"))
+    stop_quality = _as_upper(inputs.get("stop_quality"))
+
+    decision = _as_upper(v2_policy.get("decision"))
+    risk_mode = _as_upper(v2_policy.get("risk_mode"))
+    battle_allowed = _as_bool(v2_policy.get("battle_allowed"))
+
+    if open_behavior != "OPEN_TEST_DRIVE":
+        return False
+
+    if not _is_neutral_htf(htf_bias):
+        return False
+
+    if direction not in {"LONG", "SHORT"}:
+        return False
+
+    if decision not in {"ALLOW", "ALLOW_WITH_CAUTION"}:
+        return False
+
+    if battle_allowed is not True:
+        return False
+
+    if risk_mode not in {"TRANSITION_CANDIDATE", "BATTLE_CANDIDATE", "CAUTION_BATTLE_CANDIDATE"}:
+        return False
+
+    if execution_status != "EXECUTABLE":
+        return False
+
+    if practical_rr is None or practical_rr < 2.0:
+        return False
+
+    if not _is_valid_stop_quality_for_battle(stop_quality):
+        return False
+
+    return True
 
 
 def _extract_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1039,6 +1109,18 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
     market_state = inputs.get("market_state")
     scenario = inputs.get("scenario")
 
+    v2_neutral_otd_transition_allowed = _v2_allows_neutral_open_test_drive_transition(
+        inputs=inputs,
+        v2_policy=v2_policy,
+    )
+
+    if v2_neutral_otd_transition_allowed:
+        modifiers.append("v2_neutral_otd_transition_allowed")
+        reasons.append(
+            "Battle Gate v2 allows OPEN_TEST_DRIVE with HTF NEUTRAL as a transition candidate; "
+            "legacy HTF conflict block will not be applied to this case."
+        )
+
     # 1. Absolute market / data blockers.
     if market_is_open is False or market_status in {"MARKET_CLOSED", "MARKET_CLOSED_AND_STALE"}:
         blockers.append("market_closed")
@@ -1128,32 +1210,45 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
 
     # 4. HTF alignment.
     if not _direction_matches_htf(direction, htf_bias):
-        blockers.append("direction_not_aligned_with_htf")
-        return _build_result(
-            inputs=inputs,
-            auction_score=auction_score,
-            reasons=reasons + [f"direction={direction} not aligned with htf_bias={htf_bias}"],
-            blockers=blockers,
-            modifiers=modifiers,
-            battle_permission=BattlePermission.BLOCKED_BY_HTF.value,
-            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
-            battle_ready=False,
-            v2_policy=v2_policy,
-        )
+        if v2_neutral_otd_transition_allowed:
+            modifiers.append("legacy_htf_block_overridden_by_v2_neutral_otd")
+            reasons.append(
+                f"direction={direction} not aligned with htf_bias={htf_bias}, "
+                "but OPEN_TEST_DRIVE + HTF NEUTRAL is treated as a valid transition candidate."
+            )
+        else:
+            blockers.append("direction_not_aligned_with_htf")
+            return _build_result(
+                inputs=inputs,
+                auction_score=auction_score,
+                reasons=reasons + [f"direction={direction} not aligned with htf_bias={htf_bias}"],
+                blockers=blockers,
+                modifiers=modifiers,
+                battle_permission=BattlePermission.BLOCKED_BY_HTF.value,
+                telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+                battle_ready=False,
+                v2_policy=v2_policy,
+            )
 
     if signal_alignment == "COUNTER_TREND":
-        blockers.append("counter_trend")
-        return _build_result(
-            inputs=inputs,
-            auction_score=auction_score,
-            reasons=reasons + ["signal_alignment=COUNTER_TREND; battle signal disabled"],
-            blockers=blockers,
-            modifiers=modifiers,
-            battle_permission=BattlePermission.BLOCKED_BY_HTF.value,
-            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
-            battle_ready=False,
-            v2_policy=v2_policy,
-        )
+        if v2_neutral_otd_transition_allowed:
+            modifiers.append("legacy_countertrend_label_overridden_by_v2_neutral_otd")
+            reasons.append(
+                "signal_alignment=COUNTER_TREND ignored for OPEN_TEST_DRIVE + HTF NEUTRAL transition candidate."
+            )
+        else:
+            blockers.append("counter_trend")
+            return _build_result(
+                inputs=inputs,
+                auction_score=auction_score,
+                reasons=reasons + ["signal_alignment=COUNTER_TREND; battle signal disabled"],
+                blockers=blockers,
+                modifiers=modifiers,
+                battle_permission=BattlePermission.BLOCKED_BY_HTF.value,
+                telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+                battle_ready=False,
+                v2_policy=v2_policy,
+            )
 
     # 5. RR / stop / quality.
     if practical_rr is None or practical_rr < 2.0:
@@ -1214,18 +1309,25 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
 
     # 6. Auction score final gate.
     if auction_score < 3:
-        blockers.append("auction_context_score_below_3")
-        return _build_result(
-            inputs=inputs,
-            auction_score=auction_score,
-            reasons=reasons + [f"auction_context_score={auction_score}; minimum is 3"],
-            blockers=blockers,
-            modifiers=modifiers,
-            battle_permission=BattlePermission.BLOCKED_BY_AUCTION.value,
-            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
-            battle_ready=False,
-            v2_policy=v2_policy,
-        )
+        if v2_neutral_otd_transition_allowed:
+            modifiers.append("auction_score_override_by_v2_neutral_otd")
+            reasons.append(
+                f"auction_context_score={auction_score} is below legacy minimum 3, "
+                "but Battle Gate v2 allows this OPEN_TEST_DRIVE + HTF NEUTRAL transition candidate."
+            )
+        else:
+            blockers.append("auction_context_score_below_3")
+            return _build_result(
+                inputs=inputs,
+                auction_score=auction_score,
+                reasons=reasons + [f"auction_context_score={auction_score}; minimum is 3"],
+                blockers=blockers,
+                modifiers=modifiers,
+                battle_permission=BattlePermission.BLOCKED_BY_AUCTION.value,
+                telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+                battle_ready=False,
+                v2_policy=v2_policy,
+            )
 
     # 7. Battle ready.
     if tpo_telegram_modifier == "BOOST":
