@@ -41,6 +41,7 @@ from app.services.radar_journal import (
     write_signal_updated,
 )
 from app.services.signal_quality_engine import enrich_payload_with_quality
+from app.services.tpo_watch_bridge import enrich_payload_with_tpo_watch
 from app.services.signal_tracker import SignalTracker, SignalTrackerResult
 from app.services.telegram_formatter import format_signal_message
 from app.services.telegram_notifier import build_telegram_notifier
@@ -49,7 +50,7 @@ from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.4.8-tpo-context-preserve-v1"
+RUNNER_VERSION = "1.4.9-tpo-watch-bridge-v1"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -1914,6 +1915,25 @@ class StatefulBatchRunner:
             metadata["market_holiday_name"] = market_holiday_name
 
         payload["metadata"] = metadata
+
+        try:
+            payload = enrich_payload_with_tpo_watch(
+                payload,
+                context=context_payload,
+                filters=filters_payload,
+            )
+        except Exception as error:  # noqa: BLE001
+            logger.exception(
+                "TPO Watch Bridge enrichment failed. symbol=%s error=%s",
+                payload.get("symbol") or payload.get("instrument"),
+                error,
+            )
+            metadata = payload.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata["tpo_watch_bridge_error"] = str(error)
+            payload["metadata"] = metadata
+
         return payload
 
 
@@ -1931,7 +1951,8 @@ class StatefulBatchRunner:
         It does NOT lower standards. It only calls build_execution_plan when:
         - payload status is READY;
         - direction is LONG/SHORT;
-        - HTF bias is not NEUTRAL;
+        - HTF is aligned, or HTF is NEUTRAL and TPO Watch Bridge marked
+          OPEN_TEST_DRIVE as a valid transition candidate;
         - a canonical execution scenario can be inferred.
 
         If geometry/RR is incomplete, execution.py returns INCOMPLETE with a
@@ -1973,10 +1994,38 @@ class StatefulBatchRunner:
             )
 
         if htf_bias == "NEUTRAL":
-            return self._mark_execution_bridge_block(
-                payload,
-                reason="neutral_htf_bias",
-                detail="HTF bias is NEUTRAL; execution bridge skipped",
+            tpo_watch_state = str(
+                payload.get("tpo_watch_state")
+                or metadata.get("tpo_watch_state")
+                or ""
+            ).upper()
+            open_behavior = str(
+                payload.get("open_behavior")
+                or metadata.get("open_behavior")
+                or ""
+            ).upper()
+            allowed_htf_neutral_transition = bool(
+                payload.get("allowed_htf_neutral_transition")
+                or metadata.get("allowed_htf_neutral_transition")
+            )
+
+            if not (
+                allowed_htf_neutral_transition
+                and open_behavior == "OPEN_TEST_DRIVE"
+                and tpo_watch_state in {"LTF_MODEL_PENDING", "LTF_MODEL_CONFIRMED"}
+            ):
+                return self._mark_execution_bridge_block(
+                    payload,
+                    reason="neutral_htf_bias",
+                    detail=(
+                        "HTF bias is NEUTRAL; execution bridge requires "
+                        "OPEN_TEST_DRIVE transition candidate from TPO Watch Bridge"
+                    ),
+                )
+
+            metadata["execution_bridge_neutral_otd_allowed"] = True
+            metadata["execution_bridge_neutral_otd_reason"] = (
+                "OPEN_TEST_DRIVE + HTF NEUTRAL is treated as transition candidate"
             )
 
         canonical_scenario = self._infer_execution_bridge_scenario(payload)
@@ -3410,6 +3459,23 @@ class StatefulBatchRunner:
             "tpo_telegram_modifier": tpo_telegram_modifier,
             "tpo_signal_permission": tpo_signal_permission,
             "tpo_signal_reason": tpo_signal_reason,
+            "open_context": tracked_payload.get("open_context"),
+            "open_behavior": tracked_payload.get("open_behavior"),
+            "open_behavior_confidence": tracked_payload.get("open_behavior_confidence"),
+            "entry_model_hint": tracked_payload.get("entry_model_hint"),
+            "stop_model_hint": tracked_payload.get("stop_model_hint"),
+            "battle_bias_hint": tracked_payload.get("battle_bias_hint"),
+            "tpo_watch_state": tracked_payload.get("tpo_watch_state"),
+            "ltf_model_state": tracked_payload.get("ltf_model_state"),
+            "tpo_watch_active": tracked_payload.get("tpo_watch_active"),
+            "tpo_watch_setup": tracked_payload.get("tpo_watch_setup"),
+            "tpo_watch_reason": tracked_payload.get("tpo_watch_reason"),
+            "allowed_htf_neutral_transition": tracked_payload.get("allowed_htf_neutral_transition"),
+            "htf_alignment_state": tracked_payload.get("htf_alignment_state"),
+            "primary_interest_zone": tracked_payload.get("primary_interest_zone"),
+            "interest_zone_type": tracked_payload.get("interest_zone_type"),
+            "interest_zone_price": tracked_payload.get("interest_zone_price"),
+            "interest_zone_role": tracked_payload.get("interest_zone_role"),
         }
 
         if TPO_SIGNAL_GATE_ENABLED and tpo_signal_permission in {"RESEARCH_ONLY", "BLOCK"}:
@@ -3458,6 +3524,11 @@ class StatefulBatchRunner:
                 "risk_reward_ratio": rr,
                 "execution_timeframe": enriched_payload.get("execution_timeframe"),
                 "trigger_reason": enriched_payload.get("trigger_reason"),
+                "open_behavior": enriched_payload.get("open_behavior"),
+                "tpo_watch_state": enriched_payload.get("tpo_watch_state"),
+                "ltf_model_state": enriched_payload.get("ltf_model_state"),
+                "entry_model_hint": enriched_payload.get("entry_model_hint"),
+                "stop_model_hint": enriched_payload.get("stop_model_hint"),
             }
         )
 
