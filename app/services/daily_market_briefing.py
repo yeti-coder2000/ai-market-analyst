@@ -17,6 +17,9 @@ Internal status/enums/JSON fields remain English and stable.
 import html
 import json
 import os
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -29,13 +32,14 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.5-ukrainian-operational-observe"
+BRIEFING_VERSION = "daily-market-briefing-v1.6-finnhub-economic-calendar"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
 DAILY_SUMMARY_RELATIVE = Path("stats") / "daily_summary.json"
 SIGNAL_OUTCOMES_RELATIVE = Path("stats") / "signal_outcomes.json"
 HIGH_IMPACT_EVENTS_RELATIVE = Path("calendar") / "high_impact_events.json"
+ECONOMIC_CALENDAR_CACHE_RELATIVE = Path("calendar")
 
 FINAL_TP = "TP_HIT"
 FINAL_SL = "SL_HIT"
@@ -125,6 +129,85 @@ BUILTIN_HIGH_IMPACT_EVENTS: list[dict[str, Any]] = [
         "source": "builtin",
     },
 ]
+
+CURRENCY_BY_COUNTRY: dict[str, str] = {
+    "UNITED STATES": "USD",
+    "UNITED STATES OF AMERICA": "USD",
+    "US": "USD",
+    "USA": "USD",
+    "EURO AREA": "EUR",
+    "EUROZONE": "EUR",
+    "EUROPEAN UNION": "EUR",
+    "GERMANY": "EUR",
+    "FRANCE": "EUR",
+    "ITALY": "EUR",
+    "SPAIN": "EUR",
+    "UNITED KINGDOM": "GBP",
+    "UK": "GBP",
+    "JAPAN": "JPY",
+    "SWITZERLAND": "CHF",
+    "CANADA": "CAD",
+    "AUSTRALIA": "AUD",
+    "NEW ZEALAND": "NZD",
+    "CHINA": "CNY",
+}
+
+AFFECTED_SYMBOLS_BY_CURRENCY: dict[str, list[str]] = {
+    "USD": ["XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NAS100", "SPX500", "BTCUSD", "ETHUSD"],
+    "EUR": ["EURUSD", "GER40", "XAUUSD"],
+    "GBP": ["GBPUSD"],
+    "JPY": ["USDJPY", "XAUUSD"],
+    "CHF": ["USDCHF", "XAUUSD"],
+    "CAD": ["USDCAD", "UKOIL"],
+    "AUD": ["AUDUSD", "XAUUSD"],
+    "CNY": ["XAUUSD", "AUDUSD", "NAS100", "SPX500", "BTCUSD", "ETHUSD"],
+}
+
+HIGH_IMPACT_KEYWORDS: tuple[str, ...] = (
+    "NFP",
+    "NON FARM",
+    "NON-FARM",
+    "CPI",
+    "PCE",
+    "CORE PCE",
+    "FOMC",
+    "FED",
+    "INTEREST RATE",
+    "RATE DECISION",
+    "GDP",
+    "ISM",
+    "PMI",
+    "JOLTS",
+    "UNEMPLOYMENT",
+    "PAYROLL",
+    "RETAIL SALES",
+    "DURABLE GOODS",
+    "JOBLESS CLAIMS",
+    "INFLATION",
+    "BOE",
+    "ECB",
+    "BOJ",
+    "SNB",
+    "BOC",
+    "RBA",
+    "OPEC",
+    "CRUDE OIL INVENTORIES",
+)
+
+
+@dataclass
+class CalendarLoadResult:
+    status: str
+    source: str
+    events: list[dict[str, Any]] = field(default_factory=list)
+    message: str | None = None
+    cache_path: str | None = None
+    provider_error: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status in {"OK", "EMPTY"}
+
 
 
 # =============================================================================
@@ -346,6 +429,16 @@ def _signal_outcomes_path() -> Path:
 
 def _high_impact_events_path() -> Path:
     return _get_path("HIGH_IMPACT_EVENTS_PATH", HIGH_IMPACT_EVENTS_RELATIVE)
+
+
+def _economic_calendar_cache_path(target_date: date) -> Path:
+    raw = os.getenv("ECONOMIC_CALENDAR_CACHE_PATH")
+    if raw:
+        base = Path(raw).expanduser().resolve()
+        if base.suffix:
+            return base
+        return base / f"economic_calendar_{target_date.isoformat()}.json"
+    return _runtime_dir() / ECONOMIC_CALENDAR_CACHE_RELATIVE / f"economic_calendar_{target_date.isoformat()}.json"
 
 
 def _now_utc() -> datetime:
@@ -578,7 +671,271 @@ def load_signal_outcomes() -> dict[str, Any]:
     return _safe_read_json(_signal_outcomes_path(), {})
 
 
-def load_high_impact_events(target_date: date) -> list[dict[str, Any]]:
+def _normalize_impact(value: Any, title: str = "") -> str:
+    raw = str(value or "").strip().upper()
+    if raw in {"HIGH", "RED", "IMPORTANT", "3", "3.0"}:
+        return "HIGH"
+    if raw in {"MEDIUM", "ORANGE", "2", "2.0"}:
+        return "MEDIUM"
+    if raw in {"LOW", "YELLOW", "1", "1.0"}:
+        return "LOW"
+
+    title_upper = str(title or "").upper()
+    if any(keyword in title_upper for keyword in HIGH_IMPACT_KEYWORDS):
+        return "HIGH"
+
+    return raw or "UNKNOWN"
+
+
+def _currency_from_event(country: Any, currency: Any = None) -> str:
+    raw_currency = str(currency or "").strip().upper()
+    if raw_currency:
+        return raw_currency
+
+    country_key = str(country or "").strip().upper()
+    if country_key in CURRENCY_BY_COUNTRY:
+        return CURRENCY_BY_COUNTRY[country_key]
+
+    for key, value in CURRENCY_BY_COUNTRY.items():
+        if key and key in country_key:
+            return value
+
+    return "-"
+
+
+def _affected_symbols(currency: str, event_title: str = "") -> list[str]:
+    cur = str(currency or "").strip().upper()
+    symbols = list(AFFECTED_SYMBOLS_BY_CURRENCY.get(cur, []))
+
+    title = str(event_title or "").upper()
+    if "OIL" in title or "CRUDE" in title or "OPEC" in title:
+        for sym in ("UKOIL", "USDCAD"):
+            if sym not in symbols:
+                symbols.append(sym)
+
+    return symbols
+
+
+def _parse_finnhub_time(value: Any, target_date: date) -> tuple[str, str]:
+    """
+    Finnhub economicCalendar records may expose time as an ISO string, date string,
+    datetime string, or unix timestamp depending on plan/endpoint version.
+    Return (date, HH:MM) in UTC unless the API clearly provides date-only data.
+    """
+    if value is None:
+        return target_date.isoformat(), ""
+
+    if isinstance(value, (int, float)):
+        try:
+            number = float(value)
+            if number > 10_000_000_000:
+                number = number / 1000.0
+            dt = datetime.fromtimestamp(number, tz=timezone.utc)
+            return dt.date().isoformat(), dt.strftime("%H:%M")
+        except Exception:
+            return target_date.isoformat(), ""
+
+    text = str(value).strip()
+    if not text:
+        return target_date.isoformat(), ""
+
+    try:
+        d = date.fromisoformat(text[:10])
+        if "T" not in text and len(text) <= 10:
+            return d.isoformat(), ""
+    except Exception:
+        pass
+
+    normalized = text.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(timezone.utc)
+        return dt.date().isoformat(), dt.strftime("%H:%M")
+    except Exception:
+        pass
+
+    try:
+        dt = datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        return dt.date().isoformat(), dt.strftime("%H:%M")
+    except Exception:
+        return target_date.isoformat(), ""
+
+
+def _normalize_finnhub_event(raw: dict[str, Any], target_date: date) -> dict[str, Any] | None:
+    title = str(raw.get("event") or raw.get("title") or raw.get("name") or "").strip()
+    if not title:
+        return None
+
+    event_date, event_time = _parse_finnhub_time(
+        raw.get("time") or raw.get("datetime") or raw.get("date"),
+        target_date,
+    )
+
+    country = raw.get("country") or raw.get("region")
+    currency = _currency_from_event(country, raw.get("currency"))
+    impact = _normalize_impact(raw.get("impact") or raw.get("importance"), title)
+
+    return {
+        "date": event_date,
+        "time": event_time,
+        "timezone": "UTC",
+        "currency": currency,
+        "impact": impact,
+        "title": title,
+        "country": country or "-",
+        "symbols": _affected_symbols(currency, title),
+        "note": _event_trading_note(currency, title, impact),
+        "source": "finnhub",
+        "actual": raw.get("actual"),
+        "forecast": raw.get("estimate") if raw.get("estimate") is not None else raw.get("forecast"),
+        "previous": raw.get("prev") if raw.get("prev") is not None else raw.get("previous"),
+        "raw": raw,
+    }
+
+
+def _event_trading_note(currency: str, title: str, impact: str) -> str:
+    cur = str(currency or "").upper()
+    title_upper = str(title or "").upper()
+
+    if impact != "HIGH":
+        return "Подія не high-impact; використовувати як фон, не як торговий тригер."
+
+    if cur == "USD":
+        return "USD high-impact macro. До релізу не піднімати research у battle; після релізу чекати acceptance."
+    if cur == "EUR":
+        return "EUR / Europe high-impact macro. Впливає на EURUSD та GER40; чекати підтвердження після релізу."
+    if cur == "GBP":
+        return "GBP high-impact macro. Для GBPUSD чекати post-news acceptance / rejection."
+    if cur == "JPY":
+        return "JPY high-impact macro. Для USDJPY не торгувати ранній імпульс без LTF confirmation."
+    if cur == "CAD":
+        return "CAD high-impact macro. Для USDCAD / UKOIL врахувати post-news volatility."
+    if "OIL" in title_upper or "CRUDE" in title_upper or "OPEC" in title_upper:
+        return "Oil-related event. Для UKOIL не торгувати перший імпульс без acceptance."
+
+    return "High-impact macro. До релізу не вважати структуру стабільним напрямком."
+
+
+def _fetch_finnhub_calendar(target_date: date) -> CalendarLoadResult:
+    enabled = str(os.getenv("ENABLE_ECONOMIC_CALENDAR", "true")).strip().lower() in {"1", "true", "yes", "on"}
+    provider = str(os.getenv("ECONOMIC_CALENDAR_PROVIDER", "finnhub")).strip().lower()
+    if not enabled:
+        return CalendarLoadResult(
+            status="UNAVAILABLE",
+            source="disabled",
+            message="Economic calendar disabled by ENABLE_ECONOMIC_CALENDAR.",
+        )
+    if provider not in {"finnhub", "auto"}:
+        return CalendarLoadResult(
+            status="UNAVAILABLE",
+            source=provider or "unknown",
+            message=f"Economic calendar provider is not Finnhub: {provider}.",
+        )
+
+    token = os.getenv("FINNHUB_API_KEY") or os.getenv("FINNHUB_TOKEN")
+    if not token:
+        return CalendarLoadResult(
+            status="UNAVAILABLE",
+            source="finnhub",
+            message="FINNHUB_API_KEY is missing.",
+        )
+
+    cache_path = _economic_calendar_cache_path(target_date)
+    cache_ttl_sec = int(os.getenv("ECONOMIC_CALENDAR_CACHE_TTL_SEC", "21600"))
+    force_refresh = str(os.getenv("ECONOMIC_CALENDAR_FORCE_REFRESH", "false")).strip().lower() in {"1", "true", "yes", "on"}
+
+    if cache_path.exists() and not force_refresh:
+        try:
+            age_sec = (_now_utc().timestamp() - cache_path.stat().st_mtime)
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if age_sec <= cache_ttl_sec and isinstance(cached, dict):
+                events = _extract_list(cached.get("events", []))
+                status = "OK" if events else "EMPTY"
+                return CalendarLoadResult(
+                    status=status,
+                    source=str(cached.get("source") or "finnhub_cache"),
+                    events=events,
+                    message=f"Loaded from cache. age_sec={round(age_sec, 1)}",
+                    cache_path=str(cache_path),
+                )
+        except Exception:
+            pass
+
+    params = urllib.parse.urlencode(
+        {
+            "from": target_date.isoformat(),
+            "to": target_date.isoformat(),
+            "token": token,
+        }
+    )
+    url = f"https://finnhub.io/api/v1/calendar/economic?{params}"
+
+    try:
+        timeout = float(os.getenv("FINNHUB_TIMEOUT_SEC", "12"))
+        req = urllib.request.Request(url, headers={"User-Agent": "AI-Market-Analyst/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+        payload = json.loads(body)
+    except urllib.error.HTTPError as exc:
+        return CalendarLoadResult(
+            status="UNAVAILABLE",
+            source="finnhub",
+            message=f"Finnhub HTTP error: {exc.code}.",
+            provider_error=str(exc),
+            cache_path=str(cache_path),
+        )
+    except Exception as exc:
+        return CalendarLoadResult(
+            status="UNAVAILABLE",
+            source="finnhub",
+            message="Finnhub economic calendar unavailable.",
+            provider_error=f"{type(exc).__name__}: {exc}",
+            cache_path=str(cache_path),
+        )
+
+    raw_events = payload.get("economicCalendar") if isinstance(payload, dict) else None
+    if not isinstance(raw_events, list):
+        raw_events = _extract_list(payload)
+
+    normalized: list[dict[str, Any]] = []
+    for raw_event in raw_events:
+        if not isinstance(raw_event, dict):
+            continue
+        event = _normalize_finnhub_event(raw_event, target_date)
+        if not event:
+            continue
+        if event.get("date") != target_date.isoformat():
+            continue
+        normalized.append(event)
+
+    normalized.sort(key=lambda x: (str(x.get("time") or "99:99"), str(x.get("currency") or ""), str(x.get("title") or "")))
+
+    status = "OK" if normalized else "EMPTY"
+    cache_payload = {
+        "source": "finnhub",
+        "status": status,
+        "date": target_date.isoformat(),
+        "updated_at_utc": _now_utc().isoformat(),
+        "events": normalized,
+        "raw_count": len(raw_events),
+    }
+    try:
+        _safe_write_json(cache_path, cache_payload)
+    except Exception:
+        pass
+
+    return CalendarLoadResult(
+        status=status,
+        source="finnhub",
+        events=normalized,
+        message="Loaded from Finnhub API." if normalized else "Finnhub returned no events for this date.",
+        cache_path=str(cache_path),
+    )
+
+
+def _load_static_calendar_events(target_date: date) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
 
     events.extend(_extract_list(_safe_read_json(_high_impact_events_path(), [])))
@@ -600,23 +957,64 @@ def load_high_impact_events(target_date: date) -> list[dict[str, Any]]:
         if str(event.get("date") or "").strip() != target_text:
             continue
 
-        impact = str(event.get("impact") or "").strip().upper()
+        impact = _normalize_impact(event.get("impact"), str(event.get("title") or ""))
         if impact and impact not in {"HIGH", "RED", "IMPORTANT"}:
             continue
 
+        normalized = dict(event)
+        normalized["impact"] = "HIGH" if impact in {"RED", "IMPORTANT"} else impact
+        normalized.setdefault("source", "static_fallback")
+        normalized.setdefault("symbols", _affected_symbols(str(normalized.get("currency") or ""), str(normalized.get("title") or "")))
+        normalized.setdefault("note", _event_trading_note(str(normalized.get("currency") or ""), str(normalized.get("title") or ""), str(normalized.get("impact") or "")))
+
         key = (
-            str(event.get("date") or ""),
-            str(event.get("time") or ""),
-            str(event.get("timezone") or ""),
-            str(event.get("title") or ""),
+            str(normalized.get("date") or ""),
+            str(normalized.get("time") or ""),
+            str(normalized.get("timezone") or ""),
+            str(normalized.get("title") or ""),
         )
         if key in seen:
             continue
         seen.add(key)
-        selected.append(event)
+        selected.append(normalized)
 
     selected.sort(key=lambda x: (str(x.get("time") or "99:99"), str(x.get("title") or "")))
     return selected
+
+
+def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
+    result = _fetch_finnhub_calendar(target_date)
+
+    if result.status in {"OK", "EMPTY"}:
+        high_events = [
+            e for e in result.events
+            if _normalize_impact(e.get("impact"), str(e.get("title") or "")) in {"HIGH", "RED", "IMPORTANT"}
+        ]
+        return CalendarLoadResult(
+            status="OK" if high_events else "EMPTY",
+            source=result.source,
+            events=high_events,
+            message=result.message,
+            cache_path=result.cache_path,
+            provider_error=result.provider_error,
+        )
+
+    static_events = _load_static_calendar_events(target_date)
+    if static_events:
+        return CalendarLoadResult(
+            status="FALLBACK",
+            source="static_fallback",
+            events=static_events,
+            message=f"{result.message or 'Provider unavailable'} Using static fallback.",
+            cache_path=result.cache_path,
+            provider_error=result.provider_error,
+        )
+
+    return result
+
+
+def load_high_impact_events(target_date: date) -> list[dict[str, Any]]:
+    return load_high_impact_calendar(target_date).events
 
 
 def _signals_from_outcomes(outcomes: dict[str, Any]) -> list[dict[str, Any]]:
@@ -976,22 +1374,45 @@ def _build_market_status_section(tpo: dict[str, Any], report_type: str) -> Brief
 
 
 def _build_high_impact_section(target_date: date, timezone_name: str, report_type: str) -> BriefingSection:
-    events = load_high_impact_events(target_date)
+    calendar = load_high_impact_calendar(target_date)
+    events = calendar.events
     section = BriefingSection("🔴 Ризик дня")
 
     if not events:
-        section.lines.append("HIGH/RED подій на сьогодні не налаштовано.")
+        if calendar.status == "EMPTY":
+            section.lines.append("HIGH/RED подій за підключеним календарем не знайдено.")
+            section.lines.append(f"Джерело: {calendar.source}.")
+        else:
+            section.lines.append("Календар high-impact news не завантажений / provider unavailable.")
+            section.lines.append("Це не означає, що high-impact news немає.")
+            section.lines.append("Режим: обережність, перевірити зовнішній календар перед NY.")
+            if calendar.message:
+                section.lines.append(f"Статус: {calendar.message}")
         return section
 
-    for e in events[:4]:
+    if calendar.status == "FALLBACK":
+        section.lines.append("⚠️ Основний календар недоступний; використовується static fallback.")
+        section.lines.append("Це може бути неповний список подій.")
+
+    for e in events[:5]:
         local_time = _local_dt_from_event(e, timezone_name)
         currency = e.get("currency") or "-"
         impact = str(e.get("impact") or "HIGH").upper()
-        title = e.get("title") or "Unnamed event"
+        title = e.get("title") or e.get("event") or "Unnamed event"
+        symbols = _filter_symbols_for_report(e.get("symbols") or [], report_type)
         note = _translate_note(e.get("note"))
-        section.lines.append(f"• {local_time} — {currency} {impact}: {title}")
+        source = e.get("source") or calendar.source
+
+        symbol_text = ""
+        if symbols:
+            symbol_text = f" | активи: {', '.join(symbols[:8])}"
+
+        section.lines.append(f"• {local_time} — {currency} {impact}: {title}{symbol_text}")
         if note:
             section.lines.append(f"  {note}")
+        if source:
+            section.lines.append(f"  Джерело: {source}")
+
     return section
 
 
@@ -1310,6 +1731,9 @@ def build_briefing_report(
             "daily_summary_path": str(_daily_summary_path()),
             "signal_outcomes_path": str(_signal_outcomes_path()),
             "high_impact_events_path": str(_high_impact_events_path()),
+            "economic_calendar_cache_path": str(_economic_calendar_cache_path(target_date)),
+            "economic_calendar_provider": os.getenv("ECONOMIC_CALENDAR_PROVIDER", "finnhub"),
+            "economic_calendar_enabled": os.getenv("ENABLE_ECONOMIC_CALENDAR", "true"),
             "tpo_updated_at_utc": tpo.get("updated_at_utc") if isinstance(tpo, dict) else None,
             "daily_summary_updated_at_utc": daily_summary.get("updated_at_utc") if isinstance(daily_summary, dict) else None,
         },
