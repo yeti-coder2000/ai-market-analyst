@@ -3,7 +3,7 @@ from __future__ import annotations
 """
 TPO LTF Model Detector for AI Market Analyst.
 
-v1.1 purpose:
+v1.2 purpose:
 - Convert TPO Watch Bridge states into an operational live setup state.
 - Keep OPEN_TEST_DRIVE contexts visible in journal/snapshot instead of allowing
   them to be buried as NO_ACTION.
@@ -13,6 +13,13 @@ v1.1 purpose:
     valid stop,
     valid target,
     RR >= MIN_CONFIRMED_RR.
+
+v1.2 upgrade:
+- Detect displacement/BOS across a recent 3-5 candle window, not only the last
+  15m candle.
+- Detect conservative zone reclaim / failed-acceptance behavior around the
+  primary interest zone.
+- Keep detailed diagnostics so PENDING states explain exactly what is missing.
 
 Pipeline:
 TPO Watch Bridge:
@@ -33,17 +40,20 @@ This module:
 """
 
 from dataclasses import asdict, dataclass, field
+import re
 from typing import Any
 
 import pandas as pd
 
 
-LTF_MODEL_DETECTOR_VERSION = "tpo-ltf-model-detector-v1.1-debuggable-blockers"
+LTF_MODEL_DETECTOR_VERSION = "tpo-ltf-model-detector-v1.2-windowed-displacement-reclaim"
 
 MIN_CONFIRMED_RR = 2.0
 MIN_BARS = 8
 RECENT_WINDOW = 16
 STRUCTURE_WINDOW = 5
+DISPLACEMENT_LOOKBACK = 5
+RECLAIM_LOOKBACK = 5
 
 COMPACT_TO_FULL_STATE = {
     "NO_MODEL": "LTF_MODEL_NO_MODEL",
@@ -68,6 +78,8 @@ MIN_STOP_BY_SYMBOL = {
     "AUDUSD": 0.0003,
 }
 
+_QUOTED_ENUM_VALUE_RE = re.compile(r":\s*['\"]([^'\"]+)['\"]")
+
 
 @dataclass
 class LTFModelResult:
@@ -86,6 +98,7 @@ class LTFModelResult:
     ltf_model_confirmed: bool = False
 
     direction: str | None = None
+    expected_direction: str | None = None
     signal_class: str = "WATCH"
     status: str = "WATCH"
     scenario: str = "TPO_OPEN_TEST_DRIVE_WATCH"
@@ -129,10 +142,76 @@ class LTFModelResult:
         return asdict(self)
 
 
+def _unwrap_enum_value(value: Any) -> Any:
+    if value is None:
+        return None
+
+    enum_value = getattr(value, "value", None)
+    if enum_value is not None and not isinstance(value, (str, bytes, int, float, bool)):
+        return enum_value
+
+    return value
+
+
 def _s(value: Any, default: str = "") -> str:
     if value is None:
         return default
-    return str(value).strip().upper()
+
+    value = _unwrap_enum_value(value)
+    text = str(value).strip()
+
+    if not text:
+        return default
+
+    quoted_match = _QUOTED_ENUM_VALUE_RE.search(text)
+    if text.startswith("<") and quoted_match:
+        text = quoted_match.group(1).strip()
+    elif "." in text:
+        tail = text.rsplit(".", 1)[-1].strip()
+        if tail:
+            text = tail
+
+    return text.upper()
+
+
+def _direction_s(value: Any, default: str = "") -> str:
+    text = _s(value, default)
+
+    if not text:
+        return default
+
+    if text in {"LONG", "BUY", "BULL", "BULLISH", "UP"}:
+        return "LONG"
+
+    if text in {"SHORT", "SELL", "BEAR", "BEARISH", "DOWN"}:
+        return "SHORT"
+
+    if text in {"NEUTRAL", "NONE", "FLAT", "NO_BIAS", "UNKNOWN"}:
+        return "NEUTRAL"
+
+    if "LONG" in text and "SHORT" not in text:
+        return "LONG"
+
+    if "SHORT" in text and "LONG" not in text:
+        return "SHORT"
+
+    return text
+
+
+def _bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y", "on"}:
+        return True
+    if text in {"false", "0", "no", "n", "off", "none", "null", ""}:
+        return False
+    return default
 
 
 def _f(value: Any, default: float | None = None) -> float | None:
@@ -161,6 +240,33 @@ def _first_non_empty(*values: Any, default: Any = None) -> Any:
             continue
         return value
     return default
+
+
+def _payload_direction(payload: dict[str, Any]) -> str | None:
+    meta = _metadata(payload)
+    direction = _direction_s(
+        _first_non_empty(
+            payload.get("direction"),
+            meta.get("direction"),
+            payload.get("raw_direction"),
+            meta.get("raw_direction"),
+        )
+    )
+    if direction in {"LONG", "SHORT", "NEUTRAL"}:
+        return direction
+
+    scenario_direction = _direction_s(
+        _first_non_empty(
+            payload.get("scenario"),
+            payload.get("scenario_type"),
+            meta.get("scenario"),
+            meta.get("scenario_type"),
+        )
+    )
+    if scenario_direction in {"LONG", "SHORT", "NEUTRAL"}:
+        return scenario_direction
+
+    return None
 
 
 def _min_stop(symbol: str, price: float) -> float:
@@ -210,6 +316,8 @@ def _prepare_ohlc(df: pd.DataFrame | None) -> tuple[pd.DataFrame | None, dict[st
     diagnostics["prepared_rows"] = len(prepared)
     diagnostics["recent_window"] = RECENT_WINDOW
     diagnostics["structure_window"] = STRUCTURE_WINDOW
+    diagnostics["displacement_lookback"] = DISPLACEMENT_LOOKBACK
+    diagnostics["reclaim_lookback"] = RECLAIM_LOOKBACK
 
     return prepared, diagnostics
 
@@ -269,19 +377,27 @@ def _interest_zone_summary(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _detect_displacement(df: pd.DataFrame) -> tuple[str | None, dict[str, Any]]:
-    """
-    Return LONG/SHORT when the last 15m candle breaks local structure with body.
+def _row_snapshot(row: pd.Series) -> dict[str, float]:
+    return {
+        "open": round(float(row["open"]), 8),
+        "high": round(float(row["high"]), 8),
+        "low": round(float(row["low"]), 8),
+        "close": round(float(row["close"]), 8),
+    }
 
-    This is deliberately simple/conservative:
-    - LONG requires close above recent structure high and a meaningful body.
-    - SHORT requires close below recent structure low and a meaningful body.
-    """
+
+def _detect_last_candle_structure_break(
+    df: pd.DataFrame,
+    *,
+    avg: float,
+    expected_direction: str | None = None,
+) -> tuple[str | None, dict[str, Any]]:
     last = df.iloc[-1]
     prev = df.iloc[:-1].tail(STRUCTURE_WINDOW)
 
     if prev.empty:
         return None, {
+            "method": "last_candle_structure_break",
             "displacement": "none",
             "displacement_blocker": "not_enough_previous_structure",
         }
@@ -294,14 +410,16 @@ def _detect_displacement(df: pd.DataFrame) -> tuple[str | None, dict[str, Any]]:
     prev_high = float(prev["high"].max())
     prev_low = float(prev["low"].min())
 
-    avg = _avg_range(df) or max(high - low, abs(close) * 0.0002)
     body = abs(close - open_)
     candle_range = abs(high - low)
 
     body_threshold = avg * 0.30
     body_ok = body >= body_threshold
+    close_above_structure = close > prev_high
+    close_below_structure = close < prev_low
 
     diagnostics = {
+        "method": "last_candle_structure_break",
         "last_open": round(open_, 8),
         "last_high": round(high, 8),
         "last_low": round(low, 8),
@@ -313,16 +431,17 @@ def _detect_displacement(df: pd.DataFrame) -> tuple[str | None, dict[str, Any]]:
         "last_range": round(candle_range, 8),
         "body_threshold": round(body_threshold, 8),
         "body_ok": bool(body_ok),
-        "close_above_structure": bool(close > prev_high),
-        "close_below_structure": bool(close < prev_low),
+        "close_above_structure": bool(close_above_structure),
+        "close_below_structure": bool(close_below_structure),
+        "expected_direction": expected_direction,
     }
 
-    if close > prev_high and body_ok:
+    if close_above_structure and body_ok:
         diagnostics["displacement"] = "bullish_breakout"
         diagnostics["displacement_direction"] = "LONG"
         return "LONG", diagnostics
 
-    if close < prev_low and body_ok:
+    if close_below_structure and body_ok:
         diagnostics["displacement"] = "bearish_breakdown"
         diagnostics["displacement_direction"] = "SHORT"
         return "SHORT", diagnostics
@@ -331,11 +450,316 @@ def _detect_displacement(df: pd.DataFrame) -> tuple[str | None, dict[str, Any]]:
 
     if not body_ok:
         diagnostics["displacement_blocker"] = "body_too_small"
-    elif not (close > prev_high or close < prev_low):
+    elif not (close_above_structure or close_below_structure):
         diagnostics["displacement_blocker"] = "no_structure_break"
     else:
         diagnostics["displacement_blocker"] = "unknown_no_direction"
 
+    return None, diagnostics
+
+
+def _detect_window_structure_break(
+    df: pd.DataFrame,
+    *,
+    avg: float,
+    expected_direction: str | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    """
+    Detect a structure break that happened during the recent candle window.
+
+    This fixes the v1.1 blind spot where the last candle could be a small pause
+    after a valid displacement candle, causing a false PENDING/body_too_small.
+    """
+    rows = df.tail(DISPLACEMENT_LOOKBACK)
+    diagnostics: dict[str, Any] = {
+        "method": "window_structure_break",
+        "lookback": DISPLACEMENT_LOOKBACK,
+        "expected_direction": expected_direction,
+        "avg_range": round(avg, 8),
+        "body_threshold": round(avg * 0.30, 8),
+        "candidates_checked": [],
+    }
+
+    if len(df) < STRUCTURE_WINDOW + 2 or rows.empty:
+        diagnostics["displacement"] = "none"
+        diagnostics["displacement_blocker"] = "not_enough_window_structure"
+        return None, diagnostics
+
+    candidate_indices = list(rows.index)
+
+    for index in candidate_indices:
+        pos = df.index.get_loc(index)
+        if isinstance(pos, slice):
+            continue
+        if pos < STRUCTURE_WINDOW:
+            continue
+
+        row = df.loc[index]
+        prev = df.iloc[:pos].tail(STRUCTURE_WINDOW)
+        if prev.empty:
+            continue
+
+        close = float(row["close"])
+        open_ = float(row["open"])
+        high = float(row["high"])
+        low = float(row["low"])
+        body = abs(close - open_)
+        candle_range = abs(high - low)
+        body_threshold = avg * 0.30
+        body_ok = body >= body_threshold
+        prev_high = float(prev["high"].max())
+        prev_low = float(prev["low"].min())
+        close_above_structure = close > prev_high
+        close_below_structure = close < prev_low
+
+        candidate = {
+            "index": str(index),
+            "open": round(open_, 8),
+            "high": round(high, 8),
+            "low": round(low, 8),
+            "close": round(close, 8),
+            "body": round(body, 8),
+            "range": round(candle_range, 8),
+            "body_ok": bool(body_ok),
+            "prev_structure_high": round(prev_high, 8),
+            "prev_structure_low": round(prev_low, 8),
+            "close_above_structure": bool(close_above_structure),
+            "close_below_structure": bool(close_below_structure),
+        }
+        diagnostics["candidates_checked"].append(candidate)
+
+        direction: str | None = None
+        if close_above_structure and body_ok:
+            direction = "LONG"
+        elif close_below_structure and body_ok:
+            direction = "SHORT"
+
+        if direction is None:
+            continue
+
+        if expected_direction in {"LONG", "SHORT"} and direction != expected_direction:
+            candidate["rejected_reason"] = "against_expected_direction"
+            continue
+
+        last_close = float(df.iloc[-1]["close"])
+        last_hold_tolerance = avg * 0.35
+
+        if direction == "LONG":
+            holding_after_break = last_close >= (prev_high - last_hold_tolerance)
+        else:
+            holding_after_break = last_close <= (prev_low + last_hold_tolerance)
+
+        candidate["holding_after_break"] = bool(holding_after_break)
+        candidate["last_close"] = round(last_close, 8)
+        candidate["hold_tolerance"] = round(last_hold_tolerance, 8)
+
+        if not holding_after_break:
+            candidate["rejected_reason"] = "break_not_held"
+            continue
+
+        diagnostics["displacement"] = "window_structure_break"
+        diagnostics["displacement_direction"] = direction
+        diagnostics["selected_candidate"] = candidate
+        return direction, diagnostics
+
+    diagnostics["displacement"] = "none"
+
+    if diagnostics["candidates_checked"]:
+        if any(c.get("body_ok") is False for c in diagnostics["candidates_checked"]):
+            diagnostics["displacement_blocker"] = "window_body_too_small_or_no_valid_break"
+        else:
+            diagnostics["displacement_blocker"] = "window_no_structure_break"
+    else:
+        diagnostics["displacement_blocker"] = "no_window_candidates"
+
+    return None, diagnostics
+
+
+def _detect_zone_reclaim(
+    df: pd.DataFrame,
+    *,
+    avg: float,
+    expected_direction: str | None,
+    zone_price: float | None,
+) -> tuple[str | None, dict[str, Any]]:
+    """
+    Conservative failed-acceptance/reclaim detector around the primary zone.
+
+    This is not a standalone entry trigger. It only confirms the LTF model when:
+    - there is an expected direction from TPO/HTF context,
+    - price tested or swept the reference zone recently,
+    - price reclaimed/held the correct side of the zone,
+    - the recent multi-candle move has meaningful directional progress.
+    """
+    diagnostics: dict[str, Any] = {
+        "method": "zone_reclaim_window",
+        "lookback": RECLAIM_LOOKBACK,
+        "expected_direction": expected_direction,
+        "zone_price": round(zone_price, 8) if zone_price is not None else None,
+        "avg_range": round(avg, 8),
+    }
+
+    if expected_direction not in {"LONG", "SHORT"}:
+        diagnostics["reclaim"] = "none"
+        diagnostics["reclaim_blocker"] = "missing_expected_direction"
+        return None, diagnostics
+
+    if zone_price is None:
+        diagnostics["reclaim"] = "none"
+        diagnostics["reclaim_blocker"] = "missing_zone_price"
+        return None, diagnostics
+
+    recent = df.tail(RECLAIM_LOOKBACK)
+    if len(recent) < 3:
+        diagnostics["reclaim"] = "none"
+        diagnostics["reclaim_blocker"] = "not_enough_reclaim_window"
+        return None, diagnostics
+
+    first_open = float(recent.iloc[0]["open"])
+    last_close = float(recent.iloc[-1]["close"])
+    recent_high = float(recent["high"].max())
+    recent_low = float(recent["low"].min())
+
+    closes = [float(x) for x in recent["close"].tolist()]
+    tolerance = max(avg * 0.20, abs(zone_price) * 0.00003)
+    min_progress = avg * 0.55
+
+    if expected_direction == "LONG":
+        zone_tested = recent_low <= zone_price + tolerance
+        reclaimed = last_close > zone_price + tolerance
+        closes_on_correct_side = sum(1 for close in closes if close > zone_price)
+        directional_progress = last_close - first_open
+        progress_ok = directional_progress >= min_progress
+        direction = "LONG"
+    else:
+        zone_tested = recent_high >= zone_price - tolerance
+        reclaimed = last_close < zone_price - tolerance
+        closes_on_correct_side = sum(1 for close in closes if close < zone_price)
+        directional_progress = first_open - last_close
+        progress_ok = directional_progress >= min_progress
+        direction = "SHORT"
+
+    diagnostics.update(
+        {
+            "first_open": round(first_open, 8),
+            "last_close": round(last_close, 8),
+            "recent_high": round(recent_high, 8),
+            "recent_low": round(recent_low, 8),
+            "tolerance": round(tolerance, 8),
+            "min_progress": round(min_progress, 8),
+            "directional_progress": round(directional_progress, 8),
+            "zone_tested": bool(zone_tested),
+            "reclaimed": bool(reclaimed),
+            "closes_on_correct_side": int(closes_on_correct_side),
+            "progress_ok": bool(progress_ok),
+        }
+    )
+
+    if zone_tested and reclaimed and closes_on_correct_side >= 2 and progress_ok:
+        diagnostics["reclaim"] = "confirmed_failed_acceptance_reclaim"
+        diagnostics["displacement"] = "zone_reclaim_window"
+        diagnostics["displacement_direction"] = direction
+        return direction, diagnostics
+
+    diagnostics["reclaim"] = "none"
+
+    blockers: list[str] = []
+    if not zone_tested:
+        blockers.append("zone_not_tested")
+    if not reclaimed:
+        blockers.append("zone_not_reclaimed")
+    if closes_on_correct_side < 2:
+        blockers.append("not_enough_closes_on_correct_side")
+    if not progress_ok:
+        blockers.append("directional_progress_too_small")
+
+    diagnostics["reclaim_blocker"] = "+".join(blockers) if blockers else "unknown_reclaim_blocker"
+    return None, diagnostics
+
+
+def _detect_displacement(
+    df: pd.DataFrame,
+    *,
+    expected_direction: str | None = None,
+    zone_price: float | None = None,
+) -> tuple[str | None, dict[str, Any]]:
+    """
+    Return LONG/SHORT when recent 15m structure confirms an OTD LTF model.
+
+    v1.2 order:
+    1. Last-candle structure break, same as v1.1.
+    2. Windowed structure break across the last 3-5 candles.
+    3. Conservative zone reclaim / failed acceptance around the interest zone.
+    """
+    last = df.iloc[-1]
+    high = float(last["high"])
+    low = float(last["low"])
+    close = float(last["close"])
+
+    avg = _avg_range(df) or max(high - low, abs(close) * 0.0002)
+
+    diagnostics: dict[str, Any] = {
+        "detector": "windowed_displacement_reclaim",
+        "expected_direction": expected_direction,
+        "zone_price": round(zone_price, 8) if zone_price is not None else None,
+        "avg_range": round(avg, 8),
+        "last_candle": _row_snapshot(last),
+    }
+
+    last_direction, last_diag = _detect_last_candle_structure_break(
+        df,
+        avg=avg,
+        expected_direction=expected_direction,
+    )
+    diagnostics["last_candle_structure_break"] = last_diag
+
+    if last_direction in {"LONG", "SHORT"}:
+        if expected_direction in {"LONG", "SHORT"} and last_direction != expected_direction:
+            diagnostics["displacement"] = "none"
+            diagnostics["displacement_blocker"] = "last_candle_break_against_expected_direction"
+            diagnostics["candidate_direction"] = last_direction
+            return None, diagnostics
+
+        diagnostics["displacement"] = last_diag.get("displacement")
+        diagnostics["displacement_direction"] = last_direction
+        diagnostics["selected_method"] = "last_candle_structure_break"
+        return last_direction, diagnostics
+
+    window_direction, window_diag = _detect_window_structure_break(
+        df,
+        avg=avg,
+        expected_direction=expected_direction,
+    )
+    diagnostics["window_structure_break"] = window_diag
+
+    if window_direction in {"LONG", "SHORT"}:
+        diagnostics["displacement"] = window_diag.get("displacement")
+        diagnostics["displacement_direction"] = window_direction
+        diagnostics["selected_method"] = "window_structure_break"
+        return window_direction, diagnostics
+
+    reclaim_direction, reclaim_diag = _detect_zone_reclaim(
+        df,
+        avg=avg,
+        expected_direction=expected_direction,
+        zone_price=zone_price,
+    )
+    diagnostics["zone_reclaim_window"] = reclaim_diag
+
+    if reclaim_direction in {"LONG", "SHORT"}:
+        diagnostics["displacement"] = reclaim_diag.get("displacement")
+        diagnostics["displacement_direction"] = reclaim_direction
+        diagnostics["selected_method"] = "zone_reclaim_window"
+        return reclaim_direction, diagnostics
+
+    diagnostics["displacement"] = "none"
+
+    blockers = [
+        last_diag.get("displacement_blocker"),
+        window_diag.get("displacement_blocker"),
+        reclaim_diag.get("reclaim_blocker"),
+    ]
+    diagnostics["displacement_blocker"] = " | ".join(str(x) for x in blockers if x) or "no_confirmed_windowed_model"
     return None, diagnostics
 
 
@@ -414,12 +838,13 @@ def _is_active_tpo_otd_watch(payload: dict[str, Any]) -> tuple[bool, dict[str, A
             meta.get("open_behavior"),
         )
     )
-    tpo_watch_active = bool(
+    tpo_watch_active = _bool(
         _first_non_empty(
             payload.get("tpo_watch_active"),
             meta.get("tpo_watch_active"),
             default=False,
-        )
+        ),
+        default=False,
     )
 
     diagnostics = {
@@ -456,11 +881,17 @@ def detect_ltf_model(
         return result.to_dict()
 
     symbol = _symbol(payload)
+    expected_direction = _payload_direction(payload)
+    if expected_direction == "NEUTRAL":
+        expected_direction = None
+
+    result.expected_direction = expected_direction
     active_watch, watch_diagnostics = _is_active_tpo_otd_watch(payload)
 
     result.diagnostics.update(
         {
             "symbol": symbol,
+            "expected_direction": expected_direction,
             **watch_diagnostics,
             **_interest_zone_summary(payload),
         }
@@ -508,7 +939,12 @@ def detect_ltf_model(
         )
         return result.to_dict()
 
-    direction, displacement_diagnostics = _detect_displacement(df)
+    zone_price = _interest_zone_price(payload)
+    direction, displacement_diagnostics = _detect_displacement(
+        df,
+        expected_direction=expected_direction,
+        zone_price=zone_price,
+    )
     result.diagnostics["displacement"] = displacement_diagnostics
 
     if direction not in {"LONG", "SHORT"}:
@@ -517,11 +953,20 @@ def detect_ltf_model(
             trigger_reason="pending_no_directional_displacement",
         )
         result.reasons.append(
-            "No confirmed 15m displacement/BOS yet; keep WATCH, no Telegram."
+            "No confirmed 15m displacement/BOS/reclaim yet; keep WATCH, no Telegram."
         )
         return result.to_dict()
 
-    zone_price = _interest_zone_price(payload)
+    if expected_direction in {"LONG", "SHORT"} and direction != expected_direction:
+        result.add_blocker(
+            "PENDING_DISPLACEMENT_AGAINST_EXPECTED_DIRECTION",
+            trigger_reason="pending_displacement_against_expected_direction",
+        )
+        result.reasons.append(
+            "Detected LTF movement conflicts with TPO/HTF expected direction; keep WATCH."
+        )
+        return result.to_dict()
+
     geometry = _build_geometry(
         symbol=symbol,
         direction=direction,
@@ -553,8 +998,9 @@ def detect_ltf_model(
     result.confidence = 0.64
     result.probability = 0.64
     result.execution_model = "FAILED_ACCEPTANCE_RETEST"
+    selected_method = displacement_diagnostics.get("selected_method") or displacement_diagnostics.get("displacement")
     result.reasons.append(
-        f"15m structure confirmed directional OPEN_TEST_DRIVE model: {direction}."
+        f"15m structure confirmed directional OPEN_TEST_DRIVE model: {direction} via {selected_method}."
     )
 
     if stop_distance is None or stop_distance < min_stop:
