@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.7-finnhub-filtered-risk-calendar"
+BRIEFING_VERSION = "daily-market-briefing-v1.8-finnhub-time-aware-clean-risk"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -650,6 +650,47 @@ def _local_dt_from_event(event: dict[str, Any], report_timezone: str) -> str:
         return report_event.strftime("%H:%M %Z")
     except Exception:
         return f"{event_date} {event_time} {event_tz}"
+
+
+def _event_local_datetime(event: dict[str, Any], report_timezone: str) -> datetime | None:
+    event_date = str(event.get("date") or "").strip()
+    event_time = str(event.get("time") or "").strip()
+    event_tz = str(event.get("timezone") or report_timezone).strip() or report_timezone
+
+    if not event_date or not event_time:
+        return None
+
+    try:
+        hour, minute = [int(x) for x in event_time.split(":", 1)]
+        provider_dt = datetime.combine(
+            date.fromisoformat(event_date),
+            time(hour=hour, minute=minute),
+            tzinfo=ZoneInfo(event_tz),
+        )
+        return provider_dt.astimezone(_tz(report_timezone))
+    except Exception:
+        return None
+
+
+def _time_aware_event_note(event: dict[str, Any], report_timezone: str) -> str:
+    """Return operational pre/post-news guidance for Telegram risk block."""
+    event_dt = _event_local_datetime(event, report_timezone)
+    if event_dt is None:
+        return "До high-impact news не вважати ранню структуру стабільною."
+
+    now_local = _now_utc().astimezone(_tz(report_timezone))
+    minutes = (now_local - event_dt).total_seconds() / 60.0
+
+    if minutes < -15:
+        return "До релізу: не піднімати research у battle; перша структура може бути фальшивою."
+
+    if -15 <= minutes < 0:
+        return "Реліз близько. Не відкривати новий battle без уже сформованої моделі та захисту ризику."
+
+    if 0 <= minutes <= 90:
+        return "Реліз уже був. Режим: post-news acceptance / failed move; не наздоганяти перший імпульс."
+
+    return "Новина вже відпрацьована; враховувати лише якщо volatility regime ще активний."
 
 
 def _extract_list(payload: Any) -> list[dict[str, Any]]:
@@ -1435,13 +1476,16 @@ def _build_high_impact_section(target_date: date, timezone_name: str, report_typ
     events, hidden_unmapped = _filter_actionable_high_impact_events(raw_events, report_type)
     section = BriefingSection("🔴 Ризик дня")
 
+    # hidden_unmapped remains available in JSON/debug artifacts through raw calendar data,
+    # but Telegram stays operational and concise. No provider-noise line here.
+    del hidden_unmapped
+
     if not events:
         if calendar.status == "EMPTY":
             section.lines.append("HIGH/RED подій за підключеним календарем не знайдено.")
             section.lines.append(f"Джерело: {calendar.source}.")
-        elif raw_events and hidden_unmapped:
+        elif raw_events:
             section.lines.append("HIGH/RED подій для нашого торгового фокусу не знайдено.")
-            section.lines.append(f"Приховано невизначених provider-подій без валюти/активів: {hidden_unmapped}.")
             section.lines.append(f"Джерело: {calendar.source}.")
         else:
             section.lines.append("Календар high-impact news не завантажений / provider unavailable.")
@@ -1455,17 +1499,17 @@ def _build_high_impact_section(target_date: date, timezone_name: str, report_typ
         section.lines.append("⚠️ Основний календар недоступний; використовується static fallback.")
         section.lines.append("Це може бути неповний список подій.")
 
-    if hidden_unmapped:
-        section.lines.append(f"ℹ️ Приховано provider-подій без валюти/активів: {hidden_unmapped}.")
-
     for e in events[:5]:
         local_time = _local_dt_from_event(e, timezone_name)
         currency = e.get("currency") or "-"
         impact = str(e.get("impact") or "HIGH").upper()
         title = e.get("title") or e.get("event") or "Unnamed event"
         symbols = _filter_symbols_for_report(e.get("symbols") or [], report_type)
-        note = _translate_note(e.get("note"))
         source = e.get("source") or calendar.source
+
+        provider_note = _translate_note(e.get("note"))
+        operational_note = _time_aware_event_note(e, timezone_name)
+        note = operational_note or provider_note
 
         symbol_text = ""
         if symbols:
@@ -1474,6 +1518,8 @@ def _build_high_impact_section(target_date: date, timezone_name: str, report_typ
         section.lines.append(f"• {local_time} — {currency} {impact}: {title}{symbol_text}")
         if note:
             section.lines.append(f"  {note}")
+        if provider_note and provider_note != note:
+            section.lines.append(f"  {provider_note}")
         if source:
             section.lines.append(f"  Джерело: {source}")
 
