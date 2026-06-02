@@ -3,7 +3,7 @@ from __future__ import annotations
 """
 TPO LTF Model Detector for AI Market Analyst.
 
-v1.2 purpose:
+v1.3 purpose:
 - Convert TPO Watch Bridge states into an operational live setup state.
 - Keep OPEN_TEST_DRIVE contexts visible in journal/snapshot instead of allowing
   them to be buried as NO_ACTION.
@@ -20,6 +20,14 @@ v1.2 upgrade:
 - Detect conservative zone reclaim / failed-acceptance behavior around the
   primary interest zone.
 - Keep detailed diagnostics so PENDING states explain exactly what is missing.
+
+v1.3 safety gate:
+- A synthetic 2.5R target is research geometry only. It is useful for journal
+  diagnostics, but it cannot produce EXECUTABLE / READY.
+- CONFIRMED LTF model + synthetic target becomes WATCH / INCOMPLETE with
+  outcome CONFIRMED_NEEDS_REAL_TARGET.
+- READY requires a real target zone on the correct side of entry, valid stop,
+  and RR >= MIN_CONFIRMED_RR.
 
 Pipeline:
 TPO Watch Bridge:
@@ -46,7 +54,7 @@ from typing import Any
 import pandas as pd
 
 
-LTF_MODEL_DETECTOR_VERSION = "tpo-ltf-model-detector-v1.2-windowed-displacement-reclaim"
+LTF_MODEL_DETECTOR_VERSION = "tpo-ltf-model-detector-v1.3-real-target-required"
 
 MIN_CONFIRMED_RR = 2.0
 MIN_BARS = 8
@@ -54,6 +62,9 @@ RECENT_WINDOW = 16
 STRUCTURE_WINDOW = 5
 DISPLACEMENT_LOOKBACK = 5
 RECLAIM_LOOKBACK = 5
+REQUIRE_REAL_TARGET_FOR_EXECUTABLE = True
+SYNTHETIC_TARGET_SOURCE = "synthetic_2_5r"
+REAL_TARGET_SOURCE = "interest_zone"
 
 COMPACT_TO_FULL_STATE = {
     "NO_MODEL": "LTF_MODEL_NO_MODEL",
@@ -111,6 +122,7 @@ class LTFModelResult:
     target_distance: float | None = None
     risk_reward_ratio: float | None = None
     practical_rr: float | None = None
+    target_source: str | None = None
 
     execution_status: str = "NOT_EXECUTABLE"
     execution_model: str = "NONE"
@@ -784,10 +796,10 @@ def _build_geometry(
 
         if target_zone_price is not None and target_zone_price > last_close:
             target = target_zone_price
-            target_source = "interest_zone"
+            target_source = REAL_TARGET_SOURCE
         else:
             target = last_close + (risk * 2.5)
-            target_source = "synthetic_2_5r"
+            target_source = SYNTHETIC_TARGET_SOURCE
 
         reward = target - last_close
 
@@ -801,10 +813,10 @@ def _build_geometry(
 
         if target_zone_price is not None and target_zone_price < last_close:
             target = target_zone_price
-            target_source = "interest_zone"
+            target_source = REAL_TARGET_SOURCE
         else:
             target = last_close - (risk * 2.5)
-            target_source = "synthetic_2_5r"
+            target_source = SYNTHETIC_TARGET_SOURCE
 
         reward = last_close - target
 
@@ -988,6 +1000,7 @@ def detect_ltf_model(
     result.target_distance = geometry["target_distance"]
     result.risk_reward_ratio = geometry["risk_reward_ratio"]
     result.practical_rr = geometry["practical_rr"]
+    result.target_source = geometry.get("target_source")
 
     result.scenario = f"TPO_OPEN_TEST_DRIVE_{direction}"
     result.scenario_type = result.scenario
@@ -1013,6 +1026,22 @@ def detect_ltf_model(
             trigger_reason=result.trigger_reason,
         )
         result.diagnostics["min_stop"] = min_stop
+        return result.to_dict()
+
+    if REQUIRE_REAL_TARGET_FOR_EXECUTABLE and geometry.get("target_source") == SYNTHETIC_TARGET_SOURCE:
+        result.status = "WATCH"
+        result.signal_class = "WATCH"
+        result.execution_status = "INCOMPLETE"
+        result.trigger_reason = "confirmed_needs_real_target_zone"
+        result.add_blocker(
+            "CONFIRMED_NEEDS_REAL_TARGET",
+            trigger_reason=result.trigger_reason,
+        )
+        result.diagnostics["real_target_required"] = True
+        result.diagnostics["synthetic_target_not_executable"] = True
+        result.reasons.append(
+            "LTF model is confirmed, but target is synthetic 2.5R; keep WATCH until a real target zone is available."
+        )
         return result.to_dict()
 
     if rr is None or rr < MIN_CONFIRMED_RR:
@@ -1055,6 +1084,7 @@ def _merge_ltf_result_into_metadata(meta: dict[str, Any], result: dict[str, Any]
     meta["ltf_model_blockers"] = result.get("blockers") or []
     meta["ltf_model_warnings"] = result.get("warnings") or []
     meta["ltf_model_diagnostics"] = result.get("diagnostics") or {}
+    meta["target_source"] = result.get("target_source")
 
     return meta
 
@@ -1087,6 +1117,8 @@ def enrich_payload_with_ltf_model(
     enriched["ltf_model_blockers"] = result.get("blockers") or []
     enriched["ltf_model_warnings"] = result.get("warnings") or []
     enriched["ltf_model_diagnostics"] = result.get("diagnostics") or {}
+    if result.get("target_source") is not None:
+        enriched["target_source"] = result.get("target_source")
 
     # If this is an active TPO watch, prevent it from being buried as NO_ACTION.
     #
@@ -1125,6 +1157,7 @@ def enrich_payload_with_ltf_model(
             "target_distance",
             "risk_reward_ratio",
             "practical_rr",
+            "target_source",
             "execution_timeframe",
             "confidence",
             "probability",
@@ -1147,6 +1180,7 @@ def enrich_payload_with_ltf_model(
                 "risk_reward_ratio": result.get("risk_reward_ratio"),
                 "stop_distance": result.get("stop_distance"),
                 "target_distance": result.get("target_distance"),
+                "target_source": result.get("target_source"),
                 "execution_timeframe": result.get("execution_timeframe"),
                 "trigger_reason": result.get("trigger_reason"),
                 "ltf_model_state": result.get("ltf_model_state"),
@@ -1159,3 +1193,4 @@ def enrich_payload_with_ltf_model(
 
     enriched["metadata"] = meta
     return enriched
+
