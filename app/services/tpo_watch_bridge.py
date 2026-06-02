@@ -23,13 +23,16 @@ Important:
 - POC/nPOC/VAH/VAL are interest zones, not entry triggers.
 - OPEN_TEST_DRIVE + HTF NEUTRAL is allowed as a transition candidate.
 - A watch-state is not a battle signal.
+- TPO telegram DOWNGRADE is not an automatic watch blocker. It is a warning
+  for downstream Battle/Telegram layers unless permission/status explicitly blocks.
 """
 
 from dataclasses import dataclass, field, asdict
+import re
 from typing import Any
 
 
-TPO_WATCH_BRIDGE_VERSION = "tpo-watch-bridge-v1.0-open-behavior-to-ltf-pending"
+TPO_WATCH_BRIDGE_VERSION = "tpo-watch-bridge-v1.1-normalize-direction-enums"
 
 
 BLOCK_MARKET_STATUSES = {
@@ -42,15 +45,26 @@ BLOCK_MARKET_STATUSES = {
 
 BLOCK_PERMISSIONS = {
     "BLOCK",
+    "BLOCKED",
     "MARKET_CLOSED",
     "STALE_DATA",
     "DATA_STALE",
+    "SUPPRESS",
+    "NO_TRADE",
+    "NOT_ALLOWED",
 }
 
-DOWNGRADE_MODIFIERS = {
-    "DOWNGRADE",
+BLOCK_TELEGRAM_MODIFIERS = {
     "BLOCK",
+    "SUPPRESS",
 }
+
+DOWNGRADE_TELEGRAM_MODIFIERS = {
+    "DOWNGRADE",
+}
+
+
+_QUOTED_ENUM_VALUE_RE = re.compile(r":\s*['\"]([^'\"]+)['\"]")
 
 
 @dataclass
@@ -83,6 +97,9 @@ class TPOWatchResult:
 
     direction: str | None = None
     htf_bias: str | None = None
+    raw_direction: str | None = None
+    raw_htf_bias: str | None = None
+
     allowed_htf_neutral_transition: bool = False
     htf_alignment_state: str = "UNKNOWN"
 
@@ -94,16 +111,108 @@ class TPOWatchResult:
         return asdict(self)
 
 
+def _unwrap_enum_value(value: Any) -> Any:
+    """
+    Normalize Python Enum-like values before string conversion.
+
+    Handles:
+    - Direction.LONG
+    - <Direction.LONG: 'LONG'>
+    - plain strings like "LONG"
+    """
+    if value is None:
+        return None
+
+    enum_value = getattr(value, "value", None)
+    if enum_value is not None and not isinstance(value, (str, bytes, int, float, bool)):
+        return enum_value
+
+    return value
+
+
 def _s(value: Any, default: str = "") -> str:
+    """
+    Uppercase normalizer with Enum/string-enum protection.
+
+    Examples:
+    - Direction.LONG -> LONG
+    - "Direction.LONG" -> LONG
+    - "<Direction.LONG: 'LONG'>" -> LONG
+    - " long " -> LONG
+    """
     if value is None:
         return default
-    return str(value).strip().upper()
+
+    value = _unwrap_enum_value(value)
+    text = str(value).strip()
+
+    if not text:
+        return default
+
+    quoted_match = _QUOTED_ENUM_VALUE_RE.search(text)
+    if text.startswith("<") and quoted_match:
+        text = quoted_match.group(1).strip()
+    elif "." in text:
+        tail = text.rsplit(".", 1)[-1].strip()
+        if tail:
+            text = tail
+
+    return text.upper()
 
 
 def _raw_s(value: Any, default: str = "") -> str:
     if value is None:
         return default
-    return str(value).strip()
+
+    value = _unwrap_enum_value(value)
+    text = str(value).strip()
+
+    quoted_match = _QUOTED_ENUM_VALUE_RE.search(text)
+    if text.startswith("<") and quoted_match:
+        text = quoted_match.group(1).strip()
+
+    return text
+
+
+def _direction_s(value: Any, default: str = "") -> str:
+    """
+    Normalize direction-like values.
+
+    Handles direct directions and scenario-like strings:
+    - LONG
+    - Direction.LONG
+    - SWEEP_RETURN_LONG
+    - TPO_OPEN_TEST_DRIVE_SHORT
+    """
+    text = _s(value, default)
+
+    if not text:
+        return default
+
+    if text in {"LONG", "BUY", "BULL", "BULLISH", "UP"}:
+        return "LONG"
+
+    if text in {"SHORT", "SELL", "BEAR", "BEARISH", "DOWN"}:
+        return "SHORT"
+
+    if text in {"NEUTRAL", "NONE", "FLAT", "NO_BIAS", "UNKNOWN"}:
+        return "NEUTRAL"
+
+    if "LONG" in text and "SHORT" not in text:
+        return "LONG"
+
+    if "SHORT" in text and "LONG" not in text:
+        return "SHORT"
+
+    return text
+
+
+def _direction_from_scenario(*values: Any) -> str | None:
+    for value in values:
+        direction = _direction_s(value)
+        if direction in {"LONG", "SHORT", "NEUTRAL"}:
+            return direction
+    return None
 
 
 def _f(value: Any, default: float | None = None) -> float | None:
@@ -188,6 +297,23 @@ def _normalize_tpo_record(
     return record, context or {}, filters or {}
 
 
+def _activate_ltf_pending(
+    result: TPOWatchResult,
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    result.tpo_watch_state = "LTF_MODEL_PENDING"
+    result.ltf_model_state = "PENDING"
+    result.tpo_watch_active = True
+    result.tpo_watch_reason = reason
+    result.reasons.append(reason)
+
+    if result.primary_interest_zone:
+        result.reasons.append("Primary interest zone is available; zone is not an entry trigger.")
+
+    return result.to_dict()
+
+
 def evaluate_tpo_watch_bridge(
     *,
     symbol: str | None = None,
@@ -205,6 +331,7 @@ def evaluate_tpo_watch_bridge(
     It creates LTF_MODEL_PENDING when auction context is worth watching.
     """
     del symbol
+
     signal_payload = signal_payload if isinstance(signal_payload, dict) else {}
     record, ctx, flt = _normalize_tpo_record(
         symbol_payload=symbol_payload,
@@ -214,26 +341,36 @@ def evaluate_tpo_watch_bridge(
 
     result = TPOWatchResult()
 
-    result.direction = _s(
-        _first_non_empty(
-            direction,
-            signal_payload.get("direction"),
-            record.get("direction"),
-            ctx.get("direction"),
-            flt.get("direction"),
-        )
-    ) or None
-
-    result.htf_bias = _s(
-        _first_non_empty(
-            htf_bias,
-            signal_payload.get("htf_bias"),
-            record.get("htf_bias"),
-            ctx.get("htf_bias"),
-            flt.get("htf_bias"),
-        ),
-        "NEUTRAL",
+    raw_direction = _first_non_empty(
+        direction,
+        signal_payload.get("direction"),
+        record.get("direction"),
+        ctx.get("direction"),
+        flt.get("direction"),
     )
+
+    result.raw_direction = _raw_s(raw_direction) if raw_direction is not None else None
+    result.direction = _direction_s(raw_direction) or _direction_from_scenario(
+        signal_payload.get("scenario"),
+        signal_payload.get("scenario_type"),
+        record.get("scenario"),
+        record.get("scenario_type"),
+        ctx.get("scenario"),
+        ctx.get("scenario_type"),
+        flt.get("scenario"),
+        flt.get("scenario_type"),
+    )
+
+    raw_htf_bias = _first_non_empty(
+        htf_bias,
+        signal_payload.get("htf_bias"),
+        record.get("htf_bias"),
+        ctx.get("htf_bias"),
+        flt.get("htf_bias"),
+    )
+
+    result.raw_htf_bias = _raw_s(raw_htf_bias) if raw_htf_bias is not None else None
+    result.htf_bias = _direction_s(raw_htf_bias, "NEUTRAL") or "NEUTRAL"
 
     result.market_status = _s(
         _first_non_empty(
@@ -349,7 +486,7 @@ def evaluate_tpo_watch_bridge(
         result.reasons.append(result.tpo_watch_reason)
         return result.to_dict()
 
-    if result.tpo_telegram_modifier in DOWNGRADE_MODIFIERS:
+    if result.tpo_telegram_modifier in BLOCK_TELEGRAM_MODIFIERS:
         result.tpo_watch_state = "OBSERVE_ONLY"
         result.ltf_model_state = "NO_MODEL"
         result.tpo_watch_active = False
@@ -358,6 +495,9 @@ def evaluate_tpo_watch_bridge(
         result.blockers.append(f"tpo_modifier_{result.tpo_telegram_modifier.lower()}")
         result.reasons.append(result.tpo_watch_reason)
         return result.to_dict()
+
+    if result.tpo_telegram_modifier in DOWNGRADE_TELEGRAM_MODIFIERS:
+        result.warnings.append("tpo_modifier_downgrade_watch_allowed_for_ltf_validation")
 
     direction_value = result.direction or ""
     htf_bias_value = result.htf_bias or "NEUTRAL"
@@ -370,6 +510,7 @@ def evaluate_tpo_watch_bridge(
         result.htf_alignment_state = "HTF_CONFLICT"
     else:
         result.htf_alignment_state = "UNKNOWN"
+        result.warnings.append("direction_or_htf_bias_unknown_ltf_detector_must_confirm")
 
     if result.open_behavior == "OPEN_TEST_DRIVE":
         result.tpo_watch_setup = "OPEN_TEST_DRIVE"
@@ -379,8 +520,8 @@ def evaluate_tpo_watch_bridge(
             result.ltf_model_state = "NO_MODEL"
             result.tpo_watch_active = False
             result.tpo_watch_reason = (
-                "OPEN_TEST_DRIVE detected, but direction conflicts with HTF bias; "
-                "keep research-only unless later policy explicitly allows it."
+                "OPEN_TEST_DRIVE detected, but normalized direction conflicts with HTF bias; "
+                "keep research-only unless later policy explicitly allows counter-HTF OTD."
             )
             result.blockers.append("htf_conflict")
             result.reasons.append(result.tpo_watch_reason)
@@ -390,19 +531,13 @@ def evaluate_tpo_watch_bridge(
             result.allowed_htf_neutral_transition = True
             result.warnings.append("htf_neutral_transition_candidate")
 
-        result.tpo_watch_state = "LTF_MODEL_PENDING"
-        result.ltf_model_state = "PENDING"
-        result.tpo_watch_active = True
-        result.tpo_watch_reason = (
-            "OPEN_TEST_DRIVE context is active; wait for 5m-15m LTF model "
-            "before any ENTRY_READY signal."
+        return _activate_ltf_pending(
+            result,
+            reason=(
+                "OPEN_TEST_DRIVE context is active; wait for 5m-15m LTF model "
+                "before any ENTRY_READY signal."
+            ),
         )
-        result.reasons.append(result.tpo_watch_reason)
-
-        if result.primary_interest_zone:
-            result.reasons.append("Primary interest zone is available; zone is not an entry trigger.")
-
-        return result.to_dict()
 
     if result.open_behavior == "OPEN_DRIVE":
         result.tpo_watch_setup = "OPEN_DRIVE"
@@ -416,25 +551,21 @@ def evaluate_tpo_watch_bridge(
             result.reasons.append(result.tpo_watch_reason)
             return result.to_dict()
 
-        result.tpo_watch_state = "LTF_MODEL_PENDING"
-        result.ltf_model_state = "PENDING"
-        result.tpo_watch_active = True
-        result.tpo_watch_reason = "OPEN_DRIVE context is active; wait for pullback/continuation LTF model."
-        result.reasons.append(result.tpo_watch_reason)
-        return result.to_dict()
+        return _activate_ltf_pending(
+            result,
+            reason="OPEN_DRIVE context is active; wait for pullback/continuation LTF model.",
+        )
 
     if result.open_behavior == "OPEN_REJECTION_REVERSE":
         result.tpo_watch_setup = "OPEN_REJECTION_REVERSE"
-        result.tpo_watch_state = "LTF_MODEL_PENDING"
-        result.ltf_model_state = "PENDING"
-        result.tpo_watch_active = True
-        result.tpo_watch_reason = (
-            "OPEN_REJECTION_REVERSE context is active; cautious watch only, "
-            "requires very clean reclaim/BOS/retest."
-        )
         result.warnings.append("orr_requires_caution")
-        result.reasons.append(result.tpo_watch_reason)
-        return result.to_dict()
+        return _activate_ltf_pending(
+            result,
+            reason=(
+                "OPEN_REJECTION_REVERSE context is active; cautious watch only, "
+                "requires very clean reclaim/BOS/retest."
+            ),
+        )
 
     if result.open_behavior == "OPEN_AUCTION":
         result.tpo_watch_setup = "OPEN_AUCTION"
