@@ -51,7 +51,7 @@ from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.5.0-tpo-ltf-model-detector-v1"
+RUNNER_VERSION = "1.5.1-tpo-ltf-debuggable-bridge-guard"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -2025,6 +2025,120 @@ class StatefulBatchRunner:
         if not isinstance(metadata, dict):
             metadata = {}
             payload["metadata"] = metadata
+
+        # -----------------------------------------------------------------
+        # TPO/LTF detector guard
+        # -----------------------------------------------------------------
+        # The LTF detector is allowed to keep an OPEN_TEST_DRIVE context in
+        # WATCH / LTF_MODEL_PENDING state. The old execution bridge must not
+        # overwrite that useful state with generic reasons such as
+        # "not_ready_status" or "neutral_or_invalid_direction".
+        #
+        # This guard keeps the context visible in journal/statistics:
+        #   TPO_OPEN_TEST_DRIVE_WATCH
+        #   LTF_MODEL_PENDING
+        #   waiting_for_ltf_model_confirmation
+        #
+        # It does NOT create a trade signal and does NOT allow Telegram.
+        ltf_model_state = str(
+            payload.get("ltf_model_state")
+            or metadata.get("ltf_model_state")
+            or ""
+        ).upper()
+
+        ltf_model_state_full = str(
+            payload.get("ltf_model_state_full")
+            or metadata.get("ltf_model_state_full")
+            or ""
+        ).upper()
+
+        tpo_watch_state = str(
+            payload.get("tpo_watch_state")
+            or metadata.get("tpo_watch_state")
+            or ""
+        ).upper()
+
+        open_behavior = str(
+            payload.get("open_behavior")
+            or metadata.get("open_behavior")
+            or ""
+        ).upper()
+
+        if (
+            ltf_model_state == "PENDING"
+            and tpo_watch_state == "LTF_MODEL_PENDING"
+            and open_behavior == "OPEN_TEST_DRIVE"
+        ):
+            metadata["execution_bridge_status"] = "SKIPPED"
+            metadata["execution_bridge_reason"] = "tpo_ltf_model_pending"
+            metadata["execution_bridge_detail"] = (
+                "OPEN_TEST_DRIVE is active, but LTF model is still pending; "
+                "do not overwrite detector trigger_reason."
+            )
+            metadata["ltf_model_state"] = ltf_model_state
+            metadata["ltf_model_state_full"] = ltf_model_state_full or "LTF_MODEL_PENDING"
+            metadata["ltf_model_outcome"] = (
+                payload.get("ltf_model_outcome")
+                or metadata.get("ltf_model_outcome")
+                or "PENDING_WAITING_FOR_LTF_MODEL_CONFIRMATION"
+            )
+
+            execution = payload.get("execution")
+            if not isinstance(execution, dict):
+                execution = {}
+
+            trigger_reason = (
+                payload.get("trigger_reason")
+                or metadata.get("trigger_reason")
+                or metadata.get("ltf_model_bridge_reason")
+                or "waiting_for_ltf_model_confirmation"
+            )
+
+            execution.update(
+                {
+                    "status": "NOT_EXECUTABLE",
+                    "model": "NONE",
+                    "entry_reference_price": execution.get("entry_reference_price"),
+                    "invalidation_reference_price": execution.get("invalidation_reference_price"),
+                    "target_reference_price": execution.get("target_reference_price"),
+                    "risk_reward_ratio": execution.get("risk_reward_ratio"),
+                    "stop_distance": execution.get("stop_distance"),
+                    "target_distance": execution.get("target_distance"),
+                    "execution_timeframe": execution.get("execution_timeframe") or "15m",
+                    "trigger_reason": trigger_reason,
+                    "ltf_model_state": ltf_model_state,
+                    "ltf_model_state_full": ltf_model_state_full or "LTF_MODEL_PENDING",
+                    "ltf_model_outcome": metadata["ltf_model_outcome"],
+                    "ltf_model_blockers": (
+                        payload.get("ltf_model_blockers")
+                        or metadata.get("ltf_model_blockers")
+                        or []
+                    ),
+                }
+            )
+
+            payload["execution"] = execution
+            payload["execution_status"] = "NOT_EXECUTABLE"
+            payload["execution_model"] = "NONE"
+            payload["trigger_reason"] = trigger_reason
+
+            if not payload.get("scenario") or str(payload.get("scenario")).upper() == "NO_ACTION":
+                payload["scenario"] = "TPO_OPEN_TEST_DRIVE_WATCH"
+                payload["scenario_type"] = "TPO_OPEN_TEST_DRIVE_WATCH"
+
+            if not payload.get("status") or str(payload.get("status")).upper() in {"NO_SETUP", "IDLE"}:
+                payload["status"] = "WATCH"
+
+            if not payload.get("signal_class"):
+                payload["signal_class"] = "WATCH"
+            if not payload.get("stage"):
+                payload["stage"] = payload.get("signal_class") or "WATCH"
+
+            if not payload.get("next_expected_event"):
+                payload["next_expected_event"] = "ltf_model_confirmation"
+
+            payload["metadata"] = metadata
+            return payload
 
         # If ScenarioEngine already provided a real execution payload, keep it.
         existing_status = str(payload.get("execution_status") or "").upper()
