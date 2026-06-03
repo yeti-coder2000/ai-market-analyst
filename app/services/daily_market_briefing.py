@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.8-finnhub-time-aware-clean-risk"
+BRIEFING_VERSION = "daily-market-briefing-v1.9-ny-open-status-and-post-news-reaction"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -1620,23 +1620,249 @@ def _compact_zone_text(zone: Any) -> str:
     return zone_type
 
 
-def _brief_symbol_context(item: dict[str, Any]) -> dict[str, Any]:
-    ctx = item.get("context") if isinstance(item.get("context"), dict) else {}
-    filters = item.get("filters") if isinstance(item.get("filters"), dict) else {}
-    ob = item.get("open_behavior") if isinstance(item.get("open_behavior"), dict) else {}
 
-    market_status = _upper(ctx.get("market_status") or filters.get("market_status"), "UNKNOWN")
-    permission = _upper(filters.get("tpo_signal_permission") or ctx.get("tpo_signal_permission"), "UNKNOWN")
-    modifier = _upper(filters.get("telegram_modifier") or filters.get("tpo_telegram_modifier") or ctx.get("tpo_telegram_modifier"), "NEUTRAL")
-    open_context = _upper(ctx.get("open_context") or filters.get("open_context") or ob.get("open_context"), "UNKNOWN")
-    open_behavior = _upper(ctx.get("open_behavior") or filters.get("open_behavior") or ob.get("open_behavior"), "UNKNOWN")
-    entry_hint = _upper(ctx.get("entry_model_hint") or filters.get("entry_model_hint") or ob.get("entry_model_hint"), "NO_ENTRY_MODEL")
-    battle_hint = _upper(ctx.get("battle_bias_hint") or filters.get("battle_bias_hint") or ob.get("battle_bias_hint"), "RESEARCH_ONLY")
-    primary_zone = ctx.get("primary_interest_zone") or ob.get("primary_interest_zone")
-    warnings = ob.get("warnings") if isinstance(ob.get("warnings"), list) else []
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _boolish(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "open"}:
+        return True
+    if text in {"0", "false", "no", "off", "closed"}:
+        return False
+    return default
+
+
+def _nested_dicts(item: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """
+    Return all known nested context containers used by the project.
+
+    The short Telegram market-state block must not accidentally read stale top-level
+    fallback/control values while fresh TPO context says the market is OPEN.
+    """
+    metadata = _as_dict(item.get("metadata"))
+    payload = _as_dict(item.get("payload"))
+    payload_payload = _as_dict(payload.get("payload"))
+
+    context = _as_dict(item.get("context"))
+    filters = _as_dict(item.get("filters"))
+    open_behavior = _as_dict(item.get("open_behavior"))
+
+    auction_context = _as_dict(item.get("auction_context"))
+    auction_filters = _as_dict(item.get("auction_filters"))
+
+    metadata_context = _as_dict(metadata.get("context"))
+    metadata_filters = _as_dict(metadata.get("filters"))
+    metadata_auction_context = _as_dict(metadata.get("auction_context"))
+    metadata_auction_filters = _as_dict(metadata.get("auction_filters"))
+
+    payload_context = _as_dict(payload.get("context"))
+    payload_filters = _as_dict(payload.get("filters"))
+    payload_auction_context = _as_dict(payload.get("auction_context"))
+    payload_auction_filters = _as_dict(payload.get("auction_filters"))
+
+    nested_payload_context = _as_dict(payload_payload.get("context"))
+    nested_payload_filters = _as_dict(payload_payload.get("filters"))
+    nested_payload_auction_context = _as_dict(payload_payload.get("auction_context"))
+    nested_payload_auction_filters = _as_dict(payload_payload.get("auction_filters"))
+
+    return {
+        "context": context,
+        "filters": filters,
+        "open_behavior": open_behavior,
+        "auction_context": auction_context,
+        "auction_filters": auction_filters,
+        "metadata": metadata,
+        "metadata_context": metadata_context,
+        "metadata_filters": metadata_filters,
+        "metadata_auction_context": metadata_auction_context,
+        "metadata_auction_filters": metadata_auction_filters,
+        "payload": payload,
+        "payload_context": payload_context,
+        "payload_filters": payload_filters,
+        "payload_auction_context": payload_auction_context,
+        "payload_auction_filters": payload_auction_filters,
+        "payload_payload": payload_payload,
+        "nested_payload_context": nested_payload_context,
+        "nested_payload_filters": nested_payload_filters,
+        "nested_payload_auction_context": nested_payload_auction_context,
+        "nested_payload_auction_filters": nested_payload_auction_filters,
+    }
+
+
+def _first_from_sources(keys: tuple[str, ...], sources: list[dict[str, Any]], default: Any = None) -> Any:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in keys:
+            value = source.get(key)
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            return value
+    return default
+
+
+def _first_zone_from_sources(sources: list[dict[str, Any]]) -> dict[str, Any]:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in ("primary_interest_zone", "interest_zone", "zone"):
+            value = source.get(key)
+            if isinstance(value, dict) and value:
+                return value
+    return {}
+
+
+def _context_says_open(data: dict[str, Any]) -> bool:
+    return bool(
+        data.get("market_is_open")
+        or data.get("context_market_status") == "OPEN"
+        or data.get("auction_market_status") == "OPEN"
+        or data.get("market_status") == "OPEN"
+    )
+
+
+def _context_says_clean_data(data: dict[str, Any]) -> bool:
+    return bool(
+        not data.get("provider_error")
+        and not data.get("market_data_is_stale")
+        and not data.get("fallback")
+    )
+
+
+def _brief_symbol_context(item: dict[str, Any]) -> dict[str, Any]:
+    d = _nested_dicts(item)
+
+    # Fresh TPO/auction context has priority over stale top-level signal/fallback state.
+    context_sources = [
+        d["context"],
+        d["auction_context"],
+        d["metadata_auction_context"],
+        d["payload_auction_context"],
+        d["nested_payload_auction_context"],
+        d["metadata_context"],
+        d["payload_context"],
+        d["nested_payload_context"],
+        item,
+        d["payload"],
+        d["payload_payload"],
+    ]
+    filter_sources = [
+        d["filters"],
+        d["auction_filters"],
+        d["metadata_auction_filters"],
+        d["payload_auction_filters"],
+        d["nested_payload_auction_filters"],
+        d["metadata_filters"],
+        d["payload_filters"],
+        d["nested_payload_filters"],
+        item,
+        d["payload"],
+        d["payload_payload"],
+    ]
+    behavior_sources = [
+        d["open_behavior"],
+        d["context"],
+        d["auction_context"],
+        d["metadata_auction_context"],
+        d["payload_auction_context"],
+        d["nested_payload_auction_context"],
+        item,
+        d["payload"],
+        d["payload_payload"],
+    ]
+
+    context_market_status = _upper(_first_from_sources(("market_status",), context_sources), "UNKNOWN")
+    auction_market_status = _upper(
+        _first_from_sources(("market_status",), [d["auction_context"], d["metadata_auction_context"], d["payload_auction_context"], d["nested_payload_auction_context"]]),
+        "UNKNOWN",
+    )
+
+    raw_permission = _first_from_sources(("tpo_signal_permission", "permission"), filter_sources)
+    raw_market_status = _first_from_sources(("market_status",), context_sources)
+
+    market_is_open = _boolish(
+        _first_from_sources(("market_is_open", "is_primary_session_active"), context_sources),
+        default=False,
+    )
+    market_data_is_stale = _boolish(
+        _first_from_sources(("market_data_is_stale", "is_stale"), context_sources),
+        default=False,
+    )
+    provider_error = _boolish(
+        _first_from_sources(("provider_error",), context_sources + filter_sources),
+        default=False,
+    )
+
+    fallback = bool(
+        _first_from_sources(
+            ("fallback_preserved_previous_context", "fallback"),
+            [item, d["filters"], d["auction_filters"], d["context"], d["auction_context"], d["metadata"], d["payload"], d["payload_payload"]],
+            default=False,
+        )
+    )
+
+    market_status = _upper(raw_market_status, "UNKNOWN")
+    permission = _upper(raw_permission, "UNKNOWN")
+
+    # Guard against false MARKET_CLOSED in short briefing:
+    # if fresh auction context says the market is open, do not let stale permission/top-level state
+    # print MARKET_CLOSED in the NY +1h report.
+    fresh_context_open = (
+        market_is_open
+        or context_market_status == "OPEN"
+        or auction_market_status == "OPEN"
+        or (
+            market_status == "OPEN"
+            and not market_data_is_stale
+            and not provider_error
+        )
+    )
+
+    if fresh_context_open:
+        market_status = "OPEN"
+        if permission == "MARKET_CLOSED":
+            permission = "OPEN_FOR_EVALUATION"
+
+    modifier = _upper(
+        _first_from_sources(("telegram_modifier", "tpo_telegram_modifier", "modifier"), filter_sources + context_sources),
+        "NEUTRAL",
+    )
+    open_context = _upper(
+        _first_from_sources(("open_context", "open_relation"), behavior_sources + context_sources + filter_sources),
+        "UNKNOWN",
+    )
+    open_behavior = _upper(
+        _first_from_sources(("open_behavior",), behavior_sources + context_sources + filter_sources),
+        "UNKNOWN",
+    )
+    entry_hint = _upper(
+        _first_from_sources(("entry_model_hint",), behavior_sources + context_sources + filter_sources),
+        "NO_ENTRY_MODEL",
+    )
+    battle_hint = _upper(
+        _first_from_sources(("battle_bias_hint",), behavior_sources + context_sources + filter_sources),
+        "RESEARCH_ONLY",
+    )
+    primary_zone = _first_zone_from_sources(behavior_sources + context_sources + filter_sources)
+
+    warnings = _first_from_sources(("warnings",), behavior_sources + context_sources + filter_sources, default=[])
+    if not isinstance(warnings, list):
+        warnings = []
 
     return {
         "market_status": market_status,
+        "context_market_status": context_market_status,
+        "auction_market_status": auction_market_status,
+        "market_is_open": market_is_open,
+        "market_data_is_stale": market_data_is_stale,
         "permission": permission,
         "modifier": modifier,
         "open_context": open_context,
@@ -1645,7 +1871,9 @@ def _brief_symbol_context(item: dict[str, Any]) -> dict[str, Any]:
         "battle_hint": battle_hint,
         "primary_zone": primary_zone,
         "warnings": warnings,
-        "fallback": bool(item.get("fallback_preserved_previous_context") or filters.get("fallback_preserved_previous_context")),
+        "provider_error": provider_error,
+        "fallback": bool(fallback),
+        "status_source_guard": "fresh_context_open_overrides_closed" if fresh_context_open else "normal",
     }
 
 
@@ -1658,16 +1886,26 @@ def _brief_verdict(sym: str, data: dict[str, Any]) -> tuple[str, str]:
     battle_hint = data["battle_hint"]
     zone = _compact_zone_text(data.get("primary_zone"))
 
-    # NO TRADE is reserved only for real blockers: stale/closed/no data/provider error/downshift/block.
+    context_open = _context_says_open(data)
+    clean_data = _context_says_clean_data(data)
+
+    # NO TRADE is reserved only for real blockers: stale/no data/provider error/fallback.
     if data.get("fallback") or market_status in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"} or permission in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"}:
         return "NO_TRADE", f"• {sym} — {market_status}"
 
+    # False closed guard: if fresh auction context says OPEN, keep the report operational.
     if market_status.startswith("MARKET_CLOSED") or permission == "MARKET_CLOSED":
+        if context_open and clean_data:
+            guarded_behavior = open_behavior if open_behavior not in {"UNKNOWN", "-"} else "OPEN"
+            return "OBSERVE", f"• {sym} — {guarded_behavior} | статус OPEN у TPO context, ігноруємо stale MARKET_CLOSED"
         return "NO_TRADE", f"• {sym} — MARKET_CLOSED"
 
     if modifier == "DOWNGRADE" or permission in {"BLOCKED_BY_CONTEXT", "BLOCKED_BY_AUCTION"} or battle_hint in {"DOWNGRADE_NO_DIRECTIONAL_BATTLE", "BLOCK"}:
         reason = open_behavior if open_behavior not in {"UNKNOWN", "-"} else (permission if permission not in {"UNKNOWN", "-"} else "DOWNGRADE")
-        return "NO_TRADE", f"• {sym} — {reason} + DOWNGRADE"
+        detail = ""
+        if zone != "-":
+            detail = f" | зона: {zone}"
+        return "NO_TRADE", f"• {sym} — {reason} + DOWNGRADE{detail}"
 
     # WATCH means there is a behavior candidate, but still no entry without 5m–15m confirmation.
     if open_behavior in {"OPEN_DRIVE", "OPEN_TEST_DRIVE"}:
@@ -1697,6 +1935,144 @@ def _brief_verdict(sym: str, data: dict[str, Any]) -> tuple[str, str]:
         return "OBSERVE", f"• {sym} — no directional model | спостерігати"
 
     return "WATCH", f"• {sym} — {open_behavior} | чекати LTF confirmation"
+
+
+def _recent_high_impact_events(target_date: date, timezone_name: str, report_type: str, window_minutes: int = 90) -> list[dict[str, Any]]:
+    if _normalize_report_type(report_type) not in {"ny", "ny_1h", "new_york"}:
+        return []
+
+    calendar = load_high_impact_calendar(target_date)
+    events, _hidden = _filter_actionable_high_impact_events(calendar.events, report_type)
+    now_local = _now_utc().astimezone(_tz(timezone_name))
+
+    selected: list[dict[str, Any]] = []
+    for event in events:
+        event_dt = _event_local_datetime(event, timezone_name)
+        if event_dt is None:
+            continue
+        minutes = (now_local - event_dt).total_seconds() / 60.0
+        if 0 <= minutes <= window_minutes:
+            enriched = dict(event)
+            enriched["minutes_since_event"] = round(minutes, 1)
+            selected.append(enriched)
+
+    return selected
+
+
+def _first_hour_activity_text(activity: dict[str, Any]) -> str:
+    if not isinstance(activity, dict) or not activity:
+        return "first-hour activity: немає даних"
+
+    parts: list[str] = []
+    ib_dir = _upper(activity.get("ib_direction"), "")
+    ib_ext = _upper(activity.get("ib_extension_direction"), "")
+    open_dir = _upper(activity.get("open_direction"), "")
+    tested = _upper(activity.get("tested_level"), "")
+    test_result = _upper(activity.get("test_result"), "")
+
+    if ib_dir:
+        parts.append(f"IB={ib_dir}")
+    if ib_ext and ib_ext not in {"NONE", "-"}:
+        parts.append(f"extension={ib_ext}")
+    if open_dir:
+        parts.append(f"open={open_dir}")
+    if tested and tested not in {"NONE", "-"}:
+        if test_result and test_result not in {"NONE", "-"}:
+            parts.append(f"test {tested}: {test_result}")
+        else:
+            parts.append(f"test {tested}")
+
+    if _boolish(activity.get("failed_auction")):
+        parts.append("failed auction")
+    if _boolish(activity.get("accepted_back_inside_value")):
+        parts.append("acceptance back inside value")
+    if _boolish(activity.get("accepted_back_inside_range")):
+        parts.append("acceptance back inside range")
+    if _boolish(activity.get("accepted_outside_range")):
+        parts.append("acceptance outside range")
+
+    return ", ".join(parts) if parts else "first-hour activity: без явного висновку"
+
+
+def _post_news_symbol_line(sym: str, item: dict[str, Any]) -> str:
+    data = _brief_symbol_context(item)
+    d = _nested_dicts(item)
+    context_sources = [
+        d["context"],
+        d["auction_context"],
+        d["metadata_auction_context"],
+        d["payload_auction_context"],
+        d["nested_payload_auction_context"],
+        d["metadata_context"],
+        d["payload_context"],
+        d["nested_payload_context"],
+        item,
+        d["payload"],
+        d["payload_payload"],
+    ]
+
+    activity = _first_from_sources(("first_hour_activity",), context_sources, default={})
+    activity = activity if isinstance(activity, dict) else {}
+
+    behavior = data.get("open_behavior") or "UNKNOWN"
+    context = data.get("open_context") or "UNKNOWN"
+    zone = _compact_zone_text(data.get("primary_zone"))
+    activity_text = _first_hour_activity_text(activity)
+
+    if behavior == "OPEN_REJECTION_REVERSE":
+        mode = "rejection/failed move context; тільки research до reclaim/BOS/retest"
+    elif behavior == "OPEN_TEST_DRIVE":
+        mode = "test-drive context; чекати LTF model + stop + real target"
+    elif behavior == "OPEN_AUCTION":
+        mode = "auction/rotation; не наздоганяти імпульс"
+    elif behavior == "OPEN_DRIVE":
+        mode = "drive context; battle тільки після pullback/acceptance"
+    else:
+        mode = "чекати acceptance / failed move"
+
+    zone_text = f" | зона: {zone}" if zone != "-" else ""
+    return f"• {sym} — {behavior} / {context}{zone_text} | {activity_text} | {mode}"
+
+
+def _build_post_news_reaction_section(
+    tpo: dict[str, Any],
+    target_date: date,
+    timezone_name: str,
+    report_type: str,
+) -> BriefingSection | None:
+    recent_events = _recent_high_impact_events(target_date, timezone_name, report_type)
+    if not recent_events:
+        return None
+
+    symbols = tpo.get("symbols") if isinstance(tpo, dict) else {}
+    symbols = symbols if isinstance(symbols, dict) else {}
+
+    section = BriefingSection("🧭 Post-news реакція")
+    event = recent_events[0]
+    title = event.get("title") or event.get("event") or "high-impact event"
+    minutes = event.get("minutes_since_event")
+    local_time = _local_dt_from_event(event, timezone_name)
+    section.lines.append(f"Подія: {local_time} — {_raw(event.get('currency'))} {_raw(event.get('impact'))}: {_raw(title)} | минуло: {minutes} хв")
+    section.lines.append("Режим: оцінюємо acceptance / failed move; перший імпульс не наздоганяти.")
+
+    focus_symbols = _filter_symbols_for_report(event.get("symbols") or [], report_type)
+    if not focus_symbols:
+        focus_symbols = list(_symbol_scope_for_report(report_type))
+
+    printed = 0
+    for sym in focus_symbols:
+        item = symbols.get(sym)
+        if not isinstance(item, dict):
+            continue
+        section.lines.append(_post_news_symbol_line(sym, item))
+        printed += 1
+        if printed >= 8:
+            break
+
+    if printed == 0:
+        section.lines.append("Немає TPO snapshot для активів post-news фокусу.")
+
+    return section
 
 
 def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str) -> BriefingSection:
@@ -1850,6 +2226,11 @@ def build_briefing_report(
     )
 
     report.sections.append(_build_high_impact_section(target_date, tz_name, normalized_type))
+
+    post_news_section = _build_post_news_reaction_section(tpo, target_date, tz_name, normalized_type)
+    if post_news_section is not None:
+        report.sections.append(post_news_section)
+
     report.sections.append(_build_tpo_snapshot_section(tpo, normalized_type))
 
     if normalized_type in {"morning", "morning_briefing", "morning_combined", "holiday_warning", "pre_market"}:
