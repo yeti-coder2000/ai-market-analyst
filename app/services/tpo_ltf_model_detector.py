@@ -3,7 +3,7 @@ from __future__ import annotations
 """
 TPO LTF Model Detector for AI Market Analyst.
 
-v1.3 purpose:
+v1.4 purpose:
 - Convert TPO Watch Bridge states into an operational live setup state.
 - Keep OPEN_TEST_DRIVE contexts visible in journal/snapshot instead of allowing
   them to be buried as NO_ACTION.
@@ -28,6 +28,14 @@ v1.3 safety gate:
   outcome CONFIRMED_NEEDS_REAL_TARGET.
 - READY requires a real target zone on the correct side of entry, valid stop,
   and RR >= MIN_CONFIRMED_RR.
+
+v1.4 target selector:
+- Select the next real target zone from the full interest_zones list, not only
+  primary_interest_zone.
+- For LONG, target must be above entry. For SHORT, target must be below entry.
+- Prefer the nearest real zone that can satisfy MIN_CONFIRMED_RR; otherwise use
+  the nearest real zone and let CONFIRMED_RR_TOO_LOW block execution.
+- Synthetic 2.5R remains research-only fallback and cannot produce READY.
 
 Pipeline:
 TPO Watch Bridge:
@@ -54,7 +62,7 @@ from typing import Any
 import pandas as pd
 
 
-LTF_MODEL_DETECTOR_VERSION = "tpo-ltf-model-detector-v1.3-real-target-required"
+LTF_MODEL_DETECTOR_VERSION = "tpo-ltf-model-detector-v1.4-target-zone-selector"
 
 MIN_CONFIRMED_RR = 2.0
 MIN_BARS = 8
@@ -65,6 +73,7 @@ RECLAIM_LOOKBACK = 5
 REQUIRE_REAL_TARGET_FOR_EXECUTABLE = True
 SYNTHETIC_TARGET_SOURCE = "synthetic_2_5r"
 REAL_TARGET_SOURCE = "interest_zone"
+TARGET_SELECTOR_SOURCE = "interest_zone_selector"
 
 COMPACT_TO_FULL_STATE = {
     "NO_MODEL": "LTF_MODEL_NO_MODEL",
@@ -123,6 +132,9 @@ class LTFModelResult:
     risk_reward_ratio: float | None = None
     practical_rr: float | None = None
     target_source: str | None = None
+    target_zone_type: str | None = None
+    target_zone_role: str | None = None
+    target_zone_reason: str | None = None
 
     execution_status: str = "NOT_EXECUTABLE"
     execution_model: str = "NONE"
@@ -387,6 +399,193 @@ def _interest_zone_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "zone_price": _interest_zone_price(payload),
         "zone_raw": zone,
     }
+
+
+
+def _zone_price_from_dict(zone: dict[str, Any]) -> float | None:
+    return _f(_first_non_empty(zone.get("price"), zone.get("level"), zone.get("value")))
+
+
+def _zone_type_from_dict(zone: dict[str, Any]) -> str | None:
+    value = _first_non_empty(zone.get("zone_type"), zone.get("type"), zone.get("name"))
+    return _s(value) if value is not None else None
+
+
+def _zone_role_from_dict(zone: dict[str, Any]) -> str | None:
+    value = _first_non_empty(zone.get("role"), zone.get("zone_role"))
+    return _s(value) if value is not None else None
+
+
+def _append_zone_candidate(out: list[dict[str, Any]], zone: Any, *, source: str) -> None:
+    if not isinstance(zone, dict) or not zone:
+        return
+
+    price = _zone_price_from_dict(zone)
+    if price is None:
+        return
+
+    zone_type = _zone_type_from_dict(zone)
+    zone_role = _zone_role_from_dict(zone)
+
+    candidate = {
+        "source": source,
+        "zone_type": zone_type,
+        "zone_role": zone_role,
+        "price": float(price),
+        "reason": zone.get("reason"),
+        "reaction": zone.get("reaction"),
+        "distance": _f(zone.get("distance")),
+        "raw": dict(zone),
+    }
+    out.append(candidate)
+
+
+def _extract_interest_zones(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Return normalized target-zone candidates from payload and metadata.
+
+    v1.3 used only primary_interest_zone. v1.4 uses full interest_zones where
+    available, while still including primary_interest_zone as a candidate.
+    """
+    meta = _metadata(payload)
+    zones: list[dict[str, Any]] = []
+
+    for source_name, source in (("payload", payload), ("metadata", meta)):
+        primary = source.get("primary_interest_zone")
+        _append_zone_candidate(zones, primary, source=f"{source_name}.primary_interest_zone")
+
+        one = source.get("interest_zone")
+        _append_zone_candidate(zones, one, source=f"{source_name}.interest_zone")
+
+        seq = source.get("interest_zones")
+        if isinstance(seq, list):
+            for index, zone in enumerate(seq):
+                _append_zone_candidate(zones, zone, source=f"{source_name}.interest_zones[{index}]")
+
+    # De-duplicate by type/role/price while preserving order.
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str | None, str | None, float]] = set()
+    for zone in zones:
+        price = float(zone["price"])
+        key = (zone.get("zone_type"), zone.get("zone_role"), round(price, 8))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(zone)
+
+    return deduped
+
+
+def _target_zone_priority(zone_type: str | None) -> int:
+    # Lower is better when distances/RR are comparable.
+    z = _s(zone_type)
+    priority = {
+        "NPOC": 10,
+        "POC": 20,
+        "VAH": 30,
+        "VAL": 30,
+        "PREVIOUS_HIGH": 40,
+        "PREVIOUS_LOW": 40,
+        "SESSION_HIGH": 50,
+        "SESSION_LOW": 50,
+    }
+    return priority.get(z, 90)
+
+
+def _select_real_target_zone(
+    payload: dict[str, Any],
+    *,
+    direction: str,
+    entry: float,
+    risk: float,
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """
+    Select a real target zone on the correct side of entry.
+
+    Rule:
+    - LONG: zone price must be above entry.
+    - SHORT: zone price must be below entry.
+    - Prefer nearest zone that satisfies MIN_CONFIRMED_RR.
+    - If no zone satisfies RR, return nearest real zone and let RR filter block.
+    """
+    zones = _extract_interest_zones(payload)
+    diagnostics: dict[str, Any] = {
+        "direction": direction,
+        "entry": round(float(entry), 8),
+        "risk": round(float(risk), 8),
+        "zones_total": len(zones),
+        "candidates": [],
+        "valid_side_candidates": [],
+        "selection_rule": "nearest_real_zone_meeting_min_rr_else_nearest_real_zone",
+    }
+
+    if risk <= 0:
+        diagnostics["selected"] = None
+        diagnostics["blocker"] = "invalid_risk"
+        return None, diagnostics
+
+    valid: list[dict[str, Any]] = []
+
+    for zone in zones:
+        price = float(zone["price"])
+        if direction == "LONG":
+            correct_side = price > entry
+            reward = price - entry
+        else:
+            correct_side = price < entry
+            reward = entry - price
+
+        rr = reward / risk if risk > 0 else None
+        item = {
+            "source": zone.get("source"),
+            "zone_type": zone.get("zone_type"),
+            "zone_role": zone.get("zone_role"),
+            "price": round(price, 8),
+            "reason": zone.get("reason"),
+            "correct_side": bool(correct_side),
+            "reward": round(reward, 8),
+            "rr": round(rr, 4) if rr is not None else None,
+            "priority": _target_zone_priority(zone.get("zone_type")),
+        }
+        diagnostics["candidates"].append(item)
+
+        if correct_side and reward > 0:
+            enriched = dict(zone)
+            enriched.update(item)
+            valid.append(enriched)
+            diagnostics["valid_side_candidates"].append(item)
+
+    if not valid:
+        diagnostics["selected"] = None
+        diagnostics["blocker"] = "no_real_target_zone_on_correct_side"
+        return None, diagnostics
+
+    min_rr_candidates = [z for z in valid if (z.get("rr") is not None and float(z["rr"]) >= MIN_CONFIRMED_RR)]
+
+    if min_rr_candidates:
+        selected = sorted(
+            min_rr_candidates,
+            key=lambda z: (float(z["reward"]), int(z["priority"])),
+        )[0]
+        diagnostics["selected_reason"] = "nearest_real_zone_meeting_min_rr"
+    else:
+        selected = sorted(
+            valid,
+            key=lambda z: (float(z["reward"]), int(z["priority"])),
+        )[0]
+        diagnostics["selected_reason"] = "nearest_real_zone_but_rr_may_be_low"
+
+    diagnostics["selected"] = {
+        "source": selected.get("source"),
+        "zone_type": selected.get("zone_type"),
+        "zone_role": selected.get("zone_role"),
+        "price": round(float(selected["price"]), 8),
+        "reason": selected.get("reason"),
+        "reward": round(float(selected["reward"]), 8),
+        "rr": round(float(selected["rr"]), 4) if selected.get("rr") is not None else None,
+        "priority": int(selected.get("priority", 90)),
+    }
+    return selected, diagnostics
 
 
 def _row_snapshot(row: pd.Series) -> dict[str, float]:
@@ -780,6 +979,7 @@ def _build_geometry(
     symbol: str,
     direction: str,
     df: pd.DataFrame,
+    payload: dict[str, Any],
     target_zone_price: float | None,
 ) -> dict[str, Any]:
     recent = df.tail(STRUCTURE_WINDOW)
@@ -794,9 +994,32 @@ def _build_geometry(
             stop = last_close - avg
             risk = avg
 
-        if target_zone_price is not None and target_zone_price > last_close:
+        selected_zone, target_selector = _select_real_target_zone(
+            payload,
+            direction=direction,
+            entry=last_close,
+            risk=risk,
+        )
+
+        if selected_zone is not None:
+            target = float(selected_zone["price"])
+            target_source = REAL_TARGET_SOURCE
+        elif target_zone_price is not None and target_zone_price > last_close:
+            # Backward-compatible fallback when a valid single zone price is supplied
+            # but the full interest_zones list is missing.
             target = target_zone_price
             target_source = REAL_TARGET_SOURCE
+            target_selector["selected_reason"] = "fallback_primary_zone_price_on_correct_side"
+            target_selector["selected"] = {
+                "source": "fallback_primary_zone_price",
+                "zone_type": None,
+                "zone_role": None,
+                "price": round(float(target), 8),
+                "reason": None,
+                "reward": round(float(target - last_close), 8),
+                "rr": round(float((target - last_close) / risk), 4) if risk > 0 else None,
+                "priority": 95,
+            }
         else:
             target = last_close + (risk * 2.5)
             target_source = SYNTHETIC_TARGET_SOURCE
@@ -811,9 +1034,32 @@ def _build_geometry(
             stop = last_close + avg
             risk = avg
 
-        if target_zone_price is not None and target_zone_price < last_close:
+        selected_zone, target_selector = _select_real_target_zone(
+            payload,
+            direction=direction,
+            entry=last_close,
+            risk=risk,
+        )
+
+        if selected_zone is not None:
+            target = float(selected_zone["price"])
+            target_source = REAL_TARGET_SOURCE
+        elif target_zone_price is not None and target_zone_price < last_close:
+            # Backward-compatible fallback when a valid single zone price is supplied
+            # but the full interest_zones list is missing.
             target = target_zone_price
             target_source = REAL_TARGET_SOURCE
+            target_selector["selected_reason"] = "fallback_primary_zone_price_on_correct_side"
+            target_selector["selected"] = {
+                "source": "fallback_primary_zone_price",
+                "zone_type": None,
+                "zone_role": None,
+                "price": round(float(target), 8),
+                "reason": None,
+                "reward": round(float(last_close - target), 8),
+                "rr": round(float((last_close - target) / risk), 4) if risk > 0 else None,
+                "priority": 95,
+            }
         else:
             target = last_close - (risk * 2.5)
             target_source = SYNTHETIC_TARGET_SOURCE
@@ -821,6 +1067,7 @@ def _build_geometry(
         reward = last_close - target
 
     rr = reward / risk if risk > 0 else None
+    selected_summary = target_selector.get("selected") if isinstance(target_selector, dict) else None
 
     return {
         "entry_reference_price": round(last_close, 8),
@@ -831,9 +1078,12 @@ def _build_geometry(
         "risk_reward_ratio": round(rr, 4) if rr is not None else None,
         "practical_rr": round(rr, 4) if rr is not None else None,
         "target_source": target_source,
+        "target_zone_type": selected_summary.get("zone_type") if isinstance(selected_summary, dict) else None,
+        "target_zone_role": selected_summary.get("zone_role") if isinstance(selected_summary, dict) else None,
+        "target_zone_reason": selected_summary.get("reason") if isinstance(selected_summary, dict) else None,
+        "target_selector": target_selector,
         "geometry_direction": direction,
     }
-
 
 def _is_active_tpo_otd_watch(payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
     meta = _metadata(payload)
@@ -983,6 +1233,7 @@ def detect_ltf_model(
         symbol=symbol,
         direction=direction,
         df=df,
+        payload=payload,
         target_zone_price=zone_price,
     )
     result.diagnostics["geometry"] = geometry
@@ -1001,6 +1252,9 @@ def detect_ltf_model(
     result.risk_reward_ratio = geometry["risk_reward_ratio"]
     result.practical_rr = geometry["practical_rr"]
     result.target_source = geometry.get("target_source")
+    result.target_zone_type = geometry.get("target_zone_type")
+    result.target_zone_role = geometry.get("target_zone_role")
+    result.target_zone_reason = geometry.get("target_zone_reason")
 
     result.scenario = f"TPO_OPEN_TEST_DRIVE_{direction}"
     result.scenario_type = result.scenario
@@ -1085,6 +1339,9 @@ def _merge_ltf_result_into_metadata(meta: dict[str, Any], result: dict[str, Any]
     meta["ltf_model_warnings"] = result.get("warnings") or []
     meta["ltf_model_diagnostics"] = result.get("diagnostics") or {}
     meta["target_source"] = result.get("target_source")
+    meta["target_zone_type"] = result.get("target_zone_type")
+    meta["target_zone_role"] = result.get("target_zone_role")
+    meta["target_zone_reason"] = result.get("target_zone_reason")
 
     return meta
 
@@ -1117,8 +1374,9 @@ def enrich_payload_with_ltf_model(
     enriched["ltf_model_blockers"] = result.get("blockers") or []
     enriched["ltf_model_warnings"] = result.get("warnings") or []
     enriched["ltf_model_diagnostics"] = result.get("diagnostics") or {}
-    if result.get("target_source") is not None:
-        enriched["target_source"] = result.get("target_source")
+    for key in ("target_source", "target_zone_type", "target_zone_role", "target_zone_reason"):
+        if result.get(key) is not None:
+            enriched[key] = result.get(key)
 
     # If this is an active TPO watch, prevent it from being buried as NO_ACTION.
     #
@@ -1158,6 +1416,9 @@ def enrich_payload_with_ltf_model(
             "risk_reward_ratio",
             "practical_rr",
             "target_source",
+            "target_zone_type",
+            "target_zone_role",
+            "target_zone_reason",
             "execution_timeframe",
             "confidence",
             "probability",
@@ -1181,6 +1442,9 @@ def enrich_payload_with_ltf_model(
                 "stop_distance": result.get("stop_distance"),
                 "target_distance": result.get("target_distance"),
                 "target_source": result.get("target_source"),
+                "target_zone_type": result.get("target_zone_type"),
+                "target_zone_role": result.get("target_zone_role"),
+                "target_zone_reason": result.get("target_zone_reason"),
                 "execution_timeframe": result.get("execution_timeframe"),
                 "trigger_reason": result.get("trigger_reason"),
                 "ltf_model_state": result.get("ltf_model_state"),
@@ -1193,4 +1457,3 @@ def enrich_payload_with_ltf_model(
 
     enriched["metadata"] = meta
     return enriched
-
