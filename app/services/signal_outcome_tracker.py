@@ -91,6 +91,8 @@ SYNTHETIC_TRACKING_SCOPE = "SYNTHETIC_TEST"
 SYNTHETIC_SIGNAL_PREFIXES = ("TEST_", "SYNTHETIC_")
 SYNTHETIC_CYCLE_IDS = {"SYNTHETIC_TEST", "TEST"}
 
+OUTCOME_TRACKER_VERSION = "signal-outcome-tracker-v2.2-ohlc-range-resolution"
+
 MATERIAL_FIELDS = (
     "outcome_status",
     "outcome_error",
@@ -604,11 +606,105 @@ def extract_snapshot_time(record: dict[str, Any]) -> datetime | None:
 
 
 def extract_snapshot_price(record: dict[str, Any]) -> float | None:
+    close = extract_snapshot_close(record)
+    if close is not None:
+        return close
+
     return safe_float(
         record.get("price")
         or record.get("last_price")
         or record.get("close")
     )
+
+
+def _nested_dicts_for_snapshot(record: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Return likely containers where OHLC/price fields may be stored.
+
+    radar_snapshot_v2.ndjson has evolved over time. Some records are flat,
+    while others may keep bar data under payload/data/ohlc-like keys. The
+    tracker must be tolerant because outcome statistics should not silently
+    miss TP/SL just because the snapshot schema moved one level deeper.
+    """
+    containers: list[dict[str, Any]] = []
+
+    def add(value: Any) -> None:
+        if isinstance(value, dict) and value not in containers:
+            containers.append(value)
+
+    add(record)
+
+    for key in ("payload", "data", "ohlc", "bar", "latest_bar", "market_data"):
+        value = record.get(key)
+        add(value)
+
+        if isinstance(value, dict):
+            for nested_key in ("payload", "data", "ohlc", "bar", "latest_bar", "market_data"):
+                add(value.get(nested_key))
+
+    return containers
+
+
+def _first_float_from_snapshot(record: dict[str, Any], keys: tuple[str, ...]) -> float | None:
+    for container in _nested_dicts_for_snapshot(record):
+        for key in keys:
+            value = safe_float(container.get(key))
+            if value is not None:
+                return value
+    return None
+
+
+def extract_snapshot_open(record: dict[str, Any]) -> float | None:
+    return _first_float_from_snapshot(record, ("open", "o", "bar_open", "candle_open"))
+
+
+def extract_snapshot_high(record: dict[str, Any]) -> float | None:
+    return _first_float_from_snapshot(record, ("high", "h", "bar_high", "candle_high"))
+
+
+def extract_snapshot_low(record: dict[str, Any]) -> float | None:
+    return _first_float_from_snapshot(record, ("low", "l", "bar_low", "candle_low"))
+
+
+def extract_snapshot_close(record: dict[str, Any]) -> float | None:
+    return _first_float_from_snapshot(
+        record,
+        ("close", "c", "price", "last_price", "bar_close", "candle_close"),
+    )
+
+
+def normalize_snapshot_ohlc(record: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    """
+    Return (open, high, low, close) for a snapshot.
+
+    If true OHLC fields are unavailable, fall back to the best point price.
+    This keeps backward compatibility with older point-price snapshots while
+    allowing v2.2 to resolve TP/SL with candle ranges when high/low are present.
+    """
+    close = extract_snapshot_close(record)
+    point = close if close is not None else _first_float_from_snapshot(record, ("price", "last_price"))
+
+    if point is None:
+        return None
+
+    open_ = extract_snapshot_open(record)
+    high = extract_snapshot_high(record)
+    low = extract_snapshot_low(record)
+
+    values_for_range = [x for x in (open_, high, low, close, point) if x is not None]
+    if not values_for_range:
+        return None
+
+    open_final = open_ if open_ is not None else point
+    close_final = close if close is not None else point
+    high_final = high if high is not None else max(values_for_range)
+    low_final = low if low is not None else min(values_for_range)
+
+    # Defensive repair for malformed records.
+    high_final = max(high_final, open_final, close_final, point)
+    low_final = min(low_final, open_final, close_final, point)
+
+    return open_final, high_final, low_final, close_final
 
 
 def iter_relevant_snapshots(
@@ -644,14 +740,20 @@ def iter_relevant_snapshots(
             if since_utc is not None and ts < since_utc:
                 continue
 
-            price = extract_snapshot_price(record)
-            if price is None:
+            ohlc = normalize_snapshot_ohlc(record)
+            if ohlc is None:
                 continue
+
+            open_, high, low, close = ohlc
 
             yield {
                 "symbol": symbol,
                 "ts": ts,
-                "price": price,
+                "price": close,
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
                 "cycle_id": record.get("cycle_id"),
             }
 
@@ -711,6 +813,119 @@ def is_sl_hit(alert: dict[str, Any], price: float) -> bool:
 
 def is_target_reached_before_entry(alert: dict[str, Any], price: float) -> bool:
     return is_tp_hit(alert, price)
+
+
+def should_trigger_entry_range(alert: dict[str, Any], *, low: float, high: float) -> bool:
+    direction = normalize_direction(alert.get("direction"))
+    entry = safe_float(alert.get("entry_reference_price"))
+
+    if entry is None:
+        return False
+
+    if direction == "LONG":
+        return low <= entry
+
+    if direction == "SHORT":
+        return high >= entry
+
+    return False
+
+
+def is_tp_hit_range(alert: dict[str, Any], *, low: float, high: float) -> bool:
+    direction = normalize_direction(alert.get("direction"))
+    target = safe_float(alert.get("target_reference_price"))
+
+    if target is None:
+        return False
+
+    if direction == "LONG":
+        return high >= target
+
+    if direction == "SHORT":
+        return low <= target
+
+    return False
+
+
+def is_sl_hit_range(alert: dict[str, Any], *, low: float, high: float) -> bool:
+    direction = normalize_direction(alert.get("direction"))
+    stop = safe_float(alert.get("invalidation_reference_price"))
+
+    if stop is None:
+        return False
+
+    if direction == "LONG":
+        return low <= stop
+
+    if direction == "SHORT":
+        return high >= stop
+
+    return False
+
+
+def is_target_reached_before_entry_range(alert: dict[str, Any], *, low: float, high: float) -> bool:
+    """
+    Detect a limit-entry miss where target trades before entry is touched.
+
+    If both entry and target are inside the same candle range, ordering is
+    unknowable from OHLC alone. In that case we do NOT mark a miss; the
+    existing conservative same-candle logic will handle it after entry.
+    """
+    if not is_tp_hit_range(alert, low=low, high=high):
+        return False
+
+    if should_trigger_entry_range(alert, low=low, high=high):
+        return False
+
+    return True
+
+
+def _execution_price(alert: dict[str, Any], key: str, fallback: float) -> float:
+    value = safe_float(alert.get(key))
+    return value if value is not None else fallback
+
+
+def update_mfe_mae_range(alert: dict[str, Any], *, low: float, high: float) -> None:
+    direction = normalize_direction(alert.get("direction"))
+    entry = safe_float(alert.get("entry_reference_price"))
+    stop = safe_float(alert.get("invalidation_reference_price"))
+
+    if entry is None or stop is None:
+        return
+
+    risk = calc_risk_distance(entry, stop)
+    if risk <= 0:
+        return
+
+    if direction == "LONG":
+        favorable = high - entry
+        adverse = entry - low
+        favorable_price = high
+        adverse_price = low
+    elif direction == "SHORT":
+        favorable = entry - low
+        adverse = high - entry
+        favorable_price = low
+        adverse_price = high
+    else:
+        return
+
+    favorable = max(0.0, favorable)
+    adverse = max(0.0, adverse)
+
+    favorable_r = round(favorable / risk, 4)
+    adverse_r = round(adverse / risk, 4)
+
+    current_mfe_r = safe_float(alert.get("mfe_R"))
+    current_mae_r = safe_float(alert.get("mae_R"))
+
+    if current_mfe_r is None or favorable_r > current_mfe_r:
+        alert["mfe_R"] = favorable_r
+        alert["mfe_price"] = favorable_price if favorable_r > 0 else entry
+
+    if current_mae_r is None or adverse_r > current_mae_r:
+        alert["mae_R"] = adverse_r
+        alert["mae_price"] = adverse_price if adverse_r > 0 else entry
 
 
 def update_mfe_mae(alert: dict[str, Any], price: float) -> None:
@@ -855,7 +1070,16 @@ def update_single_alert_from_snapshot(
     *,
     ts: datetime,
     price: float,
+    low: float | None = None,
+    high: float | None = None,
 ) -> bool:
+    """
+    Update one alert from a market snapshot.
+
+    v2.2 resolves entries, TP and SL with candle high/low when available.
+    The older point-price logic missed cases where a 15m candle wicked into
+    target/stop but the snapshot close/last price later moved away.
+    """
     if is_final(alert):
         return False
 
@@ -869,6 +1093,13 @@ def update_single_alert_from_snapshot(
         alert["last_price"] = price
         return has_material_change(before, alert)
 
+    low_value = low if low is not None else price
+    high_value = high if high is not None else price
+
+    # Defensive normalization in case a provider emits malformed ranges.
+    high_value = max(high_value, low_value, price)
+    low_value = min(low_value, high_value, price)
+
     alert["last_checked_at_utc"] = ts.isoformat()
     alert["last_price"] = price
 
@@ -876,34 +1107,61 @@ def update_single_alert_from_snapshot(
     entry_triggered_on_this_snapshot = False
 
     if not entry_triggered:
-        if is_target_reached_before_entry(alert, price):
-            mark_missed_target_before_entry(alert, ts=ts, price=price)
+        if is_target_reached_before_entry_range(alert, low=low_value, high=high_value):
+            target_price = _execution_price(alert, "target_reference_price", price)
+            mark_missed_target_before_entry(alert, ts=ts, price=target_price)
+            add_note(
+                alert,
+                "Outcome tracker v2.2 used OHLC range to detect target-before-entry.",
+            )
             return has_material_change(before, alert)
 
-        if should_trigger_entry(alert, price):
-            mark_entry_triggered(alert, ts=ts, price=price)
+        if should_trigger_entry_range(alert, low=low_value, high=high_value):
+            entry_price = _execution_price(alert, "entry_reference_price", price)
+            mark_entry_triggered(alert, ts=ts, price=entry_price)
+            add_note(
+                alert,
+                "Outcome tracker v2.2 used OHLC range to detect entry trigger.",
+            )
             entry_triggered = True
             entry_triggered_on_this_snapshot = True
 
     if entry_triggered:
-        update_mfe_mae(alert, price)
+        update_mfe_mae_range(alert, low=low_value, high=high_value)
 
-        if is_sl_hit(alert, price):
+        sl_hit = is_sl_hit_range(alert, low=low_value, high=high_value)
+        tp_hit = is_tp_hit_range(alert, low=low_value, high=high_value)
+
+        # If both TP and SL are inside one candle, OHLC cannot tell ordering.
+        # Keep the existing conservative principle: protect stats from
+        # over-crediting ambiguous wins.
+        if sl_hit:
             if entry_triggered_on_this_snapshot:
                 add_note(
                     alert,
-                    "Entry and SL detected on same snapshot. Conservative SL.",
+                    "Entry and SL detected on same snapshot range. Conservative SL.",
                 )
-            mark_sl_hit(alert, ts=ts, price=price)
+            if tp_hit:
+                add_note(
+                    alert,
+                    "TP and SL were both inside one snapshot range. Conservative SL.",
+                )
+            stop_price = _execution_price(alert, "invalidation_reference_price", price)
+            mark_sl_hit(alert, ts=ts, price=stop_price)
             return has_material_change(before, alert)
 
-        if is_tp_hit(alert, price):
+        if tp_hit:
             if entry_triggered_on_this_snapshot:
                 add_note(
                     alert,
-                    "Entry and TP detected on same snapshot. Conservative TP.",
+                    "Entry and TP detected on same snapshot range. Conservative TP.",
                 )
-            mark_tp_hit(alert, ts=ts, price=price)
+            target_price = _execution_price(alert, "target_reference_price", price)
+            mark_tp_hit(alert, ts=ts, price=target_price)
+            add_note(
+                alert,
+                "Outcome tracker v2.2 used OHLC range to detect TP hit.",
+            )
             return has_material_change(before, alert)
 
     return has_material_change(before, alert)
@@ -1029,6 +1287,8 @@ def track_outcomes(
             symbol = snapshot["symbol"]
             ts = snapshot["ts"]
             price = snapshot["price"]
+            low = snapshot.get("low")
+            high = snapshot.get("high")
 
             for alert in active_alerts:
                 if is_final(alert):
@@ -1041,7 +1301,13 @@ def track_outcomes(
                 if sent_at is not None and ts < sent_at:
                     continue
 
-                if update_single_alert_from_snapshot(alert, ts=ts, price=price):
+                if update_single_alert_from_snapshot(
+                    alert,
+                    ts=ts,
+                    price=price,
+                    low=safe_float(low),
+                    high=safe_float(high),
+                ):
                     changed_alerts.add(alert_key(alert))
 
     expiry_changed_alerts = apply_expiry(all_records, now_dt=now_dt)
@@ -1065,6 +1331,7 @@ def track_outcomes(
 
     return {
         "status": "ok",
+        "tracker_version": OUTCOME_TRACKER_VERSION,
         "dry_run": dry_run,
         "snapshot_count": snapshot_count,
         "active_alerts": len(active_alerts),
@@ -1291,6 +1558,7 @@ def write_outcomes_report(
 
     payload = {
         "schema_version": "2.0-research-counterfactual",
+        "tracker_version": OUTCOME_TRACKER_VERSION,
         "updated_at_utc": utc_now(),
         "summary": summary,
         "signals": alerts,
