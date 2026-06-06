@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.9-ny-open-status-and-post-news-reaction"
+BRIEFING_VERSION = "daily-market-briefing-v1.10-overall-winrate-recap"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -1270,6 +1270,111 @@ def _yesterday_metric(timezone_name: str, target_date: date) -> tuple[dict[str, 
     grouped, source = _yesterday_grouped_metrics(timezone_name, target_date)
     return grouped.get("all", _metric_from_records([])), source
 
+def _overall_grouped_metrics() -> tuple[dict[str, Any], str]:
+    """
+    Build cumulative production metrics from signal_outcomes.json.
+
+    This intentionally separates real Telegram/Battle alerts from research /
+    counterfactual records. Mixing them makes winrate and expectancy unusable:
+    research records are useful for diagnostics, but they must not dilute the
+    production Battle/Telegram quality line.
+    """
+    outcomes = load_signal_outcomes()
+    records = _production_records(_signals_from_outcomes(outcomes))
+
+    if not records:
+        return {
+            "battle": _metric_from_records([]),
+            "research": _metric_from_records([]),
+            "other": _metric_from_records([]),
+            "all": _metric_from_records([]),
+            "tpo_otd": _metric_from_records([]),
+            "tpo_otd_long": _metric_from_records([]),
+            "tpo_otd_short": _metric_from_records([]),
+        }, "signal_outcomes_cumulative_empty"
+
+    battle = [r for r in records if _record_is_battle_alert(r)]
+    research = [r for r in records if _record_is_research_counterfactual(r)]
+    other = [r for r in records if r not in battle and r not in research]
+
+    def _scenario_name(record: dict[str, Any]) -> str:
+        return str(record.get("scenario") or record.get("scenario_type") or "").upper()
+
+    tpo_otd = [r for r in records if _scenario_name(r).startswith("TPO_OPEN_TEST_DRIVE")]
+    tpo_otd_long = [r for r in tpo_otd if _scenario_name(r).endswith("LONG")]
+    tpo_otd_short = [r for r in tpo_otd if _scenario_name(r).endswith("SHORT")]
+
+    return {
+        "battle": _metric_from_records(battle),
+        "research": _metric_from_records(research),
+        "other": _metric_from_records(other),
+        "all": _metric_from_records(records),
+        "tpo_otd": _metric_from_records(tpo_otd),
+        "tpo_otd_long": _metric_from_records(tpo_otd_long),
+        "tpo_otd_short": _metric_from_records(tpo_otd_short),
+    }, "signal_outcomes_cumulative"
+
+
+def _metric_closed_sample(metric: dict[str, Any]) -> int:
+    return int(metric.get("closed_tp_sl") or 0)
+
+
+def _metric_total_sample(metric: dict[str, Any]) -> int:
+    return int(metric.get("total") or 0)
+
+
+def _format_cumulative_metric_line(label: str, metric: dict[str, Any]) -> str:
+    total = _metric_total_sample(metric)
+    closed = _metric_closed_sample(metric)
+    tp = int(metric.get("tp") or 0)
+    sl = int(metric.get("sl") or 0)
+    missed = int(metric.get("missed") or 0)
+    expired = int(metric.get("expired") or 0)
+    pending = int(metric.get("pending") or 0)
+
+    return (
+        f"{label}: n={total} | TP/SL: {tp}/{sl} | "
+        f"WR: {_fmt_pct(metric.get('winrate'))} | avgR: {_fmt_num(metric.get('avg_result_R'), 4)}R | "
+        f"closed={closed}, missed/expired/pending={missed}/{expired}/{pending}"
+    )
+
+
+def _build_overall_stats_section() -> BriefingSection:
+    grouped, source = _overall_grouped_metrics()
+    section = BriefingSection("📈 Загальна статистика")
+
+    battle = grouped.get("battle", {}) if isinstance(grouped, dict) else {}
+    research = grouped.get("research", {}) if isinstance(grouped, dict) else {}
+    all_metric = grouped.get("all", {}) if isinstance(grouped, dict) else {}
+    tpo_otd = grouped.get("tpo_otd", {}) if isinstance(grouped, dict) else {}
+    tpo_otd_short = grouped.get("tpo_otd_short", {}) if isinstance(grouped, dict) else {}
+    tpo_otd_long = grouped.get("tpo_otd_long", {}) if isinstance(grouped, dict) else {}
+
+    if _metric_total_sample(all_metric) <= 0:
+        section.lines.append("Немає cumulative signal_outcomes для загальної статистики.")
+        section.lines.append(f"Джерело: {source}")
+        return section
+
+    section.lines.append(_format_cumulative_metric_line("Battle / Telegram", battle))
+    section.lines.append(_format_cumulative_metric_line("Research / counterfactual", research))
+
+    if _metric_total_sample(tpo_otd) > 0:
+        section.lines.append(_format_cumulative_metric_line("TPO OTD total", tpo_otd))
+
+    if _metric_total_sample(tpo_otd_short) > 0:
+        section.lines.append(_format_cumulative_metric_line("TPO OTD short", tpo_otd_short))
+
+    if _metric_total_sample(tpo_otd_long) > 0:
+        section.lines.append(_format_cumulative_metric_line("TPO OTD long", tpo_otd_long))
+
+    if _metric_total_sample(research) and (research.get("winrate") or 0) < (battle.get("winrate") or 0):
+        section.lines.append("Висновок: research/counterfactual не змішувати з бойовою статистикою.")
+    else:
+        section.lines.append("Висновок: оцінювати Battle і Research окремо; загальний winrate без розділення може брехати.")
+
+    section.lines.append(f"Джерело: {source}")
+    return section
+
 
 def _normalize_report_type(report_type: str) -> str:
     return str(report_type or "morning").strip().lower()
@@ -2235,6 +2340,7 @@ def build_briefing_report(
 
     if normalized_type in {"morning", "morning_briefing", "morning_combined", "holiday_warning", "pre_market"}:
         report.sections.append(_build_yesterday_section(target_date, tz_name))
+        report.sections.append(_build_overall_stats_section())
 
     # Provider details remain available in JSON artifacts. Telegram stays operational and concise.
     provider_section = _build_provider_section(tpo)
