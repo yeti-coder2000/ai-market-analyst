@@ -840,7 +840,162 @@ def build_quality_tier_text(signal_payload: dict) -> str | None:
 # =============================================================================
 
 
+TELEGRAM_FORMATTER_VERSION = "telegram-formatter-v1.1-tpo-ltf-ready-cleanup"
+
+TPO_LTF_READY_TRIGGERS = {
+    "ltf_model_confirmed_open_test_drive",
+}
+
+
+def _normalize_upper(value: Any) -> str:
+    return _safe_str(value, "").upper()
+
+
+def _is_tpo_ltf_ready(signal_payload: dict) -> bool:
+    """
+    True when the old scenario-engine narrative should be suppressed.
+
+    TPO/LTF READY signals are already confirmed by the LTF detector, so Telegram
+    must not show stale missing_conditions like sweep / return_to_value.
+    """
+    stage = _extract_stage(signal_payload)
+    execution_status = _normalize_upper(signal_payload.get("execution_status"))
+    trigger_reason = _safe_str(signal_payload.get("trigger_reason"), "")
+    scenario = _normalize_upper(
+        signal_payload.get("scenario") or signal_payload.get("scenario_type")
+    )
+    setup_type = _normalize_upper(
+        signal_payload.get("setup_type") or signal_payload.get("setup_name")
+    )
+    ltf_outcome = _normalize_upper(signal_payload.get("ltf_model_outcome"))
+    ltf_state = _normalize_upper(
+        signal_payload.get("ltf_model_state_full") or signal_payload.get("ltf_model_state")
+    )
+
+    if stage != "READY" or execution_status != "EXECUTABLE":
+        return False
+
+    if trigger_reason in TPO_LTF_READY_TRIGGERS:
+        return True
+
+    if scenario.startswith("TPO_OPEN_TEST_DRIVE") and (
+        ltf_outcome == "CONFIRMED_EXECUTABLE"
+        or ltf_state in {"LTF_MODEL_CONFIRMED", "CONFIRMED"}
+    ):
+        return True
+
+    if setup_type == "TPO_OPEN_TEST_DRIVE" and (
+        ltf_outcome == "CONFIRMED_EXECUTABLE"
+        or ltf_state in {"LTF_MODEL_CONFIRMED", "CONFIRMED"}
+    ):
+        return True
+
+    return False
+
+
+def _humanize_zone_type(value: Any) -> str:
+    text = _safe_str(value, "")
+    mapping = {
+        "PREVIOUS_LOW": "previous low",
+        "PREVIOUS_HIGH": "previous high",
+        "VAL": "VAL",
+        "VAH": "VAH",
+        "POC": "POC",
+        "NPOC": "nPOC",
+    }
+    return mapping.get(text.upper(), text.replace("_", " ").lower() if text else "реальна зона інтересу")
+
+
+def _extract_target_zone_type(signal_payload: dict) -> str:
+    direct = _safe_str(signal_payload.get("target_zone_type"), "")
+    if direct not in {"", "-"}:
+        return direct
+
+    metadata = signal_payload.get("metadata")
+    if isinstance(metadata, dict):
+        diagnostics = metadata.get("diagnostics")
+        if isinstance(diagnostics, dict):
+            geometry = diagnostics.get("geometry")
+            if isinstance(geometry, dict):
+                value = _safe_str(geometry.get("target_zone_type"), "")
+                if value not in {"", "-"}:
+                    return value
+
+        ltf_diagnostics = metadata.get("ltf_model_diagnostics")
+        if isinstance(ltf_diagnostics, dict):
+            geometry = ltf_diagnostics.get("geometry")
+            if isinstance(geometry, dict):
+                value = _safe_str(geometry.get("target_zone_type"), "")
+                if value not in {"", "-"}:
+                    return value
+
+    return ""
+
+
+def build_tpo_ltf_ready_reason_text(signal_payload: dict) -> str:
+    direction = humanize_direction(signal_payload.get("direction"))
+    timeframe = _safe_str(signal_payload.get("execution_timeframe"), "15m")
+    selected_method = _safe_str(signal_payload.get("selected_method"), "")
+    if selected_method in {"", "-"}:
+        metadata = signal_payload.get("metadata")
+        if isinstance(metadata, dict):
+            diagnostics = metadata.get("diagnostics") or metadata.get("ltf_model_diagnostics")
+            if isinstance(diagnostics, dict):
+                displacement = diagnostics.get("displacement")
+                if isinstance(displacement, dict):
+                    selected_method = _safe_str(displacement.get("selected_method"), "")
+
+    method_text = (
+        f" через {selected_method}"
+        if selected_method not in {"", "-"}
+        else ""
+    )
+
+    target_source = _safe_str(signal_payload.get("target_source"), "")
+    target_zone_type = _extract_target_zone_type(signal_payload)
+    target_text = _humanize_zone_type(target_zone_type)
+
+    if target_source == "interest_zone" or target_zone_type not in {"", "-"}:
+        target_sentence = f"Ціль обрана з ринкової зони: {target_text}."
+    else:
+        target_sentence = "Ціль задана execution-планом; перевірити, що вона не synthetic."
+
+    return (
+        f"OPEN_TEST_DRIVE {direction} підтверджено на {timeframe} LTF-моделі{method_text}. "
+        f"HTF bias узгоджений із напрямком. {target_sentence}"
+    )
+
+
+def build_tpo_ltf_ready_focus_text(signal_payload: dict) -> str:
+    rr = _format_rr(signal_payload.get("risk_reward_ratio"))
+    practical_rr = signal_payload.get("practical_rr")
+    target_zone_type = _extract_target_zone_type(signal_payload)
+    target_text = _humanize_zone_type(target_zone_type)
+
+    parts = [
+        "LTF-модель підтверджена; старі precondition-умови вже не актуальні.",
+        f"У фокусі виконання за планом: stop, real target zone ({target_text}) і RR {rr}.",
+    ]
+
+    if practical_rr is not None and practical_rr != signal_payload.get("risk_reward_ratio"):
+        parts.append(f"Практичний RR: {_format_rr(practical_rr)}.")
+
+    return "\n".join(parts)
+
+
+def build_tpo_ltf_ready_action_text(signal_payload: dict) -> str:
+    execution_model = humanize_execution_model(signal_payload.get("execution_model"))
+    return (
+        f"Сценарій готовий. Execution model: {execution_model}. "
+        "Працювати тільки за entry / invalidation / target. "
+        "Після досягнення target не наздоганяти — нова структура має формувати новий сигнал."
+    )
+
+
 def build_reason_text(signal_payload: dict) -> str:
+    if _is_tpo_ltf_ready(signal_payload):
+        return build_tpo_ltf_ready_reason_text(signal_payload)
+
     scenario = _safe_str(signal_payload.get("scenario"), "")
     rationale = _safe_str(signal_payload.get("rationale"), "")
     reason = _safe_str(signal_payload.get("reason"), "")
@@ -884,6 +1039,9 @@ def build_reason_text(signal_payload: dict) -> str:
 
 
 def build_missing_conditions_text(signal_payload: dict) -> str:
+    if _is_tpo_ltf_ready(signal_payload):
+        return build_tpo_ltf_ready_focus_text(signal_payload)
+
     missing = signal_payload.get("missing_conditions") or []
 
     if not missing:
@@ -907,6 +1065,9 @@ def build_missing_conditions_text(signal_payload: dict) -> str:
 
 
 def build_action_text(signal_payload: dict) -> str:
+    if _is_tpo_ltf_ready(signal_payload):
+        return build_tpo_ltf_ready_action_text(signal_payload)
+
     stage = _extract_stage(signal_payload)
     direction = humanize_direction(signal_payload.get("direction"))
     scenario = _safe_str(signal_payload.get("scenario"), "")
@@ -1005,6 +1166,17 @@ def format_signal_message(signal_payload: dict) -> FormattedTelegramMessage:
     alignment_text = build_alignment_text(signal_payload)
     quality_tier_text = build_quality_tier_text(signal_payload)
     execution_warning = build_execution_warning_text(signal_payload)
+    tpo_ltf_ready = _is_tpo_ltf_ready(signal_payload)
+    focus_label = "Фокус:" if tpo_ltf_ready or not signal_payload.get("missing_conditions") else "Що бракує:"
+    focus_text = (
+        build_tpo_ltf_ready_focus_text(signal_payload)
+        if tpo_ltf_ready
+        else (
+            build_missing_conditions_text(signal_payload)
+            if signal_payload.get("missing_conditions")
+            else build_action_text(signal_payload)
+        )
+    )
 
     title = f"{humanize_stage(stage)} | {symbol} | {direction}"
 
@@ -1026,12 +1198,8 @@ def format_signal_message(signal_payload: dict) -> FormattedTelegramMessage:
             "Картина:",
             build_reason_text(signal_payload),
             "",
-            "Що бракує:" if signal_payload.get("missing_conditions") else "Фокус:",
-            (
-                build_missing_conditions_text(signal_payload)
-                if signal_payload.get("missing_conditions")
-                else build_action_text(signal_payload)
-            ),
+            focus_label,
+            focus_text,
             "",
             "План:",
             build_action_text(signal_payload),
