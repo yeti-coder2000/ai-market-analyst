@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.10-overall-winrate-recap"
+BRIEFING_VERSION = "daily-market-briefing-v1.11-ny-post-news-wording"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -690,7 +690,7 @@ def _time_aware_event_note(event: dict[str, Any], report_timezone: str) -> str:
     if 0 <= minutes <= 90:
         return "Реліз уже був. Режим: post-news acceptance / failed move; не наздоганяти перший імпульс."
 
-    return "Новина вже відпрацьована; враховувати лише якщо volatility regime ще активний."
+    return "Новина вже дала post-news режим; якщо volatility regime ще активний — не наздоганяти, чекати ретест / acceptance."
 
 
 def _extract_list(payload: Any) -> list[dict[str, Any]]:
@@ -1982,7 +1982,20 @@ def _brief_symbol_context(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _brief_verdict(sym: str, data: dict[str, Any]) -> tuple[str, str]:
+def _post_news_watch_qualifier(sym: str, behavior: str) -> str:
+    base = "WATCH_AFTER_RETEST_ONLY: перший імпульс уже міг відпрацювати; чекати ретест + LTF model + stop + real target"
+    if sym in {"NAS100", "SPX500"}:
+        return "POST_NEWS_INDEX: first impulse already gone; не наздоганяти, чекати acceptance/retest"
+    if sym in {"BTCUSD", "ETHUSD"}:
+        return "POST_NEWS_CRYPTO: risk-impulse уже доставлений; новий battle тільки після ретесту + real target"
+    if sym in {"XAUUSD", "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD"}:
+        return "POST_NEWS_USD: не наздоганяти USD-імпульс; чекати acceptance/retest"
+    if sym == "UKOIL":
+        return "POST_NEWS_RISK: не наздоганяти імпульс; чекати retest/acceptance"
+    return base
+
+
+def _brief_verdict(sym: str, data: dict[str, Any], *, post_news_active: bool = False) -> tuple[str, str]:
     market_status = data["market_status"]
     permission = data["permission"]
     modifier = data["modifier"]
@@ -1993,6 +2006,10 @@ def _brief_verdict(sym: str, data: dict[str, Any]) -> tuple[str, str]:
 
     context_open = _context_says_open(data)
     clean_data = _context_says_clean_data(data)
+
+    post_news_suffix = ""
+    if post_news_active:
+        post_news_suffix = " | post-news: перший імпульс не наздоганяти"
 
     # NO TRADE is reserved only for real blockers: stale/no data/provider error/fallback.
     if data.get("fallback") or market_status in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"} or permission in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"}:
@@ -2010,10 +2027,20 @@ def _brief_verdict(sym: str, data: dict[str, Any]) -> tuple[str, str]:
         detail = ""
         if zone != "-":
             detail = f" | зона: {zone}"
+        if post_news_active:
+            detail += " | post-news: тільки після retest/acceptance, без chase"
         return "NO_TRADE", f"• {sym} — {reason} + DOWNGRADE{detail}"
 
     # WATCH means there is a behavior candidate, but still no entry without 5m–15m confirmation.
+    # After high-impact USD macro, WATCH must not read like immediate permission.
     if open_behavior in {"OPEN_DRIVE", "OPEN_TEST_DRIVE"}:
+        if post_news_active:
+            qualifier = _post_news_watch_qualifier(sym, open_behavior)
+            detail = qualifier
+            if zone != "-":
+                detail = f"зона: {zone} | {qualifier}"
+            return "WATCH", f"• {sym} — {open_behavior} | {detail}"
+
         detail = "чекати LTF model"
         if zone != "-":
             detail = f"зона: {zone} | чекати LTF model"
@@ -2021,6 +2048,8 @@ def _brief_verdict(sym: str, data: dict[str, Any]) -> tuple[str, str]:
 
     if open_behavior == "OPEN_REJECTION_REVERSE":
         detail = "тільки research до чистої LTF-моделі"
+        if post_news_active:
+            detail = "post-news failed move/rejection context; тільки після reclaim/BOS/retest, без chase"
         if zone != "-":
             detail = f"зона: {zone} | {detail}"
         return "WATCH", f"• {sym} — OPEN_REJECTION_REVERSE | {detail}"
@@ -2029,20 +2058,27 @@ def _brief_verdict(sym: str, data: dict[str, Any]) -> tuple[str, str]:
     # It means observe rotations only; no directional battle.
     if open_behavior == "OPEN_AUCTION":
         detail = "тільки ротації"
+        if post_news_active:
+            detail = "post-news auction/rotation; перший імпульс не наздоганяти"
         if zone != "-":
-            detail = f"зона: {zone} | тільки ротації"
+            detail = f"зона: {zone} | {detail}"
         return "OBSERVE", f"• {sym} — OPEN_AUCTION | {detail}"
 
     if open_behavior in {"UNCONFIRMED", "UNKNOWN"}:
+        if post_news_active:
+            return "OBSERVE", f"• {sym} — POST_NEWS_UNCONFIRMED | first impulse already gone; чекати retest/acceptance, не наздоганяти"
         return "OBSERVE", f"• {sym} — {open_behavior} | чекати ясності"
 
     if entry_hint in {"NO_ENTRY_MODEL", "NO_DIRECTIONAL_ENTRY_MODEL"} or battle_hint in {"RESEARCH_ONLY"}:
-        return "OBSERVE", f"• {sym} — no directional model | спостерігати"
+        return "OBSERVE", f"• {sym} — no directional model | спостерігати{post_news_suffix}"
+
+    if post_news_active:
+        return "WATCH", f"• {sym} — {open_behavior} | post-news: чекати LTF confirmation + retest/acceptance"
 
     return "WATCH", f"• {sym} — {open_behavior} | чекати LTF confirmation"
 
 
-def _recent_high_impact_events(target_date: date, timezone_name: str, report_type: str, window_minutes: int = 90) -> list[dict[str, Any]]:
+def _recent_high_impact_events(target_date: date, timezone_name: str, report_type: str, window_minutes: int = 240) -> list[dict[str, Any]]:
     if _normalize_report_type(report_type) not in {"ny", "ny_1h", "new_york"}:
         return []
 
@@ -2099,6 +2135,49 @@ def _first_hour_activity_text(activity: dict[str, Any]) -> str:
     return ", ".join(parts) if parts else "first-hour activity: без явного висновку"
 
 
+def _post_news_direction_from_activity(activity: dict[str, Any]) -> str:
+    if not isinstance(activity, dict):
+        return "UNKNOWN"
+
+    for key in ("ib_extension_direction", "ib_direction", "open_direction", "direction"):
+        value = _upper(activity.get(key), "")
+        if value in {"UP", "DOWN", "LONG", "SHORT", "BULLISH", "BEARISH"}:
+            if value in {"UP", "LONG", "BULLISH"}:
+                return "UP"
+            return "DOWN"
+    return "UNKNOWN"
+
+
+def _post_news_macro_read(sym: str, direction: str, behavior: str) -> str:
+    direction = _upper(direction, "UNKNOWN")
+    behavior = _upper(behavior, "UNKNOWN")
+
+    if direction == "DOWN":
+        if sym in {"NAS100", "SPX500", "BTCUSD", "ETHUSD"}:
+            return "risk-off / downside impulse delivered; first impulse already gone"
+        if sym in {"XAUUSD", "EURUSD", "GBPUSD", "AUDUSD"}:
+            return "USD-strength downside impulse delivered; no chase"
+        if sym == "UKOIL":
+            return "risk/oil downside impulse; wait for retest"
+        return "downside impulse delivered; wait for retest"
+
+    if direction == "UP":
+        if sym in {"USDJPY", "USDCHF", "USDCAD"}:
+            return "USD-strength upside impulse delivered; no chase"
+        if sym in {"NAS100", "SPX500"}:
+            return "risk rebound impulse; wait for acceptance/retest"
+        return "upside impulse delivered; wait for retest"
+
+    if behavior in {"OPEN_TEST_DRIVE", "OPEN_DRIVE"}:
+        return "directional context present, but post-news battle only after retest + LTF confirmation"
+    if behavior == "OPEN_REJECTION_REVERSE":
+        return "possible failed move/rejection; require reclaim/BOS/retest"
+    if behavior == "OPEN_AUCTION":
+        return "auction/rotation after news; do not chase"
+
+    return "post-news volatility regime; wait for acceptance / failed move"
+
+
 def _post_news_symbol_line(sym: str, item: dict[str, Any]) -> str:
     data = _brief_symbol_context(item)
     d = _nested_dicts(item)
@@ -2122,21 +2201,25 @@ def _post_news_symbol_line(sym: str, item: dict[str, Any]) -> str:
     behavior = data.get("open_behavior") or "UNKNOWN"
     context = data.get("open_context") or "UNKNOWN"
     zone = _compact_zone_text(data.get("primary_zone"))
+    direction = _post_news_direction_from_activity(activity)
     activity_text = _first_hour_activity_text(activity)
+    macro_read = _post_news_macro_read(sym, direction, behavior)
 
     if behavior == "OPEN_REJECTION_REVERSE":
-        mode = "rejection/failed move context; тільки research до reclaim/BOS/retest"
+        mode = "failed move/rejection: тільки після reclaim/BOS/retest"
     elif behavior == "OPEN_TEST_DRIVE":
-        mode = "test-drive context; чекати LTF model + stop + real target"
+        mode = "WATCH_AFTER_RETEST_ONLY: LTF model + stop + real target обовʼязкові"
     elif behavior == "OPEN_AUCTION":
-        mode = "auction/rotation; не наздоганяти імпульс"
+        mode = "rotation/auction: без directional battle"
     elif behavior == "OPEN_DRIVE":
-        mode = "drive context; battle тільки після pullback/acceptance"
+        mode = "drive після news: не chase, тільки pullback/acceptance"
+    elif behavior in {"UNCONFIRMED", "UNKNOWN"}:
+        mode = "UNCONFIRMED: чекати retest/acceptance"
     else:
         mode = "чекати acceptance / failed move"
 
     zone_text = f" | зона: {zone}" if zone != "-" else ""
-    return f"• {sym} — {behavior} / {context}{zone_text} | {activity_text} | {mode}"
+    return f"• {sym} — {behavior} / {context}{zone_text} | {macro_read} | {activity_text} | {mode}"
 
 
 def _build_post_news_reaction_section(
@@ -2180,7 +2263,7 @@ def _build_post_news_reaction_section(
     return section
 
 
-def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str) -> BriefingSection:
+def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str, target_date: date | None = None, timezone_name: str | None = None) -> BriefingSection:
     section = BriefingSection("📌 Стан ринку")
     symbols = tpo.get("symbols") if isinstance(tpo, dict) else {}
     symbols = symbols if isinstance(symbols, dict) else {}
@@ -2190,6 +2273,10 @@ def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str) -> Briefi
         return section
 
     watch_symbols = list(_symbol_scope_for_report(report_type))
+    post_news_active = False
+    if target_date is not None and timezone_name:
+        post_news_active = bool(_recent_high_impact_events(target_date, timezone_name, report_type))
+
     no_trade: list[str] = []
     watch: list[str] = []
     observe: list[str] = []
@@ -2201,7 +2288,7 @@ def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str) -> Briefi
             missing.append(f"• {sym} — немає даних")
             continue
 
-        bucket, line = _brief_verdict(sym, _brief_symbol_context(item))
+        bucket, line = _brief_verdict(sym, _brief_symbol_context(item), post_news_active=post_news_active)
         if bucket == "WATCH":
             watch.append(line)
         elif bucket == "OBSERVE":
@@ -2336,7 +2423,7 @@ def build_briefing_report(
     if post_news_section is not None:
         report.sections.append(post_news_section)
 
-    report.sections.append(_build_tpo_snapshot_section(tpo, normalized_type))
+    report.sections.append(_build_tpo_snapshot_section(tpo, normalized_type, target_date, tz_name))
 
     if normalized_type in {"morning", "morning_briefing", "morning_combined", "holiday_warning", "pre_market"}:
         report.sections.append(_build_yesterday_section(target_date, tz_name))
