@@ -44,6 +44,11 @@ from app.services.telegram_alert_store import (
 # - Marks TEST_* / SYNTHETIC_TEST records as SYNTHETIC_TEST.
 # - Keeps synthetic records in signal_outcomes.json for audit.
 # - Excludes synthetic records from production metrics.
+#
+# v2.3 changes:
+# - Adds NEAR_TARGET_REACHED / target_status telemetry.
+# - Keeps strict TP/SL touch rules: near TP is never counted as TP.
+# - Adds safety-behavior buckets for CAUTION_BATTLE analysis.
 # =============================================================================
 
 
@@ -67,11 +72,17 @@ ACTIVE_STATUSES = {
     "PENDING_ENTRY",
     "ENTRY_TRIGGERED",
     "ACTIVE",
+    "NEAR_TP",
+    "NEAR_TARGET_REACHED",
+    "OPEN_NEAR_TARGET",
     None,
     "",
 }
 
 DEFAULT_EXPIRY_HOURS = 24
+DEFAULT_NEAR_TARGET_PROGRESS_THRESHOLD = 0.90
+MIN_NEAR_TARGET_PROGRESS_THRESHOLD = 0.50
+MAX_NEAR_TARGET_PROGRESS_THRESHOLD = 0.99
 
 BATTLE_READY_PERMISSION = "BATTLE_READY"
 
@@ -91,7 +102,7 @@ SYNTHETIC_TRACKING_SCOPE = "SYNTHETIC_TEST"
 SYNTHETIC_SIGNAL_PREFIXES = ("TEST_", "SYNTHETIC_")
 SYNTHETIC_CYCLE_IDS = {"SYNTHETIC_TEST", "TEST"}
 
-OUTCOME_TRACKER_VERSION = "signal-outcome-tracker-v2.2-ohlc-range-resolution"
+OUTCOME_TRACKER_VERSION = "signal-outcome-tracker-v2.3-near-target-strict-touch"
 
 MATERIAL_FIELDS = (
     "outcome_status",
@@ -110,6 +121,13 @@ MATERIAL_FIELDS = (
     "mfe_price",
     "mae_R",
     "mae_price",
+    "near_target_reached",
+    "near_target_reached_at_utc",
+    "near_target_price",
+    "near_target_progress",
+    "best_progress_to_target",
+    "best_progress_price",
+    "target_status",
     "notes",
 )
 
@@ -191,6 +209,38 @@ def env_bool(name: str, default: bool = False) -> bool:
     if raw is None or str(raw).strip() == "":
         return default
     return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def env_float(
+    name: str,
+    default: float,
+    *,
+    min_value: float | None = None,
+    max_value: float | None = None,
+) -> float:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
+def near_target_progress_threshold() -> float:
+    return env_float(
+        "OUTCOME_TRACKER_NEAR_TARGET_PROGRESS",
+        DEFAULT_NEAR_TARGET_PROGRESS_THRESHOLD,
+        min_value=MIN_NEAR_TARGET_PROGRESS_THRESHOLD,
+        max_value=MAX_NEAR_TARGET_PROGRESS_THRESHOLD,
+    )
 
 
 def calc_risk_distance(entry: float, stop: float) -> float:
@@ -527,6 +577,13 @@ def build_research_alert_from_battle_event(event: dict[str, Any]) -> dict[str, A
         "battle_permission_blockers": safe_list(event.get("battle_permission_blockers")),
         "battle_permission_reasons": safe_list(event.get("battle_permission_reasons")),
         "battle_permission_modifiers": safe_list(event.get("battle_permission_modifiers")),
+        "risk_mode": event.get("risk_mode") or event.get("battle_gate_v2_risk_mode"),
+        "scenario_family": event.get("scenario_family"),
+        "news_risk_state": event.get("news_risk_state"),
+        "news_provider_status": event.get("news_provider_status"),
+        "local_structure_damaged": safe_bool(event.get("local_structure_damaged")),
+        "target_quality": event.get("target_quality"),
+        "caution_flags": safe_list(event.get("caution_flags")),
         "open_relation": event.get("open_relation"),
         "auction_bias": event.get("auction_bias"),
         "tpo_signal_permission": event.get("tpo_signal_permission"),
@@ -551,6 +608,13 @@ def build_research_alert_from_battle_event(event: dict[str, Any]) -> dict[str, A
         "mfe_price": None,
         "mae_R": None,
         "mae_price": None,
+        "near_target_reached": False,
+        "near_target_reached_at_utc": None,
+        "near_target_price": None,
+        "near_target_progress": None,
+        "best_progress_to_target": None,
+        "best_progress_price": None,
+        "target_status": "NOT_REACHED",
         "notes": [
             "Research counterfactual generated from suppressed Battle Permission event.",
             "Not a real Telegram alert and not a real trade.",
@@ -967,6 +1031,107 @@ def update_mfe_mae(alert: dict[str, Any], price: float) -> None:
         alert["mae_price"] = price if adverse_r > 0 else entry
 
 
+def target_progress_from_price(alert: dict[str, Any], price: float) -> float | None:
+    """
+    Return progress from entry toward target.
+
+    1.0 means the exact target was touched. Values below 1.0 are not TP.
+    This helper is intentionally separate from TP detection so the tracker can
+    record a high-quality near-target event without over-crediting a win.
+    """
+    direction = normalize_direction(alert.get("direction"))
+    entry = safe_float(alert.get("entry_reference_price"))
+    target = safe_float(alert.get("target_reference_price"))
+
+    if entry is None or target is None:
+        return None
+
+    if direction == "LONG":
+        target_distance = target - entry
+        if target_distance <= 0:
+            return None
+        return round((price - entry) / target_distance, 6)
+
+    if direction == "SHORT":
+        target_distance = entry - target
+        if target_distance <= 0:
+            return None
+        return round((entry - price) / target_distance, 6)
+
+    return None
+
+
+def best_target_progress_from_range(alert: dict[str, Any], *, low: float, high: float) -> tuple[float | None, float | None]:
+    direction = normalize_direction(alert.get("direction"))
+
+    if direction == "LONG":
+        price = high
+    elif direction == "SHORT":
+        price = low
+    else:
+        return None, None
+
+    return target_progress_from_price(alert, price), price
+
+
+def maybe_mark_best_target_progress(alert: dict[str, Any], *, low: float, high: float) -> None:
+    progress, progress_price = best_target_progress_from_range(alert, low=low, high=high)
+    if progress is None or progress_price is None:
+        return
+
+    progress = max(0.0, progress)
+    current = safe_float(alert.get("best_progress_to_target"))
+
+    if current is None or progress > current:
+        alert["best_progress_to_target"] = progress
+        alert["best_progress_price"] = progress_price
+
+
+def mark_near_target_reached(
+    alert: dict[str, Any],
+    *,
+    ts: datetime,
+    price: float,
+    progress: float,
+) -> None:
+    alert["near_target_reached"] = True
+    alert["near_target_reached_at_utc"] = alert.get("near_target_reached_at_utc") or ts.isoformat()
+    alert["near_target_price"] = price
+    alert["near_target_progress"] = round(progress, 6)
+    alert["target_status"] = "NEAR_TARGET_REACHED"
+    alert["outcome_status"] = "NEAR_TARGET_REACHED"
+    alert["last_checked_at_utc"] = ts.isoformat()
+    alert["last_price"] = price
+    add_note(
+        alert,
+        "Price reached near-target threshold but exact TP was not touched. Not counted as TP.",
+    )
+
+
+def maybe_mark_near_target_reached(alert: dict[str, Any], *, ts: datetime, low: float, high: float) -> None:
+    if is_final(alert):
+        return
+
+    progress, progress_price = best_target_progress_from_range(alert, low=low, high=high)
+    if progress is None or progress_price is None:
+        return
+
+    maybe_mark_best_target_progress(alert, low=low, high=high)
+
+    if progress >= 1.0:
+        return
+
+    threshold = near_target_progress_threshold()
+    if progress < threshold:
+        return
+
+    current_progress = safe_float(alert.get("near_target_progress"))
+    if bool(alert.get("near_target_reached")) and current_progress is not None and progress <= current_progress:
+        return
+
+    mark_near_target_reached(alert, ts=ts, price=progress_price, progress=progress)
+
+
 def mark_entry_triggered(alert: dict[str, Any], *, ts: datetime, price: float) -> None:
     alert["entry_triggered"] = True
     alert["entry_triggered_at_utc"] = alert.get("entry_triggered_at_utc") or ts.isoformat()
@@ -981,6 +1146,7 @@ def mark_tp_hit(alert: dict[str, Any], *, ts: datetime, price: float) -> None:
 
     alert["tp_hit"] = True
     alert["tp_hit_at_utc"] = ts.isoformat()
+    alert["target_status"] = "TP_HIT"
     alert["closed_at_utc"] = ts.isoformat()
     alert["outcome_status"] = "TP_HIT"
     alert["result_R"] = round(float(result_r), 4) if result_r is not None else None
@@ -1021,6 +1187,7 @@ def mark_missed_target_before_entry(
     price: float,
 ) -> None:
     alert["outcome_status"] = "MISSED_TARGET_BEFORE_ENTRY"
+    alert["target_status"] = "TARGET_BEFORE_ENTRY"
     alert["closed_at_utc"] = ts.isoformat()
     alert["expired"] = True
     alert["expired_at_utc"] = ts.isoformat()
@@ -1076,9 +1243,15 @@ def update_single_alert_from_snapshot(
     """
     Update one alert from a market snapshot.
 
-    v2.2 resolves entries, TP and SL with candle high/low when available.
-    The older point-price logic missed cases where a 15m candle wicked into
-    target/stop but the snapshot close/last price later moved away.
+    v2.3 resolves entries, TP and SL with candle high/low when available and
+    records NEAR_TARGET_REACHED without over-crediting it as TP.
+
+    Strict touch rule:
+    - LONG TP only when candle high >= target.
+    - SHORT TP only when candle low <= target.
+
+    If price reaches the configurable near-target threshold but does not touch
+    target, the signal remains open/active as NEAR_TARGET_REACHED.
     """
     if is_final(alert):
         return False
@@ -1112,7 +1285,7 @@ def update_single_alert_from_snapshot(
             mark_missed_target_before_entry(alert, ts=ts, price=target_price)
             add_note(
                 alert,
-                "Outcome tracker v2.2 used OHLC range to detect target-before-entry.",
+                "Outcome tracker v2.3 used OHLC range to detect target-before-entry.",
             )
             return has_material_change(before, alert)
 
@@ -1121,13 +1294,14 @@ def update_single_alert_from_snapshot(
             mark_entry_triggered(alert, ts=ts, price=entry_price)
             add_note(
                 alert,
-                "Outcome tracker v2.2 used OHLC range to detect entry trigger.",
+                "Outcome tracker v2.3 used OHLC range to detect entry trigger.",
             )
             entry_triggered = True
             entry_triggered_on_this_snapshot = True
 
     if entry_triggered:
         update_mfe_mae_range(alert, low=low_value, high=high_value)
+        maybe_mark_best_target_progress(alert, low=low_value, high=high_value)
 
         sl_hit = is_sl_hit_range(alert, low=low_value, high=high_value)
         tp_hit = is_tp_hit_range(alert, low=low_value, high=high_value)
@@ -1160,9 +1334,11 @@ def update_single_alert_from_snapshot(
             mark_tp_hit(alert, ts=ts, price=target_price)
             add_note(
                 alert,
-                "Outcome tracker v2.2 used OHLC range to detect TP hit.",
+                "Outcome tracker v2.3 used OHLC range to detect exact TP touch.",
             )
             return has_material_change(before, alert)
+
+        maybe_mark_near_target_reached(alert, ts=ts, low=low_value, high=high_value)
 
     return has_material_change(before, alert)
 
@@ -1482,9 +1658,22 @@ def build_summary(alerts: list[dict[str, Any]]) -> dict[str, Any]:
         1 for x in production
         if str(x.get("outcome_status") or "").upper() == "MISSED_TARGET_BEFORE_ENTRY"
     )
+    near_target = sum(
+        1 for x in production
+        if str(x.get("outcome_status") or "").upper() in {"NEAR_TP", "NEAR_TARGET_REACHED", "OPEN_NEAR_TARGET"}
+        or bool(x.get("near_target_reached"))
+    )
     pending = sum(
         1 for x in production
-        if str(x.get("outcome_status") or "").upper() in {"PENDING_ENTRY", "ENTRY_TRIGGERED", "ACTIVE", ""}
+        if str(x.get("outcome_status") or "").upper() in {
+            "PENDING_ENTRY",
+            "ENTRY_TRIGGERED",
+            "ACTIVE",
+            "NEAR_TP",
+            "NEAR_TARGET_REACHED",
+            "OPEN_NEAR_TARGET",
+            "",
+        }
     )
     research_count = sum(
         1 for x in production
@@ -1510,6 +1699,7 @@ def build_summary(alerts: list[dict[str, Any]]) -> dict[str, Any]:
         "sl_hit": sl,
         "missed_before_entry": missed,
         "expired": expired,
+        "near_target_reached": near_target,
         "pending_or_active": pending,
         "winrate": calc_winrate(production),
         "avg_result_R": calc_avg_result_r(production),
@@ -1522,6 +1712,13 @@ def build_summary(alerts: list[dict[str, Any]]) -> dict[str, Any]:
         "by_tracking_scope": count_by(production, "tracking_scope"),
         "by_tracking_scope_all_records": count_by(all_records, "tracking_scope"),
         "by_battle_permission": count_by(production, "battle_permission"),
+        "by_risk_mode": count_by(production, "risk_mode"),
+        "by_scenario_family": count_by(production, "scenario_family"),
+        "by_news_risk_state": count_by(production, "news_risk_state"),
+        "by_local_structure_damaged": count_by(production, "local_structure_damaged"),
+        "by_target_quality": count_by(production, "target_quality"),
+        "by_target_status": count_by(production, "target_status"),
+        "by_caution_flag": count_by_list(production, "caution_flags"),
         "by_telegram_delivery_mode": count_by(production, "telegram_delivery_mode"),
         "by_battle_permission_blocker": count_by_list(production, "battle_permission_blockers"),
         "by_open_relation": count_by(production, "open_relation"),
@@ -1535,6 +1732,13 @@ def build_summary(alerts: list[dict[str, Any]]) -> dict[str, Any]:
         "metrics_by_tracking_scope": group_metrics(production, "tracking_scope"),
         "metrics_by_tracking_scope_all_records": group_metrics(all_records, "tracking_scope"),
         "metrics_by_battle_permission": group_metrics(production, "battle_permission"),
+        "metrics_by_risk_mode": group_metrics(production, "risk_mode"),
+        "metrics_by_scenario_family": group_metrics(production, "scenario_family"),
+        "metrics_by_news_risk_state": group_metrics(production, "news_risk_state"),
+        "metrics_by_local_structure_damaged": group_metrics(production, "local_structure_damaged"),
+        "metrics_by_target_quality": group_metrics(production, "target_quality"),
+        "metrics_by_target_status": group_metrics(production, "target_status"),
+        "metrics_by_caution_flag": group_metrics_by_list(production, "caution_flags"),
         "metrics_by_telegram_delivery_mode": group_metrics(production, "telegram_delivery_mode"),
         "metrics_by_battle_permission_blocker": group_metrics_by_list(production, "battle_permission_blockers"),
         "metrics_by_open_relation": group_metrics(production, "open_relation"),

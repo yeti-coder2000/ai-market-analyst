@@ -13,11 +13,12 @@ except Exception:  # pragma: no cover
     evaluate_open_behavior_policy = None  # type: ignore[assignment]
 
 
-BATTLE_PERMISSION_VERSION = "battle-permission-v1.4-v2-neutral-otd-bridge-fixed"
+BATTLE_PERMISSION_VERSION = "battle-permission-v1.5-safety-gate-news-local-damage"
 
 
 class BattlePermission(str, Enum):
     BATTLE_READY = "BATTLE_READY"
+    CAUTION_BATTLE = "CAUTION_BATTLE"
     RESEARCH_ONLY = "RESEARCH_ONLY"
     BLOCKED_BY_MARKET_CLOSED = "BLOCKED_BY_MARKET_CLOSED"
     BLOCKED_BY_STALE_DATA = "BLOCKED_BY_STALE_DATA"
@@ -73,6 +74,17 @@ class BattlePermissionResult:
     practical_rr: float | None = None
     stop_quality: str | None = None
     quality_tier: str | None = None
+
+    # Safety Gate / scenario diagnostics.
+    symbol: str | None = None
+    session_label: str | None = None
+    news_risk_state: str | None = None
+    news_provider_status: str | None = None
+    local_structure_damaged: bool | None = None
+    scenario_family: str | None = None
+    target_quality: str | None = None
+    risk_mode: str | None = None
+    caution_flags: list[str] = field(default_factory=list)
 
     # Battle Gate v2 shadow-mode fields.
     # Legacy Battle Gate remains the execution authority for now.
@@ -198,6 +210,287 @@ def _is_valid_stop_quality_for_battle(stop_quality: str | None) -> bool:
     return True
 
 
+def _normalize_symbol(value: Any) -> str | None:
+    if value in (None, "", [], {}):
+        return None
+    return str(value).strip().upper().replace("/", "").replace(" ", "")
+
+
+def _normalize_news_risk_state(value: Any) -> str | None:
+    normalized = _as_upper(value)
+    if not normalized:
+        return None
+
+    if normalized in {"OK", "NONE", "NO_NEWS", "LOW", "NORMAL"}:
+        return "OK"
+
+    if normalized in {
+        "PROVIDER_UNAVAILABLE",
+        "CALENDAR_UNAVAILABLE",
+        "ECONOMIC_CALENDAR_UNAVAILABLE",
+        "FINNHUB_UNAVAILABLE",
+        "FINNHUB_ECONOMIC_CALENDAR_UNAVAILABLE",
+        "PROVIDER_ERROR",
+        "CALENDAR_ERROR",
+    }:
+        return "PROVIDER_UNAVAILABLE"
+
+    if any(token in normalized for token in {"UNAVAILABLE", "PROVIDER_ERROR", "CALENDAR_ERROR", "FINNHUB_UNAVAILABLE", "429", "TIMEOUT"}):
+        return "PROVIDER_UNAVAILABLE"
+
+    if any(token in normalized for token in {"POST_NEWS", "AFTER_NEWS", "NEWS_CAUTION"}):
+        return "POST_NEWS_CAUTION"
+
+    if any(token in normalized for token in {"HIGH_IMPACT", "RED_NEWS", "USD_HIGH"}):
+        return "HIGH_IMPACT"
+
+    return normalized
+
+
+def _is_news_provider_unavailable(news_risk_state: Any, news_provider_status: Any = None) -> bool:
+    state = _normalize_news_risk_state(news_risk_state)
+    provider = _as_upper(news_provider_status)
+    haystack = " ".join(part for part in [state, provider] if part)
+
+    if not haystack:
+        return False
+
+    return any(
+        token in haystack
+        for token in {
+            "PROVIDER_UNAVAILABLE",
+            "CALENDAR_UNAVAILABLE",
+            "ECONOMIC_CALENDAR_UNAVAILABLE",
+            "FINNHUB_UNAVAILABLE",
+            "UNAVAILABLE",
+            "PROVIDER_ERROR",
+            "CALENDAR_ERROR",
+            "429",
+            "TIMEOUT",
+        }
+    )
+
+
+def _is_usd_sensitive_symbol(symbol: Any) -> bool:
+    normalized = _normalize_symbol(symbol)
+    if not normalized:
+        return False
+
+    if "USD" in normalized:
+        return True
+
+    return normalized in {
+        "NAS100",
+        "NDX",
+        "NASDAQ100",
+        "US100",
+        "SPX500",
+        "SP500",
+        "US500",
+        "US30",
+        "DJI",
+        "UKOIL",
+        "USOIL",
+        "BRENT",
+        "WTI",
+        "BTCUSDT",
+        "ETHUSDT",
+        "BTC",
+        "ETH",
+        "XAU",
+        "XAG",
+    }
+
+
+def _is_ny_or_post_news_context(inputs: dict[str, Any]) -> bool:
+    candidates = [
+        inputs.get("session_label"),
+        inputs.get("news_risk_state"),
+        inputs.get("news_provider_status"),
+        inputs.get("tpo_telegram_modifier"),
+    ]
+    haystack = " ".join(str(value).upper() for value in candidates if value not in (None, "", [], {}))
+    if not haystack:
+        return False
+
+    return any(token in haystack for token in {"NY", "NEW_YORK", "US_SESSION", "POST_NEWS", "AFTER_NEWS", "USD_HIGH"})
+
+
+def _normalize_target_quality(value: Any) -> str | None:
+    normalized = _as_upper(value)
+    if not normalized:
+        return None
+
+    if normalized in {"REAL", "REAL_ZONE", "REAL_TARGET", "INTEREST_ZONE", "AUCTION_ZONE", "TPO_ZONE"}:
+        return "REAL_ZONE"
+
+    if normalized in {"SYNTHETIC", "SYNTHETIC_TARGET", "MECHANICAL", "RR_ONLY"}:
+        return "SYNTHETIC"
+
+    if normalized in {"UNKNOWN", "UNCONFIRMED", "NONE", "MISSING"}:
+        return "UNKNOWN"
+
+    return normalized
+
+
+def _infer_target_quality(payload: dict[str, Any], primary_interest_zone: dict[str, Any] | None) -> str | None:
+    explicit = _normalize_target_quality(
+        _deep_get(
+            payload,
+            "metadata.target_quality",
+            "metadata.execution.target_quality",
+            "metadata.execution_plan.target_quality",
+            "execution.target_quality",
+            "execution_plan.target_quality",
+            "target_quality",
+        )
+    )
+    if explicit:
+        return explicit
+
+    if isinstance(primary_interest_zone, dict) and primary_interest_zone:
+        zone_type = _as_upper(primary_interest_zone.get("zone_type") or primary_interest_zone.get("type"))
+        zone_price = _as_float(primary_interest_zone.get("price") or primary_interest_zone.get("level"))
+        if zone_type or zone_price is not None:
+            return "REAL_ZONE"
+
+    return None
+
+
+def _infer_local_structure_damaged(
+    payload: dict[str, Any],
+    *,
+    direction: str | None,
+    scenario: str | None,
+    entry_model_hint: str | None,
+) -> bool:
+    explicit_bool = _as_bool(
+        _deep_get(
+            payload,
+            "metadata.local_structure_damaged",
+            "metadata.structure.local_structure_damaged",
+            "metadata.local_structure.status_damaged",
+            "local_structure_damaged",
+            "structure.local_structure_damaged",
+        )
+    )
+    if explicit_bool is not None:
+        return explicit_bool
+
+    explicit_state = _as_upper(
+        _deep_get(
+            payload,
+            "metadata.local_structure_state",
+            "metadata.structure.local_structure_state",
+            "local_structure_state",
+            "structure.local_structure_state",
+        )
+    )
+    if explicit_state in {"DAMAGED", "BROKEN", "STRUCTURE_DAMAGED", "LOCAL_DAMAGE"}:
+        return True
+
+    recent_impulse_direction = _normalize_direction(
+        _deep_get(
+            payload,
+            "metadata.recent_impulse_direction",
+            "metadata.liquidation_impulse_direction",
+            "metadata.displacement_direction",
+            "recent_impulse_direction",
+            "liquidation_impulse_direction",
+            "displacement_direction",
+        )
+    )
+    impulse_strength = _as_float(
+        _deep_get(
+            payload,
+            "metadata.recent_impulse_atr",
+            "metadata.displacement_atr",
+            "metadata.liquidation_impulse_atr",
+            "recent_impulse_atr",
+            "displacement_atr",
+            "liquidation_impulse_atr",
+        )
+    )
+
+    direction_norm = _normalize_direction(direction)
+    if (
+        direction_norm in {"LONG", "SHORT"}
+        and recent_impulse_direction in {"LONG", "SHORT"}
+        and recent_impulse_direction != direction_norm
+        and (impulse_strength is None or impulse_strength >= 1.5)
+    ):
+        return True
+
+    text = " ".join(
+        str(value).upper()
+        for value in [
+            scenario,
+            entry_model_hint,
+            _deep_get(payload, "metadata.scenario_family", "scenario_family"),
+            _deep_get(payload, "metadata.battle_gate_v2_risk_mode", "battle_gate_v2_risk_mode"),
+            _deep_get(payload, "metadata.battle_gate_v2_modifiers", "battle_gate_v2_modifiers"),
+            _deep_get(payload, "metadata.battle_gate_v2_reasons", "battle_gate_v2_reasons"),
+        ]
+        if value not in (None, "", [], {})
+    )
+
+    return any(
+        token in text
+        for token in {
+            "POST_LIQUIDATION",
+            "LIQUIDATION",
+            "LOCAL_STRUCTURE_DAMAGED",
+            "STRUCTURE_DAMAGED",
+            "LOCAL_DAMAGE",
+        }
+    )
+
+
+def _derive_scenario_family(
+    payload: dict[str, Any],
+    *,
+    scenario: str | None,
+    open_behavior: str | None,
+    entry_model_hint: str | None,
+    news_risk_state: str | None,
+    local_structure_damaged: bool | None,
+) -> str | None:
+    explicit = _as_upper(_deep_get(payload, "metadata.scenario_family", "scenario_family"))
+    if explicit:
+        return explicit
+
+    scenario_norm = _as_upper(scenario) or ""
+    open_behavior_norm = _as_upper(open_behavior) or ""
+    entry_model_norm = _as_upper(entry_model_hint) or ""
+    text = " ".join([scenario_norm, open_behavior_norm, entry_model_norm])
+
+    if "POST_LIQUIDATION" in text or "LIQUIDATION_RECLAIM" in text:
+        return "POST_LIQUIDATION_RECLAIM"
+
+    if "POST_NEWS" in text or "NEWS_RECLAIM" in text:
+        return "POST_NEWS_RECLAIM"
+
+    if local_structure_damaged and (
+        open_behavior_norm == "OPEN_TEST_DRIVE"
+        or "OPEN_TEST_DRIVE" in scenario_norm
+        or "FAILED_ACCEPTANCE_RETEST" in entry_model_norm
+    ):
+        if _normalize_news_risk_state(news_risk_state) in {"PROVIDER_UNAVAILABLE", "POST_NEWS_CAUTION", "HIGH_IMPACT"}:
+            return "POST_NEWS_RECLAIM"
+        return "POST_LIQUIDATION_RECLAIM"
+
+    if "OPEN_TEST_DRIVE" in text:
+        return "TPO_OPEN_TEST_DRIVE"
+
+    if "SWEEP_RETURN" in text:
+        return "SWEEP_RETURN"
+
+    if "TREND_CONTINUATION" in text:
+        return "TREND_CONTINUATION"
+
+    return scenario_norm or None
+
+
 def _v2_allows_neutral_open_test_drive_transition(
     *,
     inputs: dict[str, Any],
@@ -227,6 +520,7 @@ def _v2_allows_neutral_open_test_drive_transition(
         and decision in {"ALLOW", "ALLOW_WITH_CAUTION"}
         and risk_mode == "TRANSITION_CANDIDATE"
     )
+
 
 def _extract_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """
@@ -506,6 +800,42 @@ def _enrich_payload_with_tpo_store(payload: dict[str, Any]) -> dict[str, Any]:
             filters.get("accepted_back_inside_value"),
             record.get("accepted_back_inside_value"),
         ),
+        "session_label": _first_non_empty(
+            context.get("session_label"),
+            context.get("session"),
+            filters.get("session_label"),
+            filters.get("session"),
+            record.get("session_label"),
+            record.get("session"),
+        ),
+        "news_risk_state": _first_non_empty(
+            context.get("news_risk_state"),
+            filters.get("news_risk_state"),
+            record.get("news_risk_state"),
+        ),
+        "news_provider_status": _first_non_empty(
+            context.get("news_provider_status"),
+            context.get("calendar_status"),
+            filters.get("news_provider_status"),
+            filters.get("calendar_status"),
+            record.get("news_provider_status"),
+            record.get("calendar_status"),
+        ),
+        "local_structure_damaged": _first_non_empty(
+            context.get("local_structure_damaged"),
+            filters.get("local_structure_damaged"),
+            record.get("local_structure_damaged"),
+        ),
+        "scenario_family": _first_non_empty(
+            context.get("scenario_family"),
+            filters.get("scenario_family"),
+            record.get("scenario_family"),
+        ),
+        "target_quality": _first_non_empty(
+            context.get("target_quality"),
+            filters.get("target_quality"),
+            record.get("target_quality"),
+        ),
     }
 
     for key, value in values.items():
@@ -568,6 +898,30 @@ def _evaluate_v2_shadow(payload: dict[str, Any]) -> dict[str, Any]:
 
 def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
     payload = _enrich_payload_with_tpo_store(_extract_payload(raw_payload))
+
+    symbol = _normalize_symbol(
+        _deep_get(
+            payload,
+            "symbol",
+            "instrument",
+            "ticker",
+            "metadata.symbol",
+            "metadata.instrument",
+            "metadata.ticker",
+        )
+    )
+
+    session_label = _as_upper(
+        _deep_get(
+            payload,
+            "metadata.session_label",
+            "metadata.session",
+            "metadata.report_session",
+            "session_label",
+            "session",
+            "report_session",
+        )
+    )
 
     market_is_open = _as_bool(
         _deep_get(
@@ -915,8 +1269,59 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
         )
     )
 
+    news_risk_state = _normalize_news_risk_state(
+        _deep_get(
+            payload,
+            "metadata.news_risk_state",
+            "metadata.news.risk_state",
+            "metadata.economic_calendar.risk_state",
+            "metadata.calendar.risk_state",
+            "news_risk_state",
+            "news.risk_state",
+            "economic_calendar.risk_state",
+            "calendar.risk_state",
+        )
+    )
+
+    news_provider_status = _as_upper(
+        _deep_get(
+            payload,
+            "metadata.news_provider_status",
+            "metadata.news.provider_status",
+            "metadata.economic_calendar.status",
+            "metadata.calendar.status",
+            "metadata.calendar_status",
+            "news_provider_status",
+            "news.provider_status",
+            "economic_calendar.status",
+            "calendar.status",
+            "calendar_status",
+            "provider_status",
+        )
+    )
+
+    target_quality = _infer_target_quality(payload, primary_interest_zone)
+
+    local_structure_damaged = _infer_local_structure_damaged(
+        payload,
+        direction=direction,
+        scenario=scenario,
+        entry_model_hint=entry_model_hint,
+    )
+
+    scenario_family = _derive_scenario_family(
+        payload,
+        scenario=scenario,
+        open_behavior=open_behavior,
+        entry_model_hint=entry_model_hint,
+        news_risk_state=news_risk_state,
+        local_structure_damaged=local_structure_damaged,
+    )
+
     return {
         "payload": payload,
+        "symbol": symbol,
+        "session_label": session_label,
         "market_is_open": market_is_open,
         "market_status": market_status,
         "tpo_signal_permission": tpo_signal_permission,
@@ -940,6 +1345,11 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
         "practical_rr": practical_rr,
         "stop_quality": stop_quality,
         "quality_tier": quality_tier,
+        "news_risk_state": news_risk_state,
+        "news_provider_status": news_provider_status,
+        "local_structure_damaged": local_structure_damaged,
+        "scenario_family": scenario_family,
+        "target_quality": target_quality,
         "status": status,
         "market_state": market_state,
         "scenario": scenario,
@@ -961,6 +1371,11 @@ def calculate_auction_context_score(inputs: dict[str, Any]) -> tuple[int, list[s
     ib_extension_up_pct = inputs.get("ib_extension_up_pct")
     ib_extension_down_pct = inputs.get("ib_extension_down_pct")
     accepted_back_inside_value = inputs.get("accepted_back_inside_value")
+    local_structure_damaged = inputs.get("local_structure_damaged")
+    target_quality = inputs.get("target_quality")
+    news_risk_state = inputs.get("news_risk_state")
+    news_provider_status = inputs.get("news_provider_status")
+    symbol = inputs.get("symbol")
 
     if open_relation == "OUT_OF_RANGE":
         score += 2
@@ -998,6 +1413,21 @@ def calculate_auction_context_score(inputs: dict[str, Any]) -> tuple[int, list[s
         score -= 2
         reasons.append("accepted back inside value: -2")
 
+    if target_quality == "REAL_ZONE":
+        score += 1
+        reasons.append("target is a real interest zone: +1")
+    elif target_quality == "SYNTHETIC":
+        score -= 2
+        reasons.append("target is synthetic/RR-only: -2")
+
+    if local_structure_damaged is True:
+        score -= 1
+        reasons.append("local structure damaged after impulse: -1")
+
+    if _is_news_provider_unavailable(news_risk_state, news_provider_status) and _is_usd_sensitive_symbol(symbol):
+        score -= 1
+        reasons.append("USD-sensitive symbol with unavailable news provider: -1")
+
     return score, reasons
 
 
@@ -1012,6 +1442,8 @@ def _build_result(
     telegram_delivery_mode: str,
     battle_ready: bool,
     v2_policy: dict[str, Any],
+    risk_mode: str | None = None,
+    caution_flags: list[str] | None = None,
 ) -> BattlePermissionResult:
     return BattlePermissionResult(
         battle_permission=battle_permission,
@@ -1044,6 +1476,15 @@ def _build_result(
         practical_rr=inputs.get("practical_rr"),
         stop_quality=inputs.get("stop_quality"),
         quality_tier=inputs.get("quality_tier"),
+        symbol=inputs.get("symbol"),
+        session_label=inputs.get("session_label"),
+        news_risk_state=inputs.get("news_risk_state"),
+        news_provider_status=inputs.get("news_provider_status"),
+        local_structure_damaged=inputs.get("local_structure_damaged"),
+        scenario_family=inputs.get("scenario_family"),
+        target_quality=inputs.get("target_quality"),
+        risk_mode=risk_mode,
+        caution_flags=list(caution_flags or []),
         battle_gate_v2_decision=v2_policy.get("decision"),
         battle_gate_v2_risk_mode=v2_policy.get("risk_mode"),
         battle_gate_v2_battle_allowed=v2_policy.get("battle_allowed"),
@@ -1079,6 +1520,26 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
     status = inputs.get("status")
     market_state = inputs.get("market_state")
     scenario = inputs.get("scenario")
+    symbol = inputs.get("symbol")
+    news_risk_state = inputs.get("news_risk_state")
+    news_provider_status = inputs.get("news_provider_status")
+    local_structure_damaged = inputs.get("local_structure_damaged")
+    scenario_family = inputs.get("scenario_family")
+    target_quality = inputs.get("target_quality")
+
+    caution_flags: list[str] = []
+
+    if _is_news_provider_unavailable(news_risk_state, news_provider_status) and _is_usd_sensitive_symbol(symbol):
+        caution_flags.append("news_provider_unavailable_usd_sensitive")
+
+    if local_structure_damaged is True:
+        caution_flags.append("local_structure_damaged")
+
+    if scenario_family in {"POST_LIQUIDATION_RECLAIM", "POST_NEWS_RECLAIM"}:
+        caution_flags.append(f"scenario_family_{str(scenario_family).lower()}")
+
+    if target_quality == "UNKNOWN":
+        caution_flags.append("target_quality_unknown")
 
     v2_neutral_otd_transition_allowed = _v2_allows_neutral_open_test_drive_transition(
         inputs=inputs,
@@ -1278,6 +1739,20 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
             v2_policy=v2_policy,
         )
 
+    if target_quality == "SYNTHETIC":
+        blockers.append("synthetic_target")
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
+            reasons=reasons + ["target_quality=SYNTHETIC; battle signal disabled until target is a real interest zone"],
+            blockers=blockers,
+            modifiers=modifiers,
+            battle_permission=BattlePermission.RESEARCH_ONLY.value,
+            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
+        )
+
     # 6. Auction score final gate.
     if auction_score < 3:
         if v2_neutral_otd_transition_allowed:
@@ -1300,9 +1775,28 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
                 v2_policy=v2_policy,
             )
 
-    # 7. Battle ready.
+    # 7. Battle ready / caution battle.
     if tpo_telegram_modifier == "BOOST":
         modifiers.append("tpo_boost")
+
+    if caution_flags:
+        modifiers.extend(flag for flag in caution_flags if flag not in modifiers)
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
+            reasons=reasons + [
+                "all hard battle permission checks passed",
+                "Safety Gate allows alert only as CAUTION_BATTLE, not clean BATTLE_READY",
+            ],
+            blockers=blockers,
+            modifiers=modifiers,
+            battle_permission=BattlePermission.CAUTION_BATTLE.value,
+            telegram_delivery_mode=TelegramDeliveryMode.BATTLE_ALERT.value,
+            battle_ready=True,
+            v2_policy=v2_policy,
+            risk_mode="CAUTION",
+            caution_flags=caution_flags,
+        )
 
     return _build_result(
         inputs=inputs,
@@ -1314,6 +1808,8 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
         telegram_delivery_mode=TelegramDeliveryMode.BATTLE_ALERT.value,
         battle_ready=True,
         v2_policy=v2_policy,
+        risk_mode="NORMAL",
+        caution_flags=[],
     )
 
 
@@ -1336,6 +1832,16 @@ def _attach_tpo_open_behavior_fields_to_metadata(metadata: dict[str, Any], resul
     metadata["interest_zone_type"] = result.get("interest_zone_type")
     metadata["interest_zone_price"] = result.get("interest_zone_price")
     metadata["interest_zone_role"] = result.get("interest_zone_role")
+
+    metadata["symbol"] = result.get("symbol")
+    metadata["session_label"] = result.get("session_label")
+    metadata["news_risk_state"] = result.get("news_risk_state")
+    metadata["news_provider_status"] = result.get("news_provider_status")
+    metadata["local_structure_damaged"] = result.get("local_structure_damaged")
+    metadata["scenario_family"] = result.get("scenario_family")
+    metadata["target_quality"] = result.get("target_quality")
+    metadata["risk_mode"] = result.get("risk_mode")
+    metadata["caution_flags"] = result.get("caution_flags") or []
 
     return metadata
 
@@ -1405,6 +1911,16 @@ def apply_battle_permission(raw_payload: dict[str, Any]) -> dict[str, Any]:
     payload["interest_zone_type"] = result.get("interest_zone_type")
     payload["interest_zone_price"] = result.get("interest_zone_price")
     payload["interest_zone_role"] = result.get("interest_zone_role")
+
+    payload["symbol"] = result.get("symbol") or payload.get("symbol")
+    payload["session_label"] = result.get("session_label")
+    payload["news_risk_state"] = result.get("news_risk_state")
+    payload["news_provider_status"] = result.get("news_provider_status")
+    payload["local_structure_damaged"] = result.get("local_structure_damaged")
+    payload["scenario_family"] = result.get("scenario_family")
+    payload["target_quality"] = result.get("target_quality")
+    payload["risk_mode"] = result.get("risk_mode")
+    payload["caution_flags"] = result.get("caution_flags") or []
 
     # Root-level v2 fields are useful for journal, telemetry and flat statistics.
     payload["battle_gate_v2_decision"] = result.get("battle_gate_v2_decision")

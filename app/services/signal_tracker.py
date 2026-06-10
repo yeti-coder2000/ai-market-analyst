@@ -95,6 +95,22 @@ DEFAULT_TTL_MINUTES_BY_STAGE = {
     "ACTIVE": 360,
 }
 
+SIGNAL_TRACKER_VERSION = "signal-tracker-v2.1-safety-context-pass-through"
+
+SAFETY_CONTEXT_FIELDS = (
+    "battle_permission",
+    "telegram_delivery_mode",
+    "battle_ready",
+    "auction_context_score",
+    "risk_mode",
+    "scenario_family",
+    "news_risk_state",
+    "news_provider_status",
+    "local_structure_damaged",
+    "target_quality",
+    "caution_flags",
+)
+
 
 @dataclass
 class SignalTrackerResult:
@@ -536,7 +552,47 @@ class SignalTracker:
         payload["theoretical_rr"] = theoretical_rr
         payload["practical_rr"] = practical_rr
 
+        self._attach_safety_context_fields(
+            payload=payload,
+            raw=raw,
+            metadata=metadata,
+        )
+
         return payload
+
+    def _attach_safety_context_fields(
+        self,
+        *,
+        payload: dict[str, Any],
+        raw: dict[str, Any],
+        metadata: dict[str, Any],
+    ) -> None:
+        """
+        Pass through Battle Gate / safety context fields when upstream stages
+        already provide them.
+
+        This tracker does not evaluate Battle Gate itself. It only preserves
+        fields so journal/statistics/Telegram can see the same context if a
+        later layer attached it before a tracker update.
+        """
+        for key in SAFETY_CONTEXT_FIELDS:
+            value = self._first_non_empty_value(
+                raw.get(key),
+                metadata.get(key),
+                self._nested_get(raw, "context", key),
+                self._nested_get(raw, "metadata", key),
+                self._nested_get(raw, "payload", key),
+            )
+
+            if value in (None, "", [], {}):
+                continue
+
+            payload[key] = value
+            metadata[key] = value
+
+        payload["metadata"] = metadata
+        payload["signal_tracker_version"] = SIGNAL_TRACKER_VERSION
+
 
     def _normalize_execution(self, execution: Any) -> dict[str, Any]:
         raw = self._to_dict(execution)
@@ -947,6 +1003,14 @@ class SignalTracker:
     @staticmethod
     def _sorted_top_level_fields(payload: dict[str, Any]) -> list[str]:
         return sorted(payload.keys())
+
+    @staticmethod
+    def _first_non_empty_value(*values: Any) -> Any:
+        for value in values:
+            if value not in (None, "", [], {}):
+                return value
+        return None
+
 
     def _to_dict(self, obj: Any) -> dict[str, Any]:
         if obj is None:

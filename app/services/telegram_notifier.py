@@ -15,6 +15,8 @@ from app.services.telegram_formatter import format_signal_message
 
 logger = logging.getLogger(__name__)
 
+TELEGRAM_NOTIFIER_VERSION = "telegram-notifier-v1.6-caution-battle-safety-context"
+
 
 # =============================================================================
 # TELEGRAM NOTIFIER CONFIG / HELPERS
@@ -75,6 +77,10 @@ def _first_present(*values: Any) -> Any:
             continue
         if value == "":
             continue
+        if value == []:
+            continue
+        if value == {}:
+            continue
         return value
     return None
 
@@ -109,6 +115,93 @@ def _escape_html(text: Any) -> str:
     )
 
 
+def _as_upper(value: Any) -> str | None:
+    if value in (None, "", [], {}):
+        return None
+    return str(value).strip().upper()
+
+
+def _as_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+
+    if value in (None, "", [], {}):
+        return None
+
+    if isinstance(value, (int, float)):
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "yes", "y", "1", "on", "damaged"}:
+        return True
+    if normalized in {"false", "no", "n", "0", "off", "clean", "ok"}:
+        return False
+
+    return None
+
+
+def _deep_get(data: dict[str, Any], path: str) -> Any:
+    current: Any = data
+    for part in path.split("."):
+        if not isinstance(current, dict):
+            return None
+        current = current.get(part)
+    return current
+
+
+def _payload_get(payload: Dict[str, Any], *paths: str) -> Any:
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    for path in paths:
+        direct = _deep_get(payload, path)
+        if direct not in (None, "", [], {}):
+            return direct
+
+        meta = _deep_get(metadata, path)
+        if meta not in (None, "", [], {}):
+            return meta
+
+    return None
+
+
+def _as_text_list(value: Any) -> list[str]:
+    if value in (None, "", [], {}):
+        return []
+
+    if isinstance(value, (list, tuple, set)):
+        result: list[str] = []
+        for item in value:
+            if item in (None, "", [], {}):
+                continue
+            result.append(str(item).strip())
+        return [x for x in result if x]
+
+    if isinstance(value, dict):
+        try:
+            return [json.dumps(value, ensure_ascii=False, sort_keys=True)]
+        except Exception:
+            return [str(value)]
+
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _dedupe_keep_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        key = item.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(item.strip())
+    return result
+
+
 def _normalize_target_zone(value: Any) -> str:
     if value is None:
         return "-"
@@ -131,6 +224,10 @@ def _normalize_direction(value: Any) -> str:
     direction = str(value or "NEUTRAL").strip().upper()
     if direction in {"LONG", "SHORT", "NEUTRAL"}:
         return direction
+    if direction in {"BUY", "BULL", "BULLISH", "UP"}:
+        return "LONG"
+    if direction in {"SELL", "BEAR", "BEARISH", "DOWN"}:
+        return "SHORT"
     return "NEUTRAL"
 
 
@@ -138,6 +235,10 @@ def _normalize_htf_bias(value: Any) -> str:
     htf_bias = str(value or "NEUTRAL").strip().upper()
     if htf_bias in {"LONG", "SHORT", "NEUTRAL"}:
         return htf_bias
+    if htf_bias in {"BUY", "BULL", "BULLISH", "UP"}:
+        return "LONG"
+    if htf_bias in {"SELL", "BEAR", "BEARISH", "DOWN"}:
+        return "SHORT"
     return "NEUTRAL"
 
 
@@ -259,6 +360,55 @@ def _infer_alert_type(payload: Dict[str, Any]) -> str:
     return ""
 
 
+def _copy_metadata_aliases(normalized: Dict[str, Any]) -> None:
+    """
+    Keep the formatter tolerant to fields attached either at root or metadata.
+
+    battle_permission.apply_battle_permission() writes most v1.5 fields at root,
+    but older payloads or journal replays may only have them under metadata.
+    """
+    metadata = normalized.get("metadata")
+    if not isinstance(metadata, dict):
+        return
+
+    aliases = (
+        "battle_permission",
+        "telegram_delivery_mode",
+        "battle_ready",
+        "auction_context_score",
+        "risk_mode",
+        "battle_risk_mode",
+        "scenario_family",
+        "news_risk_state",
+        "news_provider_status",
+        "local_structure_damaged",
+        "target_quality",
+        "caution_flags",
+        "risk_flags",
+        "safety_flags",
+        "battle_permission_modifiers",
+        "battle_permission_blockers",
+        "battle_permission_reasons",
+        "battle_gate_v2_risk_mode",
+        "battle_gate_v2_decision",
+        "battle_gate_v2_modifiers",
+        "battle_gate_v2_blockers",
+        "battle_gate_v2_reasons",
+        "battle_permission_version",
+    )
+
+    for key in aliases:
+        if normalized.get(key) in (None, "", [], {}) and metadata.get(key) not in (None, "", [], {}):
+            normalized[key] = metadata.get(key)
+
+    if normalized.get("risk_mode") in (None, "", [], {}):
+        normalized["risk_mode"] = _first_present(
+            metadata.get("battle_risk_mode"),
+            metadata.get("battle_gate_v2_risk_mode"),
+            normalized.get("battle_gate_v2_risk_mode"),
+        )
+
+
 def _normalize_alert_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalize alert payload v3 into Telegram-compatible fields.
@@ -273,6 +423,7 @@ def _normalize_alert_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     - Telegram displays both separately to avoid misleading "Probability: 45%" on READY signals.
     """
     normalized = dict(payload)
+    _copy_metadata_aliases(normalized)
 
     alert_type = _infer_alert_type(normalized)
     if alert_type:
@@ -391,7 +542,118 @@ def _normalize_alert_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if "rationale" not in normalized and normalized.get("watch_reason"):
         normalized["rationale"] = normalized.get("watch_reason")
 
+    _copy_metadata_aliases(normalized)
     return normalized
+
+
+def _collect_caution_flags(payload: Dict[str, Any]) -> list[str]:
+    flags: list[str] = []
+
+    for key in ("caution_flags", "risk_flags", "safety_flags"):
+        flags.extend(_as_text_list(_payload_get(payload, key)))
+
+    # battle_permission_modifiers are not all warnings, but for CAUTION_BATTLE they explain why
+    # the user should not read the alert as a clean green battle signal.
+    flags.extend(_as_text_list(_payload_get(payload, "battle_permission_modifiers")))
+    flags.extend(_as_text_list(_payload_get(payload, "battle_gate_v2_modifiers")))
+
+    return _dedupe_keep_order(flags)
+
+
+def _is_provider_unavailable(value: Any) -> bool:
+    normalized = _as_upper(value)
+    if not normalized:
+        return False
+    return any(token in normalized for token in ("UNAVAILABLE", "FAILED", "ERROR", "MISSING"))
+
+
+def _build_battle_safety_lines(payload: Dict[str, Any]) -> list[str]:
+    """
+    Human-facing Battle Gate context block.
+
+    The goal is not to duplicate all metadata. The goal is to prevent Telegram from
+    presenting CAUTION_BATTLE / post-news reclaim / local damage as a clean trend battle.
+    """
+    battle_permission = _as_upper(_payload_get(payload, "battle_permission"))
+    risk_mode = _as_upper(
+        _first_present(
+            _payload_get(payload, "risk_mode"),
+            _payload_get(payload, "battle_risk_mode"),
+            _payload_get(payload, "battle_gate_v2_risk_mode"),
+        )
+    )
+    scenario_family = _as_upper(_payload_get(payload, "scenario_family"))
+    news_risk_state = _as_upper(_payload_get(payload, "news_risk_state"))
+    news_provider_status = _as_upper(_payload_get(payload, "news_provider_status"))
+    local_structure_damaged = _as_bool(_payload_get(payload, "local_structure_damaged"))
+    target_quality = _as_upper(_payload_get(payload, "target_quality"))
+    auction_context_score = _payload_get(payload, "auction_context_score")
+    flags = _collect_caution_flags(payload)
+
+    should_render = (
+        battle_permission == "CAUTION_BATTLE"
+        or risk_mode in {"CAUTION", "CAUTION_BATTLE", "TRANSITION_CANDIDATE", "POST_NEWS_CAUTION"}
+        or scenario_family in {"POST_NEWS_RECLAIM", "POST_LIQUIDATION_RECLAIM"}
+        or local_structure_damaged is True
+        or _is_provider_unavailable(news_risk_state)
+        or _is_provider_unavailable(news_provider_status)
+        or target_quality in {"SYNTHETIC", "UNKNOWN"}
+        or bool(flags)
+    )
+
+    if not should_render:
+        return []
+
+    lines: list[str] = ["🛡 Battle Gate / Safety"]
+
+    if battle_permission:
+        if battle_permission == "CAUTION_BATTLE":
+            lines.append("Режим: 🟡 CAUTION_BATTLE — сигнал дозволений, але це не clean battle.")
+        elif battle_permission == "BATTLE_READY":
+            lines.append("Режим: 🟢 BATTLE_READY")
+        else:
+            lines.append(f"Режим: {battle_permission}")
+
+    if risk_mode:
+        lines.append(f"Risk mode: {risk_mode}")
+
+    if scenario_family:
+        if scenario_family in {"POST_NEWS_RECLAIM", "POST_LIQUIDATION_RECLAIM"}:
+            lines.append(f"Scenario family: {scenario_family} — reclaim/mean-reversion, не чисте trend continuation.")
+        else:
+            lines.append(f"Scenario family: {scenario_family}")
+
+    if news_risk_state:
+        lines.append(f"News risk: {news_risk_state}")
+
+    if news_provider_status and news_provider_status != news_risk_state:
+        lines.append(f"News provider: {news_provider_status}")
+
+    if local_structure_damaged is True:
+        lines.append("Local structure: DAMAGED після імпульсу / ліквідації.")
+    elif local_structure_damaged is False and battle_permission == "CAUTION_BATTLE":
+        lines.append("Local structure: not marked damaged")
+
+    if target_quality:
+        if target_quality == "REAL_ZONE":
+            lines.append("Target quality: REAL_ZONE")
+        elif target_quality == "SYNTHETIC":
+            lines.append("Target quality: SYNTHETIC — battle має бути понижений.")
+        else:
+            lines.append(f"Target quality: {target_quality}")
+
+    if auction_context_score not in (None, ""):
+        lines.append(f"Auction score: {auction_context_score}")
+
+    if flags:
+        shown_flags = flags[:6]
+        suffix = "" if len(flags) <= 6 else f" +{len(flags) - 6} more"
+        lines.append("Flags: " + ", ".join(shown_flags) + suffix)
+
+    if battle_permission == "CAUTION_BATTLE" or scenario_family in {"POST_NEWS_RECLAIM", "POST_LIQUIDATION_RECLAIM"}:
+        lines.append("Management: працювати тільки за entry/SL/target; після near-target не наздоганяти.")
+
+    return lines
 
 
 @dataclass
@@ -563,6 +825,7 @@ class TelegramNotifier:
 
         try:
             normalized_payload = apply_battle_permission(normalized_payload)
+            normalized_payload = _normalize_alert_payload(normalized_payload)
         except Exception as exc:  # noqa: BLE001
             logger.exception(
                 "Battle permission evaluation failed. Telegram alert suppressed for safety. "
@@ -589,8 +852,14 @@ class TelegramNotifier:
         if not isinstance(metadata, dict):
             metadata = {}
 
-        battle_blockers = metadata.get("battle_permission_blockers") or []
-        battle_reasons = metadata.get("battle_permission_reasons") or []
+        battle_blockers = metadata.get("battle_permission_blockers") or normalized_payload.get("battle_permission_blockers") or []
+        battle_reasons = metadata.get("battle_permission_reasons") or normalized_payload.get("battle_permission_reasons") or []
+        risk_mode = _payload_get(normalized_payload, "risk_mode", "battle_risk_mode", "battle_gate_v2_risk_mode")
+        scenario_family = _payload_get(normalized_payload, "scenario_family")
+        news_risk_state = _payload_get(normalized_payload, "news_risk_state")
+        local_structure_damaged = _payload_get(normalized_payload, "local_structure_damaged")
+        target_quality = _payload_get(normalized_payload, "target_quality")
+        caution_flags = _collect_caution_flags(normalized_payload)
 
         if telegram_delivery_mode != "BATTLE_ALERT" or not battle_ready:
             record_battle_permission_event(
@@ -603,13 +872,15 @@ class TelegramNotifier:
             logger.info(
                 "Telegram alert suppressed by battle permission. "
                 "symbol=%s alert_type=%s signal_id=%s battle_permission=%s "
-                "delivery_mode=%s score=%s blockers=%s reasons=%s",
+                "delivery_mode=%s score=%s risk_mode=%s scenario_family=%s blockers=%s reasons=%s",
                 normalized_payload.get("symbol"),
                 alert_type,
                 normalized_payload.get("signal_id"),
                 battle_permission,
                 telegram_delivery_mode,
                 auction_context_score,
+                risk_mode,
+                scenario_family,
                 battle_blockers,
                 battle_reasons[:5] if isinstance(battle_reasons, list) else battle_reasons,
             )
@@ -618,7 +889,10 @@ class TelegramNotifier:
         message = self.format_alert_payload(normalized_payload)
 
         logger.info(
-            "Sending Telegram alert. symbol=%s alert_type=%s signal_id=%s alignment=%s stop_quality=%s practical_rr=%s trade_confidence=%s scenario_probability=%s battle_permission=%s auction_context_score=%s formatter=%s",
+            "Sending Telegram alert. symbol=%s alert_type=%s signal_id=%s alignment=%s "
+            "stop_quality=%s practical_rr=%s trade_confidence=%s scenario_probability=%s "
+            "battle_permission=%s risk_mode=%s scenario_family=%s news_risk_state=%s "
+            "local_structure_damaged=%s target_quality=%s caution_flags=%s auction_context_score=%s formatter=%s version=%s",
             normalized_payload.get("symbol"),
             alert_type,
             normalized_payload.get("signal_id"),
@@ -628,17 +902,31 @@ class TelegramNotifier:
             normalized_payload.get("trade_confidence"),
             normalized_payload.get("scenario_probability"),
             battle_permission,
+            risk_mode,
+            scenario_family,
+            news_risk_state,
+            local_structure_damaged,
+            target_quality,
+            caution_flags[:6],
             auction_context_score,
             "ukrainian" if self.config.use_ukrainian_formatter else "legacy_html",
+            TELEGRAM_NOTIFIER_VERSION,
         )
 
         sent = self.send_text(message)
+
+        if sent and battle_permission == "CAUTION_BATTLE":
+            note = "caution_battle_alert_sent"
+        elif sent:
+            note = "battle_alert_sent"
+        else:
+            note = "battle_alert_send_failed"
 
         record_battle_permission_event(
             normalized_payload,
             source="telegram_notifier",
             sent_to_telegram=sent,
-            note="battle_alert_sent" if sent else "battle_alert_send_failed",
+            note=note,
         )
 
         return sent
@@ -671,6 +959,10 @@ class TelegramNotifier:
 
         formatted = format_signal_message(payload)
         text = formatted.render()
+
+        safety_lines = _build_battle_safety_lines(payload)
+        if safety_lines:
+            text = text + "\n\n" + "\n".join(safety_lines)
 
         return _truncate(_escape_html(text), self.config.max_message_length)
 
@@ -730,6 +1022,15 @@ class TelegramNotifier:
             f"<b>{header} | {symbol}</b>",
             f"<b>{_escape_html(signal_alignment_marker)} {_escape_html(signal_alignment_label)}</b>",
         ]
+
+        safety_lines = _build_battle_safety_lines(payload)
+        if safety_lines:
+            lines.append("")
+            for idx, safety_line in enumerate(safety_lines):
+                if idx == 0:
+                    lines.append(f"<b>{_escape_html(safety_line)}</b>")
+                else:
+                    lines.append(_escape_html(safety_line))
 
         if stop_quality == "TIGHT_STOP":
             lines.append("<b>⚠️ TIGHT STOP / RR INFLATED</b>")
@@ -809,6 +1110,7 @@ class TelegramNotifier:
                     "",
                     "<b>Status:</b> online",
                     "<b>Mode:</b> 24/7 loop",
+                    f"<b>Telegram notifier:</b> {_escape_html(TELEGRAM_NOTIFIER_VERSION)}",
                 ]
             )
         )
@@ -851,42 +1153,45 @@ if __name__ == "__main__":
         "symbol": "NAS100",
         "signal_class": "READY",
         "alert_type": "ENTRY_READY",
-        "scenario": "TREND_CONTINUATION_LONG",
-        "scenario_type": "TREND_CONTINUATION_LONG",
+        "scenario": "TPO_OPEN_TEST_DRIVE_LONG",
+        "scenario_type": "TPO_OPEN_TEST_DRIVE_LONG",
+        "scenario_family": "POST_NEWS_RECLAIM",
         "direction": "LONG",
-        "confidence": 0.8,
-        "scenario_probability": 0.65,
-        "rationale": "Battle-ready directional auction test payload.",
-        "market_state": "TREND",
+        "confidence": 0.68,
+        "scenario_probability": 0.68,
+        "rationale": "OPEN_TEST_DRIVE / reclaim regression payload.",
+        "market_state": "TRANSITION",
         "htf_bias": "LONG",
         "signal_alignment": "TREND_ALIGNED",
-        "entry_reference_price": 19000.0,
-        "invalidation_reference_price": 18950.0,
-        "target_reference_price": 19150.0,
+        "entry_reference_price": 28855.13,
+        "invalidation_reference_price": 28789.73,
+        "target_reference_price": 29100.0,
         "execution_status": "EXECUTABLE",
-        "execution_model": "LIMIT_ON_RETEST",
-        "risk_reward_ratio": 3.0,
-        "practical_rr": 3.0,
+        "execution_model": "FAILED_ACCEPTANCE_RETEST",
+        "risk_reward_ratio": 3.74,
+        "practical_rr": 3.74,
         "stop_quality": "OK",
-        "quality_tier": "GOOD",
+        "quality_tier": "CAUTION",
         "paper_mode": False,
-        "cycle_id": "2026-05-13T12:49:17.416321+00:00",
-        "signal_id": "TEST_NAS100_BATTLE_READY",
+        "cycle_id": "2026-06-09T17:39:10.610073+00:00",
+        "signal_id": "TEST_NAS100_CAUTION_BATTLE",
         "metadata": {
-            "auction_context": {
-                "market_is_open": True,
-                "market_status": "OPEN",
-                "open_relation": "OUT_OF_RANGE",
-                "auction_bias": "DIRECTIONAL_IMBALANCE",
-                "ib_extension_up_pct": 0.7,
-            },
-            "auction_filters": {
-                "tpo_signal_permission": "OPEN_FOR_EVALUATION",
-                "telegram_modifier": "BOOST",
-            },
+            "battle_permission": "CAUTION_BATTLE",
+            "telegram_delivery_mode": "BATTLE_ALERT",
+            "battle_ready": True,
+            "auction_context_score": 3,
+            "risk_mode": "CAUTION",
+            "news_risk_state": "PROVIDER_UNAVAILABLE",
+            "news_provider_status": "FINNHUB_UNAVAILABLE",
+            "local_structure_damaged": True,
+            "target_quality": "REAL_ZONE",
+            "caution_flags": [
+                "news_provider_unavailable_usd_sensitive",
+                "local_structure_damaged",
+            ],
         },
     }
 
     notifier = build_telegram_notifier()
-    ok = notifier.send_alert_payload(sample_payload)
-    print(json.dumps({"telegram_sent": ok}, ensure_ascii=False))
+    text = notifier.format_alert_payload_legacy_html(sample_payload)
+    print(text)

@@ -137,6 +137,20 @@ class SignalRecord:
     execution_timeframe: Optional[str] = None
     trigger_reason: Optional[str] = None
 
+    # Battle Gate / safety context fields.
+    # These are diagnostic/statistical only; they do not change signal logic.
+    battle_permission: Optional[str] = None
+    telegram_delivery_mode: Optional[str] = None
+    battle_ready: Optional[bool] = None
+    auction_context_score: Optional[float] = None
+    risk_mode: Optional[str] = None
+    scenario_family: Optional[str] = None
+    news_risk_state: Optional[str] = None
+    news_provider_status: Optional[str] = None
+    local_structure_damaged: Optional[bool] = None
+    target_quality: Optional[str] = None
+    caution_flags: list[str] | None = None
+
     was_sent_to_telegram: bool = False
     was_deduped: bool = False
 
@@ -176,6 +190,20 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _safe_bool(value: Any, default: bool | None = None) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 def _safe_list_str(value: Any) -> list[str]:
@@ -563,6 +591,105 @@ def _event_symbol(event: dict[str, Any], payload: dict[str, Any]) -> str:
         payload.get("metadata"),
         event.get("symbol"),
     )
+
+
+def _first_context_value(payload: dict[str, Any] | None, *keys: str) -> Any:
+    payload = payload or {}
+    metadata = _metadata_dict(payload)
+
+    for key in keys:
+        value = payload.get(key)
+        if value not in (None, "", [], {}):
+            return value
+
+        value = metadata.get(key)
+        if value not in (None, "", [], {}):
+            return value
+
+    return None
+
+
+def _extract_safety_context_fields(payload: dict[str, Any] | None) -> dict[str, Any]:
+    payload = payload or {}
+
+    fields: dict[str, Any] = {
+        "battle_permission": _clean_text(_first_context_value(payload, "battle_permission")),
+        "telegram_delivery_mode": _clean_text(_first_context_value(payload, "telegram_delivery_mode")),
+        "battle_ready": _safe_bool(_first_context_value(payload, "battle_ready"), None),
+        "auction_context_score": _safe_float(_first_context_value(payload, "auction_context_score"), None),
+        "risk_mode": _clean_text(_first_context_value(payload, "risk_mode", "battle_gate_v2_risk_mode")),
+        "scenario_family": _clean_text(_first_context_value(payload, "scenario_family")),
+        "news_risk_state": _clean_text(_first_context_value(payload, "news_risk_state")),
+        "news_provider_status": _clean_text(_first_context_value(payload, "news_provider_status")),
+        "local_structure_damaged": _safe_bool(_first_context_value(payload, "local_structure_damaged"), None),
+        "target_quality": _clean_text(_first_context_value(payload, "target_quality")),
+        "caution_flags": _safe_list_str(_first_context_value(payload, "caution_flags")),
+    }
+
+    return {
+        key: value
+        for key, value in fields.items()
+        if value not in (None, "", [], {})
+    }
+
+
+def _apply_safety_context_fields(rec: SignalRecord, fields: dict[str, Any] | None) -> SignalRecord:
+    if not isinstance(fields, dict):
+        return rec
+
+    for key, value in fields.items():
+        if value in (None, "", [], {}):
+            continue
+        if hasattr(rec, key):
+            setattr(rec, key, value)
+
+    return rec
+
+
+def _build_safety_context_index(events: list[dict]) -> dict[str, dict[str, Any]]:
+    index: dict[str, dict[str, Any]] = {}
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+
+        payload = event.get("payload", {}) or {}
+        payloads: list[dict[str, Any]] = []
+
+        if isinstance(payload, dict):
+            payloads.append(payload)
+            nested = payload.get("payload")
+            if isinstance(nested, dict):
+                payloads.append(nested)
+                nested_2 = nested.get("payload")
+                if isinstance(nested_2, dict):
+                    payloads.append(nested_2)
+
+        for candidate in payloads:
+            fields = _extract_safety_context_fields(candidate)
+            if not fields:
+                continue
+
+            symbol = _event_symbol(event, candidate)
+            cycle_id = str(event.get("cycle_id") or candidate.get("cycle_id") or "")
+            scenario = str(candidate.get("scenario") or candidate.get("scenario_type") or "UNKNOWN")
+            direction = str(candidate.get("direction") or "NEUTRAL")
+
+            signal_id = _normalize_signal_id(
+                candidate.get("signal_id") or payload.get("signal_id"),
+                symbol=symbol,
+                cycle_id=cycle_id,
+                scenario=scenario,
+                direction=direction,
+            )
+
+            if not signal_id:
+                continue
+
+            bucket = index.setdefault(signal_id, {})
+            bucket.update(fields)
+
+    return index
 
 
 def _confidence_bucket(confidence: float) -> str:
@@ -1102,7 +1229,10 @@ def build_signal_records(events: list[dict]) -> list[SignalRecord]:
             rec.was_sent_to_telegram = True
             continue
 
+    safety_context_index = _build_safety_context_index(events)
+
     for rec in records.values():
+        _apply_safety_context_fields(rec, safety_context_index.get(rec.signal_id))
         _apply_record_derived_fields(rec)
 
     return list(records.values())
@@ -1434,6 +1564,33 @@ def compute_metrics_by_stop_quality(records: list[SignalRecord]) -> dict:
 
     return {key: _compute_grouped_record_metrics(items) for key, items in grouped.items()}
 
+
+def compute_metrics_by_record_field(records: list[SignalRecord], field_name: str) -> dict:
+    grouped: dict[str, list[SignalRecord]] = {}
+    for rec in records:
+        value = getattr(rec, field_name, None)
+        key = str(value if value not in (None, "", [], {}) else "UNKNOWN")
+        grouped.setdefault(key, []).append(rec)
+
+    return {key: _compute_grouped_record_metrics(items) for key, items in grouped.items()}
+
+
+def compute_metrics_by_record_list_field(records: list[SignalRecord], field_name: str) -> dict:
+    grouped: dict[str, list[SignalRecord]] = {}
+
+    for rec in records:
+        value = getattr(rec, field_name, None)
+        if isinstance(value, list):
+            keys = [str(x) for x in value if str(x).strip()] or ["NONE"]
+        else:
+            keys = [str(value or "NONE")]
+
+        for key in keys:
+            grouped.setdefault(key, []).append(rec)
+
+    return {key: _compute_grouped_record_metrics(items) for key, items in grouped.items()}
+
+
 def records_to_dataframe(records: list[SignalRecord]) -> pd.DataFrame:
     rows = [r.to_dict() for r in records]
     if not rows:
@@ -1478,6 +1635,17 @@ def records_to_dataframe(records: list[SignalRecord]) -> pd.DataFrame:
             "target_distance",
             "execution_timeframe",
             "trigger_reason",
+            "battle_permission",
+            "telegram_delivery_mode",
+            "battle_ready",
+            "auction_context_score",
+            "risk_mode",
+            "scenario_family",
+            "news_risk_state",
+            "news_provider_status",
+            "local_structure_damaged",
+            "target_quality",
+            "caution_flags",
             "was_sent_to_telegram",
             "was_deduped",
             "current_stage",
@@ -1541,6 +1709,14 @@ def build_statistics_bundle(
         "metrics_by_status": compute_metrics_by_status(records),
         "metrics_by_signal_alignment": compute_metrics_by_signal_alignment(records),
         "metrics_by_stop_quality": compute_metrics_by_stop_quality(records),
+        "metrics_by_battle_permission": compute_metrics_by_record_field(records, "battle_permission"),
+        "metrics_by_telegram_delivery_mode": compute_metrics_by_record_field(records, "telegram_delivery_mode"),
+        "metrics_by_risk_mode": compute_metrics_by_record_field(records, "risk_mode"),
+        "metrics_by_scenario_family": compute_metrics_by_record_field(records, "scenario_family"),
+        "metrics_by_news_risk_state": compute_metrics_by_record_field(records, "news_risk_state"),
+        "metrics_by_local_structure_damaged": compute_metrics_by_record_field(records, "local_structure_damaged"),
+        "metrics_by_target_quality": compute_metrics_by_record_field(records, "target_quality"),
+        "metrics_by_caution_flag": compute_metrics_by_record_list_field(records, "caution_flags"),
         "records_count": len(records),
         "events_count": len(events),
     }
@@ -1568,6 +1744,14 @@ def build_and_export_statistics(
         "metrics_by_status": compute_metrics_by_status(records),
         "metrics_by_signal_alignment": compute_metrics_by_signal_alignment(records),
         "metrics_by_stop_quality": compute_metrics_by_stop_quality(records),
+        "metrics_by_battle_permission": compute_metrics_by_record_field(records, "battle_permission"),
+        "metrics_by_telegram_delivery_mode": compute_metrics_by_record_field(records, "telegram_delivery_mode"),
+        "metrics_by_risk_mode": compute_metrics_by_record_field(records, "risk_mode"),
+        "metrics_by_scenario_family": compute_metrics_by_record_field(records, "scenario_family"),
+        "metrics_by_news_risk_state": compute_metrics_by_record_field(records, "news_risk_state"),
+        "metrics_by_local_structure_damaged": compute_metrics_by_record_field(records, "local_structure_damaged"),
+        "metrics_by_target_quality": compute_metrics_by_record_field(records, "target_quality"),
+        "metrics_by_caution_flag": compute_metrics_by_record_list_field(records, "caution_flags"),
         "records_count": len(records),
         "events_count": len(events),
     }
