@@ -15,7 +15,7 @@ from app.services.telegram_formatter import format_signal_message
 
 logger = logging.getLogger(__name__)
 
-TELEGRAM_NOTIFIER_VERSION = "telegram-notifier-v1.6-caution-battle-safety-context"
+TELEGRAM_NOTIFIER_VERSION = "telegram-notifier-v1.7-battle-telemetry-safety-fields"
 
 
 # =============================================================================
@@ -152,19 +152,67 @@ def _deep_get(data: dict[str, Any], path: str) -> Any:
     return current
 
 
-def _payload_get(payload: Dict[str, Any], *paths: str) -> Any:
+def _is_present(value: Any) -> bool:
+    return value not in (None, "", [], {})
+
+
+def _iter_payload_contexts(payload: Dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Return payload dictionaries that may contain market/TPO/Battle fields.
+
+    Historically some fields were stored at root, some in metadata, and some
+    inside context.auction.context / context.auction.filters. Telemetry should
+    not write null just because the field is nested one level deeper.
+    """
+    contexts: list[dict[str, Any]] = []
+    seen: set[int] = set()
+
+    def add(value: Any) -> None:
+        if not isinstance(value, dict):
+            return
+        marker = id(value)
+        if marker in seen:
+            return
+        seen.add(marker)
+        contexts.append(value)
+
+    add(payload)
+
     metadata = payload.get("metadata")
-    if not isinstance(metadata, dict):
-        metadata = {}
+    add(metadata)
 
+    for root in (payload, metadata if isinstance(metadata, dict) else {}):
+        add(root.get("auction_filters"))
+        add(root.get("auction_context"))
+        add(root.get("tpo_context"))
+        add(root.get("battle_context"))
+        add(root.get("safety_context"))
+        add(root.get("post_news_context"))
+
+        auction = root.get("auction")
+        add(auction)
+        if isinstance(auction, dict):
+            add(auction.get("filters"))
+            add(auction.get("context"))
+
+        context = root.get("context")
+        add(context)
+        if isinstance(context, dict):
+            context_auction = context.get("auction")
+            add(context_auction)
+            if isinstance(context_auction, dict):
+                add(context_auction.get("filters"))
+                add(context_auction.get("context"))
+
+    return contexts
+
+
+def _payload_get(payload: Dict[str, Any], *paths: str) -> Any:
     for path in paths:
-        direct = _deep_get(payload, path)
-        if direct not in (None, "", [], {}):
-            return direct
-
-        meta = _deep_get(metadata, path)
-        if meta not in (None, "", [], {}):
-            return meta
+        for context in _iter_payload_contexts(payload):
+            value = _deep_get(context, path)
+            if _is_present(value):
+                return value
 
     return None
 
@@ -409,6 +457,126 @@ def _copy_metadata_aliases(normalized: Dict[str, Any]) -> None:
         )
 
 
+def _copy_battle_telemetry_aliases(normalized: Dict[str, Any]) -> None:
+    """
+    Flatten safety/TPO fields before telemetry is written.
+
+    record_battle_permission_event() receives one payload and historically reads
+    mostly root-level keys. This helper makes sure fields that already exist in
+    metadata, auction_filters, auction_context, context.auction.context, or
+    context.auction.filters are also available at root.
+    """
+
+    def set_if_missing(key: str, *paths: str) -> None:
+        if _is_present(normalized.get(key)):
+            return
+        value = _payload_get(normalized, *(paths or (key,)))
+        if _is_present(value):
+            normalized[key] = value
+
+    set_if_missing("battle_permission")
+    set_if_missing("telegram_delivery_mode")
+    set_if_missing("battle_ready")
+    set_if_missing("auction_context_score")
+    set_if_missing("risk_mode", "risk_mode", "battle_risk_mode", "battle_gate_v2_risk_mode")
+    set_if_missing("scenario_family")
+    set_if_missing("news_risk_state")
+    set_if_missing("news_provider_status")
+    set_if_missing("local_structure_damaged")
+    set_if_missing("target_quality")
+    set_if_missing("caution_flags")
+    set_if_missing("risk_flags")
+    set_if_missing("safety_flags")
+    set_if_missing("session_label")
+    set_if_missing("battle_permission_modifiers")
+    set_if_missing("battle_permission_blockers")
+    set_if_missing("battle_permission_reasons")
+    set_if_missing("battle_permission_version")
+    set_if_missing("battle_gate_v2_decision")
+    set_if_missing("battle_gate_v2_risk_mode")
+    set_if_missing("battle_gate_v2_modifiers")
+    set_if_missing("battle_gate_v2_blockers")
+    set_if_missing("battle_gate_v2_reasons")
+
+    set_if_missing("market_is_open")
+    set_if_missing("market_status")
+    set_if_missing("market_closed_reason")
+    set_if_missing("market_holiday_name")
+    set_if_missing("market_data_is_stale")
+    set_if_missing("market_data_age_minutes")
+    set_if_missing("last_bar_timestamp_utc")
+    set_if_missing("stale_bar_threshold_minutes")
+    set_if_missing("tpo_signal_permission")
+    set_if_missing("tpo_source")
+    set_if_missing("provider_error")
+    set_if_missing("fallback_preserved_previous_context")
+    set_if_missing("tpo_telegram_modifier", "tpo_telegram_modifier", "telegram_modifier")
+    set_if_missing("open_relation")
+    set_if_missing("auction_bias")
+    set_if_missing("open_context")
+    set_if_missing("open_behavior")
+    set_if_missing("open_behavior_confidence")
+    set_if_missing("entry_model_hint")
+    set_if_missing("stop_model_hint")
+    set_if_missing("battle_bias_hint")
+    set_if_missing("open_behavior_reason")
+    set_if_missing("session_anchor")
+    set_if_missing("session_timezone")
+    set_if_missing("session_open_utc")
+    set_if_missing("session_open_kyiv")
+    set_if_missing("current_session_id")
+    set_if_missing("previous_session_id")
+    set_if_missing("nearest_npoc")
+    set_if_missing("nearest_npoc_distance")
+    set_if_missing("ib_high")
+    set_if_missing("ib_low")
+    set_if_missing("ib_range")
+    set_if_missing("ib_extension_up_pct")
+    set_if_missing("ib_extension_down_pct")
+    set_if_missing("first_hour_activity")
+
+    primary_zone = _payload_get(normalized, "primary_interest_zone")
+    if isinstance(primary_zone, dict):
+        if not _is_present(normalized.get("primary_interest_zone")):
+            normalized["primary_interest_zone"] = primary_zone
+        if not _is_present(normalized.get("interest_zone_type")):
+            normalized["interest_zone_type"] = primary_zone.get("zone_type")
+        if not _is_present(normalized.get("interest_zone_price")):
+            normalized["interest_zone_price"] = primary_zone.get("price")
+        if not _is_present(normalized.get("interest_zone_role")):
+            normalized["interest_zone_role"] = primary_zone.get("role")
+        if not _is_present(normalized.get("interest_zone_reaction")):
+            normalized["interest_zone_reaction"] = primary_zone.get("reaction")
+        if not _is_present(normalized.get("interest_zone_reason")):
+            normalized["interest_zone_reason"] = primary_zone.get("reason")
+    else:
+        set_if_missing("primary_interest_zone")
+
+    set_if_missing("interest_zone_type")
+    set_if_missing("interest_zone_price")
+    set_if_missing("interest_zone_role")
+    set_if_missing("interest_zone_reaction")
+
+    # Forward-compatible fields for post_news_continuation_detector.
+    set_if_missing("post_news_regime")
+    set_if_missing("post_news_elapsed_minutes")
+    set_if_missing("post_news_impulse_direction")
+    set_if_missing("post_news_impulse_confirmed")
+    set_if_missing("post_news_retest_level")
+    set_if_missing("post_news_retest_status")
+    set_if_missing("post_news_acceptance_status")
+    set_if_missing("post_news_failed_move")
+    set_if_missing("post_news_continuation_quality")
+    set_if_missing("post_news_continuation_direction")
+    set_if_missing("post_news_trade_permission")
+
+    if not _is_present(normalized.get("risk_mode")):
+        normalized["risk_mode"] = _first_present(
+            normalized.get("battle_risk_mode"),
+            normalized.get("battle_gate_v2_risk_mode"),
+        )
+
+
 def _normalize_alert_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalize alert payload v3 into Telegram-compatible fields.
@@ -424,6 +592,7 @@ def _normalize_alert_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     normalized = dict(payload)
     _copy_metadata_aliases(normalized)
+    _copy_battle_telemetry_aliases(normalized)
 
     alert_type = _infer_alert_type(normalized)
     if alert_type:
@@ -543,6 +712,7 @@ def _normalize_alert_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized["rationale"] = normalized.get("watch_reason")
 
     _copy_metadata_aliases(normalized)
+    _copy_battle_telemetry_aliases(normalized)
     return normalized
 
 
@@ -654,6 +824,24 @@ def _build_battle_safety_lines(payload: Dict[str, Any]) -> list[str]:
         lines.append("Management: працювати тільки за entry/SL/target; після near-target не наздоганяти.")
 
     return lines
+
+
+def _record_battle_permission_event_enriched(
+    payload: Dict[str, Any],
+    *,
+    source: str,
+    sent_to_telegram: bool,
+    note: str,
+) -> None:
+    """Write Battle telemetry with root-level safety/TPO aliases populated."""
+    telemetry_payload = _normalize_alert_payload(dict(payload))
+    _copy_battle_telemetry_aliases(telemetry_payload)
+    record_battle_permission_event(
+        telemetry_payload,
+        source=source,
+        sent_to_telegram=sent_to_telegram,
+        note=note,
+    )
 
 
 @dataclass
@@ -862,7 +1050,7 @@ class TelegramNotifier:
         caution_flags = _collect_caution_flags(normalized_payload)
 
         if telegram_delivery_mode != "BATTLE_ALERT" or not battle_ready:
-            record_battle_permission_event(
+            _record_battle_permission_event_enriched(
                 normalized_payload,
                 source="telegram_notifier",
                 sent_to_telegram=False,
@@ -922,7 +1110,7 @@ class TelegramNotifier:
         else:
             note = "battle_alert_send_failed"
 
-        record_battle_permission_event(
+        _record_battle_permission_event_enriched(
             normalized_payload,
             source="telegram_notifier",
             sent_to_telegram=sent,
@@ -1195,3 +1383,4 @@ if __name__ == "__main__":
     notifier = build_telegram_notifier()
     text = notifier.format_alert_payload_legacy_html(sample_payload)
     print(text)
+
