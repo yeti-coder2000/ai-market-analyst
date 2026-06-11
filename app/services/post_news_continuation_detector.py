@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 
-POST_NEWS_CONTINUATION_DETECTOR_VERSION = "post-news-continuation-detector-v1.0-conservative-acceptance"
+POST_NEWS_CONTINUATION_DETECTOR_VERSION = "post-news-continuation-detector-v1.1-conservative-acceptance"
 
 
 # =============================================================================

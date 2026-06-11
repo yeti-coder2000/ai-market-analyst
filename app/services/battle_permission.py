@@ -12,8 +12,13 @@ try:
 except Exception:  # pragma: no cover
     evaluate_open_behavior_policy = None  # type: ignore[assignment]
 
+try:
+    from app.services.post_news_continuation_detector import apply_post_news_continuation
+except Exception:  # pragma: no cover
+    apply_post_news_continuation = None  # type: ignore[assignment]
 
-BATTLE_PERMISSION_VERSION = "battle-permission-v1.5-safety-gate-news-local-damage"
+
+BATTLE_PERMISSION_VERSION = "battle-permission-v1.6-post-news-continuation-gate"
 
 
 class BattlePermission(str, Enum):
@@ -86,6 +91,23 @@ class BattlePermissionResult:
     risk_mode: str | None = None
     caution_flags: list[str] = field(default_factory=list)
 
+    # Post-news continuation detector fields.
+    post_news_detector_version: str | None = None
+    post_news_regime: str | None = None
+    post_news_trade_permission: str | None = None
+    post_news_elapsed_minutes: int | None = None
+    post_news_impulse_direction: str | None = None
+    post_news_impulse_confirmed: bool | None = None
+    post_news_retest_level: str | None = None
+    post_news_retest_status: str | None = None
+    post_news_acceptance_status: str | None = None
+    post_news_failed_move: bool | None = None
+    post_news_continuation_quality: str | None = None
+    post_news_continuation_direction: str | None = None
+    post_news_reasons: list[str] = field(default_factory=list)
+    post_news_blockers: list[str] = field(default_factory=list)
+    post_news_modifiers: list[str] = field(default_factory=list)
+
     # Battle Gate v2 shadow-mode fields.
     # Legacy Battle Gate remains the execution authority for now.
     battle_gate_v2_decision: str | None = None
@@ -157,6 +179,42 @@ def _as_bool(value: Any) -> bool | None:
             return False
 
     return None
+
+
+def _as_text_list(value: Any) -> list[str]:
+    if value in (None, "", [], {}):
+        return []
+
+    if isinstance(value, (list, tuple, set)):
+        result: list[str] = []
+        for item in value:
+            if item in (None, "", [], {}):
+                continue
+            text = str(item).strip()
+            if text:
+                result.append(text)
+        return result
+
+    if isinstance(value, dict):
+        try:
+            return [json.dumps(value, ensure_ascii=False, sort_keys=True)]
+        except Exception:
+            return [str(value)]
+
+    text = str(value).strip()
+    return [text] if text else []
+
+
+def _dedupe_text_list(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in items:
+        key = item.strip().lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(item.strip())
+    return result
 
 
 def _normalize_direction(value: Any) -> str | None:
@@ -899,6 +957,13 @@ def _evaluate_v2_shadow(payload: dict[str, Any]) -> dict[str, Any]:
 def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
     payload = _enrich_payload_with_tpo_store(_extract_payload(raw_payload))
 
+    if apply_post_news_continuation is not None:
+        try:
+            payload = apply_post_news_continuation(payload)
+        except Exception:  # noqa: BLE001
+            # Post-news detector is advisory. It must never break legacy Battle Gate.
+            pass
+
     symbol = _normalize_symbol(
         _deep_get(
             payload,
@@ -1357,6 +1422,21 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
         "ib_extension_up_pct": ib_extension_up_pct,
         "ib_extension_down_pct": ib_extension_down_pct,
         "accepted_back_inside_value": accepted_back_inside_value,
+        "post_news_detector_version": _deep_get(payload, "metadata.post_news_detector_version", "post_news_detector_version"),
+        "post_news_regime": _as_upper(_deep_get(payload, "metadata.post_news_regime", "post_news_regime")),
+        "post_news_trade_permission": _as_upper(_deep_get(payload, "metadata.post_news_trade_permission", "post_news_trade_permission")),
+        "post_news_elapsed_minutes": _as_float(_deep_get(payload, "metadata.post_news_elapsed_minutes", "post_news_elapsed_minutes")),
+        "post_news_impulse_direction": _normalize_direction(_deep_get(payload, "metadata.post_news_impulse_direction", "post_news_impulse_direction")),
+        "post_news_impulse_confirmed": _as_bool(_deep_get(payload, "metadata.post_news_impulse_confirmed", "post_news_impulse_confirmed")),
+        "post_news_retest_level": _deep_get(payload, "metadata.post_news_retest_level", "post_news_retest_level"),
+        "post_news_retest_status": _as_upper(_deep_get(payload, "metadata.post_news_retest_status", "post_news_retest_status")),
+        "post_news_acceptance_status": _as_upper(_deep_get(payload, "metadata.post_news_acceptance_status", "post_news_acceptance_status")),
+        "post_news_failed_move": _as_bool(_deep_get(payload, "metadata.post_news_failed_move", "post_news_failed_move")),
+        "post_news_continuation_quality": _as_upper(_deep_get(payload, "metadata.post_news_continuation_quality", "post_news_continuation_quality")),
+        "post_news_continuation_direction": _normalize_direction(_deep_get(payload, "metadata.post_news_continuation_direction", "post_news_continuation_direction")),
+        "post_news_reasons": _as_text_list(_deep_get(payload, "metadata.post_news_reasons", "post_news_reasons")),
+        "post_news_blockers": _as_text_list(_deep_get(payload, "metadata.post_news_blockers", "post_news_blockers")),
+        "post_news_modifiers": _as_text_list(_deep_get(payload, "metadata.post_news_modifiers", "post_news_modifiers")),
     }
 
 
@@ -1485,6 +1565,21 @@ def _build_result(
         target_quality=inputs.get("target_quality"),
         risk_mode=risk_mode,
         caution_flags=list(caution_flags or []),
+        post_news_detector_version=inputs.get("post_news_detector_version"),
+        post_news_regime=inputs.get("post_news_regime"),
+        post_news_trade_permission=inputs.get("post_news_trade_permission"),
+        post_news_elapsed_minutes=int(inputs.get("post_news_elapsed_minutes")) if inputs.get("post_news_elapsed_minutes") is not None else None,
+        post_news_impulse_direction=inputs.get("post_news_impulse_direction"),
+        post_news_impulse_confirmed=inputs.get("post_news_impulse_confirmed"),
+        post_news_retest_level=inputs.get("post_news_retest_level"),
+        post_news_retest_status=inputs.get("post_news_retest_status"),
+        post_news_acceptance_status=inputs.get("post_news_acceptance_status"),
+        post_news_failed_move=inputs.get("post_news_failed_move"),
+        post_news_continuation_quality=inputs.get("post_news_continuation_quality"),
+        post_news_continuation_direction=inputs.get("post_news_continuation_direction"),
+        post_news_reasons=list(inputs.get("post_news_reasons") or []),
+        post_news_blockers=list(inputs.get("post_news_blockers") or []),
+        post_news_modifiers=list(inputs.get("post_news_modifiers") or []),
         battle_gate_v2_decision=v2_policy.get("decision"),
         battle_gate_v2_risk_mode=v2_policy.get("risk_mode"),
         battle_gate_v2_battle_allowed=v2_policy.get("battle_allowed"),
@@ -1527,6 +1622,21 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
     scenario_family = inputs.get("scenario_family")
     target_quality = inputs.get("target_quality")
 
+    post_news_regime = inputs.get("post_news_regime")
+    post_news_trade_permission = inputs.get("post_news_trade_permission")
+    post_news_reasons = list(inputs.get("post_news_reasons") or [])
+    post_news_blockers = list(inputs.get("post_news_blockers") or [])
+    post_news_modifiers = list(inputs.get("post_news_modifiers") or [])
+
+    post_news_allows_clean_battle = post_news_trade_permission == "ALLOW_BATTLE_IF_GEOMETRY_VALID"
+    post_news_allows_caution_battle = post_news_trade_permission == "ALLOW_CAUTION_BATTLE_IF_GEOMETRY_VALID"
+    post_news_allows_battle = post_news_allows_clean_battle or post_news_allows_caution_battle
+
+    if post_news_regime and post_news_regime != "NOT_POST_NEWS":
+        reasons.append(f"post_news_regime={post_news_regime}")
+        reasons.extend(f"post_news: {reason}" for reason in post_news_reasons[:8])
+        modifiers.extend(f"post_news_{modifier}" for modifier in post_news_modifiers if f"post_news_{modifier}" not in modifiers)
+
     caution_flags: list[str] = []
 
     if _is_news_provider_unavailable(news_risk_state, news_provider_status) and _is_usd_sensitive_symbol(symbol):
@@ -1540,6 +1650,15 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
 
     if target_quality == "UNKNOWN":
         caution_flags.append("target_quality_unknown")
+
+    if post_news_allows_caution_battle:
+        caution_flags.append("post_news_caution_continuation")
+
+    if post_news_allows_clean_battle:
+        modifiers.append("post_news_clean_continuation")
+
+    caution_flags = _dedupe_text_list(caution_flags)
+    modifiers = _dedupe_text_list(modifiers)
 
     v2_neutral_otd_transition_allowed = _v2_allows_neutral_open_test_drive_transition(
         inputs=inputs,
@@ -1582,36 +1701,83 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
             v2_policy=v2_policy,
         )
 
-    # 2. TPO / auction research blockers.
-    if tpo_signal_permission in {"MARKET_CLOSED", "RESEARCH_ONLY", "BLOCKED_BY_CONTEXT", "BLOCKED_BY_AUCTION"}:
-        blockers.append(f"tpo_permission_{str(tpo_signal_permission).lower()}")
+    # 2. Post-news state gate.
+    # This is the key layer: first impulse remains NO CHASE, but confirmed retest
+    # and acceptance can later release a clean continuation into the normal Battle Gate.
+    if post_news_trade_permission in {"BLOCK_BATTLE", "SUPPRESS"}:
+        blockers.extend(post_news_blockers or ["post_news_block_battle"])
         return _build_result(
             inputs=inputs,
             auction_score=auction_score,
-            reasons=reasons + [f"TPO permission is {tpo_signal_permission}; battle signal disabled"],
-            blockers=blockers,
+            reasons=reasons + ["post-news detector blocks battle: no chase / unsafe early auction"],
+            blockers=_dedupe_text_list(blockers),
+            modifiers=modifiers,
+            battle_permission=BattlePermission.BLOCKED_BY_CONTEXT.value,
+            telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
+            risk_mode="POST_NEWS_NO_CHASE",
+            caution_flags=caution_flags,
+        )
+
+    if post_news_trade_permission == "RESEARCH_ONLY":
+        blockers.extend(post_news_blockers or ["post_news_research_only"])
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
+            reasons=reasons + ["post-news detector allows research only until retest/acceptance is clean"],
+            blockers=_dedupe_text_list(blockers),
             modifiers=modifiers,
             battle_permission=BattlePermission.RESEARCH_ONLY.value,
             telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
             battle_ready=False,
             v2_policy=v2_policy,
+            risk_mode="POST_NEWS_RESEARCH_ONLY",
+            caution_flags=caution_flags,
         )
+
+    # 3. TPO / auction research blockers.
+    if tpo_signal_permission in {"MARKET_CLOSED", "RESEARCH_ONLY", "BLOCKED_BY_CONTEXT", "BLOCKED_BY_AUCTION"}:
+        if post_news_allows_battle and tpo_signal_permission == "RESEARCH_ONLY":
+            modifiers.append("post_news_continuation_overrides_tpo_research_only")
+            reasons.append(
+                "post-news detector confirms continuation; TPO RESEARCH_ONLY is not used as a hard blocker"
+            )
+        else:
+            blockers.append(f"tpo_permission_{str(tpo_signal_permission).lower()}")
+            return _build_result(
+                inputs=inputs,
+                auction_score=auction_score,
+                reasons=reasons + [f"TPO permission is {tpo_signal_permission}; battle signal disabled"],
+                blockers=blockers,
+                modifiers=modifiers,
+                battle_permission=BattlePermission.RESEARCH_ONLY.value,
+                telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+                battle_ready=False,
+                v2_policy=v2_policy,
+            )
 
     if tpo_telegram_modifier == "DOWNGRADE":
-        blockers.append("tpo_downgrade")
-        return _build_result(
-            inputs=inputs,
-            auction_score=auction_score,
-            reasons=reasons + ["TPO telegram modifier is DOWNGRADE; research only"],
-            blockers=blockers,
-            modifiers=modifiers,
-            battle_permission=BattlePermission.RESEARCH_ONLY.value,
-            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
-            battle_ready=False,
-            v2_policy=v2_policy,
-        )
+        if post_news_allows_battle:
+            modifiers.append("post_news_continuation_overrides_tpo_downgrade")
+            reasons.append(
+                "post-news detector confirms retest/acceptance continuation; TPO DOWNGRADE is not used as a hard blocker"
+            )
+        else:
+            blockers.append("tpo_downgrade")
+            return _build_result(
+                inputs=inputs,
+                auction_score=auction_score,
+                reasons=reasons + ["TPO telegram modifier is DOWNGRADE; research only"],
+                blockers=blockers,
+                modifiers=modifiers,
+                battle_permission=BattlePermission.RESEARCH_ONLY.value,
+                telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+                battle_ready=False,
+                v2_policy=v2_policy,
+            )
 
-    # 3. Technical readiness.
+    # 4. Technical readiness.
     if status not in {"READY", "ENTRY_READY", "EXECUTABLE"}:
         blockers.append("not_ready_status")
         return _build_result(
@@ -1640,7 +1806,7 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
             v2_policy=v2_policy,
         )
 
-    # 4. HTF alignment.
+    # 5. HTF alignment.
     if not _direction_matches_htf(direction, htf_bias):
         if v2_neutral_otd_transition_allowed:
             modifiers.append("legacy_htf_block_overridden_by_v2_neutral_otd")
@@ -1682,7 +1848,7 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
                 v2_policy=v2_policy,
             )
 
-    # 5. RR / stop / quality.
+    # 6. RR / stop / quality.
     if practical_rr is None or practical_rr < 2.0:
         blockers.append("practical_rr_below_2")
         return _build_result(
@@ -1753,13 +1919,19 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
             v2_policy=v2_policy,
         )
 
-    # 6. Auction score final gate.
+    # 7. Auction score final gate.
     if auction_score < 3:
         if v2_neutral_otd_transition_allowed:
             modifiers.append("auction_score_override_by_v2_neutral_otd")
             reasons.append(
                 f"auction_context_score={auction_score} is below legacy minimum 3, "
                 "but Battle Gate v2 allows this OPEN_TEST_DRIVE + HTF NEUTRAL transition candidate."
+            )
+        elif post_news_allows_battle:
+            modifiers.append("auction_score_override_by_post_news_continuation")
+            reasons.append(
+                f"auction_context_score={auction_score} is below legacy minimum 3, "
+                "but post-news retest/acceptance continuation is confirmed."
             )
         else:
             blockers.append("auction_context_score_below_3")
@@ -1775,7 +1947,7 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
                 v2_policy=v2_policy,
             )
 
-    # 7. Battle ready / caution battle.
+    # 8. Battle ready / caution battle.
     if tpo_telegram_modifier == "BOOST":
         modifiers.append("tpo_boost")
 
@@ -1786,10 +1958,10 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
             auction_score=auction_score,
             reasons=reasons + [
                 "all hard battle permission checks passed",
-                "Safety Gate allows alert only as CAUTION_BATTLE, not clean BATTLE_READY",
+                "Safety/Post-News Gate allows alert only as CAUTION_BATTLE, not clean BATTLE_READY",
             ],
             blockers=blockers,
-            modifiers=modifiers,
+            modifiers=_dedupe_text_list(modifiers),
             battle_permission=BattlePermission.CAUTION_BATTLE.value,
             telegram_delivery_mode=TelegramDeliveryMode.BATTLE_ALERT.value,
             battle_ready=True,
@@ -1803,7 +1975,7 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
         auction_score=auction_score,
         reasons=reasons + ["all battle permission checks passed"],
         blockers=blockers,
-        modifiers=modifiers,
+        modifiers=_dedupe_text_list(modifiers),
         battle_permission=BattlePermission.BATTLE_READY.value,
         telegram_delivery_mode=TelegramDeliveryMode.BATTLE_ALERT.value,
         battle_ready=True,
@@ -1811,7 +1983,6 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
         risk_mode="NORMAL",
         caution_flags=[],
     )
-
 
 
 def _attach_tpo_open_behavior_fields_to_metadata(metadata: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
@@ -1842,6 +2013,22 @@ def _attach_tpo_open_behavior_fields_to_metadata(metadata: dict[str, Any], resul
     metadata["target_quality"] = result.get("target_quality")
     metadata["risk_mode"] = result.get("risk_mode")
     metadata["caution_flags"] = result.get("caution_flags") or []
+
+    metadata["post_news_detector_version"] = result.get("post_news_detector_version")
+    metadata["post_news_regime"] = result.get("post_news_regime")
+    metadata["post_news_trade_permission"] = result.get("post_news_trade_permission")
+    metadata["post_news_elapsed_minutes"] = result.get("post_news_elapsed_minutes")
+    metadata["post_news_impulse_direction"] = result.get("post_news_impulse_direction")
+    metadata["post_news_impulse_confirmed"] = result.get("post_news_impulse_confirmed")
+    metadata["post_news_retest_level"] = result.get("post_news_retest_level")
+    metadata["post_news_retest_status"] = result.get("post_news_retest_status")
+    metadata["post_news_acceptance_status"] = result.get("post_news_acceptance_status")
+    metadata["post_news_failed_move"] = result.get("post_news_failed_move")
+    metadata["post_news_continuation_quality"] = result.get("post_news_continuation_quality")
+    metadata["post_news_continuation_direction"] = result.get("post_news_continuation_direction")
+    metadata["post_news_reasons"] = result.get("post_news_reasons") or []
+    metadata["post_news_blockers"] = result.get("post_news_blockers") or []
+    metadata["post_news_modifiers"] = result.get("post_news_modifiers") or []
 
     return metadata
 
@@ -1921,6 +2108,22 @@ def apply_battle_permission(raw_payload: dict[str, Any]) -> dict[str, Any]:
     payload["target_quality"] = result.get("target_quality")
     payload["risk_mode"] = result.get("risk_mode")
     payload["caution_flags"] = result.get("caution_flags") or []
+
+    payload["post_news_detector_version"] = result.get("post_news_detector_version")
+    payload["post_news_regime"] = result.get("post_news_regime")
+    payload["post_news_trade_permission"] = result.get("post_news_trade_permission")
+    payload["post_news_elapsed_minutes"] = result.get("post_news_elapsed_minutes")
+    payload["post_news_impulse_direction"] = result.get("post_news_impulse_direction")
+    payload["post_news_impulse_confirmed"] = result.get("post_news_impulse_confirmed")
+    payload["post_news_retest_level"] = result.get("post_news_retest_level")
+    payload["post_news_retest_status"] = result.get("post_news_retest_status")
+    payload["post_news_acceptance_status"] = result.get("post_news_acceptance_status")
+    payload["post_news_failed_move"] = result.get("post_news_failed_move")
+    payload["post_news_continuation_quality"] = result.get("post_news_continuation_quality")
+    payload["post_news_continuation_direction"] = result.get("post_news_continuation_direction")
+    payload["post_news_reasons"] = result.get("post_news_reasons") or []
+    payload["post_news_blockers"] = result.get("post_news_blockers") or []
+    payload["post_news_modifiers"] = result.get("post_news_modifiers") or []
 
     # Root-level v2 fields are useful for journal, telemetry and flat statistics.
     payload["battle_gate_v2_decision"] = result.get("battle_gate_v2_decision")
