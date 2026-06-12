@@ -11,7 +11,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-TELEMETRY_SCHEMA_VERSION = "battle-permission-telemetry-v3-safety-fields"
+TELEMETRY_SCHEMA_VERSION = "battle-permission-telemetry-v3.1-macro-ttl-fields"
 
 
 # =============================================================================
@@ -858,6 +858,82 @@ def build_battle_permission_event(
             context.get("interest_zone_reaction"),
             payload.get("interest_zone_reaction"),
             metadata.get("interest_zone_reaction"),
+        ),
+
+        # Signal lifecycle / stale READY protection.
+        "signal_created_at_utc": _first_non_empty(
+            payload.get("signal_created_at_utc"),
+            metadata.get("signal_created_at_utc"),
+            context.get("signal_created_at_utc"),
+        ),
+        "signal_age_minutes": _safe_float(
+            _first_non_empty(
+                payload.get("signal_age_minutes"),
+                metadata.get("signal_age_minutes"),
+                context.get("signal_age_minutes"),
+            )
+        ),
+        "signal_max_age_minutes": _safe_float(
+            _first_non_empty(
+                payload.get("signal_max_age_minutes"),
+                metadata.get("signal_max_age_minutes"),
+                context.get("signal_max_age_minutes"),
+            )
+        ),
+        "signal_freshness_status": _first_non_empty(
+            payload.get("signal_freshness_status"),
+            metadata.get("signal_freshness_status"),
+            context.get("signal_freshness_status"),
+        ),
+
+        # Macro shock detector fields.
+        "macro_detector_version": _first_non_empty(
+            payload.get("macro_detector_version"),
+            metadata.get("macro_detector_version"),
+            context.get("macro_detector_version"),
+        ),
+        "macro_regime": _first_non_empty(
+            payload.get("macro_regime"),
+            metadata.get("macro_regime"),
+            context.get("macro_regime"),
+        ),
+        "macro_shock_recent": _safe_bool(
+            _first_non_empty(
+                payload.get("macro_shock_recent"),
+                metadata.get("macro_shock_recent"),
+                context.get("macro_shock_recent"),
+            )
+        ),
+        "macro_shock_score": _safe_float(
+            _first_non_empty(
+                payload.get("macro_shock_score"),
+                metadata.get("macro_shock_score"),
+                context.get("macro_shock_score"),
+            )
+        ),
+        "macro_risk_mode": _first_non_empty(
+            payload.get("macro_risk_mode"),
+            metadata.get("macro_risk_mode"),
+            context.get("macro_risk_mode"),
+        ),
+        "macro_direction_for_symbol": _first_non_empty(
+            payload.get("macro_direction_for_symbol"),
+            metadata.get("macro_direction_for_symbol"),
+            context.get("macro_direction_for_symbol"),
+        ),
+        "macro_caution_flags": _as_text_list(
+            _first_non_empty(
+                payload.get("macro_caution_flags"),
+                metadata.get("macro_caution_flags"),
+                context.get("macro_caution_flags"),
+            )
+        ),
+        "macro_reasons": _as_text_list(
+            _first_non_empty(
+                payload.get("macro_reasons"),
+                metadata.get("macro_reasons"),
+                context.get("macro_reasons"),
+            )
         ),
 
         # Post-news fields are optional now, but keeping placeholders in telemetry

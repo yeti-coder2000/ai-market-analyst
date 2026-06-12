@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 import json
 import os
 from pathlib import Path
+import re
 from typing import Any
 
 try:
@@ -17,8 +19,13 @@ try:
 except Exception:  # pragma: no cover
     apply_post_news_continuation = None  # type: ignore[assignment]
 
+try:
+    from app.services.macro_shock_detector import apply_macro_shock_context
+except Exception:  # pragma: no cover
+    apply_macro_shock_context = None  # type: ignore[assignment]
 
-BATTLE_PERMISSION_VERSION = "battle-permission-v1.6-post-news-continuation-gate"
+
+BATTLE_PERMISSION_VERSION = "battle-permission-v1.7-policy-hints-ttl-macro-shock"
 
 
 class BattlePermission(str, Enum):
@@ -107,6 +114,22 @@ class BattlePermissionResult:
     post_news_reasons: list[str] = field(default_factory=list)
     post_news_blockers: list[str] = field(default_factory=list)
     post_news_modifiers: list[str] = field(default_factory=list)
+
+    # Signal lifecycle / stale READY protection.
+    signal_created_at_utc: str | None = None
+    signal_age_minutes: float | None = None
+    signal_max_age_minutes: float | None = None
+    signal_freshness_status: str | None = None
+
+    # Macro shock detector fields.
+    macro_detector_version: str | None = None
+    macro_regime: str | None = None
+    macro_shock_recent: bool | None = None
+    macro_shock_score: float | None = None
+    macro_risk_mode: str | None = None
+    macro_direction_for_symbol: str | None = None
+    macro_caution_flags: list[str] = field(default_factory=list)
+    macro_reasons: list[str] = field(default_factory=list)
 
     # Battle Gate v2 shadow-mode fields.
     # Legacy Battle Gate remains the execution authority for now.
@@ -215,6 +238,191 @@ def _dedupe_text_list(items: list[str]) -> list[str]:
         seen.add(key)
         result.append(item.strip())
     return result
+
+
+def _parse_datetime_utc(value: Any) -> datetime | None:
+    if value in (None, "", [], {}):
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    # Normal ISO values: 2026-06-12T06:36:22.931251+00:00
+    candidates = [text, text.replace("Z", "+00:00")]
+
+    # Signal-id safe timestamp values: 2026-06-10T14-41-52.395754+00-00
+    m = re.search(
+        r"(\d{4}-\d{2}-\d{2}T\d{2})-(\d{2})-(\d{2}(?:\.\d+)?)(\+\d{2}-\d{2}|Z)?",
+        text,
+    )
+    if m:
+        tz = m.group(4) or "+00-00"
+        tz = "+00:00" if tz in {"+00-00", "Z"} else tz.replace("-", ":", 1)
+        candidates.append(f"{m.group(1)}:{m.group(2)}:{m.group(3)}{tz}")
+
+    # Looser signal-id value after T, where every time separator was replaced by '-'.
+    m = re.search(
+        r"(\d{4}-\d{2}-\d{2}T\d{2})-(\d{2})-(\d{2}(?:\.\d+)?)",
+        text,
+    )
+    if m:
+        candidates.append(f"{m.group(1)}:{m.group(2)}:{m.group(3)}+00:00")
+
+    for candidate in candidates:
+        try:
+            dt = datetime.fromisoformat(candidate)
+        except ValueError:
+            continue
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    return None
+
+
+def _extract_signal_created_at(payload: dict[str, Any]) -> datetime | None:
+    explicit = _deep_get(
+        payload,
+        "signal_created_at_utc",
+        "created_at_utc",
+        "created_at",
+        "metadata.signal_created_at_utc",
+        "metadata.created_at_utc",
+        "metadata.created_at",
+    )
+    dt = _parse_datetime_utc(explicit)
+    if dt is not None:
+        return dt
+
+    # Prefer signal_id over cycle_id for lifecycle freshness because signal_id
+    # often preserves the original setup creation time while cycle_id can be the
+    # current scan that rediscovered an old READY idea.
+    dt = _parse_datetime_utc(_deep_get(payload, "signal_id", "metadata.signal_id"))
+    if dt is not None:
+        return dt
+
+    return _parse_datetime_utc(_deep_get(payload, "cycle_id", "metadata.cycle_id"))
+
+
+def _max_signal_age_minutes(*, symbol: Any, scenario: Any, execution_timeframe: Any) -> float | None:
+    scenario_text = _as_upper(scenario) or ""
+    tf = str(execution_timeframe or "").strip().lower()
+    sym = _normalize_symbol(symbol)
+
+    # Only enforce TTL for short-term executable ideas. Longer-term setups should
+    # explicitly provide their own lifecycle fields before we block them.
+    is_15m = tf in {"", "15m", "m15", "15", "15min"}
+    if not is_15m:
+        return None
+
+    if "SWEEP_RETURN" in scenario_text:
+        base = 240.0
+    elif "OPEN_TEST_DRIVE" in scenario_text or "TPO_OPEN_TEST_DRIVE" in scenario_text:
+        base = 360.0
+    else:
+        base = 360.0
+
+    if sym in {"BTCUSD", "BTCUSDT", "ETHUSD", "ETHUSDT", "BTC", "ETH"}:
+        # Crypto is 24/7 and can carry structure a bit longer, but not for days.
+        return max(base, 720.0)
+
+    return base
+
+
+def _compute_signal_freshness(payload: dict[str, Any]) -> dict[str, Any]:
+    created_at = _extract_signal_created_at(payload)
+    scenario = _deep_get(payload, "scenario", "scenario_type", "metadata.scenario", "metadata.scenario_type")
+    symbol = _deep_get(payload, "symbol", "instrument", "metadata.symbol", "metadata.instrument")
+    execution_timeframe = _deep_get(payload, "execution_timeframe", "timeframe", "metadata.execution_timeframe", "metadata.timeframe")
+    max_age = _max_signal_age_minutes(symbol=symbol, scenario=scenario, execution_timeframe=execution_timeframe)
+
+    if created_at is None or max_age is None:
+        return {
+            "signal_created_at_utc": created_at.isoformat() if created_at else None,
+            "signal_age_minutes": None,
+            "signal_max_age_minutes": max_age,
+            "signal_freshness_status": "UNKNOWN",
+        }
+
+    age_minutes = max(0.0, (datetime.now(timezone.utc) - created_at).total_seconds() / 60.0)
+    if age_minutes > max_age:
+        status = "STALE_READY"
+    elif age_minutes > max_age * 0.75:
+        status = "AGING_READY"
+    else:
+        status = "FRESH"
+
+    return {
+        "signal_created_at_utc": created_at.isoformat(),
+        "signal_age_minutes": round(age_minutes, 3),
+        "signal_max_age_minutes": max_age,
+        "signal_freshness_status": status,
+    }
+
+
+def _collect_policy_hint_flags(inputs: dict[str, Any], v2_policy: dict[str, Any]) -> list[str]:
+    flags: list[str] = []
+
+    open_behavior = _as_upper(inputs.get("open_behavior"))
+    entry_model_hint = _as_upper(inputs.get("entry_model_hint"))
+    stop_model_hint = _as_upper(inputs.get("stop_model_hint"))
+    battle_bias_hint = _as_upper(inputs.get("battle_bias_hint"))
+
+    if open_behavior:
+        flags.append(f"open_behavior_{open_behavior.lower()}")
+    if entry_model_hint:
+        flags.append(f"entry_hint_{entry_model_hint.lower()}")
+    if stop_model_hint:
+        flags.append(f"stop_hint_{stop_model_hint.lower()}")
+    if battle_bias_hint:
+        flags.append(f"battle_hint_{battle_bias_hint.lower()}")
+
+    for key in ("modifiers", "blockers", "reasons"):
+        for item in _as_text_list(v2_policy.get(key)):
+            normalized = item.strip().lower().replace(" ", "_").replace("-", "_")
+            if normalized:
+                flags.append(normalized)
+
+    return _dedupe_text_list(flags)
+
+
+def _policy_hint_requires_research_only(*, inputs: dict[str, Any], policy_flags: list[str], post_news_allows_battle: bool) -> tuple[bool, list[str]]:
+    if post_news_allows_battle:
+        return False, []
+
+    hard: list[str] = []
+    open_behavior = _as_upper(inputs.get("open_behavior"))
+    entry_model_hint = _as_upper(inputs.get("entry_model_hint"))
+    battle_bias_hint = _as_upper(inputs.get("battle_bias_hint"))
+
+    joined = " ".join(policy_flags).lower()
+
+    if "battle_hint_research_only" in joined or battle_bias_hint == "RESEARCH_ONLY":
+        hard.append("policy_hint_battle_research_only")
+
+    if entry_model_hint in {"NO_DIRECTIONAL_ENTRY_MODEL", "NO_ENTRY_MODEL", "ROTATION_ONLY_IF_LTF_CONFIRMED"}:
+        hard.append(f"policy_hint_entry_{entry_model_hint.lower()}")
+
+    if open_behavior == "OPEN_AUCTION":
+        hard.append("policy_hint_open_auction_requires_late_continuation")
+
+    return bool(hard), hard
+
+
+def _policy_hint_requires_caution(*, inputs: dict[str, Any], policy_flags: list[str]) -> list[str]:
+    caution: list[str] = []
+    stop_model_hint = _as_upper(inputs.get("stop_model_hint"))
+
+    if stop_model_hint in {"NO_STOP_MODEL", "WEAK_STOP_MODEL", "TACTICAL_STOP_ONLY"}:
+        caution.append(f"policy_hint_stop_{stop_model_hint.lower()}")
+
+    joined = " ".join(policy_flags).lower()
+    if "allow_with_caution" in joined or "caution" in joined:
+        caution.append("policy_hint_allow_with_caution")
+
+    return _dedupe_text_list(caution)
 
 
 def _normalize_direction(value: Any) -> str | None:
@@ -964,6 +1172,15 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
             # Post-news detector is advisory. It must never break legacy Battle Gate.
             pass
 
+    if apply_macro_shock_context is not None:
+        try:
+            payload = apply_macro_shock_context(payload)
+        except Exception:  # noqa: BLE001
+            # Macro detector is advisory. It must never break legacy Battle Gate.
+            pass
+
+    freshness = _compute_signal_freshness(payload)
+
     symbol = _normalize_symbol(
         _deep_get(
             payload,
@@ -1437,6 +1654,18 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
         "post_news_reasons": _as_text_list(_deep_get(payload, "metadata.post_news_reasons", "post_news_reasons")),
         "post_news_blockers": _as_text_list(_deep_get(payload, "metadata.post_news_blockers", "post_news_blockers")),
         "post_news_modifiers": _as_text_list(_deep_get(payload, "metadata.post_news_modifiers", "post_news_modifiers")),
+        "signal_created_at_utc": freshness.get("signal_created_at_utc"),
+        "signal_age_minutes": freshness.get("signal_age_minutes"),
+        "signal_max_age_minutes": freshness.get("signal_max_age_minutes"),
+        "signal_freshness_status": freshness.get("signal_freshness_status"),
+        "macro_detector_version": _deep_get(payload, "metadata.macro_detector_version", "macro_detector_version"),
+        "macro_regime": _as_upper(_deep_get(payload, "metadata.macro_regime", "macro_regime")),
+        "macro_shock_recent": _as_bool(_deep_get(payload, "metadata.macro_shock_recent", "macro_shock_recent")),
+        "macro_shock_score": _as_float(_deep_get(payload, "metadata.macro_shock_score", "macro_shock_score")),
+        "macro_risk_mode": _as_upper(_deep_get(payload, "metadata.macro_risk_mode", "macro_risk_mode")),
+        "macro_direction_for_symbol": _as_upper(_deep_get(payload, "metadata.macro_direction_for_symbol", "macro_direction_for_symbol")),
+        "macro_caution_flags": _as_text_list(_deep_get(payload, "metadata.macro_caution_flags", "macro_caution_flags")),
+        "macro_reasons": _as_text_list(_deep_get(payload, "metadata.macro_reasons", "macro_reasons")),
     }
 
 
@@ -1580,6 +1809,18 @@ def _build_result(
         post_news_reasons=list(inputs.get("post_news_reasons") or []),
         post_news_blockers=list(inputs.get("post_news_blockers") or []),
         post_news_modifiers=list(inputs.get("post_news_modifiers") or []),
+        signal_created_at_utc=inputs.get("signal_created_at_utc"),
+        signal_age_minutes=inputs.get("signal_age_minutes"),
+        signal_max_age_minutes=inputs.get("signal_max_age_minutes"),
+        signal_freshness_status=inputs.get("signal_freshness_status"),
+        macro_detector_version=inputs.get("macro_detector_version"),
+        macro_regime=inputs.get("macro_regime"),
+        macro_shock_recent=inputs.get("macro_shock_recent"),
+        macro_shock_score=inputs.get("macro_shock_score"),
+        macro_risk_mode=inputs.get("macro_risk_mode"),
+        macro_direction_for_symbol=inputs.get("macro_direction_for_symbol"),
+        macro_caution_flags=list(inputs.get("macro_caution_flags") or []),
+        macro_reasons=list(inputs.get("macro_reasons") or []),
         battle_gate_v2_decision=v2_policy.get("decision"),
         battle_gate_v2_risk_mode=v2_policy.get("risk_mode"),
         battle_gate_v2_battle_allowed=v2_policy.get("battle_allowed"),
@@ -1628,6 +1869,16 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
     post_news_blockers = list(inputs.get("post_news_blockers") or [])
     post_news_modifiers = list(inputs.get("post_news_modifiers") or [])
 
+    signal_freshness_status = inputs.get("signal_freshness_status")
+    signal_age_minutes = inputs.get("signal_age_minutes")
+    signal_max_age_minutes = inputs.get("signal_max_age_minutes")
+
+    macro_regime = inputs.get("macro_regime")
+    macro_shock_recent = inputs.get("macro_shock_recent")
+    macro_risk_mode = inputs.get("macro_risk_mode")
+    macro_caution_flags = list(inputs.get("macro_caution_flags") or [])
+    macro_reasons = list(inputs.get("macro_reasons") or [])
+
     post_news_allows_clean_battle = post_news_trade_permission == "ALLOW_BATTLE_IF_GEOMETRY_VALID"
     post_news_allows_caution_battle = post_news_trade_permission == "ALLOW_CAUTION_BATTLE_IF_GEOMETRY_VALID"
     post_news_allows_battle = post_news_allows_clean_battle or post_news_allows_caution_battle
@@ -1636,6 +1887,23 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
         reasons.append(f"post_news_regime={post_news_regime}")
         reasons.extend(f"post_news: {reason}" for reason in post_news_reasons[:8])
         modifiers.extend(f"post_news_{modifier}" for modifier in post_news_modifiers if f"post_news_{modifier}" not in modifiers)
+
+    if signal_freshness_status and signal_freshness_status != "UNKNOWN":
+        reasons.append(
+            f"signal_freshness={signal_freshness_status} age={signal_age_minutes}m max={signal_max_age_minutes}m"
+        )
+
+    if macro_regime and macro_regime != "NO_MACRO_SHOCK":
+        reasons.append(f"macro_regime={macro_regime}")
+        reasons.extend(f"macro: {reason}" for reason in macro_reasons[:6])
+
+    policy_flags = _collect_policy_hint_flags(inputs, v2_policy)
+    policy_requires_research, policy_research_blockers = _policy_hint_requires_research_only(
+        inputs=inputs,
+        policy_flags=policy_flags,
+        post_news_allows_battle=post_news_allows_battle,
+    )
+    policy_caution_flags = _policy_hint_requires_caution(inputs=inputs, policy_flags=policy_flags)
 
     caution_flags: list[str] = []
 
@@ -1650,6 +1918,17 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
 
     if target_quality == "UNKNOWN":
         caution_flags.append("target_quality_unknown")
+
+    if quality_tier == "CAUTION":
+        caution_flags.append("quality_tier_caution")
+
+    if macro_shock_recent is True:
+        caution_flags.append("macro_shock_recent")
+        if macro_risk_mode:
+            caution_flags.append(f"macro_risk_{str(macro_risk_mode).lower()}")
+        caution_flags.extend(macro_caution_flags)
+
+    caution_flags.extend(policy_caution_flags)
 
     if post_news_allows_caution_battle:
         caution_flags.append("post_news_caution_continuation")
@@ -1806,7 +2085,30 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
             v2_policy=v2_policy,
         )
 
-    # 5. HTF alignment.
+    # 5. Signal lifecycle / stale READY protection.
+    if signal_freshness_status == "STALE_READY":
+        blockers.append("stale_ready_signal")
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
+            reasons=reasons + [
+                f"READY signal is stale: age={signal_age_minutes}m exceeds max={signal_max_age_minutes}m; "
+                "new structure must generate a new signal_id"
+            ],
+            blockers=_dedupe_text_list(blockers),
+            modifiers=modifiers,
+            battle_permission=BattlePermission.BLOCKED_BY_CONTEXT.value,
+            telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
+            risk_mode="STALE_READY",
+            caution_flags=caution_flags,
+        )
+
+    if signal_freshness_status == "AGING_READY":
+        caution_flags.append("signal_aging_ready")
+
+    # 6. HTF alignment.
     if not _direction_matches_htf(direction, htf_bias):
         if v2_neutral_otd_transition_allowed:
             modifiers.append("legacy_htf_block_overridden_by_v2_neutral_otd")
@@ -1848,7 +2150,29 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
                 v2_policy=v2_policy,
             )
 
-    # 6. RR / stop / quality.
+    # 7. Open-behavior policy hints override legacy score.
+    # Score is useful, but explicit policy hints are authoritative: OPEN_AUCTION
+    # without a directional entry model or a research-only battle hint cannot be
+    # promoted to clean BATTLE_READY by auction_score alone.
+    if policy_requires_research:
+        blockers.extend(policy_research_blockers)
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
+            reasons=reasons + [
+                "open-behavior/v2 policy hints require RESEARCH_ONLY; legacy auction score cannot override this"
+            ],
+            blockers=_dedupe_text_list(blockers),
+            modifiers=_dedupe_text_list(modifiers + policy_flags[:12]),
+            battle_permission=BattlePermission.RESEARCH_ONLY.value,
+            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
+            risk_mode="POLICY_RESEARCH_ONLY",
+            caution_flags=caution_flags,
+        )
+
+    # 8. RR / stop / quality.
     if practical_rr is None or practical_rr < 2.0:
         blockers.append("practical_rr_below_2")
         return _build_result(
@@ -2030,6 +2354,20 @@ def _attach_tpo_open_behavior_fields_to_metadata(metadata: dict[str, Any], resul
     metadata["post_news_blockers"] = result.get("post_news_blockers") or []
     metadata["post_news_modifiers"] = result.get("post_news_modifiers") or []
 
+    metadata["signal_created_at_utc"] = result.get("signal_created_at_utc")
+    metadata["signal_age_minutes"] = result.get("signal_age_minutes")
+    metadata["signal_max_age_minutes"] = result.get("signal_max_age_minutes")
+    metadata["signal_freshness_status"] = result.get("signal_freshness_status")
+
+    metadata["macro_detector_version"] = result.get("macro_detector_version")
+    metadata["macro_regime"] = result.get("macro_regime")
+    metadata["macro_shock_recent"] = result.get("macro_shock_recent")
+    metadata["macro_shock_score"] = result.get("macro_shock_score")
+    metadata["macro_risk_mode"] = result.get("macro_risk_mode")
+    metadata["macro_direction_for_symbol"] = result.get("macro_direction_for_symbol")
+    metadata["macro_caution_flags"] = result.get("macro_caution_flags") or []
+    metadata["macro_reasons"] = result.get("macro_reasons") or []
+
     return metadata
 
 
@@ -2124,6 +2462,20 @@ def apply_battle_permission(raw_payload: dict[str, Any]) -> dict[str, Any]:
     payload["post_news_reasons"] = result.get("post_news_reasons") or []
     payload["post_news_blockers"] = result.get("post_news_blockers") or []
     payload["post_news_modifiers"] = result.get("post_news_modifiers") or []
+
+    payload["signal_created_at_utc"] = result.get("signal_created_at_utc")
+    payload["signal_age_minutes"] = result.get("signal_age_minutes")
+    payload["signal_max_age_minutes"] = result.get("signal_max_age_minutes")
+    payload["signal_freshness_status"] = result.get("signal_freshness_status")
+
+    payload["macro_detector_version"] = result.get("macro_detector_version")
+    payload["macro_regime"] = result.get("macro_regime")
+    payload["macro_shock_recent"] = result.get("macro_shock_recent")
+    payload["macro_shock_score"] = result.get("macro_shock_score")
+    payload["macro_risk_mode"] = result.get("macro_risk_mode")
+    payload["macro_direction_for_symbol"] = result.get("macro_direction_for_symbol")
+    payload["macro_caution_flags"] = result.get("macro_caution_flags") or []
+    payload["macro_reasons"] = result.get("macro_reasons") or []
 
     # Root-level v2 fields are useful for journal, telemetry and flat statistics.
     payload["battle_gate_v2_decision"] = result.get("battle_gate_v2_decision")
