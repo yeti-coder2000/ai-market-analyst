@@ -3,13 +3,36 @@ from __future__ import annotations
 from typing import Any
 
 
-POLICY_VERSION = "battle-gate-open-behavior-policy-v1.1-neutral-otd-transition"
+POLICY_VERSION = "battle-gate-open-behavior-policy-v1.2-normalized-htf-bias"
 
 
 def _s(value: Any, default: str = "") -> str:
     if value is None:
         return default
     return str(value).strip().upper()
+
+
+def _norm_direction(value: Any, default: str = "NEUTRAL") -> str:
+    """
+    Normalize trade direction / HTF bias aliases into comparable values.
+
+    Examples:
+    - SHORT / SELL / BEARISH -> SHORT
+    - LONG / BUY / BULLISH -> LONG
+    - NEUTRAL / FLAT / NONE -> NEUTRAL
+    """
+    text = _s(value, default)
+
+    if text in {"LONG", "BUY", "BULL", "BULLISH", "UP"}:
+        return "LONG"
+
+    if text in {"SHORT", "SELL", "BEAR", "BEARISH", "DOWN"}:
+        return "SHORT"
+
+    if text in {"NEUTRAL", "NONE", "FLAT", "NO_TRADE", ""}:
+        return "NEUTRAL"
+
+    return text
 
 
 def _f(value: Any, default: float = 0.0) -> float:
@@ -53,8 +76,8 @@ def evaluate_open_behavior_policy(payload: dict[str, Any]) -> dict[str, Any]:
     modifiers: list[str] = []
 
     symbol = _s(payload.get("symbol"))
-    direction = _s(payload.get("direction"))
-    htf_bias = _s(payload.get("htf_bias"), "NEUTRAL")
+    direction = _norm_direction(payload.get("direction"))
+    htf_bias = _norm_direction(payload.get("htf_bias") or "NEUTRAL")
 
     market_status = _s(payload.get("market_status"), "OPEN")
     tpo_permission = _s(payload.get("tpo_signal_permission"), "OPEN_FOR_EVALUATION")
