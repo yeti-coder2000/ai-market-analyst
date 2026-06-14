@@ -25,7 +25,7 @@ except Exception:  # pragma: no cover
     apply_macro_shock_context = None  # type: ignore[assignment]
 
 
-BATTLE_PERMISSION_VERSION = "battle-permission-v1.8-first-impulse-gone"
+BATTLE_PERMISSION_VERSION = "battle-permission-v1.9.1-open-auction-hard-block-namefix"
 
 
 class BattlePermission(str, Enum):
@@ -2125,6 +2125,7 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
     local_structure_damaged = inputs.get("local_structure_damaged")
     scenario_family = inputs.get("scenario_family")
     target_quality = inputs.get("target_quality")
+    open_behavior = _as_upper(inputs.get("open_behavior"))
 
     post_news_regime = inputs.get("post_news_regime")
     post_news_trade_permission = inputs.get("post_news_trade_permission")
@@ -2291,6 +2292,33 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
             battle_ready=False,
             v2_policy=v2_policy,
             risk_mode="NO_FRESH_RETEST_AFTER_IMPULSE",
+            caution_flags=caution_flags,
+        )
+
+    # 3. OPEN_AUCTION hard block.
+    # OPEN_AUCTION is a rotation/research environment by default. It must not
+    # reach Telegram as BATTLE_READY / CAUTION_BATTLE through legacy score,
+    # HTF alignment, post-news continuation overrides, or good RR alone.
+    #
+    # Future exception can be added only when we explicitly detect:
+    # IB break + acceptance + HTF alignment + LTF entry model + real target.
+    # Until that model exists, OPEN_AUCTION remains research-only.
+    if open_behavior == "OPEN_AUCTION":
+        blockers.append("open_auction_rotation_context")
+        modifiers.append("open_auction_hard_block")
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
+            reasons=reasons + [
+                "OPEN_AUCTION is observe/rotation context; battle disabled until IB break + acceptance + LTF model + real target are explicitly confirmed"
+            ],
+            blockers=_dedupe_text_list(blockers),
+            modifiers=_dedupe_text_list(modifiers + policy_flags[:12]),
+            battle_permission=BattlePermission.RESEARCH_ONLY.value,
+            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
+            risk_mode="OPEN_AUCTION_RESEARCH_ONLY",
             caution_flags=caution_flags,
         )
 
