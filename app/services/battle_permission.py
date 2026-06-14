@@ -25,7 +25,7 @@ except Exception:  # pragma: no cover
     apply_macro_shock_context = None  # type: ignore[assignment]
 
 
-BATTLE_PERMISSION_VERSION = "battle-permission-v1.7-policy-hints-ttl-macro-shock"
+BATTLE_PERMISSION_VERSION = "battle-permission-v1.8-first-impulse-gone"
 
 
 class BattlePermission(str, Enum):
@@ -130,6 +130,17 @@ class BattlePermissionResult:
     macro_direction_for_symbol: str | None = None
     macro_caution_flags: list[str] = field(default_factory=list)
     macro_reasons: list[str] = field(default_factory=list)
+
+    # First-impulse / no-chase protection.
+    entry_price: float | None = None
+    target_price: float | None = None
+    current_price: float | None = None
+    impulse_progress: float | None = None
+    impulse_progress_pct: float | None = None
+    impulse_state: str | None = None
+    fresh_retest_exists: bool | None = None
+    fresh_failed_acceptance_exists: bool | None = None
+    fresh_pullback_exists: bool | None = None
 
     # Battle Gate v2 shadow-mode fields.
     # Legacy Battle Gate remains the execution authority for now.
@@ -597,6 +608,241 @@ def _normalize_target_quality(value: Any) -> str | None:
         return "UNKNOWN"
 
     return normalized
+
+
+
+def _extract_trade_price_levels(payload: dict[str, Any]) -> dict[str, float | None]:
+    """
+    Extract execution geometry needed for no-chase protection.
+
+    The project has used several payload shapes over time, so this stays wide
+    and defensive. Missing fields never break Battle Gate; they simply disable
+    the first-impulse filter for that payload.
+    """
+    entry_price = _as_float(
+        _deep_get(
+            payload,
+            "metadata.entry_price",
+            "metadata.entry",
+            "metadata.entry_reference_price",
+            "metadata.execution.entry_price",
+            "metadata.execution.entry_reference_price",
+            "metadata.execution_plan.entry_price",
+            "metadata.execution_plan.entry",
+            "metadata.execution_plan.entry_reference_price",
+            "execution.entry_price",
+            "execution.entry",
+            "execution.entry_reference_price",
+            "execution_plan.entry_price",
+            "execution_plan.entry",
+            "execution_plan.entry_reference_price",
+            "entry_price",
+            "entry",
+            "entry_reference_price",
+        )
+    )
+
+    target_price = _as_float(
+        _deep_get(
+            payload,
+            "metadata.target_price",
+            "metadata.target",
+            "metadata.take_profit",
+            "metadata.tp",
+            "metadata.target_reference_price",
+            "metadata.execution.target_price",
+            "metadata.execution.target",
+            "metadata.execution.take_profit",
+            "metadata.execution.tp",
+            "metadata.execution.target_reference_price",
+            "metadata.execution_plan.target_price",
+            "metadata.execution_plan.target",
+            "metadata.execution_plan.take_profit",
+            "metadata.execution_plan.tp",
+            "metadata.execution_plan.target_reference_price",
+            "execution.target_price",
+            "execution.target",
+            "execution.take_profit",
+            "execution.tp",
+            "execution.target_reference_price",
+            "execution_plan.target_price",
+            "execution_plan.target",
+            "execution_plan.take_profit",
+            "execution_plan.tp",
+            "execution_plan.target_reference_price",
+            "target_price",
+            "target",
+            "take_profit",
+            "tp",
+            "target_reference_price",
+        )
+    )
+
+    current_price = _as_float(
+        _deep_get(
+            payload,
+            "metadata.current_price",
+            "metadata.last_price",
+            "metadata.close",
+            "metadata.price",
+            "metadata.execution.current_price",
+            "metadata.execution.last_price",
+            "metadata.execution_plan.current_price",
+            "metadata.execution_plan.last_price",
+            "execution.current_price",
+            "execution.last_price",
+            "execution_plan.current_price",
+            "execution_plan.last_price",
+            "market.current_price",
+            "market.last_price",
+            "quote.current_price",
+            "quote.last_price",
+            "current_price",
+            "last_price",
+            "close",
+            "price",
+        )
+    )
+
+    return {
+        "entry_price": entry_price,
+        "target_price": target_price,
+        "current_price": current_price,
+    }
+
+
+def _extract_fresh_retest_flags(payload: dict[str, Any]) -> dict[str, bool | None]:
+    fresh_retest_exists = _as_bool(
+        _deep_get(
+            payload,
+            "metadata.fresh_retest_exists",
+            "metadata.fresh_retest",
+            "metadata.retest.fresh",
+            "metadata.retest.exists",
+            "metadata.ltf_model.fresh_retest_exists",
+            "metadata.execution.fresh_retest_exists",
+            "metadata.execution_plan.fresh_retest_exists",
+            "fresh_retest_exists",
+            "fresh_retest",
+            "retest.fresh",
+            "retest.exists",
+            "ltf_model.fresh_retest_exists",
+            "execution.fresh_retest_exists",
+            "execution_plan.fresh_retest_exists",
+        )
+    )
+    fresh_failed_acceptance_exists = _as_bool(
+        _deep_get(
+            payload,
+            "metadata.fresh_failed_acceptance_exists",
+            "metadata.failed_acceptance.fresh",
+            "metadata.failed_acceptance.exists",
+            "metadata.ltf_model.fresh_failed_acceptance_exists",
+            "metadata.execution.fresh_failed_acceptance_exists",
+            "metadata.execution_plan.fresh_failed_acceptance_exists",
+            "fresh_failed_acceptance_exists",
+            "failed_acceptance.fresh",
+            "failed_acceptance.exists",
+            "ltf_model.fresh_failed_acceptance_exists",
+            "execution.fresh_failed_acceptance_exists",
+            "execution_plan.fresh_failed_acceptance_exists",
+        )
+    )
+    fresh_pullback_exists = _as_bool(
+        _deep_get(
+            payload,
+            "metadata.fresh_pullback_exists",
+            "metadata.pullback.fresh",
+            "metadata.pullback.exists",
+            "metadata.ltf_model.fresh_pullback_exists",
+            "metadata.execution.fresh_pullback_exists",
+            "metadata.execution_plan.fresh_pullback_exists",
+            "fresh_pullback_exists",
+            "pullback.fresh",
+            "pullback.exists",
+            "ltf_model.fresh_pullback_exists",
+            "execution.fresh_pullback_exists",
+            "execution_plan.fresh_pullback_exists",
+        )
+    )
+
+    return {
+        "fresh_retest_exists": fresh_retest_exists,
+        "fresh_failed_acceptance_exists": fresh_failed_acceptance_exists,
+        "fresh_pullback_exists": fresh_pullback_exists,
+    }
+
+
+def _compute_first_impulse_state(inputs: dict[str, Any]) -> dict[str, Any]:
+    """
+    Detect READY signals where the first move is already gone.
+
+    NORMAL:    < 30% of entry→target path already travelled.
+    LATE:      30-50%; allowed only when a fresh retest / failed acceptance /
+               pullback is explicitly present.
+    EXHAUSTED: >= 50%; battle is blocked. This is no longer a trade entry,
+               it is a historical market comment wearing a helmet.
+    """
+    entry = _as_float(inputs.get("entry_price"))
+    target = _as_float(inputs.get("target_price"))
+    current = _as_float(inputs.get("current_price"))
+    direction = _normalize_direction(inputs.get("direction"))
+
+    if entry is None or target is None or current is None or direction not in {"LONG", "SHORT"}:
+        return {
+            "impulse_progress": None,
+            "impulse_progress_pct": None,
+            "impulse_state": "UNKNOWN",
+        }
+
+    total = abs(target - entry)
+    if total <= 0:
+        return {
+            "impulse_progress": None,
+            "impulse_progress_pct": None,
+            "impulse_state": "UNKNOWN",
+        }
+
+    if direction == "LONG":
+        moved_toward_target = current - entry
+    else:
+        moved_toward_target = entry - current
+
+    progress = max(0.0, moved_toward_target / total)
+
+    if progress >= 0.50:
+        state = "EXHAUSTED"
+    elif progress >= 0.30:
+        state = "LATE"
+    else:
+        state = "NORMAL"
+
+    return {
+        "impulse_progress": round(progress, 6),
+        "impulse_progress_pct": round(progress * 100.0, 2),
+        "impulse_state": state,
+    }
+
+
+def _has_fresh_structure_after_impulse(inputs: dict[str, Any]) -> bool:
+    if inputs.get("fresh_retest_exists") is True:
+        return True
+    if inputs.get("fresh_failed_acceptance_exists") is True:
+        return True
+    if inputs.get("fresh_pullback_exists") is True:
+        return True
+
+    post_news_retest_status = _as_upper(inputs.get("post_news_retest_status"))
+    post_news_acceptance_status = _as_upper(inputs.get("post_news_acceptance_status"))
+    post_news_failed_move = _as_bool(inputs.get("post_news_failed_move"))
+    if post_news_retest_status in {"CONFIRMED", "VALID", "CLEAN", "PASSED"}:
+        return True
+    if post_news_acceptance_status in {"FAILED_ACCEPTANCE", "REJECTED", "FAILED", "CLEAN_REJECTION"}:
+        return True
+    if post_news_failed_move is True:
+        return True
+
+    return False
 
 
 def _infer_target_quality(payload: dict[str, Any], primary_interest_zone: dict[str, Any] | None) -> str | None:
@@ -1180,6 +1426,8 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
             pass
 
     freshness = _compute_signal_freshness(payload)
+    trade_price_levels = _extract_trade_price_levels(payload)
+    fresh_retest_flags = _extract_fresh_retest_flags(payload)
 
     symbol = _normalize_symbol(
         _deep_get(
@@ -1666,6 +1914,12 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
         "macro_direction_for_symbol": _as_upper(_deep_get(payload, "metadata.macro_direction_for_symbol", "macro_direction_for_symbol")),
         "macro_caution_flags": _as_text_list(_deep_get(payload, "metadata.macro_caution_flags", "macro_caution_flags")),
         "macro_reasons": _as_text_list(_deep_get(payload, "metadata.macro_reasons", "macro_reasons")),
+        "entry_price": trade_price_levels.get("entry_price"),
+        "target_price": trade_price_levels.get("target_price"),
+        "current_price": trade_price_levels.get("current_price"),
+        "fresh_retest_exists": fresh_retest_flags.get("fresh_retest_exists"),
+        "fresh_failed_acceptance_exists": fresh_retest_flags.get("fresh_failed_acceptance_exists"),
+        "fresh_pullback_exists": fresh_retest_flags.get("fresh_pullback_exists"),
     }
 
 
@@ -1821,6 +2075,15 @@ def _build_result(
         macro_direction_for_symbol=inputs.get("macro_direction_for_symbol"),
         macro_caution_flags=list(inputs.get("macro_caution_flags") or []),
         macro_reasons=list(inputs.get("macro_reasons") or []),
+        entry_price=inputs.get("entry_price"),
+        target_price=inputs.get("target_price"),
+        current_price=inputs.get("current_price"),
+        impulse_progress=inputs.get("impulse_progress"),
+        impulse_progress_pct=inputs.get("impulse_progress_pct"),
+        impulse_state=inputs.get("impulse_state"),
+        fresh_retest_exists=inputs.get("fresh_retest_exists"),
+        fresh_failed_acceptance_exists=inputs.get("fresh_failed_acceptance_exists"),
+        fresh_pullback_exists=inputs.get("fresh_pullback_exists"),
         battle_gate_v2_decision=v2_policy.get("decision"),
         battle_gate_v2_risk_mode=v2_policy.get("risk_mode"),
         battle_gate_v2_battle_allowed=v2_policy.get("battle_allowed"),
@@ -1879,6 +2142,12 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
     macro_caution_flags = list(inputs.get("macro_caution_flags") or [])
     macro_reasons = list(inputs.get("macro_reasons") or [])
 
+    first_impulse = _compute_first_impulse_state(inputs)
+    inputs.update(first_impulse)
+    impulse_state = inputs.get("impulse_state")
+    impulse_progress_pct = inputs.get("impulse_progress_pct")
+    fresh_structure_after_impulse = _has_fresh_structure_after_impulse(inputs)
+
     post_news_allows_clean_battle = post_news_trade_permission == "ALLOW_BATTLE_IF_GEOMETRY_VALID"
     post_news_allows_caution_battle = post_news_trade_permission == "ALLOW_CAUTION_BATTLE_IF_GEOMETRY_VALID"
     post_news_allows_battle = post_news_allows_clean_battle or post_news_allows_caution_battle
@@ -1896,6 +2165,12 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
     if macro_regime and macro_regime != "NO_MACRO_SHOCK":
         reasons.append(f"macro_regime={macro_regime}")
         reasons.extend(f"macro: {reason}" for reason in macro_reasons[:6])
+
+    if impulse_state and impulse_state != "UNKNOWN":
+        reasons.append(
+            f"first_impulse_state={impulse_state} progress={impulse_progress_pct}% "
+            f"fresh_structure_after_impulse={fresh_structure_after_impulse}"
+        )
 
     policy_flags = _collect_policy_hint_flags(inputs, v2_policy)
     policy_requires_research, policy_research_blockers = _policy_hint_requires_research_only(
@@ -1980,7 +2255,46 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
             v2_policy=v2_policy,
         )
 
-    # 2. Post-news state gate.
+    # 2. First impulse / no-chase gate.
+    # If the market has already travelled too far from planned entry to target,
+    # Telegram Battle must not chase. It can only return after a new structure.
+    if impulse_state == "EXHAUSTED":
+        blockers.append("first_impulse_already_gone")
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
+            reasons=reasons + [
+                f"first impulse already gone: price moved {impulse_progress_pct}% of the entry-to-target path; wait for a new structure"
+            ],
+            blockers=_dedupe_text_list(blockers),
+            modifiers=modifiers,
+            battle_permission=BattlePermission.RESEARCH_ONLY.value,
+            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
+            risk_mode="FIRST_IMPULSE_ALREADY_GONE",
+            caution_flags=caution_flags,
+        )
+
+    if impulse_state == "LATE" and not fresh_structure_after_impulse:
+        blockers.append("no_fresh_retest_after_impulse")
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
+            reasons=reasons + [
+                f"price already moved {impulse_progress_pct}% toward target, but no fresh retest/failed acceptance/pullback exists"
+            ],
+            blockers=_dedupe_text_list(blockers),
+            modifiers=modifiers,
+            battle_permission=BattlePermission.RESEARCH_ONLY.value,
+            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
+            risk_mode="NO_FRESH_RETEST_AFTER_IMPULSE",
+            caution_flags=caution_flags,
+        )
+
+    # 3. Post-news state gate.
     # This is the key layer: first impulse remains NO CHASE, but confirmed retest
     # and acceptance can later release a clean continuation into the normal Battle Gate.
     if post_news_trade_permission in {"BLOCK_BATTLE", "SUPPRESS"}:
@@ -2368,6 +2682,16 @@ def _attach_tpo_open_behavior_fields_to_metadata(metadata: dict[str, Any], resul
     metadata["macro_caution_flags"] = result.get("macro_caution_flags") or []
     metadata["macro_reasons"] = result.get("macro_reasons") or []
 
+    metadata["entry_price"] = result.get("entry_price")
+    metadata["target_price"] = result.get("target_price")
+    metadata["current_price"] = result.get("current_price")
+    metadata["impulse_progress"] = result.get("impulse_progress")
+    metadata["impulse_progress_pct"] = result.get("impulse_progress_pct")
+    metadata["impulse_state"] = result.get("impulse_state")
+    metadata["fresh_retest_exists"] = result.get("fresh_retest_exists")
+    metadata["fresh_failed_acceptance_exists"] = result.get("fresh_failed_acceptance_exists")
+    metadata["fresh_pullback_exists"] = result.get("fresh_pullback_exists")
+
     return metadata
 
 
@@ -2476,6 +2800,16 @@ def apply_battle_permission(raw_payload: dict[str, Any]) -> dict[str, Any]:
     payload["macro_direction_for_symbol"] = result.get("macro_direction_for_symbol")
     payload["macro_caution_flags"] = result.get("macro_caution_flags") or []
     payload["macro_reasons"] = result.get("macro_reasons") or []
+
+    payload["entry_price"] = result.get("entry_price")
+    payload["target_price"] = result.get("target_price")
+    payload["current_price"] = result.get("current_price")
+    payload["impulse_progress"] = result.get("impulse_progress")
+    payload["impulse_progress_pct"] = result.get("impulse_progress_pct")
+    payload["impulse_state"] = result.get("impulse_state")
+    payload["fresh_retest_exists"] = result.get("fresh_retest_exists")
+    payload["fresh_failed_acceptance_exists"] = result.get("fresh_failed_acceptance_exists")
+    payload["fresh_pullback_exists"] = result.get("fresh_pullback_exists")
 
     # Root-level v2 fields are useful for journal, telemetry and flat statistics.
     payload["battle_gate_v2_decision"] = result.get("battle_gate_v2_decision")
