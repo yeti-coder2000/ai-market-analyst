@@ -585,6 +585,32 @@ def build_battle_permission_event(
         "invalidation_reference_price": stop,
         "target_reference_price": target,
 
+        # Execution timing / no-chase guard.
+        "current_price": _safe_float(
+            _payload_get(payload, "current_price", "last_price", "price", "close")
+        ),
+        "entry_distance": _safe_float(
+            _payload_get(payload, "entry_distance")
+        ),
+        "entry_distance_R": _safe_float(
+            _payload_get(payload, "entry_distance_R")
+        ),
+        "already_moved_R": _safe_float(
+            _payload_get(payload, "already_moved_R")
+        ),
+        "entry_timing_status": _payload_get(payload, "entry_timing_status"),
+        "wait_retest_only": _safe_bool(
+            _payload_get(payload, "wait_retest_only")
+        ),
+        "late_signal_reason": _payload_get(payload, "late_signal_reason"),
+        "entry_retest_required": _safe_bool(
+            _payload_get(payload, "entry_retest_required")
+        ),
+        "execution_timing_guard_version": _payload_get(
+            payload,
+            "execution_timing_guard_version",
+        ),
+
         "risk_reward_ratio": rr,
         "theoretical_rr": theoretical_rr,
         "practical_rr": practical_rr,
@@ -921,14 +947,14 @@ def build_battle_permission_event(
             metadata.get("macro_direction_for_symbol"),
             context.get("macro_direction_for_symbol"),
         ),
-        "macro_caution_flags": _as_text_list(
+        "macro_caution_flags": _safe_text_list(
             _first_non_empty(
                 payload.get("macro_caution_flags"),
                 metadata.get("macro_caution_flags"),
                 context.get("macro_caution_flags"),
             )
         ),
-        "macro_reasons": _as_text_list(
+        "macro_reasons": _safe_text_list(
             _first_non_empty(
                 payload.get("macro_reasons"),
                 metadata.get("macro_reasons"),

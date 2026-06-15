@@ -185,6 +185,15 @@ class TelegramAlertSnapshot:
     last_checked_at_utc: str | None = None
     last_price: float | None = None
 
+    entry_distance: float | None = None
+    entry_distance_R: float | None = None
+    already_moved_R: float | None = None
+    entry_timing_status: str | None = None
+    wait_retest_only: bool | None = None
+    late_signal_reason: str | None = None
+    entry_retest_required: bool | None = None
+    execution_timing_guard_version: str | None = None
+
     expires_at_utc: str | None = None
 
     # raw / diagnostics
@@ -865,6 +874,15 @@ def build_telegram_alert_snapshot(
         telegram_allowed=payload.get("telegram_allowed"),
         telegram_hard_gate_allowed=payload.get("telegram_hard_gate_allowed"),
         telegram_hard_gate_reason=safe_str(payload.get("telegram_hard_gate_reason"), "") or None,
+
+        entry_distance=safe_float(payload.get("entry_distance")),
+        entry_distance_R=safe_float(payload.get("entry_distance_R")),
+        already_moved_R=safe_float(payload.get("already_moved_R")),
+        entry_timing_status=safe_str(payload.get("entry_timing_status"), "") or None,
+        wait_retest_only=payload.get("wait_retest_only"),
+        late_signal_reason=safe_str(payload.get("late_signal_reason"), "") or None,
+        entry_retest_required=payload.get("entry_retest_required"),
+        execution_timing_guard_version=safe_str(payload.get("execution_timing_guard_version"), "") or None,
         telegram_title=safe_str(payload.get("telegram_title"), "") or None,
         telegram_body=safe_str(payload.get("telegram_body"), "") or None,
         telegram_text=safe_str(payload.get("telegram_text"), "") or None,
