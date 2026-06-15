@@ -51,7 +51,7 @@ from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.5.1-tpo-ltf-debuggable-bridge-guard"
+RUNNER_VERSION = "1.5.2-execution-timing-guard"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -59,6 +59,21 @@ RUNNER_VERSION = "1.5.1-tpo-ltf-debuggable-bridge-guard"
 TELEGRAM_MIN_RR = 2.0
 TELEGRAM_MAX_RR = 10.0
 TELEGRAM_MIN_CONFIDENCE = 0.60
+TELEGRAM_LATE_SIGNAL_THRESHOLD_R = float(os.getenv("TELEGRAM_LATE_SIGNAL_THRESHOLD_R", "0.5"))
+TELEGRAM_HARD_LATE_SIGNAL_THRESHOLD_R = float(os.getenv("TELEGRAM_HARD_LATE_SIGNAL_THRESHOLD_R", "0.7"))
+EXECUTION_TIMING_GUARD_VERSION = "execution-timing-guard-v1.0-runner-hard-gate"
+
+ENTRY_TIMING_FIELD_KEYS = (
+    "current_price",
+    "entry_distance",
+    "entry_distance_R",
+    "already_moved_R",
+    "entry_timing_status",
+    "wait_retest_only",
+    "late_signal_reason",
+    "entry_retest_required",
+    "execution_timing_guard_version",
+)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -513,6 +528,12 @@ def _is_telegram_trade_alert_allowed(payload: dict[str, Any]) -> tuple[bool, str
         or payload.get("take_profit")
         or payload.get("target")
     )
+    current = _safe_float_for_alert(
+        payload.get("current_price")
+        or payload.get("last_price")
+        or payload.get("price")
+        or payload.get("close")
+    )
 
     if scenario in {"", "NO_ACTION", "MARKET_CLOSED"}:
         return False, f"blocked_scenario:{scenario or '-'}"
@@ -552,6 +573,43 @@ def _is_telegram_trade_alert_allowed(payload: dict[str, Any]) -> tuple[bool, str
 
     if direction == "SHORT" and not (target < entry < stop):
         return False, "blocked_invalid_short_geometry"
+
+    if current is not None:
+        risk = abs(stop - entry)
+        if risk > 0:
+            entry_distance = current - entry
+            entry_distance_r = entry_distance / risk
+            already_moved_r = 0.0
+
+            if direction == "LONG" and current > entry:
+                already_moved_r = (current - entry) / risk
+            elif direction == "SHORT" and current < entry:
+                already_moved_r = (entry - current) / risk
+
+            payload["current_price"] = current
+            payload["entry_distance"] = round(entry_distance, 8)
+            payload["entry_distance_R"] = round(entry_distance_r, 6)
+            payload["already_moved_R"] = round(already_moved_r, 6)
+            payload["execution_timing_guard_version"] = EXECUTION_TIMING_GUARD_VERSION
+
+            if already_moved_r >= TELEGRAM_HARD_LATE_SIGNAL_THRESHOLD_R:
+                payload["entry_timing_status"] = "HARD_LATE_SIGNAL"
+                payload["wait_retest_only"] = True
+                payload["entry_retest_required"] = True
+                payload["late_signal_reason"] = f"price_already_moved_{already_moved_r:.2f}R_from_entry"
+                return False, "blocked_late_signal_wait_retest_only"
+
+            if already_moved_r >= TELEGRAM_LATE_SIGNAL_THRESHOLD_R:
+                payload["entry_timing_status"] = "LATE_SIGNAL"
+                payload["wait_retest_only"] = True
+                payload["entry_retest_required"] = True
+                payload["late_signal_reason"] = f"price_already_moved_{already_moved_r:.2f}R_from_entry"
+                return False, "blocked_late_signal_wait_retest_only"
+
+            payload["entry_timing_status"] = "ENTRY_ACTIONABLE"
+            payload["wait_retest_only"] = False
+            payload["entry_retest_required"] = False
+            payload["late_signal_reason"] = None
 
     return True, "telegram_allowed_ready_executable_trade"
 
@@ -2528,6 +2586,7 @@ class StatefulBatchRunner:
             previous_payload=previous_payload,
             tracker_action=tracker_result.action if tracker_result is not None else "NOOP",
             cycle_id=tracked_payload.get("cycle_id"),
+            current_price=price,
             market_state=market_state,
             htf_bias=htf_bias,
             watch_reason=watch_reason,
@@ -3530,6 +3589,7 @@ class StatefulBatchRunner:
         previous_payload: dict[str, Any] | None,
         tracker_action: str,
         cycle_id: str | None,
+        current_price: float | None,
         market_state: str | None,
         htf_bias: str | None,
         watch_reason: str | None,
@@ -3587,6 +3647,12 @@ class StatefulBatchRunner:
         tpo_auction_bias = tracked_payload.get("tpo_auction_bias")
         tpo_telegram_modifier = tracked_payload.get("tpo_telegram_modifier")
 
+        alert_current_price = (
+            tracked_payload.get("current_price")
+            or tracked_payload.get("last_price")
+            or current_price
+        )
+
         raw_alert_payload = {
             "schema_version": "2.0",
             "should_alert": True,
@@ -3595,6 +3661,8 @@ class StatefulBatchRunner:
             "symbol": symbol,
             "batch_group": batch_group,
             "cycle_id": cycle_id,
+            "current_price": alert_current_price,
+            "last_price": alert_current_price,
             "paper_mode": paper_mode,
             "signal_class": tracked_payload.get("signal_class"),
             "stage": tracked_payload.get("signal_class"),
