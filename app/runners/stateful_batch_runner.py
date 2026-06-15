@@ -51,7 +51,7 @@ from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.5.2-execution-timing-guard"
+RUNNER_VERSION = "1.5.3-rr-alias-ny-market-status-guard"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -99,6 +99,28 @@ SNAPSHOT_FALLBACK_PATH = RUNTIME_DIR / "radar_snapshot_v2.ndjson"
 TPO_STORE_PATH = RUNTIME_DIR / "tpo" / "tpo_latest.json"
 TPO_MAX_STALE_MINUTES = int(os.getenv("TPO_MAX_STALE_MINUTES", "240"))
 TPO_SIGNAL_GATE_ENABLED = _env_bool("TPO_SIGNAL_GATE_ENABLED", True)
+
+# Guard against false MARKET_CLOSED propagation for NY-focused instruments.
+# MARKET_CLOSED is a session/calendar state; STALE_DATA is a provider/freshness state.
+# The runner must not mark NAS100/SPX500/UKOIL as MARKET_CLOSED during NY / US /
+# post-news context only because the offline TPO store or provider freshness is stale.
+RUNNER_NY_MARKET_STATUS_GUARD_ENABLED = _env_bool(
+    "RUNNER_NY_MARKET_STATUS_GUARD_ENABLED",
+    True,
+)
+RUNNER_NY_MARKET_STATUS_GUARD_SYMBOLS = {"NAS100", "SPX500", "UKOIL"}
+RUNNER_NY_MARKET_STATUS_GUARD_TOKENS = (
+    "NY",
+    "NY_1H",
+    "NEW_YORK",
+    "NEW YORK",
+    "NEW_YORK_CASH",
+    "US_SESSION",
+    "US CASH",
+    "POST_NEWS",
+    "AFTER_NEWS",
+)
+RUNNER_CLOSED_MARKET_STATUSES = {"MARKET_CLOSED", "CLOSED", "MARKET_CLOSED_AND_STALE"}
 
 
 def safe_append_ndjson(path: Path, payload: dict[str, Any]) -> None:
@@ -511,7 +533,18 @@ def _is_telegram_trade_alert_allowed(payload: dict[str, Any]) -> tuple[bool, str
     direction = str(payload.get("direction") or "").upper()
     scenario = str(payload.get("scenario") or payload.get("scenario_type") or "").upper()
 
-    rr = _safe_float_for_alert(payload.get("risk_reward_ratio") or payload.get("rr"))
+    rr = _safe_float_for_alert(
+        payload.get("risk_reward_ratio")
+        or payload.get("practical_rr")
+        or payload.get("rr")
+        or payload.get("rr_ratio")
+        or payload.get("risk_reward")
+        or payload.get("expected_rr")
+        or payload.get("planned_rr")
+    )
+    if rr is not None:
+        payload["risk_reward_ratio"] = rr
+        payload.setdefault("practical_rr", rr)
     confidence = _safe_float_for_alert(payload.get("confidence") or payload.get("probability"))
 
     entry = _safe_float_for_alert(
@@ -1900,6 +1933,83 @@ class StatefulBatchRunner:
                 else:
                     permission = "OPEN_FOR_EVALUATION"
                     reason = "tpo_context_available"
+
+        # -----------------------------------------------------------------
+        # NY market status guard
+        # -----------------------------------------------------------------
+        # Some offline TPO snapshots may carry stale MARKET_CLOSED state into
+        # active NY / US / post-news reporting context. For NAS100/SPX500/UKOIL
+        # this must not become a false MARKET_CLOSED block.
+        #
+        # If the context is stale, downgrade to STALE_DATA.
+        # If the context is fresh enough, allow OPEN_FOR_EVALUATION.
+        # This does not force a Telegram/Battle trade; it only fixes the reason.
+        symbol_upper = str(
+            payload.get("symbol")
+            or payload.get("instrument")
+            or filters_payload.get("symbol")
+            or context_payload.get("symbol")
+            or ""
+        ).upper()
+
+        session_haystack = " ".join(
+            str(x or "")
+            for x in (
+                payload.get("report_type"),
+                payload.get("session_label"),
+                payload.get("session"),
+                payload.get("session_anchor"),
+                payload.get("market_session"),
+                payload.get("batch_group"),
+                filters_payload.get("report_type"),
+                filters_payload.get("session_label"),
+                filters_payload.get("session"),
+                filters_payload.get("session_anchor"),
+                filters_payload.get("market_session"),
+                context_payload.get("report_type"),
+                context_payload.get("session_label"),
+                context_payload.get("session"),
+                context_payload.get("session_anchor"),
+                context_payload.get("market_session"),
+                context_payload.get("current_session_id"),
+            )
+        ).upper()
+
+        is_ny_context = any(
+            token in session_haystack
+            for token in RUNNER_NY_MARKET_STATUS_GUARD_TOKENS
+        )
+
+        original_market_status = market_status
+        original_permission = permission
+
+        ny_market_status_override = (
+            RUNNER_NY_MARKET_STATUS_GUARD_ENABLED
+            and symbol_upper in RUNNER_NY_MARKET_STATUS_GUARD_SYMBOLS
+            and is_ny_context
+            and (
+                market_status in RUNNER_CLOSED_MARKET_STATUSES
+                or str(permission or "").upper() in RUNNER_CLOSED_MARKET_STATUSES
+            )
+        )
+
+        if ny_market_status_override:
+            if is_stale:
+                market_status = "STALE_DATA"
+                permission = "STALE_DATA"
+                reason = "ny_context_guard_converted_false_market_closed_to_stale_data"
+                if modifier == "NEUTRAL":
+                    modifier = "DOWNGRADE"
+            else:
+                market_status = "OPEN"
+                permission = "OPEN_FOR_EVALUATION"
+                reason = "ny_context_guard_converted_false_market_closed_to_open_for_evaluation"
+
+            for target in (filters_payload, context_payload, payload):
+                target["market_status_override"] = "NY_CONTEXT_MARKET_STATUS_GUARD"
+                target["market_status_original"] = original_market_status
+                target["tpo_signal_permission_original"] = original_permission
+                target["market_status_override_reason"] = reason
 
         confidence_modifier = first_non_empty(
             filters_payload.get("confidence_modifier"),
@@ -3639,7 +3749,15 @@ class StatefulBatchRunner:
         entry_price = tracked_payload.get("entry_reference_price")
         stop_price = tracked_payload.get("invalidation_reference_price")
         target_price = tracked_payload.get("target_reference_price")
-        rr = tracked_payload.get("risk_reward_ratio")
+        rr = (
+            tracked_payload.get("risk_reward_ratio")
+            or tracked_payload.get("practical_rr")
+            or tracked_payload.get("rr")
+            or tracked_payload.get("rr_ratio")
+            or tracked_payload.get("risk_reward")
+            or tracked_payload.get("expected_rr")
+            or tracked_payload.get("planned_rr")
+        )
 
         tpo_signal_permission = str(tracked_payload.get("tpo_signal_permission") or "NEUTRAL").upper()
         tpo_signal_reason = tracked_payload.get("tpo_signal_reason")
@@ -3691,6 +3809,7 @@ class StatefulBatchRunner:
             "invalidation_reference_price": stop_price,
             "target_reference_price": target_price,
             "risk_reward_ratio": rr,
+            "practical_rr": rr,
             "entry": entry_price,
             "stop_loss": stop_price,
             "take_profit": target_price,
@@ -3773,6 +3892,7 @@ class StatefulBatchRunner:
                 "invalidation_reference_price": stop_price,
                 "target_reference_price": target_price,
                 "risk_reward_ratio": rr,
+                "practical_rr": rr,
                 "execution_timeframe": enriched_payload.get("execution_timeframe"),
                 "trigger_reason": enriched_payload.get("trigger_reason"),
                 "open_behavior": enriched_payload.get("open_behavior"),
