@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.11-ny-post-news-wording"
+BRIEFING_VERSION = "daily-market-briefing-v1.12-macro-fallback-post-open-reaction"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -40,6 +40,14 @@ DAILY_SUMMARY_RELATIVE = Path("stats") / "daily_summary.json"
 SIGNAL_OUTCOMES_RELATIVE = Path("stats") / "signal_outcomes.json"
 HIGH_IMPACT_EVENTS_RELATIVE = Path("calendar") / "high_impact_events.json"
 ECONOMIC_CALENDAR_CACHE_RELATIVE = Path("calendar")
+MANUAL_HIGH_IMPACT_EVENTS_RELATIVE = Path("macro") / "manual_high_impact_events.json"
+LAST_GOOD_HIGH_IMPACT_EVENTS_RELATIVE = Path("calendar") / "last_good_high_impact_events.json"
+
+MACRO_OK = "OK"
+MACRO_EMPTY = "EMPTY"
+MACRO_FALLBACK = "FALLBACK"
+MACRO_LAST_GOOD_CACHE = "LAST_GOOD_CACHE"
+MACRO_UNKNOWN_CONSERVATIVE = "MACRO_UNKNOWN_CONSERVATIVE"
 
 FINAL_TP = "TP_HIT"
 FINAL_SL = "SL_HIT"
@@ -207,10 +215,14 @@ class CalendarLoadResult:
     message: str | None = None
     cache_path: str | None = None
     provider_error: str | None = None
+    macro_risk_status: str = MACRO_UNKNOWN_CONSERVATIVE
+    fallback_chain: list[str] = field(default_factory=list)
+    data_freshness: str | None = None
+    last_good_cache_path: str | None = None
 
     @property
     def ok(self) -> bool:
-        return self.status in {"OK", "EMPTY"}
+        return self.status in {MACRO_OK, MACRO_EMPTY}
 
 
 
@@ -443,6 +455,14 @@ def _economic_calendar_cache_path(target_date: date) -> Path:
             return base
         return base / f"economic_calendar_{target_date.isoformat()}.json"
     return _runtime_dir() / ECONOMIC_CALENDAR_CACHE_RELATIVE / f"economic_calendar_{target_date.isoformat()}.json"
+
+
+def _manual_high_impact_events_path() -> Path:
+    return _get_path("MANUAL_HIGH_IMPACT_EVENTS_PATH", MANUAL_HIGH_IMPACT_EVENTS_RELATIVE)
+
+
+def _last_good_high_impact_events_path() -> Path:
+    return _get_path("LAST_GOOD_HIGH_IMPACT_EVENTS_PATH", LAST_GOOD_HIGH_IMPACT_EVENTS_RELATIVE)
 
 
 def _now_utc() -> datetime:
@@ -980,9 +1000,83 @@ def _fetch_finnhub_calendar(target_date: date) -> CalendarLoadResult:
     )
 
 
+def _normalize_calendar_event_payload(event: dict[str, Any], target_date: date, *, source: str) -> dict[str, Any] | None:
+    """Normalize manual/static/cache calendar entries into the internal event contract."""
+    if not isinstance(event, dict):
+        return None
+
+    title = str(event.get("title") or event.get("event") or event.get("name") or "").strip()
+    if not title:
+        return None
+
+    event_date = str(event.get("date") or target_date.isoformat()).strip()
+    if event_date != target_date.isoformat():
+        return None
+
+    event_time = str(event.get("time") or "").strip()
+    event_tz = str(event.get("timezone") or event.get("tz") or DEFAULT_TIMEZONE).strip() or DEFAULT_TIMEZONE
+    currency = _currency_from_event(event.get("country"), event.get("currency"))
+    impact = _normalize_impact(event.get("impact") or event.get("importance"), title)
+    if impact and impact not in {"HIGH", "RED", "IMPORTANT"}:
+        return None
+
+    symbols = event.get("symbols")
+    if not isinstance(symbols, list):
+        symbols = _affected_symbols(currency, title)
+
+    normalized = dict(event)
+    normalized.update(
+        {
+            "date": event_date,
+            "time": event_time,
+            "timezone": event_tz,
+            "currency": currency,
+            "impact": "HIGH" if impact in {"RED", "IMPORTANT"} else (impact or "HIGH"),
+            "title": title,
+            "symbols": [str(x).strip().upper() for x in symbols if str(x).strip()],
+            "note": event.get("note") or _event_trading_note(currency, title, "HIGH"),
+            "source": str(event.get("source") or source),
+        }
+    )
+    return normalized
+
+
+def _dedupe_calendar_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, str, str, str, str]] = set()
+    selected: list[dict[str, Any]] = []
+
+    for event in events:
+        key = (
+            str(event.get("date") or ""),
+            str(event.get("time") or ""),
+            str(event.get("timezone") or ""),
+            str(event.get("currency") or ""),
+            str(event.get("title") or event.get("event") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(event)
+
+    selected.sort(key=lambda x: (str(x.get("time") or "99:99"), str(x.get("currency") or ""), str(x.get("title") or "")))
+    return selected
+
+
+def _load_manual_calendar_events(target_date: date) -> list[dict[str, Any]]:
+    """Load operator-maintained macro events from /var/data/runtime/macro/manual_high_impact_events.json."""
+    payload = _safe_read_json(_manual_high_impact_events_path(), [])
+    events: list[dict[str, Any]] = []
+    for event in _extract_list(payload):
+        normalized = _normalize_calendar_event_payload(event, target_date, source="manual_macro_json")
+        if normalized:
+            events.append(normalized)
+    return _dedupe_calendar_events(events)
+
+
 def _load_static_calendar_events(target_date: date) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
 
+    # Existing static file/env fallback remains supported.
     events.extend(_extract_list(_safe_read_json(_high_impact_events_path(), [])))
 
     inline = os.getenv("HIGH_IMPACT_EVENTS_JSON")
@@ -994,68 +1088,164 @@ def _load_static_calendar_events(target_date: date) -> list[dict[str, Any]]:
 
     events.extend(BUILTIN_HIGH_IMPACT_EVENTS)
 
-    target_text = target_date.isoformat()
-    seen: set[tuple[str, str, str, str]] = set()
-    selected: list[dict[str, Any]] = []
-
+    normalized_events: list[dict[str, Any]] = []
     for event in events:
-        if str(event.get("date") or "").strip() != target_text:
-            continue
+        normalized = _normalize_calendar_event_payload(event, target_date, source="static_fallback")
+        if normalized:
+            normalized_events.append(normalized)
 
-        impact = _normalize_impact(event.get("impact"), str(event.get("title") or ""))
-        if impact and impact not in {"HIGH", "RED", "IMPORTANT"}:
-            continue
+    return _dedupe_calendar_events(normalized_events)
 
-        normalized = dict(event)
-        normalized["impact"] = "HIGH" if impact in {"RED", "IMPORTANT"} else impact
-        normalized.setdefault("source", "static_fallback")
-        normalized.setdefault("symbols", _affected_symbols(str(normalized.get("currency") or ""), str(normalized.get("title") or "")))
-        normalized.setdefault("note", _event_trading_note(str(normalized.get("currency") or ""), str(normalized.get("title") or ""), str(normalized.get("impact") or "")))
 
-        key = (
-            str(normalized.get("date") or ""),
-            str(normalized.get("time") or ""),
-            str(normalized.get("timezone") or ""),
-            str(normalized.get("title") or ""),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        selected.append(normalized)
+def _write_last_good_calendar_cache(target_date: date, events: list[dict[str, Any]], *, source: str) -> None:
+    if not events:
+        return
 
-    selected.sort(key=lambda x: (str(x.get("time") or "99:99"), str(x.get("title") or "")))
-    return selected
+    payload = {
+        "source": source,
+        "status": MACRO_OK,
+        "date": target_date.isoformat(),
+        "updated_at_utc": _now_utc().isoformat(),
+        "events": events,
+    }
+    try:
+        _safe_write_json(_last_good_high_impact_events_path(), payload)
+    except Exception:
+        pass
+
+
+def _load_last_good_calendar_events(target_date: date) -> tuple[list[dict[str, Any]], str | None]:
+    path = _last_good_high_impact_events_path()
+    payload = _safe_read_json(path, {})
+    if not isinstance(payload, dict):
+        return [], None
+
+    max_age_hours = float(os.getenv("LAST_GOOD_MACRO_CACHE_MAX_AGE_HOURS", "36"))
+    updated_at = str(payload.get("updated_at_utc") or "")
+    if updated_at:
+        try:
+            dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            age_hours = (_now_utc() - dt.astimezone(timezone.utc)).total_seconds() / 3600.0
+            if age_hours > max_age_hours:
+                return [], f"last_good_cache_stale:{age_hours:.1f}h"
+        except Exception:
+            return [], "last_good_cache_bad_timestamp"
+
+    events: list[dict[str, Any]] = []
+    for event in _extract_list(payload.get("events", [])):
+        normalized = _normalize_calendar_event_payload(event, target_date, source="last_good_cache")
+        if normalized:
+            normalized["source"] = "last_good_cache"
+            events.append(normalized)
+
+    deduped = _dedupe_calendar_events(events)
+    if not deduped:
+        return [], None
+    return deduped, str(path)
 
 
 def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
-    result = _fetch_finnhub_calendar(target_date)
+    """
+    High-impact macro calendar cascade.
 
-    if result.status in {"OK", "EMPTY"}:
+    Order:
+    1) Finnhub primary provider;
+    2) manual operator JSON backup;
+    3) static fallback file/env/builtin;
+    4) last-good cache;
+    5) MACRO_UNKNOWN_CONSERVATIVE.
+
+    Provider unavailable is never treated as "no news".
+    """
+    fallback_chain: list[str] = []
+    result = _fetch_finnhub_calendar(target_date)
+    fallback_chain.append(f"primary:{result.source}:{result.status}")
+
+    if result.status in {MACRO_OK, MACRO_EMPTY}:
         high_events = [
             e for e in result.events
             if _normalize_impact(e.get("impact"), str(e.get("title") or "")) in {"HIGH", "RED", "IMPORTANT"}
         ]
+        high_events = _dedupe_calendar_events(high_events)
+        if high_events:
+            _write_last_good_calendar_cache(target_date, high_events, source=result.source)
         return CalendarLoadResult(
-            status="OK" if high_events else "EMPTY",
+            status=MACRO_OK if high_events else MACRO_EMPTY,
             source=result.source,
             events=high_events,
             message=result.message,
             cache_path=result.cache_path,
             provider_error=result.provider_error,
+            macro_risk_status=MACRO_OK if high_events else MACRO_EMPTY,
+            fallback_chain=fallback_chain,
+            data_freshness="fresh_or_valid_cache",
+            last_good_cache_path=str(_last_good_high_impact_events_path()),
+        )
+
+    manual_events = _load_manual_calendar_events(target_date)
+    fallback_chain.append(f"backup:manual_macro_json:{'OK' if manual_events else 'EMPTY'}")
+    if manual_events:
+        _write_last_good_calendar_cache(target_date, manual_events, source="manual_macro_json")
+        return CalendarLoadResult(
+            status=MACRO_FALLBACK,
+            source="manual_macro_json",
+            events=manual_events,
+            message=f"{result.message or 'Primary provider unavailable'} Using manual macro JSON backup.",
+            cache_path=str(_manual_high_impact_events_path()),
+            provider_error=result.provider_error,
+            macro_risk_status=MACRO_FALLBACK,
+            fallback_chain=fallback_chain,
+            data_freshness="manual_backup",
+            last_good_cache_path=str(_last_good_high_impact_events_path()),
         )
 
     static_events = _load_static_calendar_events(target_date)
+    fallback_chain.append(f"backup:static_fallback:{'OK' if static_events else 'EMPTY'}")
     if static_events:
+        _write_last_good_calendar_cache(target_date, static_events, source="static_fallback")
         return CalendarLoadResult(
-            status="FALLBACK",
+            status=MACRO_FALLBACK,
             source="static_fallback",
             events=static_events,
-            message=f"{result.message or 'Provider unavailable'} Using static fallback.",
+            message=f"{result.message or 'Primary provider unavailable'} Using static fallback.",
             cache_path=result.cache_path,
             provider_error=result.provider_error,
+            macro_risk_status=MACRO_FALLBACK,
+            fallback_chain=fallback_chain,
+            data_freshness="static_fallback",
+            last_good_cache_path=str(_last_good_high_impact_events_path()),
         )
 
-    return result
+    last_good_events, last_good_status = _load_last_good_calendar_events(target_date)
+    fallback_chain.append(f"backup:last_good_cache:{'OK' if last_good_events else (last_good_status or 'EMPTY')}")
+    if last_good_events:
+        return CalendarLoadResult(
+            status=MACRO_LAST_GOOD_CACHE,
+            source="last_good_cache",
+            events=last_good_events,
+            message=f"{result.message or 'Primary provider unavailable'} Using last-good macro cache.",
+            cache_path=str(_last_good_high_impact_events_path()),
+            provider_error=result.provider_error,
+            macro_risk_status=MACRO_LAST_GOOD_CACHE,
+            fallback_chain=fallback_chain,
+            data_freshness="stale_or_cached",
+            last_good_cache_path=str(_last_good_high_impact_events_path()),
+        )
+
+    return CalendarLoadResult(
+        status=MACRO_UNKNOWN_CONSERVATIVE,
+        source=result.source or "macro_calendar_cascade",
+        events=[],
+        message=result.message or "Macro calendar unavailable; no fallback data.",
+        cache_path=result.cache_path,
+        provider_error=result.provider_error,
+        macro_risk_status=MACRO_UNKNOWN_CONSERVATIVE,
+        fallback_chain=fallback_chain,
+        data_freshness="unknown",
+        last_good_cache_path=str(_last_good_high_impact_events_path()),
+    )
 
 
 def load_high_impact_events(target_date: date) -> list[dict[str, Any]]:
@@ -1575,34 +1765,54 @@ def _filter_actionable_high_impact_events(events: list[dict[str, Any]], report_t
 
     return actionable, hidden_unmapped
 
+def _macro_calendar_unknown_conservative(calendar: CalendarLoadResult) -> bool:
+    return calendar.status == MACRO_UNKNOWN_CONSERVATIVE or calendar.macro_risk_status == MACRO_UNKNOWN_CONSERVATIVE
+
+
 def _build_high_impact_section(target_date: date, timezone_name: str, report_type: str) -> BriefingSection:
     calendar = load_high_impact_calendar(target_date)
     raw_events = calendar.events
     events, hidden_unmapped = _filter_actionable_high_impact_events(raw_events, report_type)
     section = BriefingSection("🔴 Ризик дня")
 
-    # hidden_unmapped remains available in JSON/debug artifacts through raw calendar data,
-    # but Telegram stays operational and concise. No provider-noise line here.
-    del hidden_unmapped
+    if hidden_unmapped:
+        section.lines.append(f"Provider повернув {hidden_unmapped} unmapped HIGH подій; вони сховані з Telegram як неactionable.")
 
     if not events:
-        if calendar.status == "EMPTY":
+        if calendar.status == MACRO_EMPTY:
             section.lines.append("HIGH/RED подій за підключеним календарем не знайдено.")
+            section.lines.append("Macro mode: CLEAR_BY_PROVIDER.")
             section.lines.append(f"Джерело: {calendar.source}.")
         elif raw_events:
             section.lines.append("HIGH/RED подій для нашого торгового фокусу не знайдено.")
+            section.lines.append(f"Macro mode: {calendar.macro_risk_status}.")
             section.lines.append(f"Джерело: {calendar.source}.")
         else:
+            section.lines.append("MACRO_RISK_STATUS: UNKNOWN.")
             section.lines.append("Календар high-impact news не завантажений / provider unavailable.")
             section.lines.append("Це не означає, що high-impact news немає.")
-            section.lines.append("Режим: обережність, перевірити зовнішній календар перед NY.")
+            section.lines.append("Режим: MACRO_UNKNOWN_CONSERVATIVE — не піднімати research у battle без зовнішньої перевірки.")
             if calendar.message:
                 section.lines.append(f"Статус: {calendar.message}")
+            if calendar.provider_error:
+                section.lines.append(f"Provider error: {calendar.provider_error}")
+            if calendar.fallback_chain:
+                section.lines.append(f"Fallback chain: {' → '.join(calendar.fallback_chain)}")
+            if calendar.last_good_cache_path:
+                section.lines.append(f"Last-good cache: {calendar.last_good_cache_path}")
         return section
 
-    if calendar.status == "FALLBACK":
-        section.lines.append("⚠️ Основний календар недоступний; використовується static fallback.")
-        section.lines.append("Це може бути неповний список подій.")
+    if calendar.status == MACRO_FALLBACK:
+        section.lines.append(f"⚠️ Основний календар недоступний; використовується {calendar.source}.")
+        section.lines.append("Це може бути неповний список подій. Режим: conservative.")
+    elif calendar.status == MACRO_LAST_GOOD_CACHE:
+        section.lines.append("⚠️ Використовується last-good macro cache.")
+        section.lines.append("Кеш може бути застарілим; перед NY перевірити зовнішній календар.")
+    elif calendar.status == MACRO_UNKNOWN_CONSERVATIVE:
+        section.lines.append("⚠️ Macro calendar unknown; conservative mode.")
+
+    if calendar.fallback_chain and calendar.status != MACRO_OK:
+        section.lines.append(f"Fallback chain: {' → '.join(calendar.fallback_chain)}")
 
     for e in events[:5]:
         local_time = _local_dt_from_event(e, timezone_name)
@@ -1978,9 +2188,113 @@ def _brief_symbol_context(item: dict[str, Any]) -> dict[str, Any]:
         "warnings": warnings,
         "provider_error": provider_error,
         "fallback": bool(fallback),
+        "first_hour_activity": _first_from_sources(("first_hour_activity",), behavior_sources + context_sources + filter_sources, default={}),
+        "entry_timing_status": _upper(_first_from_sources(("entry_timing_status",), behavior_sources + context_sources + filter_sources), ""),
+        "already_moved_R": _first_from_sources(("already_moved_R", "already_moved_r"), behavior_sources + context_sources + filter_sources),
+        "trigger_reason": _first_from_sources(("trigger_reason",), behavior_sources + context_sources + filter_sources),
+        "tpo_signal_reason": _first_from_sources(("tpo_signal_reason", "signal_reason", "reason"), filter_sources + context_sources + behavior_sources),
         "status_source_guard": "fresh_context_open_overrides_closed" if fresh_context_open else "normal",
     }
 
+
+
+def _calendar_status_for_context(target_date: date | None, timezone_name: str | None, report_type: str) -> CalendarLoadResult | None:
+    if target_date is None or timezone_name is None:
+        return None
+    if _normalize_report_type(report_type) not in {"ny", "ny_1h", "new_york"}:
+        return None
+    return load_high_impact_calendar(target_date)
+
+
+def _macro_unknown_conservative_for_report(target_date: date | None, timezone_name: str | None, report_type: str) -> bool:
+    calendar = _calendar_status_for_context(target_date, timezone_name, report_type)
+    return bool(calendar and _macro_calendar_unknown_conservative(calendar))
+
+
+def _first_hour_activity_from_item(item: dict[str, Any]) -> dict[str, Any]:
+    d = _nested_dicts(item)
+    context_sources = [
+        d["context"],
+        d["auction_context"],
+        d["metadata_auction_context"],
+        d["payload_auction_context"],
+        d["nested_payload_auction_context"],
+        d["metadata_context"],
+        d["payload_context"],
+        d["nested_payload_context"],
+        item,
+        d["payload"],
+        d["payload_payload"],
+    ]
+    activity = _first_from_sources(("first_hour_activity",), context_sources, default={})
+    return activity if isinstance(activity, dict) else {}
+
+
+def _activity_direction_label(activity: dict[str, Any]) -> str:
+    direction = _post_news_direction_from_activity(activity)
+    if direction == "DOWN":
+        return "bearish"
+    if direction == "UP":
+        return "bullish"
+    return "neutral"
+
+
+def _auction_subtype(sym: str, data: dict[str, Any], *, post_news_active: bool = False, macro_unknown: bool = False) -> str:
+    market_status = str(data.get("market_status") or "").upper()
+    permission = str(data.get("permission") or "").upper()
+    open_behavior = str(data.get("open_behavior") or "").upper()
+    modifier = str(data.get("modifier") or "").upper()
+    warnings = [str(x).upper() for x in data.get("warnings") or []]
+    activity = data.get("first_hour_activity") if isinstance(data.get("first_hour_activity"), dict) else {}
+    entry_timing_status = str(data.get("entry_timing_status") or "").upper()
+    trigger_reason = str(data.get("trigger_reason") or data.get("tpo_signal_reason") or "").upper()
+
+    if market_status in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"} or permission in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"} or data.get("provider_error") or data.get("fallback"):
+        return "PROVIDER_STALE"
+    if macro_unknown:
+        return "MACRO_UNKNOWN"
+    if entry_timing_status in {"LATE_SIGNAL", "HARD_LATE_SIGNAL"}:
+        return "FIRST_IMPULSE_GONE"
+    if any("FIRST_IMPULSE" in x or "IMPULSE_ALREADY_GONE" in x for x in warnings) or "FIRST_IMPULSE" in trigger_reason:
+        return "FIRST_IMPULSE_GONE"
+    if _boolish(activity.get("failed_auction")):
+        return "FAILED_ACCEPTANCE"
+    if _boolish(activity.get("accepted_back_inside_value")) or _boolish(activity.get("accepted_back_inside_range")):
+        return "REJECTION_ROTATION"
+    if post_news_active:
+        return "FIRST_IMPULSE_GONE"
+    if open_behavior == "OPEN_REJECTION_REVERSE":
+        return "REJECTION_ROTATION"
+    if open_behavior == "OPEN_AUCTION" and modifier == "DOWNGRADE":
+        return "BALANCE_CHOP"
+    if open_behavior == "OPEN_AUCTION":
+        return "BALANCE_CHOP"
+    return open_behavior or "UNCONFIRMED"
+
+
+def _bias_without_trade(sym: str, data: dict[str, Any], *, post_news_active: bool = False, macro_unknown: bool = False) -> str:
+    if data.get("provider_error") or data.get("fallback") or str(data.get("market_status") or "").upper() in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"}:
+        return "provider stale / no trade"
+    if macro_unknown:
+        return "macro unknown / conservative mode"
+
+    activity = data.get("first_hour_activity") if isinstance(data.get("first_hour_activity"), dict) else {}
+    direction = _activity_direction_label(activity)
+    open_behavior = str(data.get("open_behavior") or "").upper()
+
+    if direction == "bearish":
+        return "bearish bias / wait retest"
+    if direction == "bullish":
+        return "bullish bias / wait pullback"
+    if open_behavior == "OPEN_TEST_DRIVE":
+        return "directional watch / LTF pending"
+    if open_behavior == "OPEN_REJECTION_REVERSE":
+        return "failed-move watch / reclaim-BOS-retest only"
+    if open_behavior == "OPEN_AUCTION":
+        return "neutral chop / rotations only"
+    if post_news_active:
+        return "post-news volatility / wait acceptance"
+    return "neutral / wait clarity"
 
 def _post_news_watch_qualifier(sym: str, behavior: str) -> str:
     base = "WATCH_AFTER_RETEST_ONLY: перший імпульс уже міг відпрацювати; чекати ретест + LTF model + stop + real target"
@@ -1995,7 +2309,13 @@ def _post_news_watch_qualifier(sym: str, behavior: str) -> str:
     return base
 
 
-def _brief_verdict(sym: str, data: dict[str, Any], *, post_news_active: bool = False) -> tuple[str, str]:
+def _brief_verdict(
+    sym: str,
+    data: dict[str, Any],
+    *,
+    post_news_active: bool = False,
+    macro_unknown: bool = False,
+) -> tuple[str, str]:
     market_status = data["market_status"]
     permission = data["permission"]
     modifier = data["modifier"]
@@ -2006,76 +2326,76 @@ def _brief_verdict(sym: str, data: dict[str, Any], *, post_news_active: bool = F
 
     context_open = _context_says_open(data)
     clean_data = _context_says_clean_data(data)
+    subtype = _auction_subtype(sym, data, post_news_active=post_news_active, macro_unknown=macro_unknown)
+    bias = _bias_without_trade(sym, data, post_news_active=post_news_active, macro_unknown=macro_unknown)
 
-    post_news_suffix = ""
-    if post_news_active:
-        post_news_suffix = " | post-news: перший імпульс не наздоганяти"
+    zone_text = f" | зона: {zone}" if zone != "-" else ""
+    bias_text = f" | bias: {bias}"
+    subtype_text = f"{subtype}"
 
     # NO TRADE is reserved only for real blockers: stale/no data/provider error/fallback.
     if data.get("fallback") or market_status in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"} or permission in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"}:
-        return "NO_TRADE", f"• {sym} — {market_status}"
+        return "NO_TRADE", f"• {sym} — {subtype_text} | {market_status}{zone_text}{bias_text}"
 
     # False closed guard: if fresh auction context says OPEN, keep the report operational.
     if market_status.startswith("MARKET_CLOSED") or permission == "MARKET_CLOSED":
         if context_open and clean_data:
             guarded_behavior = open_behavior if open_behavior not in {"UNKNOWN", "-"} else "OPEN"
-            return "OBSERVE", f"• {sym} — {guarded_behavior} | статус OPEN у TPO context, ігноруємо stale MARKET_CLOSED"
+            return "OBSERVE", f"• {sym} — {guarded_behavior} | статус OPEN у TPO context, ігноруємо stale MARKET_CLOSED{bias_text}"
         return "NO_TRADE", f"• {sym} — MARKET_CLOSED"
+
+    if macro_unknown and open_behavior in {"OPEN_AUCTION", "UNCONFIRMED", "UNKNOWN"}:
+        detail = f"{subtype_text}{zone_text}{bias_text} | no Battle without external calendar check"
+        return "NO_TRADE", f"• {sym} — {detail}"
 
     if modifier == "DOWNGRADE" or permission in {"BLOCKED_BY_CONTEXT", "BLOCKED_BY_AUCTION"} or battle_hint in {"DOWNGRADE_NO_DIRECTIONAL_BATTLE", "BLOCK"}:
         reason = open_behavior if open_behavior not in {"UNKNOWN", "-"} else (permission if permission not in {"UNKNOWN", "-"} else "DOWNGRADE")
-        detail = ""
+        detail = f"{subtype_text}"
         if zone != "-":
-            detail = f" | зона: {zone}"
+            detail += f" | зона: {zone}"
+        detail += bias_text
         if post_news_active:
             detail += " | post-news: тільки після retest/acceptance, без chase"
-        return "NO_TRADE", f"• {sym} — {reason} + DOWNGRADE{detail}"
+        return "NO_TRADE", f"• {sym} — {reason} + DOWNGRADE | {detail}"
 
     # WATCH means there is a behavior candidate, but still no entry without 5m–15m confirmation.
     # After high-impact USD macro, WATCH must not read like immediate permission.
     if open_behavior in {"OPEN_DRIVE", "OPEN_TEST_DRIVE"}:
-        if post_news_active:
-            qualifier = _post_news_watch_qualifier(sym, open_behavior)
-            detail = qualifier
-            if zone != "-":
-                detail = f"зона: {zone} | {qualifier}"
+        if post_news_active or macro_unknown:
+            qualifier = _post_news_watch_qualifier(sym, open_behavior) if post_news_active else "MACRO_UNKNOWN: тільки після зовнішньої перевірки + LTF model + stop + real target"
+            detail = f"{subtype_text}{zone_text} | {qualifier}{bias_text}"
             return "WATCH", f"• {sym} — {open_behavior} | {detail}"
 
-        detail = "чекати LTF model"
-        if zone != "-":
-            detail = f"зона: {zone} | чекати LTF model"
+        detail = f"{subtype_text}{zone_text} | чекати LTF model{bias_text}"
         return "WATCH", f"• {sym} — {open_behavior} | {detail}"
 
     if open_behavior == "OPEN_REJECTION_REVERSE":
-        detail = "тільки research до чистої LTF-моделі"
+        detail = f"{subtype_text}{zone_text} | тільки research до чистої LTF-моделі{bias_text}"
         if post_news_active:
-            detail = "post-news failed move/rejection context; тільки після reclaim/BOS/retest, без chase"
-        if zone != "-":
-            detail = f"зона: {zone} | {detail}"
+            detail = f"{subtype_text}{zone_text} | post-news failed move/rejection context; тільки після reclaim/BOS/retest, без chase{bias_text}"
         return "WATCH", f"• {sym} — OPEN_REJECTION_REVERSE | {detail}"
 
     # OPEN_AUCTION without DOWNGRADE is not a full no-trade state.
     # It means observe rotations only; no directional battle.
     if open_behavior == "OPEN_AUCTION":
-        detail = "тільки ротації"
+        detail = f"{subtype_text}{zone_text} | тільки ротації{bias_text}"
         if post_news_active:
-            detail = "post-news auction/rotation; перший імпульс не наздоганяти"
-        if zone != "-":
-            detail = f"зона: {zone} | {detail}"
+            detail = f"{subtype_text}{zone_text} | post-news auction/rotation; перший імпульс не наздоганяти{bias_text}"
         return "OBSERVE", f"• {sym} — OPEN_AUCTION | {detail}"
 
     if open_behavior in {"UNCONFIRMED", "UNKNOWN"}:
         if post_news_active:
-            return "OBSERVE", f"• {sym} — POST_NEWS_UNCONFIRMED | first impulse already gone; чекати retest/acceptance, не наздоганяти"
-        return "OBSERVE", f"• {sym} — {open_behavior} | чекати ясності"
+            return "OBSERVE", f"• {sym} — POST_NEWS_UNCONFIRMED | {subtype_text} | first impulse already gone; чекати retest/acceptance, не наздоганяти{bias_text}"
+        return "OBSERVE", f"• {sym} — {open_behavior} | {subtype_text} | чекати ясності{bias_text}"
 
     if entry_hint in {"NO_ENTRY_MODEL", "NO_DIRECTIONAL_ENTRY_MODEL"} or battle_hint in {"RESEARCH_ONLY"}:
-        return "OBSERVE", f"• {sym} — no directional model | спостерігати{post_news_suffix}"
+        suffix = " | post-news: перший імпульс не наздоганяти" if post_news_active else ""
+        return "OBSERVE", f"• {sym} — no directional model | {subtype_text} | спостерігати{suffix}{bias_text}"
 
     if post_news_active:
-        return "WATCH", f"• {sym} — {open_behavior} | post-news: чекати LTF confirmation + retest/acceptance"
+        return "WATCH", f"• {sym} — {open_behavior} | {subtype_text} | post-news: чекати LTF confirmation + retest/acceptance{bias_text}"
 
-    return "WATCH", f"• {sym} — {open_behavior} | чекати LTF confirmation"
+    return "WATCH", f"• {sym} — {open_behavior} | {subtype_text} | чекати LTF confirmation{bias_text}"
 
 
 def _recent_high_impact_events(target_date: date, timezone_name: str, report_type: str, window_minutes: int = 240) -> list[dict[str, Any]]:
@@ -2178,25 +2498,9 @@ def _post_news_macro_read(sym: str, direction: str, behavior: str) -> str:
     return "post-news volatility regime; wait for acceptance / failed move"
 
 
-def _post_news_symbol_line(sym: str, item: dict[str, Any]) -> str:
+def _post_news_symbol_line(sym: str, item: dict[str, Any], *, macro_unknown: bool = False) -> str:
     data = _brief_symbol_context(item)
-    d = _nested_dicts(item)
-    context_sources = [
-        d["context"],
-        d["auction_context"],
-        d["metadata_auction_context"],
-        d["payload_auction_context"],
-        d["nested_payload_auction_context"],
-        d["metadata_context"],
-        d["payload_context"],
-        d["nested_payload_context"],
-        item,
-        d["payload"],
-        d["payload_payload"],
-    ]
-
-    activity = _first_from_sources(("first_hour_activity",), context_sources, default={})
-    activity = activity if isinstance(activity, dict) else {}
+    activity = data.get("first_hour_activity") if isinstance(data.get("first_hour_activity"), dict) else {}
 
     behavior = data.get("open_behavior") or "UNKNOWN"
     context = data.get("open_context") or "UNKNOWN"
@@ -2204,6 +2508,8 @@ def _post_news_symbol_line(sym: str, item: dict[str, Any]) -> str:
     direction = _post_news_direction_from_activity(activity)
     activity_text = _first_hour_activity_text(activity)
     macro_read = _post_news_macro_read(sym, direction, behavior)
+    subtype = _auction_subtype(sym, data, post_news_active=not macro_unknown, macro_unknown=macro_unknown)
+    bias = _bias_without_trade(sym, data, post_news_active=not macro_unknown, macro_unknown=macro_unknown)
 
     if behavior == "OPEN_REJECTION_REVERSE":
         mode = "failed move/rejection: тільки після reclaim/BOS/retest"
@@ -2218,8 +2524,12 @@ def _post_news_symbol_line(sym: str, item: dict[str, Any]) -> str:
     else:
         mode = "чекати acceptance / failed move"
 
+    if macro_unknown:
+        macro_read = "macro calendar unknown; conservative mode"
+        mode = "no Battle without external calendar check + LTF confirmation"
+
     zone_text = f" | зона: {zone}" if zone != "-" else ""
-    return f"• {sym} — {behavior} / {context}{zone_text} | {macro_read} | {activity_text} | {mode}"
+    return f"• {sym} — {behavior} / {context}{zone_text} | subtype={subtype} | bias={bias} | {macro_read} | {activity_text} | {mode}"
 
 
 def _build_post_news_reaction_section(
@@ -2228,22 +2538,34 @@ def _build_post_news_reaction_section(
     timezone_name: str,
     report_type: str,
 ) -> BriefingSection | None:
-    recent_events = _recent_high_impact_events(target_date, timezone_name, report_type)
-    if not recent_events:
+    if _normalize_report_type(report_type) not in {"ny", "ny_1h", "new_york"}:
         return None
+
+    recent_events = _recent_high_impact_events(target_date, timezone_name, report_type)
+    calendar = load_high_impact_calendar(target_date)
+    macro_unknown = _macro_calendar_unknown_conservative(calendar)
 
     symbols = tpo.get("symbols") if isinstance(tpo, dict) else {}
     symbols = symbols if isinstance(symbols, dict) else {}
 
-    section = BriefingSection("🧭 Post-news реакція")
-    event = recent_events[0]
-    title = event.get("title") or event.get("event") or "high-impact event"
-    minutes = event.get("minutes_since_event")
-    local_time = _local_dt_from_event(event, timezone_name)
-    section.lines.append(f"Подія: {local_time} — {_raw(event.get('currency'))} {_raw(event.get('impact'))}: {_raw(title)} | минуло: {minutes} хв")
-    section.lines.append("Режим: оцінюємо acceptance / failed move; перший імпульс не наздоганяти.")
+    section = BriefingSection("🧭 NY post-open / post-news реакція")
 
-    focus_symbols = _filter_symbols_for_report(event.get("symbols") or [], report_type)
+    if recent_events:
+        event = recent_events[0]
+        title = event.get("title") or event.get("event") or "high-impact event"
+        minutes = event.get("minutes_since_event")
+        local_time = _local_dt_from_event(event, timezone_name)
+        section.lines.append(f"Подія: {local_time} — {_raw(event.get('currency'))} {_raw(event.get('impact'))}: {_raw(title)} | минуло: {minutes} хв")
+        section.lines.append("Режим: оцінюємо acceptance / failed move; перший імпульс не наздоганяти.")
+        focus_symbols = _filter_symbols_for_report(event.get("symbols") or [], report_type)
+    else:
+        if macro_unknown:
+            section.lines.append("Macro calendar unavailable: MACRO_UNKNOWN_CONSERVATIVE.")
+            section.lines.append("Режим: NY post-open оцінюємо без macro-clearance; Battle тільки після зовнішньої перевірки + LTF confirmation.")
+        else:
+            section.lines.append("High-impact post-news подій у вікні не знайдено; оцінюємо NY post-open поведінку.")
+        focus_symbols = list(_symbol_scope_for_report(report_type))
+
     if not focus_symbols:
         focus_symbols = list(_symbol_scope_for_report(report_type))
 
@@ -2252,18 +2574,23 @@ def _build_post_news_reaction_section(
         item = symbols.get(sym)
         if not isinstance(item, dict):
             continue
-        section.lines.append(_post_news_symbol_line(sym, item))
+        section.lines.append(_post_news_symbol_line(sym, item, macro_unknown=macro_unknown and not recent_events))
         printed += 1
         if printed >= 8:
             break
 
     if printed == 0:
-        section.lines.append("Немає TPO snapshot для активів post-news фокусу.")
+        section.lines.append("Немає TPO snapshot для активів NY фокусу.")
 
     return section
 
 
-def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str, target_date: date | None = None, timezone_name: str | None = None) -> BriefingSection:
+def _build_tpo_snapshot_section(
+    tpo: dict[str, Any],
+    report_type: str,
+    target_date: date | None = None,
+    timezone_name: str | None = None,
+) -> BriefingSection:
     section = BriefingSection("📌 Стан ринку")
     symbols = tpo.get("symbols") if isinstance(tpo, dict) else {}
     symbols = symbols if isinstance(symbols, dict) else {}
@@ -2274,8 +2601,10 @@ def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str, target_da
 
     watch_symbols = list(_symbol_scope_for_report(report_type))
     post_news_active = False
+    macro_unknown = False
     if target_date is not None and timezone_name:
         post_news_active = bool(_recent_high_impact_events(target_date, timezone_name, report_type))
+        macro_unknown = _macro_unknown_conservative_for_report(target_date, timezone_name, report_type)
 
     no_trade: list[str] = []
     watch: list[str] = []
@@ -2288,7 +2617,12 @@ def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str, target_da
             missing.append(f"• {sym} — немає даних")
             continue
 
-        bucket, line = _brief_verdict(sym, _brief_symbol_context(item), post_news_active=post_news_active)
+        bucket, line = _brief_verdict(
+            sym,
+            _brief_symbol_context(item),
+            post_news_active=post_news_active,
+            macro_unknown=macro_unknown,
+        )
         if bucket == "WATCH":
             watch.append(line)
         elif bucket == "OBSERVE":
@@ -2316,6 +2650,42 @@ def _build_tpo_snapshot_section(tpo: dict[str, Any], report_type: str, target_da
 
     return section
 
+
+
+def _build_session_scope_section(tpo: dict[str, Any], report_type: str) -> BriefingSection:
+    section = BriefingSection("🎯 Фокус звіту")
+    normalized = _normalize_report_type(report_type)
+    scope = list(_symbol_scope_for_report(normalized))
+    section.lines.append(_scope_label_for_report(normalized))
+    section.lines.append(f"У фокусі: {', '.join(scope)}")
+
+    symbols = tpo.get("symbols") if isinstance(tpo, dict) else {}
+    symbols = symbols if isinstance(symbols, dict) else {}
+    outside_active: list[str] = []
+    outside_degraded: list[str] = []
+
+    for sym in _sort_symbols_by_scope([str(x).upper() for x in symbols.keys()], "global"):
+        if sym in scope:
+            continue
+        item = symbols.get(sym)
+        if not isinstance(item, dict):
+            continue
+        data = _brief_symbol_context(item)
+        status = str(data.get("market_status") or "").upper()
+        if status == "OPEN":
+            outside_active.append(sym)
+        elif status in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"}:
+            outside_degraded.append(f"{sym}:{status}")
+
+    if outside_active:
+        section.lines.append(f"Поза фокусом, але активні: {', '.join(outside_active[:8])}")
+    if outside_degraded:
+        section.lines.append(f"Поза фокусом з data issue: {', '.join(outside_degraded[:5])}")
+
+    if not outside_active and not outside_degraded:
+        section.lines.append("Поза фокусом немає важливих active/data-warning символів.")
+
+    return section
 
 def _build_provider_section(tpo: dict[str, Any]) -> BriefingSection:
     section = BriefingSection("🧯 Дані")
@@ -2410,6 +2780,8 @@ def build_briefing_report(
             "signal_outcomes_path": str(_signal_outcomes_path()),
             "high_impact_events_path": str(_high_impact_events_path()),
             "economic_calendar_cache_path": str(_economic_calendar_cache_path(target_date)),
+            "manual_high_impact_events_path": str(_manual_high_impact_events_path()),
+            "last_good_high_impact_events_path": str(_last_good_high_impact_events_path()),
             "economic_calendar_provider": os.getenv("ECONOMIC_CALENDAR_PROVIDER", "finnhub"),
             "economic_calendar_enabled": os.getenv("ENABLE_ECONOMIC_CALENDAR", "true"),
             "tpo_updated_at_utc": tpo.get("updated_at_utc") if isinstance(tpo, dict) else None,
@@ -2418,6 +2790,7 @@ def build_briefing_report(
     )
 
     report.sections.append(_build_high_impact_section(target_date, tz_name, normalized_type))
+    report.sections.append(_build_session_scope_section(tpo, normalized_type))
 
     post_news_section = _build_post_news_reaction_section(tpo, target_date, tz_name, normalized_type)
     if post_news_section is not None:
@@ -2431,9 +2804,7 @@ def build_briefing_report(
 
     # Provider details remain available in JSON artifacts. Telegram stays operational and concise.
     provider_section = _build_provider_section(tpo)
-    if any(line.startswith("Помилок: ") and not line.endswith("0") for line in provider_section.lines) or any(
-        line.startswith("Fallback-режимів: ") and not line.endswith("0") for line in provider_section.lines
-    ):
+    if provider_section.lines and provider_section.lines != ["Критичних проблем з даними немає."]:
         report.sections.append(provider_section)
 
     report.sections.append(_build_focus_section(normalized_type))
