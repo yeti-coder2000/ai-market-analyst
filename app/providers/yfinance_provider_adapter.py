@@ -34,6 +34,9 @@ class YFinanceResponseError(YFinanceAdapterError):
     """Raised when yfinance returns no usable OHLC data."""
 
 
+YFINANCE_PROVIDER_ADAPTER_VERSION = "yfinance-provider-adapter-v1.1-intraday-period-symbol-fallback"
+
+
 @dataclass(frozen=True, slots=True)
 class YFinanceAdapterConfig:
     debug: bool = True
@@ -56,6 +59,19 @@ class YFinanceProviderAdapter:
         Instrument.UKOIL: "BZ=F",
     }
 
+    # Extra fallback tickers for symbols that are known to be unstable on Yahoo
+    # for long intraday windows. The first item remains the canonical primary.
+    SYMBOL_FALLBACK_MAP: dict[Instrument, tuple[str, ...]] = {
+        Instrument.GER40: ("^GDAXI", "EXS1.DE", "DAX"),
+    }
+
+    # Yahoo intraday history can rate-limit or return empty frames for long
+    # periods. Try shorter periods before marking the symbol as stale.
+    INTRADAY_PERIOD_FALLBACKS: dict[str, tuple[str, ...]] = {
+        "15m": ("60d", "30d", "10d", "7d", "5d"),
+        "30m": ("60d", "30d", "10d", "7d", "5d"),
+    }
+
     # yfinance has no native 4h interval, so H4 is built from 1h bars.
     TIMEFRAME_MAP: dict[Timeframe, tuple[str, str, bool]] = {
         Timeframe.M15: ("15m", "60d", False),
@@ -69,7 +85,8 @@ class YFinanceProviderAdapter:
         self.config = config or YFinanceAdapterConfig()
 
     def fetch_time_series(self, request: FetchRequest) -> dict[str, Any]:
-        provider_symbol = self._map_symbol(request.instrument)
+        provider_symbols = self._map_symbol_candidates(request.instrument)
+        provider_symbol = provider_symbols[0]
         provider_interval, provider_period, needs_h4_resample = self._map_timeframe(
             request.timeframe
         )
@@ -78,14 +95,20 @@ class YFinanceProviderAdapter:
             f"[DEBUG] YF request "
             f"internal_symbol={request.instrument.value} provider_symbol={provider_symbol} "
             f"internal_tf={request.timeframe.value} provider_interval={provider_interval} "
-            f"period={provider_period}"
+            f"period={provider_period} symbol_candidates={provider_symbols}"
         )
 
-        df = self._download_history(
-            provider_symbol=provider_symbol,
+        download_result = self._download_history_with_fallback(
+            provider_symbols=provider_symbols,
             provider_interval=provider_interval,
             provider_period=provider_period,
         )
+        df = download_result["df"]
+        provider_symbol = str(download_result["provider_symbol"])
+        provider_period = str(download_result["provider_period"])
+        provider_fallback_used = bool(download_result["provider_fallback_used"])
+        provider_period_candidates = tuple(download_result["provider_period_candidates"])
+        provider_download_attempts = list(download_result["download_attempts"])
 
         if needs_h4_resample:
             df = self._resample_to_h4(df)
@@ -108,9 +131,15 @@ class YFinanceProviderAdapter:
             "requested_internal_timeframe": request.timeframe.value,
             "requested_outputsize": request.outputsize,
             "provider": "yfinance",
+            "provider_adapter_version": YFINANCE_PROVIDER_ADAPTER_VERSION,
             "provider_symbol": provider_symbol,
             "provider_interval": provider_interval,
             "provider_period": provider_period,
+            "provider_requested_symbol": provider_symbols[0],
+            "provider_symbol_candidates": list(provider_symbols),
+            "provider_period_candidates": list(provider_period_candidates),
+            "provider_fallback_used": provider_fallback_used,
+            "provider_download_attempts": provider_download_attempts,
             "provider_resampled_to": "4h" if needs_h4_resample else None,
             "exchange": None,
             "type": "Index/Commodity",
