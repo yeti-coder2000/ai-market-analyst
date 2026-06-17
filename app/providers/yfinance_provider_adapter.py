@@ -172,6 +172,94 @@ class YFinanceProviderAdapter:
                 f"No yfinance timeframe mapping for {timeframe.value}"
             ) from error
 
+    def _map_symbol_candidates(self, instrument: Instrument) -> tuple[str, ...]:
+        primary = self._map_symbol(instrument)
+        configured = self.SYMBOL_FALLBACK_MAP.get(instrument)
+        if not configured:
+            return (primary,)
+        return tuple(dict.fromkeys((primary, *configured)))
+
+    def _period_candidates(self, *, provider_interval: str, provider_period: str) -> tuple[str, ...]:
+        configured = self.INTRADAY_PERIOD_FALLBACKS.get(provider_interval)
+        if not configured:
+            return (provider_period,)
+        return tuple(dict.fromkeys((provider_period, *configured)))
+
+    def _download_history_with_fallback(
+        self,
+        *,
+        provider_symbols: tuple[str, ...],
+        provider_interval: str,
+        provider_period: str,
+    ) -> dict[str, Any]:
+        period_candidates = self._period_candidates(
+            provider_interval=provider_interval,
+            provider_period=provider_period,
+        )
+
+        attempts: list[dict[str, Any]] = []
+        last_error: Exception | None = None
+
+        for symbol in provider_symbols:
+            for period in period_candidates:
+                attempt = {
+                    "provider_symbol": symbol,
+                    "provider_interval": provider_interval,
+                    "provider_period": period,
+                    "rows": 0,
+                    "error_type": None,
+                    "error": None,
+                }
+
+                try:
+                    df = self._download_history(
+                        provider_symbol=symbol,
+                        provider_interval=provider_interval,
+                        provider_period=period,
+                    )
+                    normalized = self._normalize_dataframe(df)
+                    rows = int(len(normalized))
+                    attempt["rows"] = rows
+
+                    if rows > 0:
+                        attempts.append(attempt)
+                        fallback_used = symbol != provider_symbols[0] or period != provider_period
+                        return {
+                            "df": df,
+                            "provider_symbol": symbol,
+                            "provider_period": period,
+                            "provider_fallback_used": fallback_used,
+                            "provider_period_candidates": period_candidates,
+                            "download_attempts": attempts,
+                        }
+
+                    attempt["error_type"] = "EMPTY_AFTER_NORMALIZATION"
+                    attempt["error"] = "yfinance returned no usable OHLC rows after normalization"
+
+                except Exception as exc:
+                    last_error = exc
+                    attempt["error_type"] = type(exc).__name__
+                    attempt["error"] = str(exc)[:500]
+
+                attempts.append(attempt)
+
+        summary = "; ".join(
+            f"{x.get('provider_symbol')} {x.get('provider_interval')} {x.get('provider_period')} "
+            f"rows={x.get('rows')} error={x.get('error_type')}"
+            for x in attempts
+        )
+
+        message = (
+            "No usable yfinance OHLC data after fallback attempts. "
+            f"interval={provider_interval}; attempts={summary}"
+        )
+
+        if last_error is not None:
+            raise YFinanceResponseError(message) from last_error
+
+        raise YFinanceResponseError(message)
+
+
     def _download_history(
         self,
         *,
