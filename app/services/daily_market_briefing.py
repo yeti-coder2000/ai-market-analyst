@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.12-macro-fallback-post-open-reaction"
+BRIEFING_VERSION = "daily-market-briefing-v1.13-cli-no-write-dry-run"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -1140,10 +1140,7 @@ def _load_last_good_calendar_events(target_date: date) -> tuple[list[dict[str, A
             normalized["source"] = "last_good_cache"
             events.append(normalized)
 
-    deduped = _dedupe_calendar_events(events)
-    if not deduped:
-        return [], None
-    return deduped, str(path)
+    return _dedupe_calendar_events(events), str(path)
 
 
 def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
@@ -2861,7 +2858,22 @@ def main() -> int:
     parser.add_argument("--date", default=os.getenv("REPORT_DATE"))
     parser.add_argument("--timezone", default=os.getenv("REPORT_TIMEZONE", DEFAULT_TIMEZONE))
     parser.add_argument("--print", dest="print_report", action="store_true")
-    parser.add_argument("--write", action="store_true", default=True)
+
+    write_group = parser.add_mutually_exclusive_group()
+    write_group.add_argument(
+        "--write",
+        dest="write",
+        action="store_true",
+        help="Write briefing JSON/text artifacts to the runtime reports directory. This is the default.",
+    )
+    write_group.add_argument(
+        "--no-write",
+        dest="write",
+        action="store_false",
+        help="Dry-run mode: build the report but do not write runtime artifacts.",
+    )
+    parser.set_defaults(write=True)
+
     args = parser.parse_args()
 
     report = build_briefing_report(report_type=args.type, report_date=args.date, timezone_name=args.timezone)
@@ -2869,6 +2881,19 @@ def main() -> int:
     if args.write:
         json_path, txt_path = write_briefing_artifacts(report)
         print(json.dumps({"json": str(json_path), "text": str(txt_path)}, ensure_ascii=False, indent=2))
+    elif not args.print_report:
+        print(
+            json.dumps(
+                {
+                    "json": None,
+                    "text": None,
+                    "write": False,
+                    "note": "--no-write used; no runtime artifacts were written.",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
 
     if args.print_report:
         print(render_briefing_text(report))
