@@ -15,7 +15,7 @@ from app.services.telegram_formatter import format_signal_message
 
 logger = logging.getLogger(__name__)
 
-TELEGRAM_NOTIFIER_VERSION = "telegram-notifier-v1.7-battle-telemetry-safety-fields"
+TELEGRAM_NOTIFIER_VERSION = "telegram-notifier-v1.8-telemetry-runtime-version-forwarding"
 
 
 # =============================================================================
@@ -443,6 +443,10 @@ def _copy_metadata_aliases(normalized: Dict[str, Any]) -> None:
         "battle_gate_v2_blockers",
         "battle_gate_v2_reasons",
         "battle_permission_version",
+        "runner_version",
+        "stateful_runner_version",
+        "telegram_notifier_version",
+        "source_component_version",
     )
 
     for key in aliases:
@@ -492,6 +496,10 @@ def _copy_battle_telemetry_aliases(normalized: Dict[str, Any]) -> None:
     set_if_missing("battle_permission_blockers")
     set_if_missing("battle_permission_reasons")
     set_if_missing("battle_permission_version")
+    set_if_missing("runner_version")
+    set_if_missing("stateful_runner_version")
+    set_if_missing("telegram_notifier_version")
+    set_if_missing("source_component_version")
     set_if_missing("battle_gate_v2_decision")
     set_if_missing("battle_gate_v2_risk_mode")
     set_if_missing("battle_gate_v2_modifiers")
@@ -826,6 +834,49 @@ def _build_battle_safety_lines(payload: Dict[str, Any]) -> list[str]:
     return lines
 
 
+def _inject_telemetry_runtime_versions(normalized: Dict[str, Any]) -> None:
+    """
+    Add runtime/component version fields before Battle telemetry is written.
+
+    Upstream runners may not always pass runner_version. In that case we keep
+    telemetry non-empty by using the notifier version as a clear component
+    fallback, while still allowing real runner_version/stateful_runner_version
+    to override it when present.
+    """
+    metadata = normalized.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+        normalized["metadata"] = metadata
+
+    if not _is_present(normalized.get("telegram_notifier_version")):
+        normalized["telegram_notifier_version"] = TELEGRAM_NOTIFIER_VERSION
+
+    if not _is_present(metadata.get("telegram_notifier_version")):
+        metadata["telegram_notifier_version"] = TELEGRAM_NOTIFIER_VERSION
+
+    if not _is_present(normalized.get("source_component_version")):
+        normalized["source_component_version"] = TELEGRAM_NOTIFIER_VERSION
+
+    if not _is_present(metadata.get("source_component_version")):
+        metadata["source_component_version"] = TELEGRAM_NOTIFIER_VERSION
+
+    runner_version = _first_present(
+        normalized.get("runner_version"),
+        normalized.get("stateful_runner_version"),
+        metadata.get("runner_version"),
+        metadata.get("stateful_runner_version"),
+        os.getenv("AI_MARKET_ANALYST_RUNNER_VERSION"),
+        os.getenv("STATEFUL_RUNNER_VERSION"),
+        os.getenv("RUNNER_VERSION"),
+        os.getenv("APP_RUNNER_VERSION"),
+        TELEGRAM_NOTIFIER_VERSION,
+    )
+
+    if _is_present(runner_version):
+        normalized["runner_version"] = runner_version
+        if not _is_present(metadata.get("runner_version")):
+            metadata["runner_version"] = runner_version
+
 def _record_battle_permission_event_enriched(
     payload: Dict[str, Any],
     *,
@@ -836,6 +887,7 @@ def _record_battle_permission_event_enriched(
     """Write Battle telemetry with root-level safety/TPO aliases populated."""
     telemetry_payload = _normalize_alert_payload(dict(payload))
     _copy_battle_telemetry_aliases(telemetry_payload)
+    _inject_telemetry_runtime_versions(telemetry_payload)
     record_battle_permission_event(
         telemetry_payload,
         source=source,
