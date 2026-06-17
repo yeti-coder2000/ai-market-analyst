@@ -11,7 +11,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-TELEMETRY_SCHEMA_VERSION = "battle-permission-telemetry-v3.1-macro-ttl-fields"
+TELEMETRY_SCHEMA_VERSION = "battle-permission-telemetry-v3.2-runner-version-market-context"
 
 
 # =============================================================================
@@ -194,6 +194,104 @@ def _payload_get(payload: dict[str, Any], *paths: str) -> Any:
     return None
 
 
+def _extract_runner_version(payload: dict[str, Any], metadata: dict[str, Any], context: dict[str, Any]) -> str:
+    """
+    Return a stable runner version for telemetry.
+
+    Older telemetry v3.1 did not persist runner_version even when the runner
+    supplied it in the payload/metadata. v3.2 makes this field mandatory for
+    live audits, falling back to an explicit UNKNOWN marker instead of None.
+    """
+    value = _first_non_empty(
+        payload.get("runner_version"),
+        metadata.get("runner_version"),
+        context.get("runner_version"),
+        payload.get("stateful_runner_version"),
+        metadata.get("stateful_runner_version"),
+        context.get("stateful_runner_version"),
+        payload.get("worker_version"),
+        metadata.get("worker_version"),
+        context.get("worker_version"),
+        os.getenv("RUNNER_VERSION"),
+        os.getenv("AI_MARKET_ANALYST_RUNNER_VERSION"),
+    )
+
+    if value in (None, "", [], {}):
+        return "UNKNOWN_RUNNER_VERSION"
+
+    text = str(value).strip()
+    return text if text else "UNKNOWN_RUNNER_VERSION"
+
+
+def _extract_decision(payload: dict[str, Any], metadata: dict[str, Any], context: dict[str, Any]) -> Any:
+    """
+    Normalize the final decision field.
+
+    The project has used several names over time. Keeping a top-level
+    `decision` makes telemetry easier to audit while preserving the original
+    battle_gate_v2_decision field below.
+    """
+    return _first_non_empty(
+        payload.get("decision"),
+        metadata.get("decision"),
+        context.get("decision"),
+        payload.get("battle_decision"),
+        metadata.get("battle_decision"),
+        context.get("battle_decision"),
+        payload.get("battle_gate_v2_decision"),
+        metadata.get("battle_gate_v2_decision"),
+        context.get("battle_gate_v2_decision"),
+        payload.get("battle_permission_decision"),
+        metadata.get("battle_permission_decision"),
+        context.get("battle_permission_decision"),
+    )
+
+
+def _extract_market_status_override(payload: dict[str, Any], metadata: dict[str, Any], context: dict[str, Any]) -> Any:
+    """
+    Preserve market-status guard diagnostics.
+
+    This is especially useful for NY assets where stale top-level state may say
+    MARKET_CLOSED while fresh session/TPO context says the market is active.
+    """
+    return _first_non_empty(
+        context.get("market_status_override"),
+        payload.get("market_status_override"),
+        metadata.get("market_status_override"),
+        context.get("tpo_market_status_override"),
+        payload.get("tpo_market_status_override"),
+        metadata.get("tpo_market_status_override"),
+    )
+
+
+def _extract_original_market_status(payload: dict[str, Any], metadata: dict[str, Any], context: dict[str, Any]) -> Any:
+    return _first_non_empty(
+        context.get("original_market_status"),
+        payload.get("original_market_status"),
+        metadata.get("original_market_status"),
+        context.get("market_status_original"),
+        payload.get("market_status_original"),
+        metadata.get("market_status_original"),
+        context.get("market_status_before_override"),
+        payload.get("market_status_before_override"),
+        metadata.get("market_status_before_override"),
+    )
+
+
+def _extract_original_tpo_permission(payload: dict[str, Any], metadata: dict[str, Any], context: dict[str, Any]) -> Any:
+    return _first_non_empty(
+        context.get("original_tpo_signal_permission"),
+        payload.get("original_tpo_signal_permission"),
+        metadata.get("original_tpo_signal_permission"),
+        context.get("tpo_signal_permission_original"),
+        payload.get("tpo_signal_permission_original"),
+        metadata.get("tpo_signal_permission_original"),
+        context.get("tpo_signal_permission_before_override"),
+        payload.get("tpo_signal_permission_before_override"),
+        metadata.get("tpo_signal_permission_before_override"),
+    )
+
+
 def _merge_non_empty_dicts(*values: Any) -> dict[str, Any]:
     """
     Merge dictionaries from left to right, but ignore empty override values.
@@ -340,11 +438,19 @@ def _extract_rr(payload: dict[str, Any], execution: dict[str, Any]) -> float | N
     return _safe_float(
         _first_non_empty(
             payload.get("risk_reward_ratio"),
+            payload.get("practical_rr"),
             payload.get("rr"),
+            payload.get("rr_ratio"),
             payload.get("risk_reward"),
+            payload.get("expected_rr"),
+            payload.get("planned_rr"),
             execution.get("risk_reward_ratio"),
+            execution.get("practical_rr"),
             execution.get("rr"),
+            execution.get("rr_ratio"),
             execution.get("risk_reward"),
+            execution.get("expected_rr"),
+            execution.get("planned_rr"),
         )
     )
 
@@ -366,6 +472,12 @@ def _extract_practical_rr(payload: dict[str, Any], execution: dict[str, Any]) ->
             execution.get("practical_rr"),
             payload.get("risk_reward_ratio"),
             execution.get("risk_reward_ratio"),
+            payload.get("rr"),
+            execution.get("rr"),
+            payload.get("rr_ratio"),
+            execution.get("rr_ratio"),
+            payload.get("risk_reward"),
+            execution.get("risk_reward"),
         )
     )
 
@@ -457,6 +569,12 @@ def build_battle_permission_event(
     execution = _payload_execution(payload)
     context = _collect_context_sources(payload)
 
+    runner_version = _extract_runner_version(payload, metadata, context)
+    decision = _extract_decision(payload, metadata, context)
+    market_status_override = _extract_market_status_override(payload, metadata, context)
+    original_market_status = _extract_original_market_status(payload, metadata, context)
+    original_tpo_signal_permission = _extract_original_tpo_permission(payload, metadata, context)
+
     entry = _extract_entry(payload, execution)
     stop = _extract_stop(payload, execution)
     target = _extract_target(payload, execution)
@@ -530,8 +648,12 @@ def build_battle_permission_event(
         "event_type": "battle_permission_evaluated",
         "ts_utc": datetime.now(timezone.utc).isoformat(),
         "source": source,
+        "runner_version": runner_version,
         "sent_to_telegram": sent_to_telegram,
         "note": note,
+
+        # Normalized audit aliases.
+        "decision": decision,
 
         # Signal identity.
         "symbol": payload.get("symbol"),
@@ -754,11 +876,19 @@ def build_battle_permission_event(
             payload.get("market_status"),
             metadata.get("market_status"),
         ),
+        "market_status_override": market_status_override,
+        "original_market_status": original_market_status,
+        "market_status_original": original_market_status,
         "tpo_signal_permission": _first_non_empty(
             context.get("tpo_signal_permission"),
+            context.get("permission"),
             payload.get("tpo_signal_permission"),
+            payload.get("permission"),
             metadata.get("tpo_signal_permission"),
+            metadata.get("permission"),
         ),
+        "original_tpo_signal_permission": original_tpo_signal_permission,
+        "tpo_signal_permission_original": original_tpo_signal_permission,
         "tpo_telegram_modifier": _first_non_empty(
             context.get("tpo_telegram_modifier"),
             context.get("telegram_modifier"),
