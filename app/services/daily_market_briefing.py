@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.14-no-write-no-cache-side-effects"
+BRIEFING_VERSION = "daily-market-briefing-v1.15-ny-false-market-closed-report-guard"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -2346,6 +2346,14 @@ def _brief_verdict(
     subtype = _auction_subtype(sym, data, post_news_active=post_news_active, macro_unknown=macro_unknown)
     bias = _bias_without_trade(sym, data, post_news_active=post_news_active, macro_unknown=macro_unknown)
 
+    activity = data.get("first_hour_activity") if isinstance(data.get("first_hour_activity"), dict) else {}
+    open_context = str(data.get("open_context") or "").upper()
+    has_operational_context = bool(
+        activity
+        or open_behavior not in {"", "-", "UNKNOWN"}
+        or open_context not in {"", "-", "UNKNOWN"}
+    )
+
     zone_text = f" | зона: {zone}" if zone != "-" else ""
     bias_text = f" | bias: {bias}"
     subtype_text = f"{subtype}"
@@ -2354,11 +2362,18 @@ def _brief_verdict(
     if data.get("fallback") or market_status in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"} or permission in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"}:
         return "NO_TRADE", f"• {sym} — {subtype_text} | {market_status}{zone_text}{bias_text}"
 
-    # False closed guard: if fresh auction context says OPEN, keep the report operational.
+    # In NY reports, macro-unknown is the blocker. Do not let stale top-level
+    # MARKET_CLOSED labels hide valid post-open/auction context for indices/oil.
+    if macro_unknown and has_operational_context:
+        detail = f"{subtype_text}{zone_text}{bias_text} | no Battle without external calendar check"
+        return "NO_TRADE", f"• {sym} — {detail}"
+
+    # False closed guard: if fresh or operational auction context exists, keep the report
+    # operational instead of printing stale MARKET_CLOSED in the NY +1h report.
     if market_status.startswith("MARKET_CLOSED") or permission == "MARKET_CLOSED":
-        if context_open and clean_data:
-            guarded_behavior = open_behavior if open_behavior not in {"UNKNOWN", "-"} else "OPEN"
-            return "OBSERVE", f"• {sym} — {guarded_behavior} | статус OPEN у TPO context, ігноруємо stale MARKET_CLOSED{bias_text}"
+        if clean_data and (context_open or ((post_news_active or macro_unknown) and has_operational_context)):
+            guarded_behavior = open_behavior if open_behavior not in {"UNKNOWN", "-"} else "UNCONFIRMED"
+            return "OBSERVE", f"• {sym} — {guarded_behavior} | stale MARKET_CLOSED ignored; wait retest/acceptance{bias_text}"
         return "NO_TRADE", f"• {sym} — MARKET_CLOSED"
 
     if macro_unknown and open_behavior in {"OPEN_AUCTION", "UNCONFIRMED", "UNKNOWN"}:
