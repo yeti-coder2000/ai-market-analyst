@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.13-cli-no-write-dry-run"
+BRIEFING_VERSION = "daily-market-briefing-v1.14-no-write-no-cache-side-effects"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -416,6 +416,23 @@ def _safe_read_json(path: Path, default: Any) -> Any:
     except Exception:
         return default
 
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _runtime_writes_disabled() -> bool:
+    return _env_bool("BRIEFING_DISABLE_RUNTIME_WRITES", False)
+
+
+def _macro_cache_writes_enabled() -> bool:
+    if _runtime_writes_disabled():
+        return False
+    return _env_bool("ENABLE_MACRO_CACHE_WRITES", True)
 
 def _safe_write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -986,10 +1003,11 @@ def _fetch_finnhub_calendar(target_date: date) -> CalendarLoadResult:
         "events": normalized,
         "raw_count": len(raw_events),
     }
-    try:
-        _safe_write_json(cache_path, cache_payload)
-    except Exception:
-        pass
+    if _macro_cache_writes_enabled():
+        try:
+            _safe_write_json(cache_path, cache_payload)
+        except Exception:
+            pass
 
     return CalendarLoadResult(
         status=status,
@@ -1099,6 +1117,8 @@ def _load_static_calendar_events(target_date: date) -> list[dict[str, Any]]:
 
 def _write_last_good_calendar_cache(target_date: date, events: list[dict[str, Any]], *, source: str) -> None:
     if not events:
+        return
+    if not _macro_cache_writes_enabled():
         return
 
     payload = {
@@ -2870,13 +2890,23 @@ def main() -> int:
         "--no-write",
         dest="write",
         action="store_false",
-        help="Dry-run mode: build the report but do not write runtime artifacts.",
+        help="Dry-run mode: build the report without writing runtime artifacts or macro caches.",
     )
     parser.set_defaults(write=True)
 
     args = parser.parse_args()
 
-    report = build_briefing_report(report_type=args.type, report_date=args.date, timezone_name=args.timezone)
+    previous_disable_runtime_writes = os.environ.get("BRIEFING_DISABLE_RUNTIME_WRITES")
+    if not args.write:
+        os.environ["BRIEFING_DISABLE_RUNTIME_WRITES"] = "1"
+    try:
+        report = build_briefing_report(report_type=args.type, report_date=args.date, timezone_name=args.timezone)
+    finally:
+        if not args.write:
+            if previous_disable_runtime_writes is None:
+                os.environ.pop("BRIEFING_DISABLE_RUNTIME_WRITES", None)
+            else:
+                os.environ["BRIEFING_DISABLE_RUNTIME_WRITES"] = previous_disable_runtime_writes
 
     if args.write:
         json_path, txt_path = write_briefing_artifacts(report)
@@ -2888,7 +2918,7 @@ def main() -> int:
                     "json": None,
                     "text": None,
                     "write": False,
-                    "note": "--no-write used; no runtime artifacts were written.",
+                    "note": "--no-write used; no runtime artifacts or macro caches were written.",
                 },
                 ensure_ascii=False,
                 indent=2,
