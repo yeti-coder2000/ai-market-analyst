@@ -20,7 +20,7 @@ BATTLE_PERMISSION_TELEMETRY_PATH = TELEMETRY_DIR / "battle_permission_events.ndj
 SIGNALS_FLAT_JSON_PATH = STATS_DIR / "signals_flat.json"
 DAILY_SUMMARY_PATH = STATS_DIR / "daily_summary.json"
 
-EXPORTER_VERSION = "lightweight-statistics-exporter-v2.2-tpo-open-behavior-battle-gate-v2"
+EXPORTER_VERSION = "lightweight-statistics-exporter-v2.3-battle-telemetry-v32-aliases"
 
 
 FINAL_OUTCOMES = {
@@ -639,39 +639,128 @@ def extract_tpo_fields_from_item(item: dict[str, Any]) -> dict[str, Any]:
 def extract_battle_gate_v2_fields_from_item(item: dict[str, Any]) -> dict[str, Any]:
     candidates = collect_nested_candidates(item)
 
-    return {
-        "battle_gate_v2_decision": first_non_empty(
-            pick_from_candidates(candidates, "battle_gate_v2_decision", "v2_decision", "decision")
-        ),
-        "battle_gate_v2_risk_mode": first_non_empty(
-            pick_from_candidates(candidates, "battle_gate_v2_risk_mode", "v2_risk_mode", "risk_mode")
-        ),
-        "battle_gate_v2_battle_allowed": safe_optional_bool(
-            pick_from_candidates(candidates, "battle_gate_v2_battle_allowed", "v2_battle_allowed", "battle_allowed")
-        ),
-        "battle_gate_v2_should_suppress_telegram": safe_optional_bool(
+    decision = first_non_empty(
+        pick_from_candidates(
+            candidates,
+            "battle_gate_v2_decision",
+            "battle_gate_decision",
+            "battle_decision",
+            "permission_decision",
+            "gate_decision",
+            "v2_decision",
+            "decision",
+        )
+    )
+
+    risk_mode = first_non_empty(
+        pick_from_candidates(
+            candidates,
+            "battle_gate_v2_risk_mode",
+            "battle_gate_risk_mode",
+            "battle_risk_mode",
+            "permission_risk_mode",
+            "gate_risk_mode",
+            "v2_risk_mode",
+            "risk_mode",
+        )
+    )
+
+    battle_allowed_raw = pick_from_candidates(
+        candidates,
+        "battle_gate_v2_battle_allowed",
+        "battle_gate_v2_allowed",
+        "battle_gate_allowed",
+        "battle_allowed",
+        "allowed_to_battle",
+        "v2_battle_allowed",
+        "v2_allowed",
+        "allowed",
+    )
+
+    suppress_raw = pick_from_candidates(
+        candidates,
+        "battle_gate_v2_should_suppress_telegram",
+        "battle_gate_v2_suppress",
+        "battle_gate_suppress",
+        "should_suppress_telegram",
+        "suppress_telegram",
+        "telegram_suppressed",
+        "v2_should_suppress_telegram",
+        "v2_suppress",
+        "suppress",
+    )
+
+    reasons = normalize_list(
+        first_non_empty(
             pick_from_candidates(
                 candidates,
-                "battle_gate_v2_should_suppress_telegram",
-                "v2_should_suppress_telegram",
-                "should_suppress_telegram",
-            )
-        ),
+                "battle_gate_v2_reasons",
+                "battle_gate_reasons",
+                "battle_permission_reasons",
+                "permission_reasons",
+                "v2_reasons",
+                "reasons",
+            ),
+            [],
+        )
+    )
+
+    blockers = normalize_list(
+        first_non_empty(
+            pick_from_candidates(
+                candidates,
+                "battle_gate_v2_blockers",
+                "battle_gate_blockers",
+                "battle_permission_blockers",
+                "permission_blockers",
+                "v2_blockers",
+                "blockers",
+            ),
+            [],
+        )
+    )
+
+    modifiers = normalize_list(
+        first_non_empty(
+            pick_from_candidates(
+                candidates,
+                "battle_gate_v2_modifiers",
+                "battle_gate_modifiers",
+                "battle_permission_modifiers",
+                "permission_modifiers",
+                "v2_modifiers",
+                "modifiers",
+            ),
+            [],
+        )
+    )
+
+    return {
+        "battle_gate_v2_decision": decision,
+        "battle_gate_v2_risk_mode": risk_mode,
+        "battle_gate_v2_battle_allowed": safe_optional_bool(battle_allowed_raw),
+        "battle_gate_v2_should_suppress_telegram": safe_optional_bool(suppress_raw),
         "battle_gate_v2_score_delta": safe_float(
-            pick_from_candidates(candidates, "battle_gate_v2_score_delta", "v2_score_delta", "score_delta"),
+            pick_from_candidates(
+                candidates,
+                "battle_gate_v2_score_delta",
+                "battle_gate_score_delta",
+                "v2_score_delta",
+                "score_delta",
+            ),
             None,
         ),
-        "battle_gate_v2_reasons": normalize_list(
-            pick_from_candidates(candidates, "battle_gate_v2_reasons", "v2_reasons", "reasons")
-        ),
-        "battle_gate_v2_blockers": normalize_list(
-            pick_from_candidates(candidates, "battle_gate_v2_blockers", "v2_blockers", "blockers")
-        ),
-        "battle_gate_v2_modifiers": normalize_list(
-            pick_from_candidates(candidates, "battle_gate_v2_modifiers", "v2_modifiers", "modifiers")
-        ),
+        "battle_gate_v2_reasons": reasons,
+        "battle_gate_v2_blockers": blockers,
+        "battle_gate_v2_modifiers": modifiers,
         "battle_gate_v2_error": first_non_empty(
-            pick_from_candidates(candidates, "battle_gate_v2_error", "v2_error", "error")
+            pick_from_candidates(
+                candidates,
+                "battle_gate_v2_error",
+                "battle_gate_error",
+                "v2_error",
+                "error",
+            )
         ),
     }
 
@@ -691,11 +780,12 @@ def extract_battle_fields(
     """
     Return battle permission fields for a flat signal.
 
-    - If a battle telemetry event exists, use it as source of truth.
-    - If no battle event exists, classify the signal as PRE_BATTLE_GATE / LEGACY.
-      This prevents mixing old Telegram alerts with the new Battle Gate era.
-    - TPO/Open Behavior/Battle Gate v2 fields are extracted from both the signal
-      record and the telemetry event with broad backward-compatible aliases.
+    v2.3:
+    - battle telemetry v3.2 root fields are treated as first-class inputs;
+    - risk_mode / decision / suppress / blockers aliases are normalized into
+      battle_gate_v2_* fields;
+    - timing and market-status guard diagnostics can be copied from telemetry
+      into flat records for later grouped metrics.
     """
     tpo_fields = extract_tpo_fields_from_item(item)
     v2_fields = extract_battle_gate_v2_fields_from_item(item)
@@ -710,6 +800,7 @@ def extract_battle_fields(
         blockers = normalize_list(
             first_non_empty(
                 battle_event.get("battle_permission_blockers"),
+                battle_event.get("battle_gate_v2_blockers"),
                 battle_event.get("blockers"),
                 v2_fields.get("battle_gate_v2_blockers"),
             )
@@ -717,6 +808,7 @@ def extract_battle_fields(
         reasons = normalize_list(
             first_non_empty(
                 battle_event.get("battle_permission_reasons"),
+                battle_event.get("battle_gate_v2_reasons"),
                 battle_event.get("reasons"),
                 v2_fields.get("battle_gate_v2_reasons"),
             )
@@ -724,23 +816,70 @@ def extract_battle_fields(
         modifiers = normalize_list(
             first_non_empty(
                 battle_event.get("battle_permission_modifiers"),
+                battle_event.get("battle_gate_v2_modifiers"),
                 battle_event.get("modifiers"),
                 v2_fields.get("battle_gate_v2_modifiers"),
             )
         )
 
+        battle_allowed = safe_optional_bool(
+            first_non_empty(
+                battle_event.get("battle_gate_v2_battle_allowed"),
+                battle_event.get("battle_gate_v2_allowed"),
+                battle_event.get("battle_allowed"),
+                v2_fields.get("battle_gate_v2_battle_allowed"),
+            )
+        )
+        suppress_telegram = safe_optional_bool(
+            first_non_empty(
+                battle_event.get("battle_gate_v2_should_suppress_telegram"),
+                battle_event.get("battle_gate_v2_suppress"),
+                battle_event.get("suppress"),
+                v2_fields.get("battle_gate_v2_should_suppress_telegram"),
+            )
+        )
+
+        # Keep explicit v2 fields populated even if the event used shorter v3.2
+        # root aliases such as "decision" and "risk_mode".
+        v2_fields["battle_gate_v2_decision"] = first_non_empty(
+            v2_fields.get("battle_gate_v2_decision"),
+            battle_event.get("decision"),
+            battle_event.get("battle_gate_v2_decision"),
+        )
+        v2_fields["battle_gate_v2_risk_mode"] = first_non_empty(
+            v2_fields.get("battle_gate_v2_risk_mode"),
+            battle_event.get("risk_mode"),
+            battle_event.get("battle_gate_v2_risk_mode"),
+        )
+        v2_fields["battle_gate_v2_battle_allowed"] = battle_allowed
+        v2_fields["battle_gate_v2_should_suppress_telegram"] = suppress_telegram
+        v2_fields["battle_gate_v2_blockers"] = blockers
+        v2_fields["battle_gate_v2_reasons"] = reasons
+        v2_fields["battle_gate_v2_modifiers"] = modifiers
+
         return {
             "battle_permission": first_non_empty(
                 battle_event.get("battle_permission"),
                 battle_event.get("permission"),
+                battle_event.get("decision"),
+                v2_fields.get("battle_gate_v2_decision"),
                 "UNKNOWN",
             ),
             "telegram_delivery_mode": first_non_empty(
                 battle_event.get("telegram_delivery_mode"),
                 battle_event.get("delivery_mode"),
+                battle_event.get("risk_mode"),
+                v2_fields.get("battle_gate_v2_risk_mode"),
                 "UNKNOWN",
             ),
-            "battle_ready": safe_optional_bool(battle_event.get("battle_ready")),
+            "battle_ready": safe_optional_bool(
+                first_non_empty(
+                    battle_event.get("battle_ready"),
+                    battle_event.get("battle_gate_v2_allowed"),
+                    battle_event.get("battle_allowed"),
+                    v2_fields.get("battle_gate_v2_battle_allowed"),
+                )
+            ),
             "sent_to_telegram": safe_optional_bool(battle_event.get("sent_to_telegram")),
             "auction_context_score": safe_float(battle_event.get("auction_context_score"), None),
             "battle_permission_blockers": blockers,
@@ -749,6 +888,32 @@ def extract_battle_fields(
             "battle_permission_event_found": True,
             "battle_permission_event_ts_utc": battle_event.get("ts_utc"),
             "battle_permission_source": battle_event.get("source") or "battle_permission_telemetry",
+            "battle_permission_event_schema_version": battle_event.get("schema_version"),
+            "runner_version": first_non_empty(
+                battle_event.get("runner_version"),
+                battle_event.get("stateful_runner_version"),
+            ),
+            "market_status_override": first_non_empty(
+                battle_event.get("market_status_override"),
+                battle_event.get("tpo_market_status_override"),
+            ),
+            "original_market_status": first_non_empty(
+                battle_event.get("original_market_status"),
+                battle_event.get("market_status_original"),
+            ),
+            "original_tpo_signal_permission": first_non_empty(
+                battle_event.get("original_tpo_signal_permission"),
+                battle_event.get("tpo_signal_permission_original"),
+            ),
+            "current_price": safe_float(battle_event.get("current_price"), None),
+            "entry_distance": safe_float(battle_event.get("entry_distance"), None),
+            "entry_distance_R": safe_float(battle_event.get("entry_distance_R"), None),
+            "already_moved_R": safe_float(battle_event.get("already_moved_R"), None),
+            "entry_timing_status": battle_event.get("entry_timing_status"),
+            "wait_retest_only": safe_optional_bool(battle_event.get("wait_retest_only")),
+            "late_signal_reason": battle_event.get("late_signal_reason"),
+            "entry_retest_required": safe_optional_bool(battle_event.get("entry_retest_required")),
+            "execution_timing_guard_version": battle_event.get("execution_timing_guard_version"),
             **tpo_fields,
             **v2_fields,
         }
@@ -771,6 +936,20 @@ def extract_battle_fields(
         "battle_permission_event_found": False,
         "battle_permission_event_ts_utc": None,
         "battle_permission_source": "legacy_no_battle_telemetry",
+        "battle_permission_event_schema_version": None,
+        "runner_version": None,
+        "market_status_override": None,
+        "original_market_status": None,
+        "original_tpo_signal_permission": None,
+        "current_price": None,
+        "entry_distance": None,
+        "entry_distance_R": None,
+        "already_moved_R": None,
+        "entry_timing_status": None,
+        "wait_retest_only": None,
+        "late_signal_reason": None,
+        "entry_retest_required": None,
+        "execution_timing_guard_version": None,
         **tpo_fields,
         **v2_fields,
     }
@@ -879,14 +1058,42 @@ def normalize_flat_signal(
         "telegram_hard_gate_allowed": safe_bool(item.get("telegram_hard_gate_allowed"), False),
         "telegram_hard_gate_reason": item.get("telegram_hard_gate_reason"),
 
-        "entry_distance": safe_float(item.get("entry_distance"), None),
-        "entry_distance_R": safe_float(item.get("entry_distance_R"), None),
-        "already_moved_R": safe_float(item.get("already_moved_R"), None),
-        "entry_timing_status": item.get("entry_timing_status"),
-        "wait_retest_only": safe_bool(item.get("wait_retest_only"), False),
-        "late_signal_reason": item.get("late_signal_reason"),
-        "entry_retest_required": safe_bool(item.get("entry_retest_required"), False),
-        "execution_timing_guard_version": item.get("execution_timing_guard_version"),
+        "current_price": first_non_empty(
+            safe_float(item.get("current_price"), None),
+            battle_fields.get("current_price"),
+        ),
+        "entry_distance": first_non_empty(
+            safe_float(item.get("entry_distance"), None),
+            battle_fields.get("entry_distance"),
+        ),
+        "entry_distance_R": first_non_empty(
+            safe_float(item.get("entry_distance_R"), None),
+            battle_fields.get("entry_distance_R"),
+        ),
+        "already_moved_R": first_non_empty(
+            safe_float(item.get("already_moved_R"), None),
+            battle_fields.get("already_moved_R"),
+        ),
+        "entry_timing_status": first_non_empty(
+            item.get("entry_timing_status"),
+            battle_fields.get("entry_timing_status"),
+        ),
+        "wait_retest_only": safe_bool(
+            first_non_empty(item.get("wait_retest_only"), battle_fields.get("wait_retest_only")),
+            False,
+        ),
+        "late_signal_reason": first_non_empty(
+            item.get("late_signal_reason"),
+            battle_fields.get("late_signal_reason"),
+        ),
+        "entry_retest_required": safe_bool(
+            first_non_empty(item.get("entry_retest_required"), battle_fields.get("entry_retest_required")),
+            False,
+        ),
+        "execution_timing_guard_version": first_non_empty(
+            item.get("execution_timing_guard_version"),
+            battle_fields.get("execution_timing_guard_version"),
+        ),
         "telegram_title": item.get("telegram_title"),
         "entry_triggered": safe_bool(item.get("entry_triggered"), False),
         "entry_triggered_at_utc": item.get("entry_triggered_at_utc"),
@@ -925,6 +1132,11 @@ def normalize_flat_signal(
         "battle_permission_event_found": battle_fields["battle_permission_event_found"],
         "battle_permission_event_ts_utc": battle_fields["battle_permission_event_ts_utc"],
         "battle_permission_source": battle_fields["battle_permission_source"],
+        "battle_permission_event_schema_version": battle_fields["battle_permission_event_schema_version"],
+        "runner_version": battle_fields["runner_version"],
+        "market_status_override": battle_fields["market_status_override"],
+        "original_market_status": battle_fields["original_market_status"],
+        "original_tpo_signal_permission": battle_fields["original_tpo_signal_permission"],
         "open_relation": battle_fields["open_relation"],
         "auction_bias": battle_fields["auction_bias"],
         "tpo_signal_permission": battle_fields["tpo_signal_permission"],
@@ -1148,7 +1360,16 @@ def build_daily_summary(flat: list[dict[str, Any]]) -> dict[str, Any]:
         "by_telegram_delivery_mode": grouped_metrics(production, "telegram_delivery_mode"),
         "by_battle_ready": grouped_metrics(production, "battle_ready"),
         "by_battle_permission_source": grouped_metrics(production, "battle_permission_source"),
+        "by_battle_permission_event_schema_version": grouped_metrics(
+            production,
+            "battle_permission_event_schema_version",
+        ),
+        "by_runner_version": grouped_metrics(production, "runner_version"),
         "by_battle_permission_blocker": grouped_metrics_by_list(production, "battle_permission_blockers"),
+        "by_entry_timing_status": grouped_metrics(production, "entry_timing_status"),
+        "by_wait_retest_only": grouped_metrics(production, "wait_retest_only"),
+        "by_market_status_override": grouped_metrics(production, "market_status_override"),
+        "by_original_market_status": grouped_metrics(production, "original_market_status"),
         "by_open_relation": grouped_metrics(production, "open_relation"),
         "by_auction_bias": grouped_metrics(production, "auction_bias"),
         "by_tpo_signal_permission": grouped_metrics(production, "tpo_signal_permission"),
@@ -1198,6 +1419,15 @@ def export_lightweight_statistics() -> dict[str, Any]:
             "by_battle_permission": summary.get("by_battle_permission", {}),
             "by_telegram_delivery_mode": summary.get("by_telegram_delivery_mode", {}),
             "by_battle_permission_blocker": summary.get("by_battle_permission_blocker", {}),
+            "by_battle_permission_event_schema_version": summary.get(
+                "by_battle_permission_event_schema_version",
+                {},
+            ),
+            "by_runner_version": summary.get("by_runner_version", {}),
+            "by_entry_timing_status": summary.get("by_entry_timing_status", {}),
+            "by_wait_retest_only": summary.get("by_wait_retest_only", {}),
+            "by_market_status_override": summary.get("by_market_status_override", {}),
+            "by_original_market_status": summary.get("by_original_market_status", {}),
             "by_tracking_scope": summary.get("by_tracking_scope", {}),
             "by_tracking_scope_all_records": summary.get("by_tracking_scope_all_records", {}),
             "by_open_context": summary.get("by_open_context", {}),
