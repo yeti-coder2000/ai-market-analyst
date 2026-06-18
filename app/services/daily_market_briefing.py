@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.15-ny-false-market-closed-report-guard"
+BRIEFING_VERSION = "daily-market-briefing-v1.16-fomc-backup-calendar-priority"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -46,6 +46,7 @@ LAST_GOOD_HIGH_IMPACT_EVENTS_RELATIVE = Path("calendar") / "last_good_high_impac
 MACRO_OK = "OK"
 MACRO_EMPTY = "EMPTY"
 MACRO_FALLBACK = "FALLBACK"
+MACRO_HIGH_FROM_BACKUP_CALENDAR = "HIGH_FROM_BACKUP_CALENDAR"
 MACRO_LAST_GOOD_CACHE = "LAST_GOOD_CACHE"
 MACRO_UNKNOWN_CONSERVATIVE = "MACRO_UNKNOWN_CONSERVATIVE"
 
@@ -482,7 +483,45 @@ def _last_good_high_impact_events_path() -> Path:
     return _get_path("LAST_GOOD_HIGH_IMPACT_EVENTS_PATH", LAST_GOOD_HIGH_IMPACT_EVENTS_RELATIVE)
 
 
+def _parse_as_of_datetime(value: str | None) -> datetime | None:
+    """
+    Parse deterministic report clock override.
+
+    Accepted examples:
+    - 2026-06-17T21:29:00+03:00
+    - 2026-06-17 21:29:00+03:00
+    - 2026-06-17T21:29:00   # interpreted in BRIEFING_AS_OF_TIMEZONE / REPORT_TIMEZONE
+    - 2026-06-17            # interpreted as 00:00 local report time
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    text = raw.replace("Z", "+00:00")
+    try:
+        if len(text) == 10:
+            local_date = date.fromisoformat(text)
+            tz_name = os.getenv("BRIEFING_AS_OF_TIMEZONE") or os.getenv("REPORT_TIMEZONE") or DEFAULT_TIMEZONE
+            return datetime.combine(local_date, time(0, 0), tzinfo=ZoneInfo(tz_name)).astimezone(timezone.utc)
+
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            tz_name = os.getenv("BRIEFING_AS_OF_TIMEZONE") or os.getenv("REPORT_TIMEZONE") or DEFAULT_TIMEZONE
+            dt = dt.replace(tzinfo=ZoneInfo(tz_name))
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
 def _now_utc() -> datetime:
+    override = (
+        os.getenv("BRIEFING_AS_OF_UTC")
+        or os.getenv("BRIEFING_AS_OF")
+        or os.getenv("REPORT_AS_OF")
+    )
+    parsed = _parse_as_of_datetime(override)
+    if parsed is not None:
+        return parsed
     return datetime.now(timezone.utc)
 
 
@@ -795,6 +834,14 @@ def _affected_symbols(currency: str, event_title: str = "") -> list[str]:
             if sym not in symbols:
                 symbols.append(sym)
 
+    # FOMC/Fed events reprice broad USD liquidity and risk assets. Keep UKOIL in
+    # the NY focus too, because oil frequently reacts via USD/risk/headline channels
+    # even when the calendar provider classifies the event only as USD.
+    if "FOMC" in title or "FED" in title or "RATE DECISION" in title or "PRESS CONFERENCE" in title:
+        for sym in ("UKOIL",):
+            if sym not in symbols:
+                symbols.append(sym)
+
     return symbols
 
 
@@ -884,6 +931,10 @@ def _event_trading_note(currency: str, title: str, impact: str) -> str:
     if impact != "HIGH":
         return "Подія не high-impact; використовувати як фон, не як торговий тригер."
 
+    if "OIL" in title_upper or "CRUDE" in title_upper or "OPEC" in title_upper:
+        return "Oil-related event. Для UKOIL не торгувати перший імпульс без acceptance / retest."
+    if "FOMC" in title_upper or "FED" in title_upper or "RATE DECISION" in title_upper or "PRESS CONFERENCE" in title_upper:
+        return "FOMC / Fed high-impact macro. NO BATTLE до завершення пресконференції; після — тільки acceptance + retest."
     if cur == "USD":
         return "USD high-impact macro. До релізу не піднімати research у battle; після релізу чекати acceptance."
     if cur == "EUR":
@@ -992,7 +1043,7 @@ def _fetch_finnhub_calendar(target_date: date) -> CalendarLoadResult:
             continue
         normalized.append(event)
 
-    normalized.sort(key=lambda x: (str(x.get("time") or "99:99"), str(x.get("currency") or ""), str(x.get("title") or "")))
+    normalized.sort(key=_calendar_display_sort_key)
 
     status = "OK" if normalized else "EMPTY"
     cache_payload = {
@@ -1059,6 +1110,181 @@ def _normalize_calendar_event_payload(event: dict[str, Any], target_date: date, 
     return normalized
 
 
+
+def _event_title(event: dict[str, Any]) -> str:
+    return str(event.get("title") or event.get("event") or event.get("name") or "").strip()
+
+
+def _event_title_upper(event: dict[str, Any]) -> str:
+    return _event_title(event).upper()
+
+
+def _is_fomc_event(event: dict[str, Any]) -> bool:
+    title = _event_title_upper(event)
+    return (
+        "FOMC" in title
+        or "FEDERAL RESERVE" in title
+        or "FED " in f"{title} "
+        or "RATE DECISION" in title
+        or "ECONOMIC PROJECTIONS" in title
+        or "PRESS CONFERENCE" in title
+    )
+
+
+def _is_fomc_press_conference(event: dict[str, Any]) -> bool:
+    title = _event_title_upper(event)
+    return "PRESS CONFERENCE" in title or "PRESSER" in title
+
+
+def _is_fomc_statement(event: dict[str, Any]) -> bool:
+    title = _event_title_upper(event)
+    return "STATEMENT" in title
+
+
+def _is_fomc_projections(event: dict[str, Any]) -> bool:
+    title = _event_title_upper(event)
+    return "PROJECTION" in title or "DOT PLOT" in title
+
+
+def _is_rate_decision_event(event: dict[str, Any]) -> bool:
+    title = _event_title_upper(event)
+    return "RATE DECISION" in title or "INTEREST RATE" in title or "FED FUNDS" in title
+
+
+def _calendar_event_type_priority(event: dict[str, Any]) -> int:
+    """
+    Stable ordering inside same timestamp.
+
+    FOMC clusters must read like the actual decision flow:
+    Rate Decision -> Statement -> Projections -> Press Conference.
+    """
+    if _is_fomc_event(event):
+        if _is_rate_decision_event(event):
+            return 10
+        if _is_fomc_statement(event):
+            return 20
+        if _is_fomc_projections(event):
+            return 30
+        if _is_fomc_press_conference(event):
+            return 40
+        return 35
+
+    title = _event_title_upper(event)
+    if "CPI" in title or "PCE" in title or "NFP" in title or "NON FARM" in title or "NON-FARM" in title:
+        return 50
+    if "RETAIL SALES" in title:
+        return 60
+    if "CRUDE" in title or "OIL" in title or "OPEC" in title:
+        return 70
+    return 100
+
+
+def _calendar_display_sort_key(event: dict[str, Any]) -> tuple[str, str, int, str, str]:
+    return (
+        str(event.get("date") or ""),
+        str(event.get("time") or "99:99"),
+        _calendar_event_type_priority(event),
+        str(event.get("currency") or ""),
+        _event_title_upper(event),
+    )
+
+
+def _select_events_for_high_impact_section(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Keep the Telegram risk block concise, but never hide parts of an FOMC cluster.
+    """
+    selected = sorted(events, key=_calendar_display_sort_key)
+    if not selected:
+        return []
+
+    try:
+        max_events = int(os.getenv("BRIEFING_HIGH_IMPACT_MAX_EVENTS", "8"))
+    except Exception:
+        max_events = 8
+
+    if any(_is_fomc_event(e) for e in selected):
+        max_events = max(max_events, 12)
+
+    return selected[:max_events]
+
+
+def _macro_regime_for_event(event: dict[str, Any]) -> str:
+    minutes = event.get("minutes_since_event")
+    try:
+        minutes_float = float(minutes)
+    except (TypeError, ValueError):
+        minutes_float = None
+
+    if _is_fomc_press_conference(event):
+        return "FOMC_PRESSER_LOCK"
+
+    if _is_fomc_event(event):
+        if minutes_float is not None and minutes_float >= 0:
+            return "FOMC_POST_NEWS_LOCK"
+        return "FOMC_DAY_LOCK"
+
+    title = _event_title_upper(event)
+    if "CRUDE" in title or "OIL" in title or "OPEC" in title:
+        return "OIL_POST_NEWS_ACCEPTANCE_REQUIRED"
+
+    return "POST_NEWS_ACCEPTANCE_REQUIRED"
+
+
+def _macro_event_selection_priority(event: dict[str, Any]) -> tuple[int, float, int, str]:
+    """
+    Pick the event that should drive the NY post-news regime.
+
+    Priority:
+    - FOMC press conference active/upcoming/recent
+    - FOMC decision/statement/projections
+    - other USD high-impact data
+    - crude/oil unless no broader macro is closer
+    """
+    title = _event_title_upper(event)
+    minutes_raw = event.get("minutes_since_event")
+    try:
+        minutes = float(minutes_raw)
+    except (TypeError, ValueError):
+        minutes = 9999.0
+
+    if _is_fomc_press_conference(event):
+        group = 0
+    elif _is_fomc_event(event):
+        group = 1
+    elif "CPI" in title or "PCE" in title or "NFP" in title or "NON FARM" in title or "NON-FARM" in title:
+        group = 2
+    elif "RETAIL SALES" in title:
+        group = 3
+    elif "CRUDE" in title or "OIL" in title or "OPEC" in title:
+        group = 5
+    else:
+        group = 4
+
+    return (group, abs(minutes), _calendar_event_type_priority(event), title)
+
+
+def _select_primary_macro_event(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not events:
+        return None
+    return sorted(events, key=_macro_event_selection_priority)[0]
+
+
+def _has_fomc_cluster(events: list[dict[str, Any]]) -> bool:
+    return any(_is_fomc_event(event) for event in events)
+
+
+def _has_fomc_press_conference(events: list[dict[str, Any]]) -> bool:
+    return any(_is_fomc_press_conference(event) for event in events)
+
+
+def _macro_risk_status_text(calendar: CalendarLoadResult) -> str:
+    if calendar.macro_risk_status == MACRO_HIGH_FROM_BACKUP_CALENDAR:
+        return MACRO_HIGH_FROM_BACKUP_CALENDAR
+    if calendar.status == MACRO_FALLBACK and calendar.events:
+        return MACRO_HIGH_FROM_BACKUP_CALENDAR
+    return str(calendar.macro_risk_status or calendar.status or MACRO_UNKNOWN_CONSERVATIVE)
+
+
 def _dedupe_calendar_events(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     seen: set[tuple[str, str, str, str, str]] = set()
     selected: list[dict[str, Any]] = []
@@ -1076,7 +1302,7 @@ def _dedupe_calendar_events(events: list[dict[str, Any]]) -> list[dict[str, Any]
         seen.add(key)
         selected.append(event)
 
-    selected.sort(key=lambda x: (str(x.get("time") or "99:99"), str(x.get("currency") or ""), str(x.get("title") or "")))
+    selected.sort(key=_calendar_display_sort_key)
     return selected
 
 
@@ -1212,7 +1438,7 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
             message=f"{result.message or 'Primary provider unavailable'} Using manual macro JSON backup.",
             cache_path=str(_manual_high_impact_events_path()),
             provider_error=result.provider_error,
-            macro_risk_status=MACRO_FALLBACK,
+            macro_risk_status=MACRO_HIGH_FROM_BACKUP_CALENDAR,
             fallback_chain=fallback_chain,
             data_freshness="manual_backup",
             last_good_cache_path=str(_last_good_high_impact_events_path()),
@@ -1229,7 +1455,7 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
             message=f"{result.message or 'Primary provider unavailable'} Using static fallback.",
             cache_path=result.cache_path,
             provider_error=result.provider_error,
-            macro_risk_status=MACRO_FALLBACK,
+            macro_risk_status=MACRO_HIGH_FROM_BACKUP_CALENDAR,
             fallback_chain=fallback_chain,
             data_freshness="static_fallback",
             last_good_cache_path=str(_last_good_high_impact_events_path()),
@@ -1820,6 +2046,7 @@ def _build_high_impact_section(target_date: date, timezone_name: str, report_typ
         return section
 
     if calendar.status == MACRO_FALLBACK:
+        section.lines.append(f"MACRO_RISK_STATUS: {_macro_risk_status_text(calendar)}.")
         section.lines.append(f"⚠️ Основний календар недоступний; використовується {calendar.source}.")
         section.lines.append("Це може бути неповний список подій. Режим: conservative.")
     elif calendar.status == MACRO_LAST_GOOD_CACHE:
@@ -1831,7 +2058,12 @@ def _build_high_impact_section(target_date: date, timezone_name: str, report_typ
     if calendar.fallback_chain and calendar.status != MACRO_OK:
         section.lines.append(f"Fallback chain: {' → '.join(calendar.fallback_chain)}")
 
-    for e in events[:5]:
+    if _has_fomc_cluster(events):
+        section.lines.append("FOMC_DAY_LOCK: не піднімати Battle у день FOMC без macro-clearance.")
+        if _has_fomc_press_conference(events):
+            section.lines.append("FOMC_PRESSER_LOCK: NO BATTLE до завершення пресконференції; після — тільки 15m acceptance + retest + LTF confirmation + real target.")
+
+    for e in _select_events_for_high_impact_section(events):
         local_time = _local_dt_from_event(e, timezone_name)
         currency = e.get("currency") or "-"
         impact = str(e.get("impact") or "HIGH").upper()
@@ -2430,7 +2662,13 @@ def _brief_verdict(
     return "WATCH", f"• {sym} — {open_behavior} | {subtype_text} | чекати LTF confirmation{bias_text}"
 
 
-def _recent_high_impact_events(target_date: date, timezone_name: str, report_type: str, window_minutes: int = 240) -> list[dict[str, Any]]:
+def _recent_high_impact_events(
+    target_date: date,
+    timezone_name: str,
+    report_type: str,
+    window_minutes: int = 240,
+    lookahead_minutes: int = 45,
+) -> list[dict[str, Any]]:
     if _normalize_report_type(report_type) not in {"ny", "ny_1h", "new_york"}:
         return []
 
@@ -2444,11 +2682,15 @@ def _recent_high_impact_events(target_date: date, timezone_name: str, report_typ
         if event_dt is None:
             continue
         minutes = (now_local - event_dt).total_seconds() / 60.0
-        if 0 <= minutes <= window_minutes:
+        if -lookahead_minutes <= minutes <= window_minutes:
             enriched = dict(event)
             enriched["minutes_since_event"] = round(minutes, 1)
+            if minutes < 0:
+                enriched["minutes_until_event"] = round(abs(minutes), 1)
+            enriched["macro_regime"] = _macro_regime_for_event(enriched)
             selected.append(enriched)
 
+    selected.sort(key=_macro_event_selection_priority)
     return selected
 
 
@@ -2583,13 +2825,29 @@ def _build_post_news_reaction_section(
     section = BriefingSection("🧭 NY post-open / post-news реакція")
 
     if recent_events:
-        event = recent_events[0]
+        event = _select_primary_macro_event(recent_events) or recent_events[0]
         title = event.get("title") or event.get("event") or "high-impact event"
         minutes = event.get("minutes_since_event")
         local_time = _local_dt_from_event(event, timezone_name)
-        section.lines.append(f"Подія: {local_time} — {_raw(event.get('currency'))} {_raw(event.get('impact'))}: {_raw(title)} | минуло: {minutes} хв")
-        section.lines.append("Режим: оцінюємо acceptance / failed move; перший імпульс не наздоганяти.")
-        focus_symbols = _filter_symbols_for_report(event.get("symbols") or [], report_type)
+        macro_regime = event.get("macro_regime") or _macro_regime_for_event(event)
+
+        if isinstance(minutes, (int, float)) and float(minutes) < 0:
+            section.lines.append(f"Подія: {local_time} — {_raw(event.get('currency'))} {_raw(event.get('impact'))}: {_raw(title)} | до релізу: {event.get('minutes_until_event')} хв")
+        else:
+            section.lines.append(f"Подія: {local_time} — {_raw(event.get('currency'))} {_raw(event.get('impact'))}: {_raw(title)} | минуло: {minutes} хв")
+
+        section.lines.append(f"Macro regime: {macro_regime}.")
+        if str(macro_regime) == "FOMC_PRESSER_LOCK":
+            section.lines.append("Режим: NO BATTLE до завершення FOMC press conference; після — тільки 15m acceptance + retest + LTF confirmation + real target.")
+        elif str(macro_regime).startswith("FOMC"):
+            section.lines.append("Режим: FOMC day/post-news lock; перший імпульс не наздоганяти, чекати acceptance / failed move.")
+        else:
+            section.lines.append("Режим: оцінюємо acceptance / failed move; перший імпульс не наздоганяти.")
+
+        if _is_fomc_event(event):
+            focus_symbols = list(_symbol_scope_for_report(report_type))
+        else:
+            focus_symbols = _filter_symbols_for_report(event.get("symbols") or [], report_type)
     else:
         if macro_unknown:
             section.lines.append("Macro calendar unavailable: MACRO_UNKNOWN_CONSERVATIVE.")
@@ -2776,6 +3034,7 @@ def _build_focus_section(report_type: str) -> BriefingSection:
         section.lines.extend(
             [
                 "NY +1h: не наздоганяємо перший імпульс.",
+                "FOMC / high-impact news: NO BATTLE до завершення lock; після — тільки acceptance + retest.",
                 "Потрібні open behavior + LTF model + stop + Battle Gate.",
                 "POC/nPOC = зона інтересу, не entry trigger.",
             ]
@@ -2892,6 +3151,11 @@ def main() -> int:
     parser.add_argument("--type", default=os.getenv("REPORT_TYPE", "morning"))
     parser.add_argument("--date", default=os.getenv("REPORT_DATE"))
     parser.add_argument("--timezone", default=os.getenv("REPORT_TIMEZONE", DEFAULT_TIMEZONE))
+    parser.add_argument(
+        "--as-of",
+        default=os.getenv("REPORT_AS_OF"),
+        help="Deterministic report clock override, e.g. 2026-06-17T21:29:00+03:00. Useful for historical dry-runs.",
+    )
     parser.add_argument("--print", dest="print_report", action="store_true")
 
     write_group = parser.add_mutually_exclusive_group()
@@ -2912,8 +3176,15 @@ def main() -> int:
     args = parser.parse_args()
 
     previous_disable_runtime_writes = os.environ.get("BRIEFING_DISABLE_RUNTIME_WRITES")
+    previous_as_of = os.environ.get("BRIEFING_AS_OF")
+    previous_as_of_tz = os.environ.get("BRIEFING_AS_OF_TIMEZONE")
+
     if not args.write:
         os.environ["BRIEFING_DISABLE_RUNTIME_WRITES"] = "1"
+    if args.as_of:
+        os.environ["BRIEFING_AS_OF"] = str(args.as_of)
+        os.environ["BRIEFING_AS_OF_TIMEZONE"] = str(args.timezone or DEFAULT_TIMEZONE)
+
     try:
         report = build_briefing_report(report_type=args.type, report_date=args.date, timezone_name=args.timezone)
     finally:
@@ -2922,6 +3193,17 @@ def main() -> int:
                 os.environ.pop("BRIEFING_DISABLE_RUNTIME_WRITES", None)
             else:
                 os.environ["BRIEFING_DISABLE_RUNTIME_WRITES"] = previous_disable_runtime_writes
+
+        if args.as_of:
+            if previous_as_of is None:
+                os.environ.pop("BRIEFING_AS_OF", None)
+            else:
+                os.environ["BRIEFING_AS_OF"] = previous_as_of
+
+            if previous_as_of_tz is None:
+                os.environ.pop("BRIEFING_AS_OF_TIMEZONE", None)
+            else:
+                os.environ["BRIEFING_AS_OF_TIMEZONE"] = previous_as_of_tz
 
     if args.write:
         json_path, txt_path = write_briefing_artifacts(report)
