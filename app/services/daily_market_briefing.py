@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.16-fomc-backup-calendar-priority"
+BRIEFING_VERSION = "daily-market-briefing-v1.16.1-ny-stale-closed-session-aware-guard"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -2352,8 +2352,17 @@ def _brief_symbol_context(item: dict[str, Any]) -> dict[str, Any]:
     raw_permission = _first_from_sources(("tpo_signal_permission", "permission"), filter_sources)
     raw_market_status = _first_from_sources(("market_status",), context_sources)
 
+    # Keep market_is_open and primary_session_active separate.
+    # At night a market can be legitimately closed even if old first-hour context exists.
+    # During the cash session, however, provider/yfinance can mark indices as
+    # MARKET_CLOSED_AND_STALE after data lag; that should render as stale data,
+    # not as a real closed market.
     market_is_open = _boolish(
-        _first_from_sources(("market_is_open", "is_primary_session_active"), context_sources),
+        _first_from_sources(("market_is_open",), context_sources),
+        default=False,
+    )
+    primary_session_active = _boolish(
+        _first_from_sources(("is_primary_session_active",), context_sources),
         default=False,
     )
     market_data_is_stale = _boolish(
@@ -2426,6 +2435,7 @@ def _brief_symbol_context(item: dict[str, Any]) -> dict[str, Any]:
         "context_market_status": context_market_status,
         "auction_market_status": auction_market_status,
         "market_is_open": market_is_open,
+        "primary_session_active": primary_session_active,
         "market_data_is_stale": market_data_is_stale,
         "permission": permission,
         "modifier": modifier,
@@ -2575,6 +2585,9 @@ def _brief_verdict(
 
     context_open = _context_says_open(data)
     clean_data = _context_says_clean_data(data)
+    primary_session_active = bool(data.get("primary_session_active"))
+    market_data_is_stale = bool(data.get("market_data_is_stale"))
+    provider_error = bool(data.get("provider_error"))
     subtype = _auction_subtype(sym, data, post_news_active=post_news_active, macro_unknown=macro_unknown)
     bias = _bias_without_trade(sym, data, post_news_active=post_news_active, macro_unknown=macro_unknown)
 
@@ -2600,9 +2613,26 @@ def _brief_verdict(
         detail = f"{subtype_text}{zone_text}{bias_text} | no Battle without external calendar check"
         return "NO_TRADE", f"• {sym} — {detail}"
 
-    # False closed guard: if fresh or operational auction context exists, keep the report
-    # operational instead of printing stale MARKET_CLOSED in the NY +1h report.
+    # Session-aware false-closed guard.
+    # Important: do not override a real night/weekend close. We only rewrite the
+    # short market-state text when the TPO store says the primary session was active
+    # and there is usable first-hour/open-behavior context. If data is stale, this
+    # remains NO_TRADE, but it is rendered as STALE_NY_DATA instead of MARKET_CLOSED.
     if market_status.startswith("MARKET_CLOSED") or permission == "MARKET_CLOSED":
+        if (
+            market_data_is_stale
+            and primary_session_active
+            and has_operational_context
+            and not provider_error
+        ):
+            detail = f"STALE_NY_DATA | session active, provider data stale"
+            if subtype_text and subtype_text not in {"UNKNOWN", "-"}:
+                detail += f" | {subtype_text}"
+            if zone != "-":
+                detail += f" | зона: {zone}"
+            detail += f" | no Battle; wait fresh data + retest/acceptance{bias_text}"
+            return "NO_TRADE", f"• {sym} — {detail}"
+
         if clean_data and (context_open or ((post_news_active or macro_unknown) and has_operational_context)):
             guarded_behavior = open_behavior if open_behavior not in {"UNKNOWN", "-"} else "UNCONFIRMED"
             return "OBSERVE", f"• {sym} — {guarded_behavior} | stale MARKET_CLOSED ignored; wait retest/acceptance{bias_text}"
