@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.16.1-ny-stale-closed-session-aware-guard"
+BRIEFING_VERSION = "daily-market-briefing-v1.16.2-strict-fomc-detector"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -824,6 +824,126 @@ def _currency_from_event(country: Any, currency: Any = None) -> str:
     return "-"
 
 
+REGIONAL_FED_EVENT_KEYWORDS: tuple[str, ...] = (
+    "PHILADELPHIA FED",
+    "PHILLY FED",
+    "NEW YORK FED",
+    "NY FED",
+    "EMPIRE STATE",
+    "DALLAS FED",
+    "RICHMOND FED",
+    "CHICAGO FED",
+    "KANSAS CITY FED",
+    "KC FED",
+    "CLEVELAND FED",
+    "ATLANTA FED",
+    "ST LOUIS FED",
+    "ST. LOUIS FED",
+    "MINNEAPOLIS FED",
+    "BEIGE BOOK",
+)
+
+
+def _is_regional_fed_indicator_title(title: Any) -> bool:
+    """Return True for regional Fed indicators that must not trigger FOMC locks."""
+    title_upper = str(title or "").upper()
+    if not title_upper:
+        return False
+    return any(keyword in title_upper for keyword in REGIONAL_FED_EVENT_KEYWORDS)
+
+
+def _is_fomc_rate_decision_title(title: Any, currency: Any = None) -> bool:
+    """Strict USD/FOMC rate-decision detector. Regional Fed data is excluded."""
+    title_upper = str(title or "").upper()
+    cur = str(currency or "").strip().upper()
+
+    if not title_upper or _is_regional_fed_indicator_title(title_upper):
+        return False
+
+    if "FEDERAL FUNDS RATE" in title_upper or "FED FUNDS" in title_upper:
+        return True
+
+    explicit_fed_context = (
+        "FOMC" in title_upper
+        or "FEDERAL RESERVE" in title_upper
+        or "FED INTEREST RATE" in title_upper
+        or "FED RATE" in title_upper
+        or "US INTEREST RATE" in title_upper
+        or "U.S. INTEREST RATE" in title_upper
+    )
+
+    rate_decision = "RATE DECISION" in title_upper or "INTEREST RATE DECISION" in title_upper
+    return bool(rate_decision and (explicit_fed_context or cur == "USD"))
+
+
+def _is_fomc_press_conference_title(title: Any, currency: Any = None) -> bool:
+    """Strict FOMC/Fed Chair press-conference detector. Regional Fed data is excluded."""
+    title_upper = str(title or "").upper()
+    cur = str(currency or "").strip().upper()
+
+    if not title_upper or _is_regional_fed_indicator_title(title_upper):
+        return False
+
+    has_press = "PRESS CONFERENCE" in title_upper or "PRESSER" in title_upper
+    if not has_press:
+        return False
+
+    return bool(
+        "FOMC" in title_upper
+        or "FEDERAL RESERVE" in title_upper
+        or "FED CHAIR" in title_upper
+        or "POWELL" in title_upper
+        or ("FED" in title_upper and cur == "USD")
+    )
+
+
+def _is_strict_fomc_title(title: Any, currency: Any = None) -> bool:
+    """
+    Detect true FOMC/Fed Chair macro events without confusing regional Fed indicators.
+
+    Examples that must NOT match:
+    - Philadelphia Fed Manufacturing Index
+    - Dallas/Richmond/Chicago/Kansas City Fed surveys
+    - Empire State Manufacturing
+
+    Examples that must match:
+    - FOMC Rate Decision / Statement / Economic Projections
+    - FOMC Press Conference
+    - Federal Funds Rate / Fed Interest Rate Decision
+    - Fed Chair Powell speech/testimony/press conference
+    """
+    title_upper = str(title or "").upper()
+    cur = str(currency or "").strip().upper()
+
+    if not title_upper or _is_regional_fed_indicator_title(title_upper):
+        return False
+
+    if "FOMC" in title_upper or "FEDERAL OPEN MARKET COMMITTEE" in title_upper:
+        return True
+
+    if _is_fomc_rate_decision_title(title_upper, cur):
+        return True
+
+    if _is_fomc_press_conference_title(title_upper, cur):
+        return True
+
+    if ("ECONOMIC PROJECTIONS" in title_upper or "DOT PLOT" in title_upper) and (
+        cur == "USD" or "FED" in title_upper or "FEDERAL RESERVE" in title_upper
+    ):
+        return True
+
+    if "FEDERAL RESERVE STATEMENT" in title_upper:
+        return True
+
+    if "POWELL" in title_upper and any(token in title_upper for token in ("SPEAK", "SPEAKS", "SPEECH", "TESTIMONY", "TESTIFIES", "PRESS", "CONFERENCE")):
+        return True
+
+    if "FED CHAIR" in title_upper and any(token in title_upper for token in ("SPEAK", "SPEAKS", "SPEECH", "TESTIMONY", "TESTIFIES", "PRESS", "CONFERENCE")):
+        return True
+
+    return False
+
+
 def _affected_symbols(currency: str, event_title: str = "") -> list[str]:
     cur = str(currency or "").strip().upper()
     symbols = list(AFFECTED_SYMBOLS_BY_CURRENCY.get(cur, []))
@@ -834,10 +954,10 @@ def _affected_symbols(currency: str, event_title: str = "") -> list[str]:
             if sym not in symbols:
                 symbols.append(sym)
 
-    # FOMC/Fed events reprice broad USD liquidity and risk assets. Keep UKOIL in
-    # the NY focus too, because oil frequently reacts via USD/risk/headline channels
-    # even when the calendar provider classifies the event only as USD.
-    if "FOMC" in title or "FED" in title or "RATE DECISION" in title or "PRESS CONFERENCE" in title:
+    # True FOMC/Fed Chair events reprice broad USD liquidity and risk assets.
+    # Regional Fed indicators, such as Philadelphia Fed Manufacturing Index,
+    # remain USD high-impact data but must not trigger FOMC-specific broad locks.
+    if _is_strict_fomc_title(title, cur):
         for sym in ("UKOIL",):
             if sym not in symbols:
                 symbols.append(sym)
@@ -933,7 +1053,7 @@ def _event_trading_note(currency: str, title: str, impact: str) -> str:
 
     if "OIL" in title_upper or "CRUDE" in title_upper or "OPEC" in title_upper:
         return "Oil-related event. Для UKOIL не торгувати перший імпульс без acceptance / retest."
-    if "FOMC" in title_upper or "FED" in title_upper or "RATE DECISION" in title_upper or "PRESS CONFERENCE" in title_upper:
+    if _is_strict_fomc_title(title_upper, cur):
         return "FOMC / Fed high-impact macro. NO BATTLE до завершення пресконференції; після — тільки acceptance + retest."
     if cur == "USD":
         return "USD high-impact macro. До релізу не піднімати research у battle; після релізу чекати acceptance."
@@ -1120,35 +1240,25 @@ def _event_title_upper(event: dict[str, Any]) -> str:
 
 
 def _is_fomc_event(event: dict[str, Any]) -> bool:
-    title = _event_title_upper(event)
-    return (
-        "FOMC" in title
-        or "FEDERAL RESERVE" in title
-        or "FED " in f"{title} "
-        or "RATE DECISION" in title
-        or "ECONOMIC PROJECTIONS" in title
-        or "PRESS CONFERENCE" in title
-    )
+    return _is_strict_fomc_title(_event_title(event), event.get("currency"))
 
 
 def _is_fomc_press_conference(event: dict[str, Any]) -> bool:
-    title = _event_title_upper(event)
-    return "PRESS CONFERENCE" in title or "PRESSER" in title
+    return _is_fomc_press_conference_title(_event_title(event), event.get("currency"))
 
 
 def _is_fomc_statement(event: dict[str, Any]) -> bool:
     title = _event_title_upper(event)
-    return "STATEMENT" in title
+    return _is_fomc_event(event) and "STATEMENT" in title
 
 
 def _is_fomc_projections(event: dict[str, Any]) -> bool:
     title = _event_title_upper(event)
-    return "PROJECTION" in title or "DOT PLOT" in title
+    return _is_fomc_event(event) and ("PROJECTION" in title or "DOT PLOT" in title)
 
 
 def _is_rate_decision_event(event: dict[str, Any]) -> bool:
-    title = _event_title_upper(event)
-    return "RATE DECISION" in title or "INTEREST RATE" in title or "FED FUNDS" in title
+    return _is_fomc_rate_decision_title(_event_title(event), event.get("currency"))
 
 
 def _calendar_event_type_priority(event: dict[str, Any]) -> int:
