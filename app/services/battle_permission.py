@@ -24,8 +24,17 @@ try:
 except Exception:  # pragma: no cover
     apply_macro_shock_context = None  # type: ignore[assignment]
 
+try:
+    from app.services.macro_event_guard import (
+        MACRO_EVENT_GUARD_VERSION,
+        evaluate_macro_guard,
+    )
+except Exception:  # pragma: no cover
+    MACRO_EVENT_GUARD_VERSION = "macro-event-guard-unavailable"
+    evaluate_macro_guard = None  # type: ignore[assignment]
 
-BATTLE_PERMISSION_VERSION = "battle-permission-v1.9.1-open-auction-hard-block-namefix"
+
+BATTLE_PERMISSION_VERSION = "battle-permission-v1.10-macro-event-guard-hard-gate"
 
 
 class BattlePermission(str, Enum):
@@ -130,6 +139,33 @@ class BattlePermissionResult:
     macro_direction_for_symbol: str | None = None
     macro_caution_flags: list[str] = field(default_factory=list)
     macro_reasons: list[str] = field(default_factory=list)
+
+    # Macro event guard fields.
+    macro_guard_version: str | None = None
+    macro_guard_status: str | None = None
+    macro_guard_allowed_for_battle: bool | None = None
+    macro_guard_block_battle: bool | None = None
+    macro_guard_research_only: bool | None = None
+    macro_guard_suppress: bool | None = None
+    macro_guard_reason_code: str | None = None
+    macro_guard_blockers: list[str] = field(default_factory=list)
+    macro_guard_requirements: list[str] = field(default_factory=list)
+    macro_guard_missing_requirements: list[str] = field(default_factory=list)
+    macro_guard_satisfied_requirements: list[str] = field(default_factory=list)
+    macro_guard_macro_risk_status: str | None = None
+    macro_guard_calendar_status: str | None = None
+    macro_guard_calendar_source: str | None = None
+    macro_guard_fallback_chain: list[str] = field(default_factory=list)
+    macro_guard_event_title: str | None = None
+    macro_guard_event_time_local: str | None = None
+    macro_guard_event_currency: str | None = None
+    macro_guard_event_impact: str | None = None
+    macro_guard_event_source: str | None = None
+    macro_guard_minutes_since_event: float | None = None
+    macro_guard_minutes_until_event: float | None = None
+    macro_guard_affected_symbols: list[str] = field(default_factory=list)
+    macro_guard_notes: list[str] = field(default_factory=list)
+    macro_guard_error: str | None = None
 
     # First-impulse / no-chase protection.
     entry_price: float | None = None
@@ -823,6 +859,219 @@ def _compute_first_impulse_state(inputs: dict[str, Any]) -> dict[str, Any]:
         "impulse_state": state,
     }
 
+
+
+
+def _macro_guard_timezone(payload: dict[str, Any]) -> str:
+    value = _deep_get(
+        payload,
+        "metadata.report_timezone",
+        "metadata.timezone",
+        "report_timezone",
+        "timezone",
+    )
+    if value not in (None, "", [], {}):
+        return str(value)
+    return os.getenv("REPORT_TIMEZONE") or os.getenv("BRIEFING_AS_OF_TIMEZONE") or "Europe/Kyiv"
+
+
+def _macro_guard_report_date(payload: dict[str, Any]) -> str | None:
+    value = _deep_get(
+        payload,
+        "metadata.report_date",
+        "metadata.date",
+        "report_date",
+        "date",
+    )
+    if value not in (None, "", [], {}):
+        return str(value)
+    value = os.getenv("REPORT_DATE")
+    return str(value) if value else None
+
+
+def _macro_guard_as_of(payload: dict[str, Any]) -> str | None:
+    value = _deep_get(
+        payload,
+        "metadata.macro_guard_as_of",
+        "metadata.report_as_of",
+        "metadata.as_of",
+        "macro_guard_as_of",
+        "report_as_of",
+        "as_of",
+    )
+    if value not in (None, "", [], {}):
+        return str(value)
+    for name in ("BRIEFING_AS_OF", "REPORT_AS_OF", "BRIEFING_AS_OF_UTC"):
+        value = os.getenv(name)
+        if value:
+            return value
+    return None
+
+
+def _status_is_confirmed(value: Any) -> bool:
+    status = _as_upper(value)
+    return status in {
+        "CONFIRMED",
+        "CONFIRMED_EXECUTABLE",
+        "EXECUTABLE",
+        "VALID",
+        "CLEAN",
+        "PASSED",
+        "ACCEPTED",
+        "REJECTED",
+        "FAILED_ACCEPTANCE",
+        "FAILED",
+        "CLEAN_REJECTION",
+    }
+
+
+def _macro_guard_context(inputs: dict[str, Any]) -> dict[str, Any]:
+    payload = inputs.get("payload") if isinstance(inputs.get("payload"), dict) else {}
+    primary_zone = inputs.get("primary_interest_zone") if isinstance(inputs.get("primary_interest_zone"), dict) else None
+
+    acceptance_confirmed = bool(
+        _as_bool(_deep_get(payload, "metadata.acceptance_confirmed", "acceptance_confirmed"))
+        or _status_is_confirmed(inputs.get("post_news_acceptance_status"))
+        or _status_is_confirmed(_deep_get(payload, "metadata.acceptance_status", "acceptance_status"))
+    )
+    retest_confirmed = bool(
+        _as_bool(_deep_get(payload, "metadata.retest_confirmed", "retest_confirmed"))
+        or _status_is_confirmed(inputs.get("post_news_retest_status"))
+        or _status_is_confirmed(_deep_get(payload, "metadata.retest_status", "retest_status"))
+        or inputs.get("fresh_retest_exists") is True
+        or inputs.get("fresh_failed_acceptance_exists") is True
+        or inputs.get("fresh_pullback_exists") is True
+    )
+    ltf_confirmed = bool(
+        _as_bool(_deep_get(payload, "metadata.ltf_confirmed", "ltf_confirmed", "metadata.ltf_model_confirmed", "ltf_model_confirmed"))
+        or _status_is_confirmed(_deep_get(payload, "metadata.ltf_model_status", "ltf_model_status", "metadata.ltf_status", "ltf_status"))
+        or (inputs.get("status") in {"READY", "ENTRY_READY", "EXECUTABLE"} and inputs.get("execution_status") == "EXECUTABLE")
+        or str(inputs.get("post_news_trade_permission") or "").upper() in {
+            "ALLOW_BATTLE_IF_GEOMETRY_VALID",
+            "ALLOW_CAUTION_BATTLE_IF_GEOMETRY_VALID",
+        }
+    )
+    real_target = bool(
+        _as_bool(_deep_get(payload, "metadata.real_target", "real_target", "metadata.has_real_target", "has_real_target"))
+        or inputs.get("target_quality") == "REAL_ZONE"
+        or bool(primary_zone)
+        or inputs.get("target_price") is not None
+        or _deep_get(payload, "target", "tp", "take_profit", "primary_target", "metadata.target", "metadata.tp", "metadata.take_profit") not in (None, "", [], {})
+    )
+    stop_ok = bool(
+        _as_bool(_deep_get(payload, "metadata.stop_ok", "stop_ok"))
+        or _is_valid_stop_quality_for_battle(inputs.get("stop_quality"))
+    )
+    practical_rr_ok = bool(
+        _as_bool(_deep_get(payload, "metadata.practical_rr_ok", "practical_rr_ok"))
+        or ((inputs.get("practical_rr") is not None) and float(inputs.get("practical_rr") or 0) >= 2.0)
+    )
+
+    return {
+        **payload,
+        **inputs,
+        "acceptance_confirmed": acceptance_confirmed,
+        "post_news_acceptance_confirmed": acceptance_confirmed,
+        "retest_confirmed": retest_confirmed,
+        "post_news_retest_confirmed": retest_confirmed,
+        "ltf_confirmed": ltf_confirmed,
+        "ltf_model_confirmed": ltf_confirmed,
+        "real_target": real_target,
+        "has_real_target": real_target,
+        "stop_ok": stop_ok,
+        "practical_rr_ok": practical_rr_ok,
+        "macro_clearance": _as_bool(_deep_get(payload, "metadata.macro_clearance", "macro_clearance")) is True,
+        "external_calendar_checked": _as_bool(_deep_get(payload, "metadata.external_calendar_checked", "external_calendar_checked")) is True,
+        "press_conference_complete": _as_bool(_deep_get(payload, "metadata.press_conference_complete", "press_conference_complete")) is True,
+        "fomc_press_conference_complete": _as_bool(_deep_get(payload, "metadata.fomc_press_conference_complete", "fomc_press_conference_complete")) is True,
+    }
+
+
+def _evaluate_macro_event_guard(inputs: dict[str, Any]) -> dict[str, Any]:
+    symbol = inputs.get("symbol")
+    payload = inputs.get("payload") if isinstance(inputs.get("payload"), dict) else {}
+
+    if not symbol:
+        return {
+            "macro_guard_version": MACRO_EVENT_GUARD_VERSION,
+            "macro_guard_status": "NOT_EVALUATED",
+            "macro_guard_allowed_for_battle": True,
+            "macro_guard_block_battle": False,
+            "macro_guard_research_only": False,
+            "macro_guard_suppress": False,
+            "macro_guard_reason_code": "missing_symbol",
+            "macro_guard_blockers": [],
+            "macro_guard_requirements": [],
+            "macro_guard_missing_requirements": [],
+            "macro_guard_satisfied_requirements": [],
+            "macro_guard_notes": ["Macro guard skipped because symbol is missing."],
+        }
+
+    if evaluate_macro_guard is None:
+        return {
+            "macro_guard_version": MACRO_EVENT_GUARD_VERSION,
+            "macro_guard_status": "NOT_EVALUATED",
+            "macro_guard_allowed_for_battle": True,
+            "macro_guard_block_battle": False,
+            "macro_guard_research_only": False,
+            "macro_guard_suppress": False,
+            "macro_guard_reason_code": "macro_event_guard_import_failed",
+            "macro_guard_blockers": [],
+            "macro_guard_requirements": [],
+            "macro_guard_missing_requirements": [],
+            "macro_guard_satisfied_requirements": [],
+            "macro_guard_error": "app.services.macro_event_guard import failed",
+        }
+
+    try:
+        decision = evaluate_macro_guard(
+            str(symbol),
+            report_date=_macro_guard_report_date(payload),
+            timezone_name=_macro_guard_timezone(payload),
+            as_of=_macro_guard_as_of(payload),
+            context=_macro_guard_context(inputs),
+        )
+        return {
+            "macro_guard_version": decision.version,
+            "macro_guard_status": decision.status,
+            "macro_guard_allowed_for_battle": decision.allowed_for_battle,
+            "macro_guard_block_battle": decision.block_battle,
+            "macro_guard_research_only": decision.research_only,
+            "macro_guard_suppress": decision.suppress,
+            "macro_guard_reason_code": decision.reason_code,
+            "macro_guard_blockers": list(decision.blockers or []),
+            "macro_guard_requirements": list(decision.requirements or []),
+            "macro_guard_missing_requirements": list(decision.missing_requirements or []),
+            "macro_guard_satisfied_requirements": list(decision.satisfied_requirements or []),
+            "macro_guard_macro_risk_status": decision.macro_risk_status,
+            "macro_guard_calendar_status": decision.calendar_status,
+            "macro_guard_calendar_source": decision.calendar_source,
+            "macro_guard_fallback_chain": list(decision.fallback_chain or []),
+            "macro_guard_event_title": decision.event_title,
+            "macro_guard_event_time_local": decision.event_time_local,
+            "macro_guard_event_currency": decision.event_currency,
+            "macro_guard_event_impact": decision.event_impact,
+            "macro_guard_event_source": decision.event_source,
+            "macro_guard_minutes_since_event": decision.minutes_since_event,
+            "macro_guard_minutes_until_event": decision.minutes_until_event,
+            "macro_guard_affected_symbols": list(decision.affected_symbols or []),
+            "macro_guard_notes": list(decision.notes or []),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "macro_guard_version": MACRO_EVENT_GUARD_VERSION,
+            "macro_guard_status": "ERROR",
+            "macro_guard_allowed_for_battle": True,
+            "macro_guard_block_battle": False,
+            "macro_guard_research_only": False,
+            "macro_guard_suppress": False,
+            "macro_guard_reason_code": "macro_event_guard_error",
+            "macro_guard_blockers": [],
+            "macro_guard_requirements": [],
+            "macro_guard_missing_requirements": [],
+            "macro_guard_satisfied_requirements": [],
+            "macro_guard_error": f"{type(exc).__name__}: {exc}",
+        }
 
 def _has_fresh_structure_after_impulse(inputs: dict[str, Any]) -> bool:
     if inputs.get("fresh_retest_exists") is True:
@@ -2075,6 +2324,31 @@ def _build_result(
         macro_direction_for_symbol=inputs.get("macro_direction_for_symbol"),
         macro_caution_flags=list(inputs.get("macro_caution_flags") or []),
         macro_reasons=list(inputs.get("macro_reasons") or []),
+        macro_guard_version=inputs.get("macro_guard_version"),
+        macro_guard_status=inputs.get("macro_guard_status"),
+        macro_guard_allowed_for_battle=inputs.get("macro_guard_allowed_for_battle"),
+        macro_guard_block_battle=inputs.get("macro_guard_block_battle"),
+        macro_guard_research_only=inputs.get("macro_guard_research_only"),
+        macro_guard_suppress=inputs.get("macro_guard_suppress"),
+        macro_guard_reason_code=inputs.get("macro_guard_reason_code"),
+        macro_guard_blockers=list(inputs.get("macro_guard_blockers") or []),
+        macro_guard_requirements=list(inputs.get("macro_guard_requirements") or []),
+        macro_guard_missing_requirements=list(inputs.get("macro_guard_missing_requirements") or []),
+        macro_guard_satisfied_requirements=list(inputs.get("macro_guard_satisfied_requirements") or []),
+        macro_guard_macro_risk_status=inputs.get("macro_guard_macro_risk_status"),
+        macro_guard_calendar_status=inputs.get("macro_guard_calendar_status"),
+        macro_guard_calendar_source=inputs.get("macro_guard_calendar_source"),
+        macro_guard_fallback_chain=list(inputs.get("macro_guard_fallback_chain") or []),
+        macro_guard_event_title=inputs.get("macro_guard_event_title"),
+        macro_guard_event_time_local=inputs.get("macro_guard_event_time_local"),
+        macro_guard_event_currency=inputs.get("macro_guard_event_currency"),
+        macro_guard_event_impact=inputs.get("macro_guard_event_impact"),
+        macro_guard_event_source=inputs.get("macro_guard_event_source"),
+        macro_guard_minutes_since_event=inputs.get("macro_guard_minutes_since_event"),
+        macro_guard_minutes_until_event=inputs.get("macro_guard_minutes_until_event"),
+        macro_guard_affected_symbols=list(inputs.get("macro_guard_affected_symbols") or []),
+        macro_guard_notes=list(inputs.get("macro_guard_notes") or []),
+        macro_guard_error=inputs.get("macro_guard_error"),
         entry_price=inputs.get("entry_price"),
         target_price=inputs.get("target_price"),
         current_price=inputs.get("current_price"),
@@ -2098,6 +2372,7 @@ def _build_result(
 
 def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionResult:
     inputs = extract_battle_inputs(raw_payload)
+    inputs.update(_evaluate_macro_event_guard(inputs))
     auction_score, score_reasons = calculate_auction_context_score(inputs)
     v2_policy = _evaluate_v2_shadow(inputs.get("payload") if isinstance(inputs.get("payload"), dict) else raw_payload)
 
@@ -2143,6 +2418,15 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
     macro_caution_flags = list(inputs.get("macro_caution_flags") or [])
     macro_reasons = list(inputs.get("macro_reasons") or [])
 
+    macro_guard_status = inputs.get("macro_guard_status")
+    macro_guard_block_battle = bool(inputs.get("macro_guard_block_battle"))
+    macro_guard_suppress = bool(inputs.get("macro_guard_suppress"))
+    macro_guard_reason_code = inputs.get("macro_guard_reason_code")
+    macro_guard_blockers = list(inputs.get("macro_guard_blockers") or [])
+    macro_guard_missing_requirements = list(inputs.get("macro_guard_missing_requirements") or [])
+    macro_guard_event_title = inputs.get("macro_guard_event_title")
+    macro_guard_error = inputs.get("macro_guard_error")
+
     first_impulse = _compute_first_impulse_state(inputs)
     inputs.update(first_impulse)
     impulse_state = inputs.get("impulse_state")
@@ -2166,6 +2450,16 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
     if macro_regime and macro_regime != "NO_MACRO_SHOCK":
         reasons.append(f"macro_regime={macro_regime}")
         reasons.extend(f"macro: {reason}" for reason in macro_reasons[:6])
+
+    if macro_guard_status and macro_guard_status not in {"MACRO_CLEAR", "NOT_EVALUATED"}:
+        reasons.append(
+            f"macro_guard_status={macro_guard_status} reason={macro_guard_reason_code} "
+            f"event={macro_guard_event_title or '-'}"
+        )
+        if macro_guard_missing_requirements:
+            reasons.append(f"macro_guard_missing_requirements={','.join(macro_guard_missing_requirements[:10])}")
+        if macro_guard_error:
+            reasons.append(f"macro_guard_error={macro_guard_error}")
 
     if impulse_state and impulse_state != "UNKNOWN":
         reasons.append(
@@ -2450,6 +2744,37 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
     if signal_freshness_status == "AGING_READY":
         caution_flags.append("signal_aging_ready")
 
+    # 6. Macro event guard hard gate.
+    # This is the execution-facing news lock: FOMC/high-impact/post-news states
+    # must never be promoted to BATTLE_READY / BATTLE_ALERT until required
+    # confirmations are present. It downgrades otherwise valid READY ideas to
+    # RESEARCH_ALERT so Telegram shows the blocker instead of sending a battle call.
+    if macro_guard_block_battle:
+        blockers.extend(macro_guard_blockers or ["macro_event_guard"])
+        modifiers.append(f"macro_guard_{str(macro_guard_status or 'blocked').lower()}")
+        if macro_guard_event_title:
+            modifiers.append("macro_guard_event_active")
+        delivery_mode = (
+            TelegramDeliveryMode.SUPPRESS.value
+            if macro_guard_suppress
+            else TelegramDeliveryMode.RESEARCH_ALERT.value
+        )
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
+            reasons=reasons + [
+                "macro event guard blocks Battle promotion; no BATTLE_READY/BATTLE_ALERT until macro requirements are satisfied"
+            ],
+            blockers=_dedupe_text_list(blockers),
+            modifiers=_dedupe_text_list(modifiers),
+            battle_permission=BattlePermission.RESEARCH_ONLY.value,
+            telegram_delivery_mode=delivery_mode,
+            battle_ready=False,
+            v2_policy=v2_policy,
+            risk_mode=str(macro_guard_status or "MACRO_GUARD_BLOCK"),
+            caution_flags=caution_flags,
+        )
+
     # 6. HTF alignment.
     if not _direction_matches_htf(direction, htf_bias):
         if v2_neutral_otd_transition_allowed:
@@ -2710,6 +3035,32 @@ def _attach_tpo_open_behavior_fields_to_metadata(metadata: dict[str, Any], resul
     metadata["macro_caution_flags"] = result.get("macro_caution_flags") or []
     metadata["macro_reasons"] = result.get("macro_reasons") or []
 
+    metadata["macro_guard_version"] = result.get("macro_guard_version")
+    metadata["macro_guard_status"] = result.get("macro_guard_status")
+    metadata["macro_guard_allowed_for_battle"] = result.get("macro_guard_allowed_for_battle")
+    metadata["macro_guard_block_battle"] = result.get("macro_guard_block_battle")
+    metadata["macro_guard_research_only"] = result.get("macro_guard_research_only")
+    metadata["macro_guard_suppress"] = result.get("macro_guard_suppress")
+    metadata["macro_guard_reason_code"] = result.get("macro_guard_reason_code")
+    metadata["macro_guard_blockers"] = result.get("macro_guard_blockers") or []
+    metadata["macro_guard_requirements"] = result.get("macro_guard_requirements") or []
+    metadata["macro_guard_missing_requirements"] = result.get("macro_guard_missing_requirements") or []
+    metadata["macro_guard_satisfied_requirements"] = result.get("macro_guard_satisfied_requirements") or []
+    metadata["macro_guard_macro_risk_status"] = result.get("macro_guard_macro_risk_status")
+    metadata["macro_guard_calendar_status"] = result.get("macro_guard_calendar_status")
+    metadata["macro_guard_calendar_source"] = result.get("macro_guard_calendar_source")
+    metadata["macro_guard_fallback_chain"] = result.get("macro_guard_fallback_chain") or []
+    metadata["macro_guard_event_title"] = result.get("macro_guard_event_title")
+    metadata["macro_guard_event_time_local"] = result.get("macro_guard_event_time_local")
+    metadata["macro_guard_event_currency"] = result.get("macro_guard_event_currency")
+    metadata["macro_guard_event_impact"] = result.get("macro_guard_event_impact")
+    metadata["macro_guard_event_source"] = result.get("macro_guard_event_source")
+    metadata["macro_guard_minutes_since_event"] = result.get("macro_guard_minutes_since_event")
+    metadata["macro_guard_minutes_until_event"] = result.get("macro_guard_minutes_until_event")
+    metadata["macro_guard_affected_symbols"] = result.get("macro_guard_affected_symbols") or []
+    metadata["macro_guard_notes"] = result.get("macro_guard_notes") or []
+    metadata["macro_guard_error"] = result.get("macro_guard_error")
+
     metadata["entry_price"] = result.get("entry_price")
     metadata["target_price"] = result.get("target_price")
     metadata["current_price"] = result.get("current_price")
@@ -2828,6 +3179,32 @@ def apply_battle_permission(raw_payload: dict[str, Any]) -> dict[str, Any]:
     payload["macro_direction_for_symbol"] = result.get("macro_direction_for_symbol")
     payload["macro_caution_flags"] = result.get("macro_caution_flags") or []
     payload["macro_reasons"] = result.get("macro_reasons") or []
+
+    payload["macro_guard_version"] = result.get("macro_guard_version")
+    payload["macro_guard_status"] = result.get("macro_guard_status")
+    payload["macro_guard_allowed_for_battle"] = result.get("macro_guard_allowed_for_battle")
+    payload["macro_guard_block_battle"] = result.get("macro_guard_block_battle")
+    payload["macro_guard_research_only"] = result.get("macro_guard_research_only")
+    payload["macro_guard_suppress"] = result.get("macro_guard_suppress")
+    payload["macro_guard_reason_code"] = result.get("macro_guard_reason_code")
+    payload["macro_guard_blockers"] = result.get("macro_guard_blockers") or []
+    payload["macro_guard_requirements"] = result.get("macro_guard_requirements") or []
+    payload["macro_guard_missing_requirements"] = result.get("macro_guard_missing_requirements") or []
+    payload["macro_guard_satisfied_requirements"] = result.get("macro_guard_satisfied_requirements") or []
+    payload["macro_guard_macro_risk_status"] = result.get("macro_guard_macro_risk_status")
+    payload["macro_guard_calendar_status"] = result.get("macro_guard_calendar_status")
+    payload["macro_guard_calendar_source"] = result.get("macro_guard_calendar_source")
+    payload["macro_guard_fallback_chain"] = result.get("macro_guard_fallback_chain") or []
+    payload["macro_guard_event_title"] = result.get("macro_guard_event_title")
+    payload["macro_guard_event_time_local"] = result.get("macro_guard_event_time_local")
+    payload["macro_guard_event_currency"] = result.get("macro_guard_event_currency")
+    payload["macro_guard_event_impact"] = result.get("macro_guard_event_impact")
+    payload["macro_guard_event_source"] = result.get("macro_guard_event_source")
+    payload["macro_guard_minutes_since_event"] = result.get("macro_guard_minutes_since_event")
+    payload["macro_guard_minutes_until_event"] = result.get("macro_guard_minutes_until_event")
+    payload["macro_guard_affected_symbols"] = result.get("macro_guard_affected_symbols") or []
+    payload["macro_guard_notes"] = result.get("macro_guard_notes") or []
+    payload["macro_guard_error"] = result.get("macro_guard_error")
 
     payload["entry_price"] = result.get("entry_price")
     payload["target_price"] = result.get("target_price")
