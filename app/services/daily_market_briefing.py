@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.16.2-strict-fomc-detector"
+BRIEFING_VERSION = "daily-market-briefing-v1.17-tradingeconomics-backup-calendar"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -40,6 +40,7 @@ DAILY_SUMMARY_RELATIVE = Path("stats") / "daily_summary.json"
 SIGNAL_OUTCOMES_RELATIVE = Path("stats") / "signal_outcomes.json"
 HIGH_IMPACT_EVENTS_RELATIVE = Path("calendar") / "high_impact_events.json"
 ECONOMIC_CALENDAR_CACHE_RELATIVE = Path("calendar")
+TRADING_ECONOMICS_CALENDAR_CACHE_RELATIVE = Path("calendar")
 MANUAL_HIGH_IMPACT_EVENTS_RELATIVE = Path("macro") / "manual_high_impact_events.json"
 LAST_GOOD_HIGH_IMPACT_EVENTS_RELATIVE = Path("calendar") / "last_good_high_impact_events.json"
 
@@ -473,6 +474,16 @@ def _economic_calendar_cache_path(target_date: date) -> Path:
             return base
         return base / f"economic_calendar_{target_date.isoformat()}.json"
     return _runtime_dir() / ECONOMIC_CALENDAR_CACHE_RELATIVE / f"economic_calendar_{target_date.isoformat()}.json"
+
+
+def _trading_economics_calendar_cache_path(target_date: date) -> Path:
+    raw = os.getenv("TRADING_ECONOMICS_CALENDAR_CACHE_PATH")
+    if raw:
+        base = Path(raw).expanduser().resolve()
+        if base.suffix:
+            return base
+        return base / f"tradingeconomics_calendar_{target_date.isoformat()}.json"
+    return _runtime_dir() / TRADING_ECONOMICS_CALENDAR_CACHE_RELATIVE / f"tradingeconomics_calendar_{target_date.isoformat()}.json"
 
 
 def _manual_high_impact_events_path() -> Path:
@@ -1071,6 +1082,261 @@ def _event_trading_note(currency: str, title: str, impact: str) -> str:
     return "High-impact macro. До релізу не вважати структуру стабільним напрямком."
 
 
+# =============================================================================
+# TRADING ECONOMICS BACKUP CALENDAR
+# =============================================================================
+
+TRADING_ECONOMICS_DEFAULT_COUNTRIES: tuple[str, ...] = (
+    "united states",
+    "euro area",
+    "united kingdom",
+    "japan",
+    "switzerland",
+    "canada",
+    "australia",
+    "china",
+    "germany",
+)
+
+
+def _trading_economics_enabled() -> bool:
+    return str(os.getenv("ENABLE_TRADING_ECONOMICS_CALENDAR", "true")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _trading_economics_credentials() -> str:
+    raw = (
+        os.getenv("TRADING_ECONOMICS_API_KEY")
+        or os.getenv("TRADING_ECONOMICS_CREDENTIALS")
+        or os.getenv("TRADING_ECONOMICS_CLIENT")
+        or "guest:guest"
+    )
+    return str(raw).strip()
+
+
+def _trading_economics_countries() -> list[str]:
+    raw = os.getenv("TRADING_ECONOMICS_COUNTRIES")
+    if raw:
+        parts = [x.strip().lower() for x in raw.split(",") if x.strip()]
+        if parts:
+            return parts
+    return list(TRADING_ECONOMICS_DEFAULT_COUNTRIES)
+
+
+def _trading_economics_country_slug(countries: list[str]) -> str:
+    # API supports comma-separated country slugs in the path. Encode spaces as %20, keep commas.
+    return ",".join(urllib.parse.quote(country.strip().lower(), safe="") for country in countries if country.strip())
+
+
+def _trading_economics_currency(country: Any, currency: Any = None) -> str:
+    raw = str(currency or "").strip().upper()
+    if raw in {"USD", "$", "US$", "U.S. DOLLAR"}:
+        return "USD"
+    if raw in {"EUR", "€", "EURO"}:
+        return "EUR"
+    if raw in {"GBP", "£", "POUND"}:
+        return "GBP"
+    if raw in {"JPY", "¥", "YEN"}:
+        return "JPY"
+    if raw in {"CHF"}:
+        return "CHF"
+    if raw in {"CAD", "C$"}:
+        return "CAD"
+    if raw in {"AUD", "A$"}:
+        return "AUD"
+    if raw in {"CNY", "CN¥", "RMB", "YUAN"}:
+        return "CNY"
+    return _currency_from_event(country, raw if raw not in {"", "-", "N/A"} else None)
+
+
+def _parse_trading_economics_datetime(value: Any, target_date: date, report_timezone: str) -> tuple[str, str, str] | None:
+    """Return (local_date, HH:MM, timezone_name) from Trading Economics UTC Date field."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = text.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except Exception:
+        try:
+            dt = datetime.strptime(text[:19], "%Y-%m-%dT%H:%M:%S")
+        except Exception:
+            try:
+                dt = datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                return None
+
+    # Trading Economics docs describe Date as UTC. Treat naive datetimes as UTC.
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    local_dt = dt.astimezone(_tz(report_timezone))
+    if local_dt.date() != target_date:
+        return None
+    return local_dt.date().isoformat(), local_dt.strftime("%H:%M"), report_timezone
+
+
+def _normalize_trading_economics_event(raw: dict[str, Any], target_date: date, report_timezone: str) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+
+    title = str(raw.get("Event") or raw.get("event") or raw.get("Category") or raw.get("category") or "").strip()
+    if not title:
+        return None
+
+    parsed_dt = _parse_trading_economics_datetime(raw.get("Date") or raw.get("date"), target_date, report_timezone)
+    if parsed_dt is None:
+        return None
+    event_date, event_time, event_tz = parsed_dt
+
+    country = raw.get("Country") or raw.get("country")
+    currency = _trading_economics_currency(country, raw.get("Currency") or raw.get("currency"))
+
+    importance_raw = raw.get("Importance") if raw.get("Importance") is not None else raw.get("importance")
+    impact = _normalize_impact(importance_raw, title)
+    if impact not in {"HIGH", "RED", "IMPORTANT"}:
+        return None
+
+    symbols = _affected_symbols(currency, title)
+    if not symbols and str(currency).upper() in RELEVANT_RISK_CURRENCIES:
+        symbols = _affected_symbols(str(currency).upper(), title)
+
+    return {
+        "date": event_date,
+        "time": event_time,
+        "timezone": event_tz,
+        "currency": currency,
+        "impact": "HIGH",
+        "title": title,
+        "country": country or "-",
+        "category": raw.get("Category") or raw.get("category"),
+        "symbols": symbols,
+        "note": _event_trading_note(currency, title, "HIGH"),
+        "source": "tradingeconomics",
+        "actual": raw.get("Actual") if raw.get("Actual") is not None else raw.get("actual"),
+        "forecast": raw.get("Forecast") if raw.get("Forecast") is not None else raw.get("forecast"),
+        "previous": raw.get("Previous") if raw.get("Previous") is not None else raw.get("previous"),
+        "te_forecast": raw.get("TEForecast") if raw.get("TEForecast") is not None else raw.get("te_forecast"),
+        "calendar_id": raw.get("CalendarId") or raw.get("CalendarID") or raw.get("calendar_id"),
+        "ticker": raw.get("Ticker") or raw.get("ticker"),
+        "symbol": raw.get("Symbol") or raw.get("symbol"),
+        "raw": raw,
+    }
+
+
+def _fetch_trading_economics_calendar(target_date: date) -> CalendarLoadResult:
+    """Fetch high-impact macro events from Trading Economics as automatic backup."""
+    if not _trading_economics_enabled():
+        return CalendarLoadResult(
+            status="UNAVAILABLE",
+            source="tradingeconomics_disabled",
+            message="Trading Economics backup calendar disabled by ENABLE_TRADING_ECONOMICS_CALENDAR.",
+        )
+
+    credentials = _trading_economics_credentials()
+    if not credentials:
+        return CalendarLoadResult(
+            status="UNAVAILABLE",
+            source="tradingeconomics",
+            message="TRADING_ECONOMICS_API_KEY/CREDENTIALS is missing.",
+        )
+
+    cache_path = _trading_economics_calendar_cache_path(target_date)
+    cache_ttl_sec = int(os.getenv("TRADING_ECONOMICS_CALENDAR_CACHE_TTL_SEC", os.getenv("ECONOMIC_CALENDAR_CACHE_TTL_SEC", "21600")))
+    force_refresh = str(os.getenv("TRADING_ECONOMICS_FORCE_REFRESH", "false")).strip().lower() in {"1", "true", "yes", "on"}
+
+    if cache_path.exists() and not force_refresh:
+        try:
+            age_sec = (_now_utc().timestamp() - cache_path.stat().st_mtime)
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if age_sec <= cache_ttl_sec and isinstance(cached, dict):
+                events = _extract_list(cached.get("events", []))
+                status = MACRO_OK if events else MACRO_EMPTY
+                return CalendarLoadResult(
+                    status=status,
+                    source=str(cached.get("source") or "tradingeconomics_cache"),
+                    events=events,
+                    message=f"Loaded Trading Economics from cache. age_sec={round(age_sec, 1)}",
+                    cache_path=str(cache_path),
+                )
+        except Exception:
+            pass
+
+    countries = _trading_economics_countries()
+    country_path = _trading_economics_country_slug(countries)
+    if not country_path:
+        return CalendarLoadResult(
+            status="UNAVAILABLE",
+            source="tradingeconomics",
+            message="Trading Economics countries list is empty.",
+            cache_path=str(cache_path),
+        )
+
+    report_tz = os.getenv("REPORT_TIMEZONE") or DEFAULT_TIMEZONE
+    params = urllib.parse.urlencode(
+        {
+            "c": credentials,
+            "importance": str(os.getenv("TRADING_ECONOMICS_IMPORTANCE", "3")),
+            "f": "json",
+        }
+    )
+    url = f"https://api.tradingeconomics.com/calendar/country/{country_path}/{target_date.isoformat()}/{target_date.isoformat()}?{params}"
+
+    try:
+        timeout = float(os.getenv("TRADING_ECONOMICS_TIMEOUT_SEC", "12"))
+        req = urllib.request.Request(url, headers={"User-Agent": "AI-Market-Analyst/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+        payload = json.loads(body)
+    except urllib.error.HTTPError as exc:
+        return CalendarLoadResult(
+            status="UNAVAILABLE",
+            source="tradingeconomics",
+            message=f"Trading Economics HTTP error: {exc.code}.",
+            provider_error=str(exc),
+            cache_path=str(cache_path),
+        )
+    except Exception as exc:
+        return CalendarLoadResult(
+            status="UNAVAILABLE",
+            source="tradingeconomics",
+            message="Trading Economics calendar unavailable.",
+            provider_error=f"{type(exc).__name__}: {exc}",
+            cache_path=str(cache_path),
+        )
+
+    raw_events = _extract_list(payload)
+    normalized: list[dict[str, Any]] = []
+    for raw_event in raw_events:
+        event = _normalize_trading_economics_event(raw_event, target_date, report_tz)
+        if event:
+            normalized.append(event)
+
+    normalized = _dedupe_calendar_events(normalized)
+    status = MACRO_OK if normalized else MACRO_EMPTY
+
+    cache_payload = {
+        "source": "tradingeconomics",
+        "status": status,
+        "date": target_date.isoformat(),
+        "updated_at_utc": _now_utc().isoformat(),
+        "countries": countries,
+        "events": normalized,
+        "raw_count": len(raw_events),
+    }
+    if _macro_cache_writes_enabled():
+        try:
+            _safe_write_json(cache_path, cache_payload)
+        except Exception:
+            pass
+
+    return CalendarLoadResult(
+        status=status,
+        source="tradingeconomics",
+        events=normalized,
+        message="Loaded from Trading Economics API." if normalized else "Trading Economics returned no high-impact events for this date.",
+        cache_path=str(cache_path),
+    )
+
+
 def _fetch_finnhub_calendar(target_date: date) -> CalendarLoadResult:
     enabled = str(os.getenv("ENABLE_ECONOMIC_CALENDAR", "true")).strip().lower() in {"1", "true", "yes", "on"}
     provider = str(os.getenv("ECONOMIC_CALENDAR_PROVIDER", "finnhub")).strip().lower()
@@ -1505,10 +1771,11 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
 
     Order:
     1) Finnhub primary provider;
-    2) manual operator JSON backup;
-    3) static fallback file/env/builtin;
-    4) last-good cache;
-    5) MACRO_UNKNOWN_CONSERVATIVE.
+    2) Trading Economics automatic backup provider;
+    3) manual operator JSON backup;
+    4) static fallback file/env/builtin;
+    5) last-good cache;
+    6) MACRO_UNKNOWN_CONSERVATIVE.
 
     Provider unavailable is never treated as "no news".
     """
@@ -1536,6 +1803,29 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
             data_freshness="fresh_or_valid_cache",
             last_good_cache_path=str(_last_good_high_impact_events_path()),
         )
+
+    te_result = _fetch_trading_economics_calendar(target_date)
+    fallback_chain.append(f"backup:{te_result.source}:{te_result.status}")
+    if te_result.status == MACRO_OK and te_result.events:
+        high_events = [
+            e for e in te_result.events
+            if _normalize_impact(e.get("impact"), str(e.get("title") or "")) in {"HIGH", "RED", "IMPORTANT"}
+        ]
+        high_events = _dedupe_calendar_events(high_events)
+        if high_events:
+            _write_last_good_calendar_cache(target_date, high_events, source=te_result.source)
+            return CalendarLoadResult(
+                status=MACRO_FALLBACK,
+                source=te_result.source,
+                events=high_events,
+                message=f"{result.message or 'Primary provider unavailable'} Using Trading Economics backup calendar.",
+                cache_path=te_result.cache_path,
+                provider_error=result.provider_error or te_result.provider_error,
+                macro_risk_status=MACRO_HIGH_FROM_BACKUP_CALENDAR,
+                fallback_chain=fallback_chain,
+                data_freshness="tradingeconomics_backup",
+                last_good_cache_path=str(_last_good_high_impact_events_path()),
+            )
 
     manual_events = _load_manual_calendar_events(target_date)
     fallback_chain.append(f"backup:manual_macro_json:{'OK' if manual_events else 'EMPTY'}")
@@ -3211,6 +3501,7 @@ def build_briefing_report(
             "signal_outcomes_path": str(_signal_outcomes_path()),
             "high_impact_events_path": str(_high_impact_events_path()),
             "economic_calendar_cache_path": str(_economic_calendar_cache_path(target_date)),
+            "trading_economics_calendar_cache_path": str(_trading_economics_calendar_cache_path(target_date)),
             "manual_high_impact_events_path": str(_manual_high_impact_events_path()),
             "last_good_high_impact_events_path": str(_last_good_high_impact_events_path()),
             "economic_calendar_provider": os.getenv("ECONOMIC_CALENDAR_PROVIDER", "finnhub"),
