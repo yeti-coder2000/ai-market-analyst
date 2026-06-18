@@ -11,7 +11,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-TELEMETRY_SCHEMA_VERSION = "battle-permission-telemetry-v3.2-runner-version-market-context"
+TELEMETRY_SCHEMA_VERSION = "battle-permission-telemetry-v3.3-macro-event-guard-fields"
 
 
 # =============================================================================
@@ -117,6 +117,24 @@ def _first_non_empty(*values: Any) -> Any:
             return value
     return None
 
+
+
+
+def _macro_guard_value(payload: dict[str, Any], metadata: dict[str, Any], context: dict[str, Any], key: str) -> Any:
+    return _first_non_empty(
+        payload.get(key),
+        metadata.get(key),
+        context.get(key),
+    )
+
+def _macro_guard_text_list(payload: dict[str, Any], metadata: dict[str, Any], context: dict[str, Any], key: str) -> list[str]:
+    return _safe_text_list(_macro_guard_value(payload, metadata, context, key))
+
+def _macro_guard_float(payload: dict[str, Any], metadata: dict[str, Any], context: dict[str, Any], key: str) -> float | None:
+    return _safe_float(_macro_guard_value(payload, metadata, context, key))
+
+def _macro_guard_bool(payload: dict[str, Any], metadata: dict[str, Any], context: dict[str, Any], key: str) -> bool | None:
+    return _safe_bool(_macro_guard_value(payload, metadata, context, key))
 
 def _json_default(value: Any) -> str:
     return str(value)
@@ -1091,6 +1109,34 @@ def build_battle_permission_event(
                 context.get("macro_reasons"),
             )
         ),
+
+
+        # Macro event guard fields (execution-facing calendar safety gate).
+        "macro_guard_version": _macro_guard_value(payload, metadata, context, "macro_guard_version"),
+        "macro_guard_status": _macro_guard_value(payload, metadata, context, "macro_guard_status"),
+        "macro_guard_allowed_for_battle": _macro_guard_bool(payload, metadata, context, "macro_guard_allowed_for_battle"),
+        "macro_guard_block_battle": _macro_guard_bool(payload, metadata, context, "macro_guard_block_battle"),
+        "macro_guard_research_only": _macro_guard_bool(payload, metadata, context, "macro_guard_research_only"),
+        "macro_guard_suppress": _macro_guard_bool(payload, metadata, context, "macro_guard_suppress"),
+        "macro_guard_reason_code": _macro_guard_value(payload, metadata, context, "macro_guard_reason_code"),
+        "macro_guard_blockers": _macro_guard_text_list(payload, metadata, context, "macro_guard_blockers"),
+        "macro_guard_requirements": _macro_guard_text_list(payload, metadata, context, "macro_guard_requirements"),
+        "macro_guard_missing_requirements": _macro_guard_text_list(payload, metadata, context, "macro_guard_missing_requirements"),
+        "macro_guard_satisfied_requirements": _macro_guard_text_list(payload, metadata, context, "macro_guard_satisfied_requirements"),
+        "macro_guard_macro_risk_status": _macro_guard_value(payload, metadata, context, "macro_guard_macro_risk_status"),
+        "macro_guard_calendar_status": _macro_guard_value(payload, metadata, context, "macro_guard_calendar_status"),
+        "macro_guard_calendar_source": _macro_guard_value(payload, metadata, context, "macro_guard_calendar_source"),
+        "macro_guard_fallback_chain": _macro_guard_text_list(payload, metadata, context, "macro_guard_fallback_chain"),
+        "macro_guard_event_title": _macro_guard_value(payload, metadata, context, "macro_guard_event_title"),
+        "macro_guard_event_time_local": _macro_guard_value(payload, metadata, context, "macro_guard_event_time_local"),
+        "macro_guard_event_currency": _macro_guard_value(payload, metadata, context, "macro_guard_event_currency"),
+        "macro_guard_event_impact": _macro_guard_value(payload, metadata, context, "macro_guard_event_impact"),
+        "macro_guard_event_source": _macro_guard_value(payload, metadata, context, "macro_guard_event_source"),
+        "macro_guard_minutes_since_event": _macro_guard_float(payload, metadata, context, "macro_guard_minutes_since_event"),
+        "macro_guard_minutes_until_event": _macro_guard_float(payload, metadata, context, "macro_guard_minutes_until_event"),
+        "macro_guard_affected_symbols": _macro_guard_text_list(payload, metadata, context, "macro_guard_affected_symbols"),
+        "macro_guard_notes": _macro_guard_text_list(payload, metadata, context, "macro_guard_notes"),
+        "macro_guard_error": _macro_guard_value(payload, metadata, context, "macro_guard_error"),
 
         # Post-news fields are optional now, but keeping placeholders in telemetry
         # lets the next detector plug in without another schema break.
