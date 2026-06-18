@@ -34,7 +34,7 @@ except Exception:  # pragma: no cover
     evaluate_macro_guard = None  # type: ignore[assignment]
 
 
-BATTLE_PERMISSION_VERSION = "battle-permission-v1.10-macro-event-guard-hard-gate"
+BATTLE_PERMISSION_VERSION = "battle-permission-v1.10.1-post-news-otd-rr3-context"
 
 
 class BattlePermission(str, Enum):
@@ -929,13 +929,23 @@ def _macro_guard_context(inputs: dict[str, Any]) -> dict[str, Any]:
     payload = inputs.get("payload") if isinstance(inputs.get("payload"), dict) else {}
     primary_zone = inputs.get("primary_interest_zone") if isinstance(inputs.get("primary_interest_zone"), dict) else None
 
+    post_news_otd_candidate = bool(
+        _as_bool(_deep_get(payload, "metadata.post_news_otd_candidate", "post_news_otd_candidate"))
+    )
+    post_news_otd_rr_ok = bool(
+        _as_bool(_deep_get(payload, "metadata.post_news_otd_practical_rr_ok", "post_news_otd_practical_rr_ok"))
+    )
+    post_news_min_rr = float(os.getenv("POST_NEWS_OTD_MIN_PRACTICAL_RR", os.getenv("MACRO_GUARD_POST_NEWS_MIN_PRACTICAL_RR", "3.0")))
+
     acceptance_confirmed = bool(
         _as_bool(_deep_get(payload, "metadata.acceptance_confirmed", "acceptance_confirmed"))
+        or _as_bool(_deep_get(payload, "metadata.post_news_otd_acceptance_confirmed", "post_news_otd_acceptance_confirmed"))
         or _status_is_confirmed(inputs.get("post_news_acceptance_status"))
         or _status_is_confirmed(_deep_get(payload, "metadata.acceptance_status", "acceptance_status"))
     )
     retest_confirmed = bool(
         _as_bool(_deep_get(payload, "metadata.retest_confirmed", "retest_confirmed"))
+        or _as_bool(_deep_get(payload, "metadata.post_news_otd_retest_confirmed", "post_news_otd_retest_confirmed"))
         or _status_is_confirmed(inputs.get("post_news_retest_status"))
         or _status_is_confirmed(_deep_get(payload, "metadata.retest_status", "retest_status"))
         or inputs.get("fresh_retest_exists") is True
@@ -944,27 +954,32 @@ def _macro_guard_context(inputs: dict[str, Any]) -> dict[str, Any]:
     )
     ltf_confirmed = bool(
         _as_bool(_deep_get(payload, "metadata.ltf_confirmed", "ltf_confirmed", "metadata.ltf_model_confirmed", "ltf_model_confirmed"))
+        or _as_bool(_deep_get(payload, "metadata.post_news_otd_ltf_confirmed", "post_news_otd_ltf_confirmed"))
         or _status_is_confirmed(_deep_get(payload, "metadata.ltf_model_status", "ltf_model_status", "metadata.ltf_status", "ltf_status"))
-        or (inputs.get("status") in {"READY", "ENTRY_READY", "EXECUTABLE"} and inputs.get("execution_status") == "EXECUTABLE")
-        or str(inputs.get("post_news_trade_permission") or "").upper() in {
+        or (post_news_otd_candidate and str(inputs.get("post_news_trade_permission") or "").upper() in {
             "ALLOW_BATTLE_IF_GEOMETRY_VALID",
             "ALLOW_CAUTION_BATTLE_IF_GEOMETRY_VALID",
-        }
+        })
     )
     real_target = bool(
         _as_bool(_deep_get(payload, "metadata.real_target", "real_target", "metadata.has_real_target", "has_real_target"))
+        or _as_bool(_deep_get(payload, "metadata.post_news_otd_real_target", "post_news_otd_real_target"))
         or inputs.get("target_quality") == "REAL_ZONE"
+        or str(_deep_get(payload, "target_source", "metadata.target_source") or "").upper() in {"INTEREST_ZONE", "REAL_ZONE", "REAL_TARGET"}
         or bool(primary_zone)
         or inputs.get("target_price") is not None
         or _deep_get(payload, "target", "tp", "take_profit", "primary_target", "metadata.target", "metadata.tp", "metadata.take_profit") not in (None, "", [], {})
     )
     stop_ok = bool(
         _as_bool(_deep_get(payload, "metadata.stop_ok", "stop_ok"))
+        or _as_bool(_deep_get(payload, "metadata.post_news_otd_stop_ok", "post_news_otd_stop_ok"))
         or _is_valid_stop_quality_for_battle(inputs.get("stop_quality"))
     )
+    practical_rr = inputs.get("practical_rr")
     practical_rr_ok = bool(
         _as_bool(_deep_get(payload, "metadata.practical_rr_ok", "practical_rr_ok"))
-        or ((inputs.get("practical_rr") is not None) and float(inputs.get("practical_rr") or 0) >= 2.0)
+        or post_news_otd_rr_ok
+        or ((practical_rr is not None) and float(practical_rr or 0) >= post_news_min_rr)
     )
 
     return {

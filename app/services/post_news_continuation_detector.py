@@ -23,17 +23,17 @@ from datetime import datetime, timezone
 from typing import Any, Iterable
 
 
-POST_NEWS_CONTINUATION_DETECTOR_VERSION = "post-news-continuation-detector-v1.1-conservative-acceptance"
+POST_NEWS_CONTINUATION_DETECTOR_VERSION = "post-news-continuation-detector-v1.2-post-news-otd-confirmation"
 
 
 # =============================================================================
 # DEFAULTS / ENUM-LIKE CONSTANTS
 # =============================================================================
 
-DEFAULT_NO_CHASE_MINUTES = 90
+DEFAULT_NO_CHASE_MINUTES = 15
 DEFAULT_RETEST_WAIT_MAX_MINUTES = 360
 DEFAULT_POST_NEWS_STALE_MINUTES = 720
-DEFAULT_MIN_PRACTICAL_RR = 2.0
+DEFAULT_MIN_PRACTICAL_RR = 3.0
 
 REGIME_NOT_POST_NEWS = "NOT_POST_NEWS"
 REGIME_NO_CHASE = "POST_NEWS_NO_CHASE"
@@ -175,6 +175,14 @@ SYNTHETIC_TARGET_QUALITIES = {
     "SYNTHETIC_TARGET",
     "UNKNOWN_SYNTHETIC",
 }
+
+POST_NEWS_OTD_CONFIRMED = "POST_NEWS_OPEN_TEST_DRIVE_CONFIRMED"
+POST_NEWS_OTD_CAUTION = "POST_NEWS_OPEN_TEST_DRIVE_CAUTION"
+POST_NEWS_OTD_PENDING = "POST_NEWS_OPEN_TEST_DRIVE_PENDING"
+POST_NEWS_OTD_REJECTED = "POST_NEWS_OPEN_TEST_DRIVE_REJECTED"
+POST_NEWS_OTD_NOT_APPLICABLE = "POST_NEWS_OPEN_TEST_DRIVE_NOT_APPLICABLE"
+
+POST_NEWS_OTD_ENTRY_MODEL = "PULLBACK_RETEST_CONTINUATION"
 
 
 # =============================================================================
@@ -562,7 +570,13 @@ def _target_quality(payload: dict[str, Any]) -> str | None:
     if explicit:
         return explicit
 
-    zone_type = _lookup_upper(payload, "interest_zone_type", "primary_interest_zone", "target_zone_role")
+    target_source = _lookup_upper(payload, "target_source", "execution.target_source")
+    if target_source in {"INTEREST_ZONE", "REAL_ZONE", "REAL_TARGET", "TARGET_ZONE"}:
+        return "REAL_ZONE"
+    if target_source in {"SYNTHETIC", "SYNTHETIC_2_5R", "SYNTHETIC_TARGET"}:
+        return "SYNTHETIC"
+
+    zone_type = _lookup_upper(payload, "target_zone_type", "interest_zone_type", "primary_interest_zone", "target_zone_role")
     if zone_type in REAL_TARGET_QUALITIES:
         return "REAL_ZONE"
     return None
@@ -586,6 +600,21 @@ def _entry_model_hint(payload: dict[str, Any]) -> str | None:
 
 
 def _has_valid_ltf_model(payload: dict[str, Any]) -> bool:
+    if _safe_bool(_lookup(payload, "ltf_confirmed", "ltf_model_confirmed")) is True:
+        return True
+
+    state = _lookup_upper(payload, "ltf_model_state", "ltf_model_state_full", "ltf_model_status", "ltf_status") or ""
+    if state in {"CONFIRMED", "LTF_MODEL_CONFIRMED", "CONFIRMED_EXECUTABLE", "EXECUTABLE"}:
+        return True
+
+    outcome = _lookup_upper(payload, "ltf_model_outcome") or ""
+    if outcome.startswith("CONFIRMED"):
+        return True
+
+    execution_status = _lookup_upper(payload, "execution_status", "execution.status") or ""
+    if execution_status == "EXECUTABLE" and "OPEN_TEST_DRIVE" in (_lookup_upper(payload, "scenario", "scenario_type") or ""):
+        return True
+
     hint = _entry_model_hint(payload)
     if hint in VALID_ENTRY_MODEL_HINTS:
         return True
@@ -599,6 +628,182 @@ def _practical_rr(payload: dict[str, Any]) -> float | None:
 
 def _local_structure_damaged(payload: dict[str, Any]) -> bool | None:
     return _safe_bool(_lookup(payload, "local_structure_damaged", "structure_damaged", "ltf_structure_damaged"))
+
+
+def _execution_status(payload: dict[str, Any]) -> str | None:
+    return _lookup_upper(payload, "execution_status", "execution.status")
+
+
+def _stop_ok(payload: dict[str, Any]) -> bool:
+    explicit = _safe_bool(_lookup(payload, "stop_ok"))
+    if explicit is not None:
+        return bool(explicit)
+
+    stop_quality = _lookup_upper(payload, "stop_quality", "execution.stop_quality") or ""
+    if stop_quality and stop_quality not in {"TIGHT_STOP", "NO_STOP", "INVALID", "UNKNOWN"}:
+        return True
+
+    stop_distance = _safe_float(_lookup(payload, "stop_distance", "execution.stop_distance"))
+    execution_status = _execution_status(payload) or ""
+    if execution_status == "EXECUTABLE" and stop_distance is not None and stop_distance > 0:
+        return True
+
+    return False
+
+
+def _post_news_otd_min_rr() -> float:
+    return _env_float("POST_NEWS_OTD_MIN_PRACTICAL_RR", DEFAULT_MIN_PRACTICAL_RR)
+
+
+def _scenario_text(payload: dict[str, Any]) -> str:
+    return " ".join(
+        str(x or "")
+        for x in (
+            _lookup(payload, "scenario", "scenario_type"),
+            _lookup(payload, "setup_type", "setup_name"),
+            _lookup(payload, "tpo_watch_setup"),
+        )
+    ).upper()
+
+
+def _is_open_test_drive_context(payload: dict[str, Any]) -> bool:
+    open_behavior = _open_behavior(payload)
+    if open_behavior == "OPEN_TEST_DRIVE":
+        return True
+    return "OPEN_TEST_DRIVE" in _scenario_text(payload)
+
+
+def _is_first_impulse_chased(payload: dict[str, Any], *, retest_ok: bool) -> bool:
+    if retest_ok:
+        return False
+
+    wait_retest_only = _safe_bool(_lookup(payload, "wait_retest_only", "entry_retest_required"))
+    if wait_retest_only is True:
+        return True
+
+    timing_status = _lookup_upper(payload, "entry_timing_status") or ""
+    if timing_status in {"LATE_SIGNAL", "HARD_LATE_SIGNAL"}:
+        return True
+
+    already_moved_r = _safe_float(_lookup(payload, "already_moved_R", "already_moved_r"))
+    if already_moved_r is not None and already_moved_r >= _env_float("POST_NEWS_OTD_FIRST_IMPULSE_CHASE_R", 0.70):
+        return True
+
+    return False
+
+
+def _derive_post_news_otd_fields(payload: dict[str, Any]) -> dict[str, Any]:
+    """
+    Structural bridge for macro guard.
+
+    This does not weaken macro policy. It only says whether the chart has already
+    produced a valid post-news OTD continuation model: first impulse -> retest /
+    acceptance -> executable continuation with a real target and >=3R practical RR.
+    Macro guard still decides whether the active event permits Battle.
+    """
+    min_rr = _post_news_otd_min_rr()
+    direction = _normalize_direction(_lookup(payload, "direction"))
+    impulse_direction, impulse_confirmed = _infer_impulse_direction(payload)
+    if impulse_direction is None and direction and _is_open_test_drive_context(payload) and _has_valid_ltf_model(payload):
+        impulse_direction = direction
+        impulse_confirmed = True
+
+    retest_status = _infer_retest_status(payload)
+    retest_ok = retest_status in VALID_RETEST_STATUSES
+    acceptance_status = _infer_acceptance_status(payload, direction=direction)
+    execution_status = _execution_status(payload) or ""
+    ltf_confirmed = _has_valid_ltf_model(payload)
+
+    if acceptance_status in (None, "UNKNOWN") and ltf_confirmed and retest_ok and _is_open_test_drive_context(payload):
+        acceptance_status = "ACCEPTANCE_CONFIRMED"
+
+    acceptance_ok = acceptance_status in ACCEPTANCE_CONFIRMED_STATUSES
+    real_target = _is_real_target(payload) is True
+    stop_ok = _stop_ok(payload)
+    rr = _practical_rr(payload)
+    practical_rr_ok = rr is not None and rr >= min_rr
+    first_impulse_chased = _is_first_impulse_chased(payload, retest_ok=retest_ok)
+    open_behavior = _open_behavior(payload)
+    directional_context = _is_open_test_drive_context(payload)
+    direction_matches = bool(direction and impulse_direction and direction == impulse_direction)
+
+    blockers: list[str] = []
+    reasons: list[str] = []
+
+    if not directional_context:
+        blockers.append("not_open_test_drive_context")
+    else:
+        reasons.append("open_test_drive_context")
+
+    if direction not in {"LONG", "SHORT"}:
+        blockers.append("missing_direction")
+    if not direction_matches:
+        blockers.append("direction_not_matching_post_news_impulse")
+    if not ltf_confirmed:
+        blockers.append("ltf_model_not_confirmed")
+    if not retest_ok:
+        blockers.append("retest_not_confirmed")
+    if not acceptance_ok:
+        blockers.append("acceptance_not_confirmed")
+    if not real_target:
+        blockers.append("real_target_missing")
+    if not stop_ok:
+        blockers.append("stop_not_ok")
+    if not practical_rr_ok:
+        blockers.append("practical_rr_below_3")
+    if first_impulse_chased:
+        blockers.append("first_impulse_chase")
+
+    if ltf_confirmed:
+        reasons.append("ltf_model_confirmed")
+    if retest_ok:
+        reasons.append(f"retest_status={retest_status}")
+    if acceptance_ok:
+        reasons.append(f"acceptance_status={acceptance_status}")
+    if rr is not None:
+        reasons.append(f"practical_rr={rr:.2f}")
+    if real_target:
+        reasons.append("real_target")
+    if stop_ok:
+        reasons.append("stop_ok")
+
+    if not directional_context:
+        model = POST_NEWS_OTD_NOT_APPLICABLE
+        candidate = False
+    elif not blockers:
+        model = POST_NEWS_OTD_CONFIRMED
+        candidate = True
+    elif ltf_confirmed and retest_ok and acceptance_ok and not first_impulse_chased:
+        model = POST_NEWS_OTD_CAUTION
+        candidate = practical_rr_ok and stop_ok and real_target
+    elif ltf_confirmed or retest_ok or acceptance_ok:
+        model = POST_NEWS_OTD_PENDING
+        candidate = False
+    else:
+        model = POST_NEWS_OTD_REJECTED
+        candidate = False
+
+    return {
+        "post_news_otd_model": model,
+        "post_news_otd_candidate": candidate,
+        "post_news_otd_direction": direction,
+        "post_news_otd_entry_model": POST_NEWS_OTD_ENTRY_MODEL if directional_context else None,
+        "post_news_otd_first_impulse_chased": first_impulse_chased,
+        "post_news_otd_acceptance_confirmed": acceptance_ok,
+        "post_news_otd_retest_confirmed": retest_ok,
+        "post_news_otd_ltf_confirmed": ltf_confirmed,
+        "post_news_otd_real_target": real_target,
+        "post_news_otd_stop_ok": stop_ok,
+        "post_news_otd_practical_rr_ok": practical_rr_ok,
+        "post_news_otd_practical_rr": rr,
+        "post_news_otd_min_practical_rr": min_rr,
+        "post_news_otd_blockers": blockers,
+        "post_news_otd_reasons": reasons,
+        "post_news_otd_impulse_direction": impulse_direction,
+        "post_news_otd_impulse_confirmed": impulse_confirmed,
+        "post_news_otd_open_behavior": open_behavior,
+        "post_news_otd_execution_status": execution_status,
+    }
 
 
 # =============================================================================
@@ -856,10 +1061,54 @@ def apply_post_news_continuation(
     *,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    """Return a shallow copy of payload enriched with post-news fields."""
+    """Return a shallow copy of payload enriched with post-news / OTD fields."""
     enriched = dict(payload)
     result = detect_post_news_continuation(enriched, now=now)
     fields = result.to_payload_fields()
+
+    # Independent structural OTD bridge. This is intentionally evaluated even
+    # when the payload itself does not know that today is a macro/news day.
+    # Battle Permission / Macro Guard will later decide whether an active macro
+    # event exists. These fields only prove chart structure.
+    otd_fields = _derive_post_news_otd_fields(enriched)
+    fields.update(otd_fields)
+
+    otd_model = str(otd_fields.get("post_news_otd_model") or "").upper()
+    if otd_model in {POST_NEWS_OTD_CONFIRMED, POST_NEWS_OTD_CAUTION} and bool(otd_fields.get("post_news_otd_candidate")):
+        # Let Battle Gate know that the chart passed the strict post-news
+        # acceptance/retest/LTF/target/stop/RR bridge. This does not bypass macro
+        # guard; it only satisfies its structural requirements.
+        fields["post_news_retest_status"] = fields.get("post_news_retest_status") or "CONFIRMED"
+        fields["post_news_acceptance_status"] = fields.get("post_news_acceptance_status") or "ACCEPTANCE_CONFIRMED"
+        fields["post_news_continuation_quality"] = (
+            fields.get("post_news_continuation_quality")
+            or ("CLEAN" if otd_model == POST_NEWS_OTD_CONFIRMED else "CAUTION")
+        )
+        fields["post_news_continuation_direction"] = fields.get("post_news_continuation_direction") or otd_fields.get("post_news_otd_direction")
+        fields["post_news_trade_permission"] = (
+            PERMISSION_ALLOW_BATTLE
+            if otd_model == POST_NEWS_OTD_CONFIRMED
+            else PERMISSION_ALLOW_CAUTION_BATTLE
+        )
+
+        # Stable context fields consumed by macro_event_guard._macro_guard_context.
+        fields["acceptance_confirmed"] = bool(otd_fields.get("post_news_otd_acceptance_confirmed"))
+        fields["post_news_acceptance_confirmed"] = bool(otd_fields.get("post_news_otd_acceptance_confirmed"))
+        fields["retest_confirmed"] = bool(otd_fields.get("post_news_otd_retest_confirmed"))
+        fields["post_news_retest_confirmed"] = bool(otd_fields.get("post_news_otd_retest_confirmed"))
+        fields["ltf_confirmed"] = bool(otd_fields.get("post_news_otd_ltf_confirmed"))
+        fields["real_target"] = bool(otd_fields.get("post_news_otd_real_target"))
+        fields["has_real_target"] = bool(otd_fields.get("post_news_otd_real_target"))
+        fields["stop_ok"] = bool(otd_fields.get("post_news_otd_stop_ok"))
+        fields["practical_rr_ok"] = bool(otd_fields.get("post_news_otd_practical_rr_ok"))
+
+        if otd_fields.get("post_news_otd_practical_rr") is not None:
+            fields["practical_rr"] = otd_fields.get("post_news_otd_practical_rr")
+
+        reasons = list(fields.get("post_news_reasons") or [])
+        reasons.extend(str(x) for x in (otd_fields.get("post_news_otd_reasons") or []))
+        fields["post_news_reasons"] = list(dict.fromkeys(reasons))
+
     enriched.update(fields)
 
     metadata = _safe_dict(enriched.get("metadata"))

@@ -43,6 +43,7 @@ from app.services.radar_journal import (
 from app.services.signal_quality_engine import enrich_payload_with_quality
 from app.services.tpo_watch_bridge import enrich_payload_with_tpo_watch
 from app.services.tpo_ltf_model_detector import enrich_payload_with_ltf_model
+from app.services.post_news_continuation_detector import apply_post_news_continuation
 from app.services.signal_tracker import SignalTracker, SignalTrackerResult
 from app.services.telegram_formatter import format_signal_message
 from app.services.telegram_notifier import build_telegram_notifier
@@ -51,7 +52,7 @@ from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.5.3-rr-alias-ny-market-status-guard"
+RUNNER_VERSION = "1.5.4-post-news-otd-bridge"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -1560,6 +1561,9 @@ class StatefulBatchRunner:
                 scenario=scenario,
                 final_signal=final_signal,
             )
+            tracker_source_payload = self._enrich_tracker_payload_with_post_news_otd_bridge(
+                payload=tracker_source_payload,
+            )
 
             tracker_result = self.signal_tracker.process(
                 scenario_result=tracker_source_payload,
@@ -1586,6 +1590,9 @@ class StatefulBatchRunner:
                     payload=tracker_result.payload,
                     series_by_tf=series_by_tf,
                 )
+                tracker_result.payload = self._enrich_tracker_payload_with_post_news_otd_bridge(
+                    payload=tracker_result.payload,
+                )
 
             if isinstance(tracker_result.previous_payload, dict):
                 tracker_result.previous_payload = self._attach_tpo_policy_to_payload(
@@ -1596,6 +1603,9 @@ class StatefulBatchRunner:
                 tracker_result.previous_payload = self._enrich_tracker_payload_with_ltf_model_bridge(
                     payload=tracker_result.previous_payload,
                     series_by_tf=series_by_tf,
+                )
+                tracker_result.previous_payload = self._enrich_tracker_payload_with_post_news_otd_bridge(
+                    payload=tracker_result.previous_payload,
                 )
 
             candidate_payload = tracker_result.payload
@@ -2160,6 +2170,50 @@ class StatefulBatchRunner:
             if not isinstance(metadata, dict):
                 metadata = {}
             metadata["ltf_model_detector_error"] = str(error)
+            payload["metadata"] = metadata
+            return payload
+
+
+    def _enrich_tracker_payload_with_post_news_otd_bridge(
+        self,
+        *,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Add strict post-news OTD structural context for Battle/Macro Gate.
+
+        This bridge does not open trades. It only converts an already confirmed
+        OPEN_TEST_DRIVE + LTF model + real target + stop + >=3R practical RR
+        into explicit acceptance/retest/ltf/target fields consumed by
+        macro_event_guard. Missing one requirement keeps the payload as research.
+        """
+        if not isinstance(payload, dict):
+            return {}
+
+        try:
+            enriched = apply_post_news_continuation(payload)
+
+            metadata = enriched.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+                enriched["metadata"] = metadata
+
+            metadata["post_news_otd_bridge_status"] = enriched.get("post_news_otd_model")
+            metadata["post_news_otd_bridge_candidate"] = enriched.get("post_news_otd_candidate")
+            metadata["runner_version"] = RUNNER_VERSION
+
+            return enriched
+
+        except Exception as error:  # noqa: BLE001
+            logger.exception(
+                "Post-news OTD bridge enrichment failed. symbol=%s error=%s",
+                payload.get("symbol") or payload.get("instrument"),
+                error,
+            )
+            metadata = payload.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata["post_news_otd_bridge_error"] = str(error)
             payload["metadata"] = metadata
             return payload
 
@@ -3847,6 +3901,62 @@ class StatefulBatchRunner:
             "interest_zone_price": tracked_payload.get("interest_zone_price"),
             "interest_zone_role": tracked_payload.get("interest_zone_role"),
         }
+
+        tracked_metadata = tracked_payload.get("metadata") if isinstance(tracked_payload.get("metadata"), dict) else {}
+        for key in (
+            "ltf_model_state_full",
+            "ltf_model_outcome",
+            "ltf_model_type",
+            "ltf_model_confirmed",
+            "ltf_model_reasons",
+            "ltf_model_blockers",
+            "target_source",
+            "target_quality",
+            "target_zone_type",
+            "target_zone_role",
+            "acceptance_confirmed",
+            "post_news_acceptance_confirmed",
+            "retest_confirmed",
+            "post_news_retest_confirmed",
+            "ltf_confirmed",
+            "real_target",
+            "has_real_target",
+            "stop_ok",
+            "practical_rr_ok",
+            "post_news_detector_version",
+            "post_news_regime",
+            "post_news_trade_permission",
+            "post_news_elapsed_minutes",
+            "post_news_impulse_direction",
+            "post_news_impulse_confirmed",
+            "post_news_retest_level",
+            "post_news_retest_status",
+            "post_news_acceptance_status",
+            "post_news_failed_move",
+            "post_news_continuation_quality",
+            "post_news_continuation_direction",
+            "post_news_reasons",
+            "post_news_blockers",
+            "post_news_modifiers",
+            "post_news_otd_model",
+            "post_news_otd_candidate",
+            "post_news_otd_direction",
+            "post_news_otd_entry_model",
+            "post_news_otd_first_impulse_chased",
+            "post_news_otd_acceptance_confirmed",
+            "post_news_otd_retest_confirmed",
+            "post_news_otd_ltf_confirmed",
+            "post_news_otd_real_target",
+            "post_news_otd_stop_ok",
+            "post_news_otd_practical_rr_ok",
+            "post_news_otd_practical_rr",
+            "post_news_otd_min_practical_rr",
+            "post_news_otd_blockers",
+            "post_news_otd_reasons",
+        ):
+            value = tracked_payload.get(key, tracked_metadata.get(key))
+            if value is not None:
+                raw_alert_payload[key] = value
 
         if TPO_SIGNAL_GATE_ENABLED and tpo_signal_permission in {"RESEARCH_ONLY", "BLOCK"}:
             raw_alert_payload["should_alert"] = False
