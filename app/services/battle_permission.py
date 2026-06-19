@@ -34,7 +34,12 @@ except Exception:  # pragma: no cover
     evaluate_macro_guard = None  # type: ignore[assignment]
 
 
-BATTLE_PERMISSION_VERSION = "battle-permission-v1.10.1-post-news-otd-rr3-context"
+BATTLE_PERMISSION_VERSION = "battle-permission-v1.10.2-statistics-only-suppression"
+
+# Signals that are structurally stale/invalid or post-shock with insufficient
+# reward must stay out of user-facing Telegram delivery. They remain in
+# journal/statistics/telemetry for diagnostics.
+POST_SHOCK_STATISTICS_ONLY_MIN_RR = float(os.getenv("POST_SHOCK_STATISTICS_ONLY_MIN_RR", os.getenv("POST_NEWS_OTD_MIN_PRACTICAL_RR", "3.0")))
 
 
 class BattlePermission(str, Enum):
@@ -107,6 +112,12 @@ class BattlePermissionResult:
     risk_mode: str | None = None
     caution_flags: list[str] = field(default_factory=list)
 
+    # Statistics-only suppression fields.
+    # These payloads are useful for journal/statistics, but must not reach Telegram.
+    statistics_only: bool = False
+    suppression_reason: str | None = None
+    suppression_reasons: list[str] = field(default_factory=list)
+
     # Post-news continuation detector fields.
     post_news_detector_version: str | None = None
     post_news_regime: str | None = None
@@ -169,6 +180,7 @@ class BattlePermissionResult:
 
     # First-impulse / no-chase protection.
     entry_price: float | None = None
+    invalidation_price: float | None = None
     target_price: float | None = None
     current_price: float | None = None
     impulse_progress: float | None = None
@@ -678,6 +690,54 @@ def _extract_trade_price_levels(payload: dict[str, Any]) -> dict[str, float | No
         )
     )
 
+    invalidation_price = _as_float(
+        _deep_get(
+            payload,
+            "metadata.invalidation_price",
+            "metadata.invalidation",
+            "metadata.invalidation_reference_price",
+            "metadata.stop_price",
+            "metadata.stop",
+            "metadata.stop_loss",
+            "metadata.sl",
+            "metadata.execution.invalidation_price",
+            "metadata.execution.invalidation",
+            "metadata.execution.invalidation_reference_price",
+            "metadata.execution.stop_price",
+            "metadata.execution.stop",
+            "metadata.execution.stop_loss",
+            "metadata.execution.sl",
+            "metadata.execution_plan.invalidation_price",
+            "metadata.execution_plan.invalidation",
+            "metadata.execution_plan.invalidation_reference_price",
+            "metadata.execution_plan.stop_price",
+            "metadata.execution_plan.stop",
+            "metadata.execution_plan.stop_loss",
+            "metadata.execution_plan.sl",
+            "execution.invalidation_price",
+            "execution.invalidation",
+            "execution.invalidation_reference_price",
+            "execution.stop_price",
+            "execution.stop",
+            "execution.stop_loss",
+            "execution.sl",
+            "execution_plan.invalidation_price",
+            "execution_plan.invalidation",
+            "execution_plan.invalidation_reference_price",
+            "execution_plan.stop_price",
+            "execution_plan.stop",
+            "execution_plan.stop_loss",
+            "execution_plan.sl",
+            "invalidation_price",
+            "invalidation",
+            "invalidation_reference_price",
+            "stop_price",
+            "stop",
+            "stop_loss",
+            "sl",
+        )
+    )
+
     target_price = _as_float(
         _deep_get(
             payload,
@@ -742,6 +802,7 @@ def _extract_trade_price_levels(payload: dict[str, Any]) -> dict[str, float | No
 
     return {
         "entry_price": entry_price,
+        "invalidation_price": invalidation_price,
         "target_price": target_price,
         "current_price": current_price,
     }
@@ -860,6 +921,143 @@ def _compute_first_impulse_state(inputs: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+
+
+def _payload_flag_haystack(inputs: dict[str, Any]) -> str:
+    payload = inputs.get("payload") if isinstance(inputs.get("payload"), dict) else {}
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+
+    values: list[Any] = [
+        inputs.get("scenario_family"),
+        inputs.get("post_news_regime"),
+        inputs.get("post_news_trade_permission"),
+        inputs.get("macro_regime"),
+        inputs.get("macro_risk_mode"),
+        inputs.get("macro_guard_status"),
+        inputs.get("news_risk_state"),
+        payload.get("trigger_reason"),
+        metadata.get("trigger_reason"),
+        payload.get("entry_timing_status"),
+        metadata.get("entry_timing_status"),
+    ]
+
+    for key in (
+        "flags",
+        "caution_flags",
+        "macro_caution_flags",
+        "battle_permission_modifiers",
+        "battle_permission_blockers",
+        "post_news_modifiers",
+        "post_news_blockers",
+        "post_news_reasons",
+        "reasons",
+        "blockers",
+        "modifiers",
+    ):
+        values.append(payload.get(key))
+        values.append(metadata.get(key))
+        values.append(inputs.get(key))
+
+    text_items: list[str] = []
+    for value in values:
+        text_items.extend(_as_text_list(value))
+
+    return " ".join(text_items).upper()
+
+
+def _is_invalidated_before_alert(inputs: dict[str, Any]) -> tuple[bool, str | None]:
+    direction = _normalize_direction(inputs.get("direction"))
+    current = _as_float(inputs.get("current_price"))
+    invalidation = _as_float(inputs.get("invalidation_price"))
+
+    if direction not in {"LONG", "SHORT"} or current is None or invalidation is None:
+        return False, None
+
+    if direction == "LONG" and current <= invalidation:
+        return True, f"current_price={current} <= invalidation={invalidation} for LONG"
+
+    if direction == "SHORT" and current >= invalidation:
+        return True, f"current_price={current} >= invalidation={invalidation} for SHORT"
+
+    return False, None
+
+
+def _is_post_shock_or_post_news_context(inputs: dict[str, Any]) -> bool:
+    if inputs.get("macro_shock_recent") is True:
+        return True
+
+    macro_regime = _as_upper(inputs.get("macro_regime"))
+    if macro_regime and macro_regime not in {"NO_MACRO_SHOCK", "NONE", "UNKNOWN"}:
+        return True
+
+    post_news_regime = _as_upper(inputs.get("post_news_regime"))
+    if post_news_regime and post_news_regime not in {"NOT_POST_NEWS", "NONE", "UNKNOWN"}:
+        return True
+
+    macro_guard_status = _as_upper(inputs.get("macro_guard_status"))
+    if macro_guard_status and any(token in macro_guard_status for token in ("POST_NEWS", "FOMC", "PRE_NEWS")):
+        return True
+
+    haystack = _payload_flag_haystack(inputs)
+    return any(
+        token in haystack
+        for token in (
+            "MACRO_SHOCK_RECENT",
+            "MACRO_RISK_POST_SHOCK_CAUTION",
+            "FAILED_ACCEPTANCE_RETEST_AFTER_SHOCK",
+            "POST_SHOCK",
+            "POST_NEWS",
+        )
+    )
+
+
+def _post_shock_rr_below_statistics_min(inputs: dict[str, Any]) -> tuple[bool, str | None]:
+    if not _is_post_shock_or_post_news_context(inputs):
+        return False, None
+
+    rr = _as_float(inputs.get("practical_rr"))
+    if rr is None:
+        return True, f"post-shock/post-news practical_rr is missing; minimum is {POST_SHOCK_STATISTICS_ONLY_MIN_RR:.2f}"
+
+    if rr < POST_SHOCK_STATISTICS_ONLY_MIN_RR:
+        return True, f"post-shock/post-news practical_rr={rr:.2f}; minimum is {POST_SHOCK_STATISTICS_ONLY_MIN_RR:.2f}"
+
+    return False, None
+
+
+def _build_statistics_only_result(
+    *,
+    inputs: dict[str, Any],
+    auction_score: int,
+    reasons: list[str],
+    blockers: list[str],
+    modifiers: list[str],
+    v2_policy: dict[str, Any],
+    risk_mode: str,
+    suppression_reason: str,
+    detail: str | None = None,
+    caution_flags: list[str] | None = None,
+) -> BattlePermissionResult:
+    suppression_reasons = [suppression_reason]
+    if detail:
+        suppression_reasons.append(detail)
+
+    return _build_result(
+        inputs=inputs,
+        auction_score=auction_score,
+        reasons=reasons + [detail or suppression_reason, "statistics_only: suppressed from user-facing Telegram delivery"],
+        blockers=_dedupe_text_list(blockers + [suppression_reason]),
+        modifiers=_dedupe_text_list(modifiers + ["statistics_only"]),
+        battle_permission=BattlePermission.BLOCKED_BY_CONTEXT.value,
+        telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
+        battle_ready=False,
+        v2_policy=v2_policy,
+        risk_mode=risk_mode,
+        caution_flags=caution_flags or [],
+        statistics_only=True,
+        suppression_reason=suppression_reason,
+        suppression_reasons=suppression_reasons,
+    )
 
 
 def _macro_guard_timezone(payload: dict[str, Any]) -> str:
@@ -2179,6 +2377,7 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
         "macro_caution_flags": _as_text_list(_deep_get(payload, "metadata.macro_caution_flags", "macro_caution_flags")),
         "macro_reasons": _as_text_list(_deep_get(payload, "metadata.macro_reasons", "macro_reasons")),
         "entry_price": trade_price_levels.get("entry_price"),
+        "invalidation_price": trade_price_levels.get("invalidation_price"),
         "target_price": trade_price_levels.get("target_price"),
         "current_price": trade_price_levels.get("current_price"),
         "fresh_retest_exists": fresh_retest_flags.get("fresh_retest_exists"),
@@ -2271,6 +2470,9 @@ def _build_result(
     v2_policy: dict[str, Any],
     risk_mode: str | None = None,
     caution_flags: list[str] | None = None,
+    statistics_only: bool = False,
+    suppression_reason: str | None = None,
+    suppression_reasons: list[str] | None = None,
 ) -> BattlePermissionResult:
     return BattlePermissionResult(
         battle_permission=battle_permission,
@@ -2312,6 +2514,9 @@ def _build_result(
         target_quality=inputs.get("target_quality"),
         risk_mode=risk_mode,
         caution_flags=list(caution_flags or []),
+        statistics_only=bool(statistics_only),
+        suppression_reason=suppression_reason,
+        suppression_reasons=list(suppression_reasons or []),
         post_news_detector_version=inputs.get("post_news_detector_version"),
         post_news_regime=inputs.get("post_news_regime"),
         post_news_trade_permission=inputs.get("post_news_trade_permission"),
@@ -2365,6 +2570,7 @@ def _build_result(
         macro_guard_notes=list(inputs.get("macro_guard_notes") or []),
         macro_guard_error=inputs.get("macro_guard_error"),
         entry_price=inputs.get("entry_price"),
+        invalidation_price=inputs.get("invalidation_price"),
         target_price=inputs.get("target_price"),
         current_price=inputs.get("current_price"),
         impulse_progress=inputs.get("impulse_progress"),
@@ -2416,6 +2622,8 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
     scenario_family = inputs.get("scenario_family")
     target_quality = inputs.get("target_quality")
     open_behavior = _as_upper(inputs.get("open_behavior"))
+    invalidation_price = inputs.get("invalidation_price")
+    current_price = inputs.get("current_price")
 
     post_news_regime = inputs.get("post_news_regime")
     post_news_trade_permission = inputs.get("post_news_trade_permission")
@@ -2563,6 +2771,39 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
             telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
             battle_ready=False,
             v2_policy=v2_policy,
+        )
+
+    # 1b. Statistics-only delivery suppression.
+    # These are not user-facing trade ideas anymore. They remain in
+    # journal/statistics/telemetry so we can measure how much noise was filtered.
+    invalidated, invalidated_detail = _is_invalidated_before_alert(inputs)
+    if invalidated:
+        return _build_statistics_only_result(
+            inputs=inputs,
+            auction_score=auction_score,
+            reasons=reasons,
+            blockers=blockers,
+            modifiers=modifiers,
+            v2_policy=v2_policy,
+            risk_mode="INVALIDATED_BEFORE_ALERT",
+            suppression_reason="invalidated_before_alert",
+            detail=invalidated_detail,
+            caution_flags=caution_flags,
+        )
+
+    post_shock_rr_low, post_shock_rr_detail = _post_shock_rr_below_statistics_min(inputs)
+    if post_shock_rr_low:
+        return _build_statistics_only_result(
+            inputs=inputs,
+            auction_score=auction_score,
+            reasons=reasons,
+            blockers=blockers,
+            modifiers=modifiers,
+            v2_policy=v2_policy,
+            risk_mode="POST_SHOCK_RR_BELOW_3",
+            suppression_reason="post_shock_rr_below_3",
+            detail=post_shock_rr_detail,
+            caution_flags=caution_flags,
         )
 
     # 2. First impulse / no-chase gate.
@@ -3019,6 +3260,9 @@ def _attach_tpo_open_behavior_fields_to_metadata(metadata: dict[str, Any], resul
     metadata["target_quality"] = result.get("target_quality")
     metadata["risk_mode"] = result.get("risk_mode")
     metadata["caution_flags"] = result.get("caution_flags") or []
+    metadata["statistics_only"] = result.get("statistics_only")
+    metadata["suppression_reason"] = result.get("suppression_reason")
+    metadata["suppression_reasons"] = result.get("suppression_reasons") or []
 
     metadata["post_news_detector_version"] = result.get("post_news_detector_version")
     metadata["post_news_regime"] = result.get("post_news_regime")
@@ -3077,6 +3321,7 @@ def _attach_tpo_open_behavior_fields_to_metadata(metadata: dict[str, Any], resul
     metadata["macro_guard_error"] = result.get("macro_guard_error")
 
     metadata["entry_price"] = result.get("entry_price")
+    metadata["invalidation_price"] = result.get("invalidation_price")
     metadata["target_price"] = result.get("target_price")
     metadata["current_price"] = result.get("current_price")
     metadata["impulse_progress"] = result.get("impulse_progress")
@@ -3164,6 +3409,9 @@ def apply_battle_permission(raw_payload: dict[str, Any]) -> dict[str, Any]:
     payload["target_quality"] = result.get("target_quality")
     payload["risk_mode"] = result.get("risk_mode")
     payload["caution_flags"] = result.get("caution_flags") or []
+    payload["statistics_only"] = result.get("statistics_only")
+    payload["suppression_reason"] = result.get("suppression_reason")
+    payload["suppression_reasons"] = result.get("suppression_reasons") or []
 
     payload["post_news_detector_version"] = result.get("post_news_detector_version")
     payload["post_news_regime"] = result.get("post_news_regime")
@@ -3222,6 +3470,7 @@ def apply_battle_permission(raw_payload: dict[str, Any]) -> dict[str, Any]:
     payload["macro_guard_error"] = result.get("macro_guard_error")
 
     payload["entry_price"] = result.get("entry_price")
+    payload["invalidation_price"] = result.get("invalidation_price")
     payload["target_price"] = result.get("target_price")
     payload["current_price"] = result.get("current_price")
     payload["impulse_progress"] = result.get("impulse_progress")

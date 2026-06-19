@@ -52,7 +52,7 @@ from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.5.4-post-news-otd-bridge"
+RUNNER_VERSION = "1.5.5-statistics-only-suppression-guard"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -599,6 +599,45 @@ def _is_telegram_trade_alert_allowed(payload: dict[str, Any]) -> tuple[bool, str
     if rr > TELEGRAM_MAX_RR:
         return False, f"blocked_rr_too_high:{rr:.2f}"
 
+    flags_raw = payload.get("flags") or payload.get("caution_flags") or payload.get("macro_caution_flags") or []
+    if not isinstance(flags_raw, (list, tuple, set)):
+        flags_raw = [flags_raw]
+    flag_haystack = " ".join(
+        str(x or "")
+        for x in (
+            list(flags_raw)
+            + [
+                payload.get("risk_mode"),
+                payload.get("macro_regime"),
+                payload.get("macro_risk_mode"),
+                payload.get("post_news_regime"),
+                payload.get("post_news_otd_model"),
+                payload.get("trigger_reason"),
+            ]
+        )
+    ).upper()
+    post_shock_context = any(
+        token in flag_haystack
+        for token in (
+            "MACRO_SHOCK_RECENT",
+            "MACRO_RISK_POST_SHOCK_CAUTION",
+            "FAILED_ACCEPTANCE_RETEST_AFTER_SHOCK",
+            "POST_SHOCK",
+            "POST_NEWS",
+        )
+    )
+    if post_shock_context and rr < 3.0:
+        payload["statistics_only"] = True
+        payload["suppression_reason"] = "post_shock_rr_below_3"
+        payload["suppression_reasons"] = [
+            "post_shock_rr_below_3",
+            f"post-shock/post-news rr={rr:.2f}; minimum is 3.00",
+        ]
+        payload["telegram_delivery_mode"] = "SUPPRESS"
+        payload["battle_ready"] = False
+        payload["risk_mode"] = "POST_SHOCK_RR_BELOW_3"
+        return False, "blocked_post_shock_rr_below_3_statistics_only"
+
     if entry is None or stop is None or target is None:
         return False, "blocked_missing_trade_geometry"
 
@@ -607,6 +646,31 @@ def _is_telegram_trade_alert_allowed(payload: dict[str, Any]) -> tuple[bool, str
 
     if direction == "SHORT" and not (target < entry < stop):
         return False, "blocked_invalid_short_geometry"
+
+    if current is not None:
+        if direction == "LONG" and current <= stop:
+            payload["statistics_only"] = True
+            payload["suppression_reason"] = "invalidated_before_alert"
+            payload["suppression_reasons"] = [
+                "invalidated_before_alert",
+                f"current_price={current} <= invalidation={stop} for LONG",
+            ]
+            payload["telegram_delivery_mode"] = "SUPPRESS"
+            payload["battle_ready"] = False
+            payload["risk_mode"] = "INVALIDATED_BEFORE_ALERT"
+            return False, "blocked_invalidated_before_alert"
+
+        if direction == "SHORT" and current >= stop:
+            payload["statistics_only"] = True
+            payload["suppression_reason"] = "invalidated_before_alert"
+            payload["suppression_reasons"] = [
+                "invalidated_before_alert",
+                f"current_price={current} >= invalidation={stop} for SHORT",
+            ]
+            payload["telegram_delivery_mode"] = "SUPPRESS"
+            payload["battle_ready"] = False
+            payload["risk_mode"] = "INVALIDATED_BEFORE_ALERT"
+            return False, "blocked_invalidated_before_alert"
 
     if current is not None:
         risk = abs(stop - entry)

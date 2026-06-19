@@ -11,7 +11,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-TELEMETRY_SCHEMA_VERSION = "battle-permission-telemetry-v3.3-macro-event-guard-fields"
+TELEMETRY_SCHEMA_VERSION = "battle-permission-telemetry-v3.4-statistics-only-suppression-fields"
 
 
 # =============================================================================
@@ -795,6 +795,41 @@ def build_battle_permission_event(
             context.get("battle_permission_version"),
         ),
 
+        # Statistics-only suppression fields.
+        "statistics_only": _safe_bool(
+            _first_non_empty(
+                payload.get("statistics_only"),
+                metadata.get("statistics_only"),
+                context.get("statistics_only"),
+            )
+        ),
+        "suppression_reason": _first_non_empty(
+            payload.get("suppression_reason"),
+            metadata.get("suppression_reason"),
+            context.get("suppression_reason"),
+        ),
+        "suppression_reasons": _safe_text_list(
+            _first_non_empty(
+                payload.get("suppression_reasons"),
+                metadata.get("suppression_reasons"),
+                context.get("suppression_reasons"),
+            )
+        ),
+        "invalidation_price": _safe_float(
+            _first_non_empty(
+                payload.get("invalidation_price"),
+                payload.get("invalidation_reference_price"),
+                payload.get("stop_price"),
+                payload.get("stop_loss"),
+                metadata.get("invalidation_price"),
+                metadata.get("invalidation_reference_price"),
+                metadata.get("stop_price"),
+                metadata.get("stop_loss"),
+                context.get("invalidation_price"),
+                context.get("invalidation_reference_price"),
+            )
+        ),
+
         # Safety-context fields added in v3.
         "risk_mode": _first_non_empty(
             payload.get("risk_mode"),
@@ -1171,6 +1206,41 @@ def build_battle_permission_event(
             payload.get("post_news_continuation_quality"),
             metadata.get("post_news_continuation_quality"),
             context.get("post_news_continuation_quality"),
+        ),
+        "post_news_otd_model": _first_non_empty(
+            payload.get("post_news_otd_model"),
+            metadata.get("post_news_otd_model"),
+            context.get("post_news_otd_model"),
+        ),
+        "post_news_otd_candidate": _safe_bool(
+            _first_non_empty(
+                payload.get("post_news_otd_candidate"),
+                metadata.get("post_news_otd_candidate"),
+                context.get("post_news_otd_candidate"),
+            )
+        ),
+        "post_news_otd_practical_rr": _safe_float(
+            _first_non_empty(
+                payload.get("post_news_otd_practical_rr"),
+                metadata.get("post_news_otd_practical_rr"),
+                context.get("post_news_otd_practical_rr"),
+                payload.get("practical_rr"),
+                metadata.get("practical_rr"),
+            )
+        ),
+        "post_news_otd_blockers": _safe_text_list(
+            _first_non_empty(
+                payload.get("post_news_otd_blockers"),
+                metadata.get("post_news_otd_blockers"),
+                context.get("post_news_otd_blockers"),
+            )
+        ),
+        "post_news_otd_reasons": _safe_text_list(
+            _first_non_empty(
+                payload.get("post_news_otd_reasons"),
+                metadata.get("post_news_otd_reasons"),
+                context.get("post_news_otd_reasons"),
+            )
         ),
 
         # Telegram final outcome.
