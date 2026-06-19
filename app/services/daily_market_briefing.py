@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.18.1-holiday-overrides-macro-unknown-downstream"
+BRIEFING_VERSION = "daily-market-briefing-v1.18.2-us-holiday-closed-market-state"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -3049,6 +3049,7 @@ def _brief_verdict(
     *,
     post_news_active: bool = False,
     macro_unknown: bool = False,
+    us_holiday_overlay: bool = False,
 ) -> tuple[str, str]:
     market_status = data["market_status"]
     permission = data["permission"]
@@ -3077,6 +3078,31 @@ def _brief_verdict(
     zone_text = f" | зона: {zone}" if zone != "-" else ""
     bias_text = f" | bias: {bias}"
     subtype_text = f"{subtype}"
+
+    # US holiday overlay must win over stale/false-session wording for NY cash assets.
+    # On Juneteenth/US market holidays NAS100/SPX500 are closed by session calendar,
+    # not merely "stale while session active". UKOIL can have limited/changed holiday
+    # liquidity, so render it as holiday caution instead of a normal NY-stale condition.
+    if us_holiday_overlay:
+        if sym in {"NAS100", "SPX500"}:
+            detail = "US_HOLIDAY | MARKET_CLOSED | NY cash session closed; no Battle"
+            if zone != "-":
+                detail += f" | зона: {zone}"
+            detail += f"{bias_text}"
+            return "NO_TRADE", f"• {sym} — {detail}"
+        if sym == "UKOIL" and (
+            market_status.startswith("MARKET_CLOSED")
+            or permission == "MARKET_CLOSED"
+            or market_data_is_stale
+            or permission in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"}
+        ):
+            detail = "HOLIDAY_LIQUIDITY_CAUTION | changed/limited NY holiday schedule"
+            if subtype_text and subtype_text not in {"UNKNOWN", "-"}:
+                detail += f" | {subtype_text}"
+            if zone != "-":
+                detail += f" | зона: {zone}"
+            detail += f" | no Battle; only fresh data + retest/acceptance + real target{bias_text}"
+            return "NO_TRADE", f"• {sym} — {detail}"
 
     # NO TRADE is reserved only for real blockers: stale/no data/provider error/fallback.
     if data.get("fallback") or market_status in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"} or permission in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"}:
@@ -3421,6 +3447,7 @@ def _build_tpo_snapshot_section(
             _brief_symbol_context(item),
             post_news_active=post_news_active,
             macro_unknown=macro_unknown,
+            us_holiday_overlay=bool(target_date and _is_us_holiday_overlay_active(target_date)),
         )
         if bucket == "WATCH":
             watch.append(line)
