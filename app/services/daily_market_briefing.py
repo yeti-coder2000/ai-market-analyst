@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.17-tradingeconomics-backup-calendar"
+BRIEFING_VERSION = "daily-market-briefing-v1.18-holiday-session-risk-separation"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -50,6 +50,21 @@ MACRO_FALLBACK = "FALLBACK"
 MACRO_HIGH_FROM_BACKUP_CALENDAR = "HIGH_FROM_BACKUP_CALENDAR"
 MACRO_LAST_GOOD_CACHE = "LAST_GOOD_CACHE"
 MACRO_UNKNOWN_CONSERVATIVE = "MACRO_UNKNOWN_CONSERVATIVE"
+
+# Static holiday/session overlay for cases where online macro providers fail.
+# This prevents known US market holidays from being rendered as generic
+# MACRO_UNKNOWN_CONSERVATIVE / provider-unavailable red risk blocks.
+# Keep this list explicit and conservative; it is a reporting overlay, not a
+# trade-permission bypass.
+US_MARKET_HOLIDAY_OVERLAY: dict[str, dict[str, Any]] = {
+    "2026-06-19": {
+        "code": "US_JUNETEENTH",
+        "name": "Juneteenth / US market holiday",
+        "ny_equity_status": "MARKET_CLOSED",
+        "liquidity_mode": "HOLIDAY_LIQUIDITY_CAUTION",
+        "session_note": "London/morning assets are not globally blocked; NY cash/risk assets are not normal Battle focus.",
+    },
+}
 
 FINAL_TP = "TP_HIT"
 FINAL_SL = "SL_HIT"
@@ -2412,11 +2427,59 @@ def _macro_calendar_unknown_conservative(calendar: CalendarLoadResult) -> bool:
     return calendar.status == MACRO_UNKNOWN_CONSERVATIVE or calendar.macro_risk_status == MACRO_UNKNOWN_CONSERVATIVE
 
 
+def _us_market_holiday_overlay(target_date: date) -> dict[str, Any] | None:
+    """Return static US holiday/session overlay for known market holidays.
+
+    This is intentionally separate from the macro calendar. If providers are
+    down on a known US holiday, the report should say "holiday liquidity risk"
+    rather than generic "macro unknown".
+    """
+    raw_enabled = str(os.getenv("ENABLE_US_HOLIDAY_RISK_OVERLAY", "true")).strip().lower()
+    if raw_enabled not in {"1", "true", "yes", "on"}:
+        return None
+
+    override = os.getenv("FORCE_US_HOLIDAY_OVERLAY")
+    if override:
+        override = override.strip().lower()
+        if override in {"0", "false", "no", "off"}:
+            return None
+        if override in {"1", "true", "yes", "on"}:
+            return {
+                "code": "US_HOLIDAY_FORCED",
+                "name": os.getenv("US_HOLIDAY_OVERLAY_NAME", "US market holiday / forced overlay"),
+                "ny_equity_status": "MARKET_CLOSED",
+                "liquidity_mode": "HOLIDAY_LIQUIDITY_CAUTION",
+                "session_note": "Forced holiday overlay: London/morning assets are not globally blocked; NY cash/risk assets are limited.",
+            }
+
+    profile = US_MARKET_HOLIDAY_OVERLAY.get(target_date.isoformat())
+    return dict(profile) if isinstance(profile, dict) else None
+
+
+def _is_us_holiday_overlay_active(target_date: date | None) -> bool:
+    return bool(target_date and _us_market_holiday_overlay(target_date))
+
+
+def _calendar_provider_diagnostic_lines(calendar: CalendarLoadResult) -> list[str]:
+    lines: list[str] = []
+    if calendar.message:
+        lines.append(f"Calendar status: {calendar.message}")
+    if calendar.provider_error:
+        lines.append(f"Provider error: {calendar.provider_error}")
+    if calendar.fallback_chain:
+        lines.append(f"Fallback chain: {' → '.join(calendar.fallback_chain)}")
+    if calendar.last_good_cache_path:
+        lines.append(f"Last-good cache: {calendar.last_good_cache_path}")
+    return lines
+
+
 def _build_high_impact_section(target_date: date, timezone_name: str, report_type: str) -> BriefingSection:
     calendar = load_high_impact_calendar(target_date)
     raw_events = calendar.events
     events, hidden_unmapped = _filter_actionable_high_impact_events(raw_events, report_type)
-    section = BriefingSection("🔴 Ризик дня")
+    holiday_overlay = _us_market_holiday_overlay(target_date)
+    section_title = "🟠 Ризик дня" if holiday_overlay and not events else "🔴 Ризик дня"
+    section = BriefingSection(section_title)
 
     if hidden_unmapped:
         section.lines.append(f"Provider повернув {hidden_unmapped} unmapped HIGH подій; вони сховані з Telegram як неactionable.")
@@ -2431,18 +2494,19 @@ def _build_high_impact_section(target_date: date, timezone_name: str, report_typ
             section.lines.append(f"Macro mode: {calendar.macro_risk_status}.")
             section.lines.append(f"Джерело: {calendar.source}.")
         else:
-            section.lines.append("MACRO_RISK_STATUS: UNKNOWN.")
-            section.lines.append("Календар high-impact news не завантажений / provider unavailable.")
-            section.lines.append("Це не означає, що high-impact news немає.")
-            section.lines.append("Режим: MACRO_UNKNOWN_CONSERVATIVE — не піднімати research у battle без зовнішньої перевірки.")
-            if calendar.message:
-                section.lines.append(f"Статус: {calendar.message}")
-            if calendar.provider_error:
-                section.lines.append(f"Provider error: {calendar.provider_error}")
-            if calendar.fallback_chain:
-                section.lines.append(f"Fallback chain: {' → '.join(calendar.fallback_chain)}")
-            if calendar.last_good_cache_path:
-                section.lines.append(f"Last-good cache: {calendar.last_good_cache_path}")
+            if holiday_overlay:
+                section.lines.append(f"US_HOLIDAY_REGIME: {holiday_overlay.get('code')} — {holiday_overlay.get('name')}.")
+                section.lines.append("High-impact macro: немає підтверджених strong NY news у підключеному календарі; provider unavailable не перетворюємо на global no-trade.")
+                section.lines.append("Режим: HOLIDAY_LIQUIDITY_CAUTION — London/morning assets можна оцінювати до NY тільки при clean setup.")
+                section.lines.append("Session scope: NAS100/SPX500 = MARKET_CLOSED / US holiday; UKOIL = caution через змінений holiday liquidity schedule.")
+                section.lines.append("Battle policy: без FOMC/CPI/NFP/Powell не блокувати ранкові активи глобально; потрібні LTF model + stop + real target + RR.")
+                section.lines.extend(_calendar_provider_diagnostic_lines(calendar))
+            else:
+                section.lines.append("MACRO_RISK_STATUS: UNKNOWN.")
+                section.lines.append("Календар high-impact news не завантажений / provider unavailable.")
+                section.lines.append("Це не означає, що high-impact news немає.")
+                section.lines.append("Режим: MACRO_UNKNOWN_CONSERVATIVE — не піднімати research у battle без зовнішньої перевірки.")
+                section.lines.extend(_calendar_provider_diagnostic_lines(calendar))
         return section
 
     if calendar.status == MACRO_FALLBACK:
@@ -2916,6 +2980,12 @@ def _auction_subtype(sym: str, data: dict[str, Any], *, post_news_active: bool =
         return "FIRST_IMPULSE_GONE"
     if any("FIRST_IMPULSE" in x or "IMPULSE_ALREADY_GONE" in x for x in warnings) or "FIRST_IMPULSE" in trigger_reason:
         return "FIRST_IMPULSE_GONE"
+    if open_behavior == "OPEN_TEST_DRIVE":
+        if _boolish(activity.get("failed_auction")):
+            return "OTD_FAILED_ACCEPTANCE_RETEST"
+        if _boolish(activity.get("accepted_back_inside_value")) or _boolish(activity.get("accepted_back_inside_range")):
+            return "OTD_RETEST_PENDING"
+
     if _boolish(activity.get("failed_auction")):
         return "FAILED_ACCEPTANCE"
     if _boolish(activity.get("accepted_back_inside_value")) or _boolish(activity.get("accepted_back_inside_range")):
@@ -3441,18 +3511,29 @@ def _build_provider_section(tpo: dict[str, Any]) -> BriefingSection:
     return section
 
 
-def _build_focus_section(report_type: str) -> BriefingSection:
+def _build_focus_section(report_type: str, target_date: date | None = None) -> BriefingSection:
     section = BriefingSection("🧠 Правило дня")
     rt = report_type.lower().strip()
+    holiday_overlay = _us_market_holiday_overlay(target_date) if target_date is not None else None
 
     if rt in {"morning", "morning_briefing", "morning_combined", "holiday_warning", "pre_market"}:
-        section.lines.extend(
-            [
-                "POC/nPOC = зона інтересу, не кнопка входу.",
-                "Battle тільки після HTF alignment + LTF 5m–15m model + stop + RR.",
-                "До high-impact news не вважати ранню структуру стабільною.",
-            ]
-        )
+        if holiday_overlay:
+            section.lines.extend(
+                [
+                    "US holiday: це holiday-liquidity caution, не global no-trade для London/morning assets.",
+                    "London/morning assets можна торгувати до NY тільки якщо є clean LTF setup + stop + real target + RR.",
+                    "NAS100/SPX500 не є Battle focus: US cash market closed / holiday schedule.",
+                    "POC/nPOC = зона інтересу, не кнопка входу.",
+                ]
+            )
+        else:
+            section.lines.extend(
+                [
+                    "POC/nPOC = зона інтересу, не кнопка входу.",
+                    "Battle тільки після HTF alignment + LTF 5m–15m model + stop + RR.",
+                    "До high-impact news не вважати ранню структуру стабільною.",
+                ]
+            )
     elif rt in {"london", "london_1h"}:
         section.lines.extend(
             [
@@ -3461,14 +3542,24 @@ def _build_focus_section(report_type: str) -> BriefingSection:
             ]
         )
     elif rt in {"ny", "ny_1h", "new_york"}:
-        section.lines.extend(
-            [
-                "NY +1h: не наздоганяємо перший імпульс.",
-                "FOMC / high-impact news: NO BATTLE до завершення lock; після — тільки acceptance + retest.",
-                "Потрібні open behavior + LTF model + stop + Battle Gate.",
-                "POC/nPOC = зона інтересу, не entry trigger.",
-            ]
-        )
+        if holiday_overlay:
+            section.lines.extend(
+                [
+                    "NY holiday: немає нормального NY cash impulse; NAS100/SPX500 closed / no Battle.",
+                    "FX/XAU/crypto тільки reduced-confidence clean setups; без chase і без weak RR.",
+                    "UKOIL — caution через holiday liquidity schedule; потрібен retest/acceptance + real target.",
+                    "POC/nPOC = зона інтересу, не entry trigger.",
+                ]
+            )
+        else:
+            section.lines.extend(
+                [
+                    "NY +1h: не наздоганяємо перший імпульс.",
+                    "FOMC / high-impact news: NO BATTLE до завершення lock; після — тільки acceptance + retest.",
+                    "Потрібні open behavior + LTF model + stop + Battle Gate.",
+                    "POC/nPOC = зона інтересу, не entry trigger.",
+                ]
+            )
     else:
         section.lines.append("Battle Gate — фінальний дозвіл для Telegram.")
     return section
@@ -3529,7 +3620,7 @@ def build_briefing_report(
     if provider_section.lines and provider_section.lines != ["Критичних проблем з даними немає."]:
         report.sections.append(provider_section)
 
-    report.sections.append(_build_focus_section(normalized_type))
+    report.sections.append(_build_focus_section(normalized_type, target_date))
     return report
 
 

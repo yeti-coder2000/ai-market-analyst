@@ -34,12 +34,14 @@ except Exception:  # pragma: no cover
     evaluate_macro_guard = None  # type: ignore[assignment]
 
 
-BATTLE_PERMISSION_VERSION = "battle-permission-v1.10.2-statistics-only-suppression"
+BATTLE_PERMISSION_VERSION = "battle-permission-v1.10.3-otd-long-stats-downgrade"
 
 # Signals that are structurally stale/invalid or post-shock with insufficient
 # reward must stay out of user-facing Telegram delivery. They remain in
 # journal/statistics/telemetry for diagnostics.
 POST_SHOCK_STATISTICS_ONLY_MIN_RR = float(os.getenv("POST_SHOCK_STATISTICS_ONLY_MIN_RR", os.getenv("POST_NEWS_OTD_MIN_PRACTICAL_RR", "3.0")))
+TPO_OTD_LONG_STATS_DOWNGRADE_ENABLED = str(os.getenv("TPO_OTD_LONG_STATS_DOWNGRADE_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
+TPO_OTD_LONG_A_PLUS_MIN_RR = float(os.getenv("TPO_OTD_LONG_A_PLUS_MIN_RR", "3.0"))
 
 
 class BattlePermission(str, Enum):
@@ -1023,6 +1025,95 @@ def _post_shock_rr_below_statistics_min(inputs: dict[str, Any]) -> tuple[bool, s
         return True, f"post-shock/post-news practical_rr={rr:.2f}; minimum is {POST_SHOCK_STATISTICS_ONLY_MIN_RR:.2f}"
 
     return False, None
+
+
+def _is_tpo_otd_long_stats_downgrade_required(inputs: dict[str, Any]) -> tuple[bool, str | None]:
+    """Suppress weak TPO OTD LONG ideas from user-facing output.
+
+    Current production statistics show TPO OTD SHORT performing much better than
+    TPO OTD LONG. Until LONG recovers statistically, LONG OTD must be A+ to be
+    user-facing. Non-A+ cases remain available for journal/statistics/telemetry.
+    """
+    if not TPO_OTD_LONG_STATS_DOWNGRADE_ENABLED:
+        return False, None
+
+    direction = _normalize_direction(inputs.get("direction"))
+    if direction != "LONG":
+        return False, None
+
+    scenario_family = _as_upper(inputs.get("scenario_family"))
+    scenario = _as_upper(inputs.get("scenario"))
+    open_behavior = _as_upper(inputs.get("open_behavior"))
+
+    is_otd = (
+        scenario_family == "TPO_OPEN_TEST_DRIVE"
+        or "TPO_OPEN_TEST_DRIVE" in scenario
+        or (open_behavior == "OPEN_TEST_DRIVE" and "OPEN_TEST_DRIVE" in scenario)
+    )
+    if not is_otd:
+        return False, None
+
+    haystack = _payload_flag_haystack(inputs)
+    has_weak_stats_marker = any(
+        token in haystack
+        for token in (
+            "EARLY_NEGATIVE_DIAGNOSTIC",
+            "EARLY_NEGATIVE_SIGNAL_STATISTICS",
+            "EARLY_NEGATIVE",
+            "LOW_SAMPLE_SIZE",
+            "OTD_LONG_WEAK_STATS",
+            "TPO_OTD_LONG_WEAK",
+            "TPO_OPEN_TEST_DRIVE_LONG_WEAK",
+        )
+    )
+
+    quality_tier = _as_upper(inputs.get("quality_tier"))
+    rr = _as_float(inputs.get("practical_rr"))
+    target_quality = _as_upper(inputs.get("target_quality"))
+    stop_quality = _as_upper(inputs.get("stop_quality"))
+    execution_status = _as_upper(inputs.get("execution_status"))
+    htf_bias = _as_upper(inputs.get("htf_bias"))
+    macro_guard_status = _as_upper(inputs.get("macro_guard_status"))
+    news_risk_state = _as_upper(inputs.get("news_risk_state"))
+    news_provider_status = _as_upper(inputs.get("news_provider_status"))
+
+    macro_unknown = (
+        macro_guard_status == "MACRO_UNKNOWN_CONSERVATIVE"
+        or news_risk_state in {"UNKNOWN", "PROVIDER_UNAVAILABLE", "CALENDAR_UNAVAILABLE"}
+        or news_provider_status in {"UNAVAILABLE", "ERROR", "FAILED"}
+    )
+
+    strong_exception = (
+        rr is not None
+        and rr >= TPO_OTD_LONG_A_PLUS_MIN_RR
+        and target_quality == "REAL_ZONE"
+        and _is_valid_stop_quality_for_battle(stop_quality)
+        and execution_status == "EXECUTABLE"
+        and htf_bias in {"BULLISH", "STRONGLY_BULLISH", "LONG"}
+        and not _is_post_shock_or_post_news_context(inputs)
+        and not macro_unknown
+        and not has_weak_stats_marker
+        and quality_tier not in {"CAUTION", "DANGER", "BLOCK", "FAIL"}
+    )
+
+    if strong_exception:
+        return False, None
+
+    detail = (
+        "TPO OTD LONG is stats-downgraded: current cumulative diagnostics are weak; "
+        f"requires A+ exception with practical_rr>={TPO_OTD_LONG_A_PLUS_MIN_RR:.2f}, "
+        "REAL_ZONE target, OK stop, bullish HTF, clean macro/session context and no weak stats markers"
+    )
+    if has_weak_stats_marker:
+        detail += "; weak_stats_marker=true"
+    if quality_tier:
+        detail += f"; quality_tier={quality_tier}"
+    if rr is not None:
+        detail += f"; practical_rr={rr:.2f}"
+    if macro_unknown:
+        detail += "; macro_unknown=true"
+
+    return True, detail
 
 
 def _build_statistics_only_result(
@@ -2803,6 +2894,21 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
             risk_mode="POST_SHOCK_RR_BELOW_3",
             suppression_reason="post_shock_rr_below_3",
             detail=post_shock_rr_detail,
+            caution_flags=caution_flags,
+        )
+
+    tpo_otd_long_stats_downgrade, tpo_otd_long_detail = _is_tpo_otd_long_stats_downgrade_required(inputs)
+    if tpo_otd_long_stats_downgrade:
+        return _build_statistics_only_result(
+            inputs=inputs,
+            auction_score=auction_score,
+            reasons=reasons,
+            blockers=blockers,
+            modifiers=modifiers,
+            v2_policy=v2_policy,
+            risk_mode="TPO_OTD_LONG_STATS_WEAK",
+            suppression_reason="tpo_otd_long_stats_downgrade",
+            detail=tpo_otd_long_detail,
             caution_flags=caution_flags,
         )
 
