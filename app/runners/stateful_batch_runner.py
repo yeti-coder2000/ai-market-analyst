@@ -47,12 +47,13 @@ from app.services.post_news_continuation_detector import apply_post_news_continu
 from app.services.signal_tracker import SignalTracker, SignalTrackerResult
 from app.services.telegram_formatter import format_signal_message
 from app.services.telegram_notifier import build_telegram_notifier
+from app.services.battle_permission_telemetry import record_battle_permission_event
 from app.services.telegram_alert_store import record_telegram_alert
 from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.5.5-statistics-only-suppression-guard"
+RUNNER_VERSION = "1.5.6-runner-suppressed-telemetry-hook"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -3695,12 +3696,121 @@ class StatefulBatchRunner:
             return "INVALIDATED"
         return None
 
+    def _record_suppressed_battle_telemetry_once(
+        self,
+        payload: dict[str, Any],
+        *,
+        reason: str | None = None,
+    ) -> bool:
+        """
+        Runner-level suppressed telemetry hook.
+
+        Telegram notifier writes telemetry only when a payload reaches the
+        notifier path. Hard gates can stop weak/statistics-only payloads before
+        that point. This hook records those suppressed decisions so statistics
+        can count Telegram noise that was intentionally filtered out.
+
+        It is intentionally limited to non-sent / suppressed payloads to avoid
+        duplicating BATTLE_ALERT / RESEARCH_ALERT events recorded by
+        telegram_notifier.py.
+        """
+        if not isinstance(payload, dict) or not payload:
+            return False
+
+        if payload.get("_runner_suppressed_telemetry_recorded") is True:
+            return False
+
+        delivery_mode = str(payload.get("telegram_delivery_mode") or "").upper()
+        statistics_only = payload.get("statistics_only") is True
+        should_alert = payload.get("should_alert")
+        telegram_allowed = payload.get("telegram_allowed")
+
+        block_reason = (
+            reason
+            or payload.get("suppression_reason")
+            or payload.get("telegram_block_reason")
+            or payload.get("signal_quality_reason")
+            or payload.get("telegram_hard_gate_reason")
+            or payload.get("risk_mode")
+            or "runner_suppressed_before_notifier"
+        )
+
+        is_suppressed = (
+            delivery_mode == "SUPPRESS"
+            or statistics_only
+            or (
+                should_alert is False
+                and (
+                    telegram_allowed is False
+                    or bool(payload.get("telegram_block_reason"))
+                    or bool(payload.get("signal_quality_reason"))
+                )
+            )
+        )
+
+        if not is_suppressed:
+            return False
+
+        payload["_runner_suppressed_telemetry_recorded"] = True
+        payload.setdefault("telegram_delivery_mode", "SUPPRESS")
+        payload.setdefault("sent_to_telegram", False)
+        payload.setdefault("suppression_reason", str(block_reason))
+
+        suppression_reasons = payload.get("suppression_reasons")
+        if not isinstance(suppression_reasons, list):
+            suppression_reasons = []
+        if str(block_reason) not in [str(x) for x in suppression_reasons]:
+            suppression_reasons.append(str(block_reason))
+        payload["suppression_reasons"] = suppression_reasons
+
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["runner_suppressed_telemetry_hook"] = True
+        metadata["runner_suppressed_telemetry_hook_version"] = RUNNER_VERSION
+        metadata["runner_suppressed_telemetry_reason"] = str(block_reason)
+        metadata["runner_version"] = RUNNER_VERSION
+        payload["metadata"] = metadata
+
+        payload["runner_version"] = RUNNER_VERSION
+        payload["telemetry_source"] = "stateful_batch_runner_suppressed_hook"
+
+        try:
+            recorded = record_battle_permission_event(
+                payload,
+                source="stateful_batch_runner_suppressed_hook",
+                sent_to_telegram=False,
+                note=str(block_reason),
+            )
+            if recorded:
+                logger.info(
+                    "Runner suppressed telemetry recorded. symbol=%s signal_id=%s reason=%s mode=%s statistics_only=%s",
+                    payload.get("symbol"),
+                    payload.get("signal_id"),
+                    block_reason,
+                    payload.get("telegram_delivery_mode"),
+                    payload.get("statistics_only"),
+                )
+            return bool(recorded)
+
+        except Exception as error:  # noqa: BLE001
+            logger.exception(
+                "Runner suppressed telemetry failed. symbol=%s signal_id=%s reason=%s error=%s",
+                payload.get("symbol"),
+                payload.get("signal_id"),
+                block_reason,
+                error,
+            )
+            return False
+
+
     def _dispatch_alert_payload(self, payload: dict[str, Any]) -> bool:
         if not payload:
             return False
 
         if not payload.get("should_alert", False):
             block_reason = payload.get("telegram_block_reason") or "should_alert_false"
+            self._record_suppressed_battle_telemetry_once(payload, reason=block_reason)
             logger.info(
                 "Telegram skipped. symbol=%s signal_id=%s class=%s execution=%s rr=%s reason=%s",
                 payload.get("symbol"),
@@ -3719,6 +3829,7 @@ class StatefulBatchRunner:
         if not hard_allowed:
             payload["telegram_allowed"] = False
             payload["telegram_block_reason"] = hard_reason
+            self._record_suppressed_battle_telemetry_once(payload, reason=hard_reason)
             logger.info(
                 "Telegram blocked by hard gate. symbol=%s signal_id=%s class=%s execution=%s rr=%s reason=%s",
                 payload.get("symbol"),
