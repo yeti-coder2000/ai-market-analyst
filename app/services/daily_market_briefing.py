@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.18.2-us-holiday-closed-market-state"
+BRIEFING_VERSION = "daily-market-briefing-v1.19-suppressed-telegram-block"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -3303,7 +3303,13 @@ def _post_news_macro_read(sym: str, direction: str, behavior: str) -> str:
     return "post-news volatility regime; wait for acceptance / failed move"
 
 
-def _post_news_symbol_line(sym: str, item: dict[str, Any], *, macro_unknown: bool = False) -> str:
+def _post_news_symbol_line(
+    sym: str,
+    item: dict[str, Any],
+    *,
+    macro_unknown: bool = False,
+    holiday_overlay: bool = False,
+) -> str:
     data = _brief_symbol_context(item)
     activity = data.get("first_hour_activity") if isinstance(data.get("first_hour_activity"), dict) else {}
 
@@ -3315,6 +3321,13 @@ def _post_news_symbol_line(sym: str, item: dict[str, Any], *, macro_unknown: boo
     macro_read = _post_news_macro_read(sym, direction, behavior)
     subtype = _auction_subtype(sym, data, post_news_active=not macro_unknown, macro_unknown=macro_unknown)
     bias = _bias_without_trade(sym, data, post_news_active=not macro_unknown, macro_unknown=macro_unknown)
+
+    if holiday_overlay and sym in {"NAS100", "SPX500"}:
+        zone_text = f" | зона: {zone}" if zone != "-" else ""
+        return (
+            f"• {sym} — US_HOLIDAY / MARKET_CLOSED{zone_text} | "
+            "NY cash session closed; немає нормального NY cash impulse | no Battle"
+        )
 
     if behavior == "OPEN_REJECTION_REVERSE":
         mode = "failed move/rejection: тільки після reclaim/BOS/retest"
@@ -3399,7 +3412,7 @@ def _build_post_news_reaction_section(
         item = symbols.get(sym)
         if not isinstance(item, dict):
             continue
-        section.lines.append(_post_news_symbol_line(sym, item, macro_unknown=macro_unknown and not recent_events))
+        section.lines.append(_post_news_symbol_line(sym, item, macro_unknown=macro_unknown and not recent_events, holiday_overlay=bool(holiday_overlay)))
         printed += 1
         if printed >= 8:
             break
@@ -3476,6 +3489,57 @@ def _build_tpo_snapshot_section(
 
     return section
 
+
+
+
+def _fmt_count(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _build_suppressed_telegram_section() -> BriefingSection:
+    section = BriefingSection("🧹 Відфільтровано з Telegram")
+    summary = load_daily_summary()
+    if not isinstance(summary, dict) or not summary:
+        section.lines.append("Немає daily_summary.json / suppressed metrics ще не згенеровані.")
+        return section
+
+    metrics = summary.get("suppressed_telegram_metrics")
+    if not isinstance(metrics, dict) or not metrics:
+        section.lines.append("Suppressed metrics ще недоступні. Потрібен lightweight_statistics_exporter v2.4.")
+        return section
+
+    total = _fmt_count(metrics.get("total"))
+    stats_only_total = _fmt_count(metrics.get("statistics_only_total"))
+    tracked = metrics.get("tracked_reasons") if isinstance(metrics.get("tracked_reasons"), dict) else {}
+    by_reason = metrics.get("by_reason") if isinstance(metrics.get("by_reason"), dict) else {}
+
+    section.lines.append(f"Усього statistics-only / suppressed: {total} | statistics_only=True: {stats_only_total}")
+    section.lines.append(
+        "Причини: "
+        f"invalidated_before_alert={_fmt_count(tracked.get('invalidated_before_alert'))}, "
+        f"post_shock_rr_below_3={_fmt_count(tracked.get('post_shock_rr_below_3'))}, "
+        f"weak_otd_long={_fmt_count(tracked.get('weak_otd_long'))}"
+    )
+
+    extra = [
+        (str(k), _fmt_count(v))
+        for k, v in by_reason.items()
+        if str(k) not in {"invalidated_before_alert", "post_shock_rr_below_3", "tpo_otd_long_stats_downgrade", "weak_otd_long", "UNKNOWN", "None", ""}
+    ]
+    extra = sorted(extra, key=lambda kv: (-kv[1], kv[0]))[:4]
+    if extra:
+        section.lines.append("Інші suppress-причини: " + ", ".join(f"{k}={v}" for k, v in extra))
+
+    by_symbol = metrics.get("by_symbol") if isinstance(metrics.get("by_symbol"), dict) else {}
+    if by_symbol:
+        top_symbols = sorted(((str(k), _fmt_count(v)) for k, v in by_symbol.items()), key=lambda kv: (-kv[1], kv[0]))[:5]
+        section.lines.append("Топ символів: " + ", ".join(f"{k}={v}" for k, v in top_symbols))
+
+    section.lines.append("Висновок: це не видалені сигнали, а контроль шуму — вони лишаються в telemetry/statistics, але не йдуть у Telegram.")
+    return section
 
 
 def _build_session_scope_section(tpo: dict[str, Any], report_type: str) -> BriefingSection:
@@ -3646,6 +3710,7 @@ def build_briefing_report(
         report.sections.append(post_news_section)
 
     report.sections.append(_build_tpo_snapshot_section(tpo, normalized_type, target_date, tz_name))
+    report.sections.append(_build_suppressed_telegram_section())
 
     if normalized_type in {"morning", "morning_briefing", "morning_combined", "holiday_warning", "pre_market"}:
         report.sections.append(_build_yesterday_section(target_date, tz_name))

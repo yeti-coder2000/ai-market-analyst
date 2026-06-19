@@ -20,7 +20,7 @@ BATTLE_PERMISSION_TELEMETRY_PATH = TELEMETRY_DIR / "battle_permission_events.ndj
 SIGNALS_FLAT_JSON_PATH = STATS_DIR / "signals_flat.json"
 DAILY_SUMMARY_PATH = STATS_DIR / "daily_summary.json"
 
-EXPORTER_VERSION = "lightweight-statistics-exporter-v2.3-battle-telemetry-v32-aliases"
+EXPORTER_VERSION = "lightweight-statistics-exporter-v2.4-suppressed-statistics-only-metrics"
 
 
 FINAL_OUTCOMES = {
@@ -171,6 +171,109 @@ def first_non_empty(*values: Any) -> Any:
         if value not in (None, "", [], {}):
             return value
     return None
+
+
+def normalize_reason(value: Any, default: str = "unknown") -> str:
+    text = normalize_text(value, default).strip().lower()
+    if not text:
+        return default
+    return text.replace(" ", "_")
+
+
+def count_by_key(items: list[dict[str, Any]], key: str) -> dict[str, int]:
+    counter: Counter[str] = Counter()
+    for item in items:
+        value = item.get(key)
+        if value in (None, "", [], {}):
+            value = "UNKNOWN"
+        counter[str(value)] += 1
+    return dict(sorted(counter.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def compute_suppressed_telegram_metrics_from_events(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Summarize signals deliberately removed from Telegram/actionable output.
+
+    v2.4 reads telemetry directly, because statistics-only events may not always
+    become normal signal_outcome records. This keeps suppression accounting visible
+    even when the signal is correctly hidden from Telegram.
+    """
+    suppressed: list[dict[str, Any]] = []
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        if event.get("event_type") != "battle_permission_evaluated":
+            continue
+        if is_synthetic_record(event):
+            continue
+
+        statistics_only = safe_bool(event.get("statistics_only"), False)
+        delivery_mode = normalize_status(event.get("telegram_delivery_mode"))
+        reason = normalize_reason(event.get("suppression_reason"), "")
+        suppress_flag = safe_bool(event.get("suppress"), False)
+
+        if not (statistics_only or delivery_mode == "SUPPRESS" or suppress_flag or reason):
+            continue
+
+        if not reason:
+            reason = normalize_reason(
+                first_non_empty(
+                    event.get("risk_mode"),
+                    event.get("battle_permission"),
+                    "unknown",
+                )
+            )
+
+        scenario_family = first_non_empty(
+            event.get("scenario_family"),
+            event.get("setup_type"),
+            event.get("scenario_type"),
+            event.get("scenario"),
+            "UNKNOWN",
+        )
+
+        row = {
+            "ts_utc": first_non_empty(event.get("ts_utc"), event.get("timestamp"), event.get("created_at_utc")),
+            "symbol": str(first_non_empty(event.get("symbol"), event.get("instrument"), "UNKNOWN")),
+            "reason": reason,
+            "scenario_family": str(scenario_family),
+            "battle_permission": str(first_non_empty(event.get("battle_permission"), "UNKNOWN")),
+            "telegram_delivery_mode": str(first_non_empty(event.get("telegram_delivery_mode"), "UNKNOWN")),
+            "risk_mode": str(first_non_empty(event.get("risk_mode"), "UNKNOWN")),
+            "practical_rr": safe_float(event.get("practical_rr"), None),
+            "statistics_only": statistics_only,
+        }
+        suppressed.append(row)
+
+    by_reason = count_by_key(suppressed, "reason")
+    by_symbol = count_by_key(suppressed, "symbol")
+    by_scenario_family = count_by_key(suppressed, "scenario_family")
+
+    tracked_reasons = {
+        "invalidated_before_alert": by_reason.get("invalidated_before_alert", 0),
+        "post_shock_rr_below_3": by_reason.get("post_shock_rr_below_3", 0),
+        "tpo_otd_long_stats_downgrade": by_reason.get("tpo_otd_long_stats_downgrade", 0),
+        "weak_otd_long": by_reason.get("weak_otd_long", 0) + by_reason.get("tpo_otd_long_stats_downgrade", 0),
+    }
+
+    latest = sorted(
+        suppressed,
+        key=lambda x: normalize_text(x.get("ts_utc")),
+    )[-10:]
+
+    return {
+        "schema_version": "1.0",
+        "exporter_version": EXPORTER_VERSION,
+        "updated_at_utc": utc_now_iso(),
+        "source": str(BATTLE_PERMISSION_TELEMETRY_PATH),
+        "total": len(suppressed),
+        "statistics_only_total": sum(1 for x in suppressed if safe_bool(x.get("statistics_only"), False)),
+        "by_reason": by_reason,
+        "tracked_reasons": tracked_reasons,
+        "by_symbol": by_symbol,
+        "by_scenario_family": by_scenario_family,
+        "latest": latest,
+    }
 
 def is_synthetic_record(record: dict[str, Any]) -> bool:
     if not isinstance(record, dict):
@@ -914,6 +1017,9 @@ def extract_battle_fields(
             "late_signal_reason": battle_event.get("late_signal_reason"),
             "entry_retest_required": safe_optional_bool(battle_event.get("entry_retest_required")),
             "execution_timing_guard_version": battle_event.get("execution_timing_guard_version"),
+            "statistics_only": safe_optional_bool(battle_event.get("statistics_only")),
+            "suppression_reason": normalize_reason(battle_event.get("suppression_reason"), "") or None,
+            "suppression_reasons": normalize_list(battle_event.get("suppression_reasons")),
             **tpo_fields,
             **v2_fields,
         }
@@ -950,6 +1056,9 @@ def extract_battle_fields(
         "late_signal_reason": None,
         "entry_retest_required": None,
         "execution_timing_guard_version": None,
+        "statistics_only": None,
+        "suppression_reason": None,
+        "suppression_reasons": [],
         **tpo_fields,
         **v2_fields,
     }
@@ -1165,6 +1274,9 @@ def normalize_flat_signal(
         "battle_gate_v2_blockers": battle_fields["battle_gate_v2_blockers"],
         "battle_gate_v2_modifiers": battle_fields["battle_gate_v2_modifiers"],
         "battle_gate_v2_error": battle_fields["battle_gate_v2_error"],
+        "statistics_only": safe_bool(battle_fields.get("statistics_only"), False),
+        "suppression_reason": battle_fields.get("suppression_reason"),
+        "suppression_reasons": battle_fields.get("suppression_reasons") if isinstance(battle_fields.get("suppression_reasons"), list) else [],
         "updated_at_utc": utc_now_iso(),
     }
 
@@ -1294,6 +1406,8 @@ def compute_signal_summary(items: list[dict[str, Any]]) -> dict[str, Any]:
     suppressed_count = sum(safe_optional_bool(x.get("sent_to_telegram")) is False for x in items)
     battle_ready_count = sum(safe_optional_bool(x.get("battle_ready")) is True for x in items)
     battle_event_found_count = sum(bool(x.get("battle_permission_event_found")) for x in items)
+    statistics_only_count = sum(safe_bool(x.get("statistics_only"), False) for x in items)
+    suppression_reason_counts = status_counts(items, "suppression_reason")
 
     return {
         "total_signals": total,
@@ -1315,6 +1429,8 @@ def compute_signal_summary(items: list[dict[str, Any]]) -> dict[str, Any]:
         "suppressed_or_not_sent": suppressed_count,
         "battle_ready": battle_ready_count,
         "battle_permission_events_found": battle_event_found_count,
+        "statistics_only": statistics_only_count,
+        "by_suppression_reason": suppression_reason_counts,
         "by_outcome_status": status_counts(items, "outcome_status"),
     }
 
@@ -1322,6 +1438,8 @@ def compute_signal_summary(items: list[dict[str, Any]]) -> dict[str, Any]:
 def build_daily_summary(flat: list[dict[str, Any]]) -> dict[str, Any]:
     production = production_records(flat)
     summary = compute_signal_summary(production)
+    battle_events = load_ndjson(BATTLE_PERMISSION_TELEMETRY_PATH)
+    suppressed_metrics = compute_suppressed_telegram_metrics_from_events(battle_events)
 
     summary.update(
         {
@@ -1347,6 +1465,7 @@ def build_daily_summary(flat: list[dict[str, Any]]) -> dict[str, Any]:
             "battle_permission_telemetry": str(BATTLE_PERMISSION_TELEMETRY_PATH),
         },
         "summary": summary,
+        "suppressed_telegram_metrics": suppressed_metrics,
         "by_symbol": grouped_metrics(production, "symbol"),
         "by_scenario": grouped_metrics(production, "scenario"),
         "by_direction": grouped_metrics(production, "direction"),
@@ -1358,6 +1477,8 @@ def build_daily_summary(flat: list[dict[str, Any]]) -> dict[str, Any]:
         # Battle Permission / TPO / auction metrics.
         "by_battle_permission": grouped_metrics(production, "battle_permission"),
         "by_telegram_delivery_mode": grouped_metrics(production, "telegram_delivery_mode"),
+        "by_statistics_only": grouped_metrics(production, "statistics_only"),
+        "by_suppression_reason": grouped_metrics(production, "suppression_reason"),
         "by_battle_ready": grouped_metrics(production, "battle_ready"),
         "by_battle_permission_source": grouped_metrics(production, "battle_permission_source"),
         "by_battle_permission_event_schema_version": grouped_metrics(
@@ -1415,9 +1536,12 @@ def export_lightweight_statistics() -> dict[str, Any]:
         "production_records": summary["summary"].get("production_records"),
         "excluded_from_metrics": summary["summary"].get("excluded_from_metrics"),
         "summary": summary["summary"],
+        "suppressed_telegram_metrics": summary.get("suppressed_telegram_metrics", {}),
         "battle_metrics": {
             "by_battle_permission": summary.get("by_battle_permission", {}),
             "by_telegram_delivery_mode": summary.get("by_telegram_delivery_mode", {}),
+            "by_statistics_only": summary.get("by_statistics_only", {}),
+            "by_suppression_reason": summary.get("by_suppression_reason", {}),
             "by_battle_permission_blocker": summary.get("by_battle_permission_blocker", {}),
             "by_battle_permission_event_schema_version": summary.get(
                 "by_battle_permission_event_schema_version",
