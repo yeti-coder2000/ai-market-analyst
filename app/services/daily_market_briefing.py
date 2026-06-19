@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.18-holiday-session-risk-separation"
+BRIEFING_VERSION = "daily-market-briefing-v1.18.1-holiday-overrides-macro-unknown-downstream"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -2930,6 +2930,11 @@ def _calendar_status_for_context(target_date: date | None, timezone_name: str | 
 
 
 def _macro_unknown_conservative_for_report(target_date: date | None, timezone_name: str | None, report_type: str) -> bool:
+    # Known US holiday/session regime is not the same thing as actionable macro unknown.
+    # If providers are unavailable on a known US holiday, downstream report sections
+    # must not render every focus symbol as MACRO_UNKNOWN / NO TRADE.
+    if target_date is not None and _us_market_holiday_overlay(target_date):
+        return False
     calendar = _calendar_status_for_context(target_date, timezone_name, report_type)
     return bool(calendar and _macro_calendar_unknown_conservative(calendar))
 
@@ -3317,7 +3322,8 @@ def _build_post_news_reaction_section(
 
     recent_events = _recent_high_impact_events(target_date, timezone_name, report_type)
     calendar = load_high_impact_calendar(target_date)
-    macro_unknown = _macro_calendar_unknown_conservative(calendar)
+    holiday_overlay = _us_market_holiday_overlay(target_date)
+    macro_unknown = _macro_calendar_unknown_conservative(calendar) and not holiday_overlay
 
     symbols = tpo.get("symbols") if isinstance(tpo, dict) else {}
     symbols = symbols if isinstance(symbols, dict) else {}
@@ -3349,7 +3355,10 @@ def _build_post_news_reaction_section(
         else:
             focus_symbols = _filter_symbols_for_report(event.get("symbols") or [], report_type)
     else:
-        if macro_unknown:
+        if holiday_overlay:
+            section.lines.append(f"US holiday session: {holiday_overlay.get('code')} — немає нормального NY cash impulse.")
+            section.lines.append("Режим: HOLIDAY_LIQUIDITY_CAUTION; NAS100/SPX500 closed/no Battle, UKOIL caution, FX/XAU/crypto тільки clean setup без chase.")
+        elif macro_unknown:
             section.lines.append("Macro calendar unavailable: MACRO_UNKNOWN_CONSERVATIVE.")
             section.lines.append("Режим: NY post-open оцінюємо без macro-clearance; Battle тільки після зовнішньої перевірки + LTF confirmation.")
         else:
