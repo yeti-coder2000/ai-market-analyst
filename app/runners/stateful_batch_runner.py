@@ -53,7 +53,7 @@ from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.5.6-runner-suppressed-telemetry-hook"
+RUNNER_VERSION = "1.5.7-continuation-day-guard"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -64,6 +64,28 @@ TELEGRAM_MIN_CONFIDENCE = 0.60
 TELEGRAM_LATE_SIGNAL_THRESHOLD_R = float(os.getenv("TELEGRAM_LATE_SIGNAL_THRESHOLD_R", "0.5"))
 TELEGRAM_HARD_LATE_SIGNAL_THRESHOLD_R = float(os.getenv("TELEGRAM_HARD_LATE_SIGNAL_THRESHOLD_R", "0.7"))
 EXECUTION_TIMING_GUARD_VERSION = "execution-timing-guard-v1.0-runner-hard-gate"
+
+CONTINUATION_DAY_GUARD_ENABLED = str(
+    os.getenv("CONTINUATION_DAY_GUARD_ENABLED", "1")
+).strip().lower() in {"1", "true", "yes", "y", "on"}
+CONTINUATION_DAY_MIN_AGE_HOURS = float(os.getenv("CONTINUATION_DAY_MIN_AGE_HOURS", "8"))
+CONTINUATION_DAY_ALREADY_MOVED_R_THRESHOLD = float(
+    os.getenv("CONTINUATION_DAY_ALREADY_MOVED_R_THRESHOLD", "0.5")
+)
+CONTINUATION_DAY_TOKENS = (
+    "FIRST_IMPULSE_GONE",
+    "FIRST_IMPULSE_ALREADY_GONE",
+    "ENTRY_WINDOW_GONE",
+    "ENTRY_WINDOW_ALREADY_GONE",
+    "IMPULSE_ALREADY_DELIVERED",
+    "IMPULSE_DELIVERED",
+    "NO_CHASE",
+    "WAIT_RETEST",
+    "WATCH_AFTER_RETEST_ONLY",
+    "LATE_SIGNAL",
+    "HARD_LATE_SIGNAL",
+    "PRICE_ALREADY_MOVED",
+)
 
 ENTRY_TIMING_FIELD_KEYS = (
     "current_price",
@@ -517,6 +539,231 @@ def _safe_float_for_alert(value: Any) -> float | None:
         return None
 
 
+def _safe_bool_for_guard(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    return text in {"1", "true", "yes", "y", "on", "confirmed", "ok"}
+
+
+def _parse_guard_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.astimezone(UTC) if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    except Exception:
+        return None
+
+
+def _payload_signal_age_hours(payload: dict[str, Any]) -> float | None:
+    timestamp_keys = (
+        "entry_window_started_at_utc",
+        "setup_started_at_utc",
+        "signal_first_seen_at_utc",
+        "first_seen_at_utc",
+        "registered_at_utc",
+        "created_at_utc",
+        "detected_at_utc",
+        "started_at_utc",
+        "signal_created_at_utc",
+    )
+
+    oldest: datetime | None = None
+    for key in timestamp_keys:
+        dt = _parse_guard_datetime(payload.get(key))
+        if dt is None:
+            continue
+        if oldest is None or dt < oldest:
+            oldest = dt
+
+    if oldest is None:
+        return None
+
+    return max(0.0, (datetime.now(UTC) - oldest).total_seconds() / 3600.0)
+
+
+def _append_unique_reason(payload: dict[str, Any], reason: str) -> None:
+    reasons = payload.get("suppression_reasons")
+    if not isinstance(reasons, list):
+        reasons = []
+    if reason not in [str(x) for x in reasons]:
+        reasons.append(reason)
+    payload["suppression_reasons"] = reasons
+
+
+def _apply_continuation_day_guard_if_needed(
+    payload: dict[str, Any],
+    *,
+    rr: float | None,
+    entry: float | None,
+    stop: float | None,
+    current: float | None,
+) -> str | None:
+    """
+    Block late trend-continuation Telegram READY signals.
+
+    This guard catches the situation:
+    - main impulse / entry window was in the previous session/day;
+    - current market is only continuing the trend;
+    - there is no fresh retest + acceptance giving a new clean entry.
+
+    It does not block a valid fresh retest setup.
+    """
+    if not CONTINUATION_DAY_GUARD_ENABLED:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    direction = str(payload.get("direction") or "").upper()
+    scenario = str(payload.get("scenario") or payload.get("scenario_type") or "").upper()
+    signal_class = str(payload.get("signal_class") or payload.get("stage") or "").upper()
+    execution_status = str(payload.get("execution_status") or "").upper()
+
+    if signal_class != "READY" or execution_status != "EXECUTABLE":
+        return None
+    if direction not in {"LONG", "SHORT"}:
+        return None
+
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    flags_raw = payload.get("flags") or payload.get("caution_flags") or payload.get("macro_caution_flags") or []
+    if not isinstance(flags_raw, (list, tuple, set)):
+        flags_raw = [flags_raw]
+
+    haystack = " ".join(
+        str(x or "")
+        for x in (
+            list(flags_raw)
+            + [
+                payload.get("risk_mode"),
+                payload.get("macro_regime"),
+                payload.get("macro_risk_mode"),
+                payload.get("trigger_reason"),
+                payload.get("late_signal_reason"),
+                payload.get("entry_timing_status"),
+                payload.get("post_news_otd_model"),
+                payload.get("post_news_otd_blockers"),
+                payload.get("post_news_blockers"),
+                payload.get("open_behavior"),
+                payload.get("open_context"),
+                payload.get("tpo_watch_state"),
+                payload.get("ltf_model_state"),
+                payload.get("next_expected_event"),
+                metadata.get("execution_bridge_reason"),
+                metadata.get("runner_suppressed_telemetry_reason"),
+            ]
+        )
+    ).upper()
+
+    first_impulse_gone = any(token in haystack for token in CONTINUATION_DAY_TOKENS)
+    continuation_family = any(
+        token in haystack or token in scenario
+        for token in (
+            "TREND_CONTINUATION",
+            "CONTINUATION",
+            "OPEN_TEST_DRIVE",
+            "TPO_OPEN_TEST_DRIVE",
+            "POST_NEWS",
+            "POST_SHOCK",
+        )
+    )
+
+    retest_confirmed = any(
+        _safe_bool_for_guard(payload.get(key, metadata.get(key)))
+        for key in (
+            "retest_confirmed",
+            "post_news_retest_confirmed",
+            "post_news_otd_retest_confirmed",
+        )
+    )
+    acceptance_confirmed = any(
+        _safe_bool_for_guard(payload.get(key, metadata.get(key)))
+        for key in (
+            "acceptance_confirmed",
+            "post_news_acceptance_confirmed",
+            "post_news_otd_acceptance_confirmed",
+        )
+    )
+    ltf_confirmed = any(
+        _safe_bool_for_guard(payload.get(key, metadata.get(key)))
+        for key in (
+            "ltf_confirmed",
+            "ltf_model_confirmed",
+            "post_news_otd_ltf_confirmed",
+        )
+    )
+
+    fresh_retest_entry = retest_confirmed and acceptance_confirmed and ltf_confirmed
+
+    already_moved_r = _safe_float_for_alert(payload.get("already_moved_R"))
+    if already_moved_r is None and entry is not None and stop is not None and current is not None:
+        risk = abs(stop - entry)
+        if risk > 0:
+            if direction == "LONG" and current > entry:
+                already_moved_r = (current - entry) / risk
+            elif direction == "SHORT" and current < entry:
+                already_moved_r = (entry - current) / risk
+            else:
+                already_moved_r = 0.0
+
+    age_hours = _payload_signal_age_hours(payload)
+    previous_day_or_old = age_hours is not None and age_hours >= CONTINUATION_DAY_MIN_AGE_HOURS
+
+    block_reason: str | None = None
+
+    if already_moved_r is not None and already_moved_r >= CONTINUATION_DAY_ALREADY_MOVED_R_THRESHOLD:
+        if not fresh_retest_entry:
+            block_reason = "continuation_day_already_moved"
+
+    if block_reason is None and first_impulse_gone and not fresh_retest_entry:
+        block_reason = "continuation_day_no_fresh_retest"
+
+    if block_reason is None and previous_day_or_old and continuation_family and not fresh_retest_entry:
+        block_reason = "previous_day_entry_window_gone"
+
+    if block_reason is None:
+        return None
+
+    payload["statistics_only"] = True
+    payload["suppression_reason"] = block_reason
+    _append_unique_reason(payload, block_reason)
+    payload["telegram_delivery_mode"] = "SUPPRESS"
+    payload["battle_ready"] = False
+    payload["risk_mode"] = "CONTINUATION_DAY_MANAGEMENT_ONLY"
+    payload["continuation_day_guard"] = True
+    payload["continuation_day_guard_version"] = RUNNER_VERSION
+    payload["continuation_day_reason"] = block_reason
+    payload["continuation_day_signal_age_hours"] = round(age_hours, 2) if age_hours is not None else None
+    payload["continuation_day_already_moved_R"] = round(already_moved_r, 4) if already_moved_r is not None else None
+    payload["continuation_day_fresh_retest_entry"] = fresh_retest_entry
+
+    metadata["continuation_day_guard"] = True
+    metadata["continuation_day_guard_version"] = RUNNER_VERSION
+    metadata["continuation_day_reason"] = block_reason
+    metadata["continuation_day_signal_age_hours"] = payload["continuation_day_signal_age_hours"]
+    metadata["continuation_day_already_moved_R"] = payload["continuation_day_already_moved_R"]
+    metadata["continuation_day_fresh_retest_entry"] = fresh_retest_entry
+    metadata["runner_version"] = RUNNER_VERSION
+    payload["metadata"] = metadata
+
+    return f"blocked_{block_reason}_statistics_only"
+
+
+
 def _is_telegram_trade_alert_allowed(payload: dict[str, Any]) -> tuple[bool, str]:
     """
     Hard Telegram gate.
@@ -638,6 +885,16 @@ def _is_telegram_trade_alert_allowed(payload: dict[str, Any]) -> tuple[bool, str
         payload["battle_ready"] = False
         payload["risk_mode"] = "POST_SHOCK_RR_BELOW_3"
         return False, "blocked_post_shock_rr_below_3_statistics_only"
+
+    continuation_day_reason = _apply_continuation_day_guard_if_needed(
+        payload,
+        rr=rr,
+        entry=entry,
+        stop=stop,
+        current=current,
+    )
+    if continuation_day_reason is not None:
+        return False, continuation_day_reason
 
     if entry is None or stop is None or target is None:
         return False, "blocked_missing_trade_geometry"
@@ -3738,12 +3995,18 @@ class StatefulBatchRunner:
         is_suppressed = (
             delivery_mode == "SUPPRESS"
             or statistics_only
+            or telegram_allowed is False
+            or bool(payload.get("telegram_block_reason"))
+            or bool(payload.get("signal_quality_reason"))
+            or bool(payload.get("telegram_hard_gate_reason"))
+            or bool(reason)
             or (
                 should_alert is False
                 and (
                     telegram_allowed is False
                     or bool(payload.get("telegram_block_reason"))
                     or bool(payload.get("signal_quality_reason"))
+                    or bool(payload.get("telegram_hard_gate_reason"))
                 )
             )
         )
@@ -3842,6 +4105,8 @@ class StatefulBatchRunner:
             return False
 
         if payload.get("telegram_allowed") is not True:
+            block_reason = payload.get("signal_quality_reason") or "signal_quality_gate_blocked"
+            self._record_suppressed_battle_telemetry_once(payload, reason=block_reason)
             logger.info(
                 "Telegram blocked by Signal Quality Engine. symbol=%s signal_id=%s class=%s execution=%s rr=%s reason=%s score=%s",
                 payload.get("symbol"),
@@ -4050,6 +4315,15 @@ class StatefulBatchRunner:
             "previous_signal_class": previous_signal_class or None,
             "previous_execution_status": previous_execution_status or None,
             "tracker_action": tracker_action,
+            "created_at_utc": tracked_payload.get("created_at_utc"),
+            "first_seen_at_utc": tracked_payload.get("first_seen_at_utc"),
+            "registered_at_utc": tracked_payload.get("registered_at_utc"),
+            "updated_at_utc": tracked_payload.get("updated_at_utc"),
+            "last_seen_at_utc": tracked_payload.get("last_seen_at_utc"),
+            "signal_first_seen_at_utc": tracked_payload.get("signal_first_seen_at_utc"),
+            "signal_created_at_utc": tracked_payload.get("signal_created_at_utc"),
+            "entry_window_started_at_utc": tracked_payload.get("entry_window_started_at_utc"),
+            "setup_started_at_utc": tracked_payload.get("setup_started_at_utc"),
             "auction_context": tracked_payload.get("auction_context"),
             "auction_filters": tracked_payload.get("auction_filters"),
             "auction_telemetry_mode": tracked_payload.get("auction_telemetry_mode"),
