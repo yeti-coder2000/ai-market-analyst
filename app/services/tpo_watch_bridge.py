@@ -3,36 +3,41 @@ from __future__ import annotations
 """
 TPO Watch Bridge for AI Market Analyst.
 
-Purpose:
-- Convert precomputed TPO/open-behavior context into a live watch-state.
-- This module does NOT generate trade entries.
-- It only answers: "Is there a valid auction context that should be watched
-  for a 5m-15m LTF model?"
+v1.2 purpose:
+- Consume the richer auction-state fields produced by
+  tpo-open-behavior-classifier-v1.4-auction-state-transitions.
+- Keep legacy open_behavior/open_context behavior backward-compatible.
+- Prevent broad legacy OPEN_TEST_DRIVE from activating an LTF watch when the
+  detailed auction state says the setup is only initial/unconfirmed or has
+  accepted back inside value.
+- Treat POC/nPOC/VAH/VAL as interest zones only; this bridge never creates
+  ENTRY_READY.
 
 Pipeline idea:
 HTF context
-→ TPO open context / open behavior
+→ TPO open context / auction-state fields
 → TPO Watch Bridge
-→ LTF_MODEL_PENDING
+→ LTF_MODEL_PENDING / OBSERVE_ONLY / RESEARCH_ONLY / BLOCKED
 → LTF_MODEL_CONFIRMED
 → execution plan
 → Battle Gate
 → Telegram
 
 Important:
-- POC/nPOC/VAH/VAL are interest zones, not entry triggers.
 - OPEN_TEST_DRIVE + HTF NEUTRAL is allowed as a transition candidate.
+- OPEN_TEST_DRIVE_CANDIDATE is a watch context only when value rejection is
+  present and current behavior is not contradicted by acceptance back into value.
+- OPEN_AUCTION remains observe/rotation unless later structure proves a real
+  directional break and LTF model.
 - A watch-state is not a battle signal.
-- TPO telegram DOWNGRADE is not an automatic watch blocker. It is a warning
-  for downstream Battle/Telegram layers unless permission/status explicitly blocks.
 """
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 import re
 from typing import Any
 
 
-TPO_WATCH_BRIDGE_VERSION = "tpo-watch-bridge-v1.1-normalize-direction-enums"
+TPO_WATCH_BRIDGE_VERSION = "tpo-watch-bridge-v1.2-auction-state-fields"
 
 
 BLOCK_MARKET_STATUSES = {
@@ -63,6 +68,31 @@ DOWNGRADE_TELEGRAM_MODIFIERS = {
     "DOWNGRADE",
 }
 
+VALUE_REJECTION_STATES = {
+    "VALUE_REJECTED_UP",
+    "VALUE_REJECTED_DOWN",
+}
+
+VALUE_ACCEPTED_BACK_STATES = {
+    "ACCEPTED_INSIDE_VALUE",
+    "ACCEPTED_BACK_INSIDE_VALUE",
+    "FAILED_OUTSIDE_VALUE",
+}
+
+OTD_DETAILED_STATES = {
+    "OPEN_TEST_DRIVE_CANDIDATE",
+    "OPEN_TEST_DRIVE_CONFIRMED",
+}
+
+OPEN_AUCTION_DETAILED_STATES = {
+    "OPEN_AUCTION_IN_RANGE",
+    "OPEN_AUCTION_OUT_OF_RANGE",
+}
+
+OPEN_DRIVE_DETAILED_STATES = {
+    "OPEN_DRIVE_CANDIDATE",
+    "OPEN_DRIVE_CONFIRMED",
+}
 
 _QUOTED_ENUM_VALUE_RE = re.compile(r":\s*['\"]([^'\"]+)['\"]")
 
@@ -78,9 +108,24 @@ class TPOWatchResult:
     tpo_watch_setup: str | None = None
     tpo_watch_reason: str | None = None
 
+    # Legacy broad fields kept for downstream compatibility.
     open_context: str | None = None
     open_behavior: str | None = None
     open_behavior_confidence: float | None = None
+
+    # v1.2 richer auction-state fields from classifier v1.4.
+    open_behavior_version: str | None = None
+    open_location: str | None = None
+    initial_open_behavior: str | None = None
+    current_open_behavior: str | None = None
+    behavior_transition: str | None = None
+    value_acceptance_state: str | None = None
+    value_test_occurred: bool | None = None
+    value_test_level: str | None = None
+    value_rejection_confirmed: bool | None = None
+    day_type_candidate: str | None = None
+    auction_state_confidence: float | None = None
+    auction_state_reason: str | None = None
 
     market_status: str | None = None
     tpo_signal_permission: str | None = None
@@ -112,14 +157,7 @@ class TPOWatchResult:
 
 
 def _unwrap_enum_value(value: Any) -> Any:
-    """
-    Normalize Python Enum-like values before string conversion.
-
-    Handles:
-    - Direction.LONG
-    - <Direction.LONG: 'LONG'>
-    - plain strings like "LONG"
-    """
+    """Normalize Python Enum-like values before string conversion."""
     if value is None:
         return None
 
@@ -131,19 +169,16 @@ def _unwrap_enum_value(value: Any) -> Any:
 
 
 def _s(value: Any, default: str = "") -> str:
-    """
-    Uppercase normalizer with Enum/string-enum protection.
-
-    Examples:
-    - Direction.LONG -> LONG
-    - "Direction.LONG" -> LONG
-    - "<Direction.LONG: 'LONG'>" -> LONG
-    - " long " -> LONG
-    """
+    """Uppercase normalizer with Enum/string-enum protection."""
     if value is None:
         return default
 
     value = _unwrap_enum_value(value)
+
+    # Avoid converting whole dicts/lists into unusable uppercase strings.
+    if isinstance(value, (dict, list, tuple, set)):
+        return default
+
     text = str(value).strip()
 
     if not text:
@@ -165,25 +200,20 @@ def _raw_s(value: Any, default: str = "") -> str:
         return default
 
     value = _unwrap_enum_value(value)
+    if isinstance(value, (dict, list, tuple, set)):
+        return default
+
     text = str(value).strip()
 
     quoted_match = _QUOTED_ENUM_VALUE_RE.search(text)
     if text.startswith("<") and quoted_match:
         text = quoted_match.group(1).strip()
 
-    return text
+    return text or default
 
 
 def _direction_s(value: Any, default: str = "") -> str:
-    """
-    Normalize direction-like values.
-
-    Handles direct directions and scenario-like strings:
-    - LONG
-    - Direction.LONG
-    - SWEEP_RETURN_LONG
-    - TPO_OPEN_TEST_DRIVE_SHORT
-    """
+    """Normalize direction-like values."""
     text = _s(value, default)
 
     if not text:
@@ -213,6 +243,22 @@ def _direction_from_scenario(*values: Any) -> str | None:
         if direction in {"LONG", "SHORT", "NEUTRAL"}:
             return direction
     return None
+
+
+def _bool(value: Any, default: bool | None = None) -> bool | None:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "y", "on"}:
+        return True
+    if text in {"false", "0", "no", "n", "off", "none", "null", ""}:
+        return False
+    return default
 
 
 def _f(value: Any, default: float | None = None) -> float | None:
@@ -272,10 +318,10 @@ def _normalize_tpo_record(
     symbol_payload: dict[str, Any] | None = None,
     context: dict[str, Any] | None = None,
     filters: dict[str, Any] | None = None,
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     """
     Accept either:
-    - full symbol record from tpo_latest.json: {"context": {...}, "filters": {...}}
+    - full symbol record from tpo_latest.json: {"context": {...}, "filters": {...}, "open_behavior": {...}}
     - separate context/filters dicts
     - already flattened payload-like dict
 
@@ -283,6 +329,7 @@ def _normalize_tpo_record(
     - record
     - context
     - filters
+    - open_behavior record
     """
     record = symbol_payload if isinstance(symbol_payload, dict) else {}
 
@@ -294,7 +341,31 @@ def _normalize_tpo_record(
         candidate = record.get("filters")
         filters = candidate if isinstance(candidate, dict) else {}
 
-    return record, context or {}, filters or {}
+    behavior = record.get("open_behavior")
+    behavior_record = behavior if isinstance(behavior, dict) else {}
+
+    return record, context or {}, filters or {}, behavior_record
+
+
+def _open_behavior_value(*values: Any) -> str | None:
+    """
+    Extract a broad open_behavior value from strings or nested behavior dicts.
+    """
+    for value in values:
+        if isinstance(value, dict):
+            candidate = _first_non_empty(
+                value.get("open_behavior"),
+                value.get("current_open_behavior"),
+                value.get("initial_open_behavior"),
+            )
+            text = _s(candidate)
+        else:
+            text = _s(value)
+
+        if text:
+            return text
+
+    return None
 
 
 def _activate_ltf_pending(
@@ -314,6 +385,27 @@ def _activate_ltf_pending(
     return result.to_dict()
 
 
+def _set_blocked(
+    result: TPOWatchResult,
+    *,
+    state: str,
+    reason: str,
+    blocker: str | None = None,
+) -> dict[str, Any]:
+    result.tpo_watch_state = state
+    result.ltf_model_state = "NO_MODEL"
+    result.tpo_watch_active = False
+    result.tpo_watch_reason = reason
+    if blocker:
+        result.blockers.append(blocker)
+    result.reasons.append(reason)
+    return result.to_dict()
+
+
+def _base_watch_setup(result: TPOWatchResult) -> str | None:
+    return result.current_open_behavior or result.open_behavior or result.initial_open_behavior
+
+
 def evaluate_tpo_watch_bridge(
     *,
     symbol: str | None = None,
@@ -328,12 +420,12 @@ def evaluate_tpo_watch_bridge(
     Convert TPO open behavior into live watch-state.
 
     This function does NOT create ENTRY_READY.
-    It creates LTF_MODEL_PENDING when auction context is worth watching.
+    It creates LTF_MODEL_PENDING only when auction context is worth watching.
     """
     del symbol
 
     signal_payload = signal_payload if isinstance(signal_payload, dict) else {}
-    record, ctx, flt = _normalize_tpo_record(
+    record, ctx, flt, ob = _normalize_tpo_record(
         symbol_payload=symbol_payload,
         context=context,
         filters=filters,
@@ -347,6 +439,7 @@ def evaluate_tpo_watch_bridge(
         record.get("direction"),
         ctx.get("direction"),
         flt.get("direction"),
+        ob.get("direction"),
     )
 
     result.raw_direction = _raw_s(raw_direction) if raw_direction is not None else None
@@ -359,6 +452,8 @@ def evaluate_tpo_watch_bridge(
         ctx.get("scenario_type"),
         flt.get("scenario"),
         flt.get("scenario_type"),
+        ob.get("scenario"),
+        ob.get("scenario_type"),
     )
 
     raw_htf_bias = _first_non_empty(
@@ -367,6 +462,7 @@ def evaluate_tpo_watch_bridge(
         record.get("htf_bias"),
         ctx.get("htf_bias"),
         flt.get("htf_bias"),
+        ob.get("htf_bias"),
     )
 
     result.raw_htf_bias = _raw_s(raw_htf_bias) if raw_htf_bias is not None else None
@@ -412,16 +508,16 @@ def evaluate_tpo_watch_bridge(
             ctx.get("open_relation"),
             flt.get("open_context"),
             flt.get("open_relation"),
+            ob.get("open_context"),
         )
     ) or None
 
-    result.open_behavior = _s(
-        _first_non_empty(
-            signal_payload.get("open_behavior"),
-            record.get("open_behavior"),
-            ctx.get("open_behavior"),
-            flt.get("open_behavior"),
-        )
+    result.open_behavior = _open_behavior_value(
+        signal_payload.get("open_behavior"),
+        record.get("open_behavior"),
+        ctx.get("open_behavior"),
+        flt.get("open_behavior"),
+        ob.get("open_behavior"),
     ) or "UNCONFIRMED"
 
     result.open_behavior_confidence = _f(
@@ -430,8 +526,114 @@ def evaluate_tpo_watch_bridge(
             record.get("open_behavior_confidence"),
             ctx.get("open_behavior_confidence"),
             flt.get("open_behavior_confidence"),
+            ob.get("open_behavior_confidence"),
         )
     )
+
+    # v1.2 auction-state fields. Prefer explicit signal override, then context/filters,
+    # then nested open_behavior dict.
+    result.open_behavior_version = _raw_s(_first_non_empty(ob.get("version"), ctx.get("open_behavior_version"))) or None
+    result.open_location = _s(
+        _first_non_empty(
+            signal_payload.get("open_location"),
+            record.get("open_location"),
+            ctx.get("open_location"),
+            flt.get("open_location"),
+            ob.get("open_location"),
+        )
+    ) or None
+    result.initial_open_behavior = _s(
+        _first_non_empty(
+            signal_payload.get("initial_open_behavior"),
+            record.get("initial_open_behavior"),
+            ctx.get("initial_open_behavior"),
+            flt.get("initial_open_behavior"),
+            ob.get("initial_open_behavior"),
+        )
+    ) or None
+    result.current_open_behavior = _s(
+        _first_non_empty(
+            signal_payload.get("current_open_behavior"),
+            record.get("current_open_behavior"),
+            ctx.get("current_open_behavior"),
+            flt.get("current_open_behavior"),
+            ob.get("current_open_behavior"),
+        )
+    ) or None
+    result.behavior_transition = _s(
+        _first_non_empty(
+            signal_payload.get("behavior_transition"),
+            record.get("behavior_transition"),
+            ctx.get("behavior_transition"),
+            flt.get("behavior_transition"),
+            ob.get("behavior_transition"),
+        )
+    ) or None
+    result.value_acceptance_state = _s(
+        _first_non_empty(
+            signal_payload.get("value_acceptance_state"),
+            record.get("value_acceptance_state"),
+            ctx.get("value_acceptance_state"),
+            flt.get("value_acceptance_state"),
+            ob.get("value_acceptance_state"),
+        )
+    ) or None
+    result.value_test_occurred = _bool(
+        _first_non_empty(
+            signal_payload.get("value_test_occurred"),
+            record.get("value_test_occurred"),
+            ctx.get("value_test_occurred"),
+            flt.get("value_test_occurred"),
+            ob.get("value_test_occurred"),
+        ),
+        None,
+    )
+    result.value_test_level = _s(
+        _first_non_empty(
+            signal_payload.get("value_test_level"),
+            record.get("value_test_level"),
+            ctx.get("value_test_level"),
+            flt.get("value_test_level"),
+            ob.get("value_test_level"),
+        )
+    ) or None
+    result.value_rejection_confirmed = _bool(
+        _first_non_empty(
+            signal_payload.get("value_rejection_confirmed"),
+            record.get("value_rejection_confirmed"),
+            ctx.get("value_rejection_confirmed"),
+            flt.get("value_rejection_confirmed"),
+            ob.get("value_rejection_confirmed"),
+        ),
+        None,
+    )
+    result.day_type_candidate = _s(
+        _first_non_empty(
+            signal_payload.get("day_type_candidate"),
+            record.get("day_type_candidate"),
+            ctx.get("day_type_candidate"),
+            flt.get("day_type_candidate"),
+            ob.get("day_type_candidate"),
+        )
+    ) or None
+    result.auction_state_confidence = _f(
+        _first_non_empty(
+            signal_payload.get("auction_state_confidence"),
+            record.get("auction_state_confidence"),
+            ctx.get("auction_state_confidence"),
+            flt.get("auction_state_confidence"),
+            ob.get("auction_state_confidence"),
+        )
+    )
+    result.auction_state_reason = _raw_s(
+        _first_non_empty(
+            signal_payload.get("auction_state_reason"),
+            record.get("auction_state_reason"),
+            ctx.get("auction_state_reason"),
+            flt.get("auction_state_reason"),
+            ob.get("auction_state_reason"),
+        )
+    ) or None
 
     result.entry_model_hint = _s(
         _first_non_empty(
@@ -439,6 +641,7 @@ def evaluate_tpo_watch_bridge(
             record.get("entry_model_hint"),
             ctx.get("entry_model_hint"),
             flt.get("entry_model_hint"),
+            ob.get("entry_model_hint"),
         )
     ) or None
 
@@ -448,6 +651,7 @@ def evaluate_tpo_watch_bridge(
             record.get("stop_model_hint"),
             ctx.get("stop_model_hint"),
             flt.get("stop_model_hint"),
+            ob.get("stop_model_hint"),
         )
     ) or None
 
@@ -457,44 +661,44 @@ def evaluate_tpo_watch_bridge(
             record.get("battle_bias_hint"),
             ctx.get("battle_bias_hint"),
             flt.get("battle_bias_hint"),
+            ob.get("battle_bias_hint"),
         )
     ) or None
 
-    zone = _extract_zone(signal_payload, record, ctx, flt)
+    zone = _extract_zone(signal_payload, record, ctx, flt, ob)
     result.primary_interest_zone = zone
     result.interest_zone_type = _zone_type(zone)
     result.interest_zone_price = _zone_price(zone)
     result.interest_zone_role = _zone_role(zone)
 
+    result.tpo_watch_setup = _base_watch_setup(result)
+
+    if result.open_behavior_version:
+        result.reasons.append(f"Auction-state source: {result.open_behavior_version}.")
+
     if result.market_status in BLOCK_MARKET_STATUSES:
-        result.tpo_watch_state = "BLOCKED"
-        result.ltf_model_state = "NO_MODEL"
-        result.tpo_watch_active = False
-        result.tpo_watch_setup = result.open_behavior
-        result.tpo_watch_reason = f"Market/TPO data status blocks watch: {result.market_status}."
-        result.blockers.append(f"market_status_{result.market_status.lower()}")
-        result.reasons.append(result.tpo_watch_reason)
-        return result.to_dict()
+        return _set_blocked(
+            result,
+            state="BLOCKED",
+            reason=f"Market/TPO data status blocks watch: {result.market_status}.",
+            blocker=f"market_status_{result.market_status.lower()}",
+        )
 
     if result.tpo_signal_permission in BLOCK_PERMISSIONS:
-        result.tpo_watch_state = "BLOCKED"
-        result.ltf_model_state = "NO_MODEL"
-        result.tpo_watch_active = False
-        result.tpo_watch_setup = result.open_behavior
-        result.tpo_watch_reason = f"TPO permission blocks watch: {result.tpo_signal_permission}."
-        result.blockers.append(f"tpo_permission_{result.tpo_signal_permission.lower()}")
-        result.reasons.append(result.tpo_watch_reason)
-        return result.to_dict()
+        return _set_blocked(
+            result,
+            state="BLOCKED",
+            reason=f"TPO permission blocks watch: {result.tpo_signal_permission}.",
+            blocker=f"tpo_permission_{result.tpo_signal_permission.lower()}",
+        )
 
     if result.tpo_telegram_modifier in BLOCK_TELEGRAM_MODIFIERS:
-        result.tpo_watch_state = "OBSERVE_ONLY"
-        result.ltf_model_state = "NO_MODEL"
-        result.tpo_watch_active = False
-        result.tpo_watch_setup = result.open_behavior
-        result.tpo_watch_reason = f"TPO modifier is {result.tpo_telegram_modifier}; no battle watch."
-        result.blockers.append(f"tpo_modifier_{result.tpo_telegram_modifier.lower()}")
-        result.reasons.append(result.tpo_watch_reason)
-        return result.to_dict()
+        return _set_blocked(
+            result,
+            state="OBSERVE_ONLY",
+            reason=f"TPO modifier is {result.tpo_telegram_modifier}; no battle watch.",
+            blocker=f"tpo_modifier_{result.tpo_telegram_modifier.lower()}",
+        )
 
     if result.tpo_telegram_modifier in DOWNGRADE_TELEGRAM_MODIFIERS:
         result.warnings.append("tpo_modifier_downgrade_watch_allowed_for_ltf_validation")
@@ -512,53 +716,40 @@ def evaluate_tpo_watch_bridge(
         result.htf_alignment_state = "UNKNOWN"
         result.warnings.append("direction_or_htf_bias_unknown_ltf_detector_must_confirm")
 
-    if result.open_behavior == "OPEN_TEST_DRIVE":
-        result.tpo_watch_setup = "OPEN_TEST_DRIVE"
+    current_behavior = result.current_open_behavior or ""
+    initial_behavior = result.initial_open_behavior or ""
+    value_state = result.value_acceptance_state or "UNKNOWN"
+    value_rejected = bool(
+        result.value_rejection_confirmed is True
+        or value_state in VALUE_REJECTION_STATES
+    )
+    value_accepted_back = value_state in VALUE_ACCEPTED_BACK_STATES
 
-        if result.htf_alignment_state == "HTF_CONFLICT":
-            result.tpo_watch_state = "RESEARCH_ONLY"
-            result.ltf_model_state = "NO_MODEL"
-            result.tpo_watch_active = False
-            result.tpo_watch_reason = (
-                "OPEN_TEST_DRIVE detected, but normalized direction conflicts with HTF bias; "
-                "keep research-only unless later policy explicitly allows counter-HTF OTD."
-            )
-            result.blockers.append("htf_conflict")
-            result.reasons.append(result.tpo_watch_reason)
-            return result.to_dict()
-
-        if result.htf_alignment_state == "NEUTRAL_TRANSITION_CANDIDATE":
-            result.allowed_htf_neutral_transition = True
-            result.warnings.append("htf_neutral_transition_candidate")
-
-        return _activate_ltf_pending(
+    # v1.2 detailed auction-state gates first.
+    if current_behavior in OPEN_AUCTION_DETAILED_STATES or result.open_behavior == "OPEN_AUCTION":
+        result.tpo_watch_setup = current_behavior or "OPEN_AUCTION"
+        state = "OBSERVE_ROTATION" if current_behavior == "OPEN_AUCTION_IN_RANGE" else "OBSERVE_ONLY"
+        return _set_blocked(
             result,
-            reason=(
-                "OPEN_TEST_DRIVE context is active; wait for 5m-15m LTF model "
-                "before any ENTRY_READY signal."
-            ),
+            state=state,
+            reason="Open auction context is observe/rotation only; no directional LTF watch yet.",
         )
 
-    if result.open_behavior == "OPEN_DRIVE":
-        result.tpo_watch_setup = "OPEN_DRIVE"
-
-        if result.htf_alignment_state != "HTF_ALIGNED":
-            result.tpo_watch_state = "RESEARCH_ONLY"
-            result.ltf_model_state = "NO_MODEL"
-            result.tpo_watch_active = False
-            result.tpo_watch_reason = "OPEN_DRIVE requires HTF alignment for battle watch."
-            result.blockers.append("open_drive_without_htf_alignment")
-            result.reasons.append(result.tpo_watch_reason)
-            return result.to_dict()
-
-        return _activate_ltf_pending(
-            result,
-            reason="OPEN_DRIVE context is active; wait for pullback/continuation LTF model.",
-        )
-
-    if result.open_behavior == "OPEN_REJECTION_REVERSE":
+    if current_behavior == "OPEN_REJECTION_REVERSE" or result.open_behavior == "OPEN_REJECTION_REVERSE":
         result.tpo_watch_setup = "OPEN_REJECTION_REVERSE"
         result.warnings.append("orr_requires_caution")
+
+        if result.htf_alignment_state == "HTF_CONFLICT":
+            return _set_blocked(
+                result,
+                state="RESEARCH_ONLY",
+                reason=(
+                    "OPEN_REJECTION_REVERSE is active, but normalized direction conflicts with HTF bias; "
+                    "keep research-only unless later structure confirms reversal quality."
+                ),
+                blocker="orr_htf_conflict",
+            )
+
         return _activate_ltf_pending(
             result,
             reason=(
@@ -567,22 +758,98 @@ def evaluate_tpo_watch_bridge(
             ),
         )
 
-    if result.open_behavior == "OPEN_AUCTION":
-        result.tpo_watch_setup = "OPEN_AUCTION"
-        result.tpo_watch_state = "OBSERVE_ROTATION"
-        result.ltf_model_state = "NO_MODEL"
-        result.tpo_watch_active = False
-        result.tpo_watch_reason = "OPEN_AUCTION is observe/rotation context, not directional battle watch."
-        result.reasons.append(result.tpo_watch_reason)
-        return result.to_dict()
+    if current_behavior in OPEN_DRIVE_DETAILED_STATES or result.open_behavior == "OPEN_DRIVE":
+        result.tpo_watch_setup = current_behavior or "OPEN_DRIVE"
 
-    result.tpo_watch_setup = result.open_behavior
-    result.tpo_watch_state = "NO_WATCH"
-    result.ltf_model_state = "NO_MODEL"
-    result.tpo_watch_active = False
-    result.tpo_watch_reason = f"Open behavior is not actionable: {result.open_behavior}."
-    result.reasons.append(result.tpo_watch_reason)
-    return result.to_dict()
+        if current_behavior == "OPEN_DRIVE_CANDIDATE":
+            return _set_blocked(
+                result,
+                state="OBSERVE_ONLY",
+                reason="OPEN_DRIVE_CANDIDATE is not confirmed yet; wait for continuation/pullback structure.",
+                blocker="open_drive_candidate_not_confirmed",
+            )
+
+        if result.htf_alignment_state != "HTF_ALIGNED":
+            return _set_blocked(
+                result,
+                state="RESEARCH_ONLY",
+                reason="OPEN_DRIVE requires HTF alignment for battle watch.",
+                blocker="open_drive_without_htf_alignment",
+            )
+
+        return _activate_ltf_pending(
+            result,
+            reason="OPEN_DRIVE context is active; wait for pullback/continuation LTF model.",
+        )
+
+    if current_behavior in OTD_DETAILED_STATES or result.open_behavior == "OPEN_TEST_DRIVE":
+        result.tpo_watch_setup = current_behavior or "OPEN_TEST_DRIVE"
+
+        if value_accepted_back:
+            return _set_blocked(
+                result,
+                state="RESEARCH_ONLY",
+                reason=(
+                    "Legacy OPEN_TEST_DRIVE is contradicted by value acceptance back inside/failed outside; "
+                    "do not activate OTD watch."
+                ),
+                blocker="otd_contradicted_by_value_acceptance",
+            )
+
+        if current_behavior == "OPEN_TEST_DRIVE_CANDIDATE" and not value_rejected:
+            return _set_blocked(
+                result,
+                state="OBSERVE_ONLY",
+                reason="OPEN_TEST_DRIVE_CANDIDATE needs value rejection before LTF watch can activate.",
+                blocker="otd_candidate_value_rejection_pending",
+            )
+
+        if initial_behavior == "OPEN_TEST_DRIVE_CANDIDATE" and current_behavior in {"", "UNCONFIRMED"}:
+            return _set_blocked(
+                result,
+                state="OBSERVE_ONLY",
+                reason="Initial OTD candidate is not current/confirmed; keep observe-only.",
+                blocker="initial_otd_not_current",
+            )
+
+        if result.htf_alignment_state == "HTF_CONFLICT":
+            return _set_blocked(
+                result,
+                state="RESEARCH_ONLY",
+                reason=(
+                    "OPEN_TEST_DRIVE detected, but normalized direction conflicts with HTF bias; "
+                    "keep research-only unless later policy explicitly allows counter-HTF OTD."
+                ),
+                blocker="htf_conflict",
+            )
+
+        if result.htf_alignment_state == "NEUTRAL_TRANSITION_CANDIDATE":
+            result.allowed_htf_neutral_transition = True
+            result.warnings.append("htf_neutral_transition_candidate")
+
+        return _activate_ltf_pending(
+            result,
+            reason=(
+                "OPEN_TEST_DRIVE auction-state is active; wait for 5m-15m LTF model "
+                "before any ENTRY_READY signal."
+            ),
+        )
+
+    if initial_behavior == "OPEN_TEST_DRIVE_CANDIDATE" and current_behavior in {"", "UNCONFIRMED"}:
+        result.tpo_watch_setup = initial_behavior
+        return _set_blocked(
+            result,
+            state="OBSERVE_ONLY",
+            reason="Initial OTD candidate exists, but current auction behavior is unconfirmed.",
+            blocker="initial_otd_current_unconfirmed",
+        )
+
+    result.tpo_watch_setup = _base_watch_setup(result)
+    return _set_blocked(
+        result,
+        state="NO_WATCH",
+        reason=f"Open behavior is not actionable: {result.tpo_watch_setup or result.open_behavior}.",
+    )
 
 
 def enrich_payload_with_tpo_watch(
