@@ -3,16 +3,39 @@ from __future__ import annotations
 """
 TPO open behavior classifier for AI Market Analyst.
 
+v1.4 purpose:
+- Add an auction-state layer without breaking existing downstream keys.
+- Keep broad legacy fields open_context/open_behavior stable.
+- Add detailed fields for:
+    open_location,
+    initial_open_behavior,
+    current_open_behavior,
+    behavior_transition,
+    value_acceptance_state,
+    value_test_occurred,
+    value_rejection_confirmed,
+    day_type_candidate.
+
+Core rule fixed in v1.4:
+Open Test Drive is NOT a generic "test level + extension" pattern.
+For this system, OTD requires:
+    outside/edge-of-value open
+    + value edge test
+    + failure to accept back into value
+    + rejection away from value
+    + directional continuation context.
+
 This module is intentionally pure and dependency-light.
 It does not fetch market data, does not write files, and does not send Telegram.
 It only converts already-computed TPO/session context into a normalized decision layer:
 
-HTF context
-→ open context
-→ first-hour activity
-→ open behavior
-→ interest zone
-→ entry/stop readiness hints
+Open Location
+→ Initial Activity
+→ Value Interaction
+→ Open Behavior / Behavior Transition
+→ Day Type Candidate
+→ Interest Zone
+→ Entry/Stop readiness hints
 
 Primary public function:
     classify_tpo_open_behavior(context, filters=None, htf_bias=None)
@@ -29,9 +52,16 @@ The classifier is deliberately conservative:
 """
 
 from dataclasses import asdict, dataclass, field
+import math
 from typing import Any, Literal
 
 
+TPO_OPEN_BEHAVIOR_CLASSIFIER_VERSION = (
+    "tpo-open-behavior-classifier-v1.4-auction-state-transitions"
+)
+
+
+# Legacy broad context. Keep stable for downstream consumers.
 OpenContext = Literal[
     "OPEN_INSIDE_VA",
     "OPEN_IN_RANGE",
@@ -39,6 +69,17 @@ OpenContext = Literal[
     "UNKNOWN",
 ]
 
+# Detailed location. Additive field; safe for telemetry/reports.
+OpenLocation = Literal[
+    "OPEN_INSIDE_VALUE",
+    "OPEN_ABOVE_VALUE_INSIDE_RANGE",
+    "OPEN_BELOW_VALUE_INSIDE_RANGE",
+    "OPEN_ABOVE_RANGE",
+    "OPEN_BELOW_RANGE",
+    "UNKNOWN",
+]
+
+# Legacy broad behavior. Keep stable for downstream consumers.
 OpenBehavior = Literal[
     "OPEN_DRIVE",
     "OPEN_TEST_DRIVE",
@@ -47,7 +88,42 @@ OpenBehavior = Literal[
     "UNCONFIRMED",
 ]
 
+# Detailed behavior. Additive field; carries the real auction-state nuance.
+DetailedOpenBehavior = Literal[
+    "OPEN_AUCTION_IN_RANGE",
+    "OPEN_AUCTION_OUT_OF_RANGE",
+    "OPEN_DRIVE_CANDIDATE",
+    "OPEN_DRIVE_CONFIRMED",
+    "OPEN_TEST_DRIVE_CANDIDATE",
+    "OPEN_TEST_DRIVE_CONFIRMED",
+    "OPEN_REJECTION_REVERSE",
+    "UNCONFIRMED",
+]
+
 Direction = Literal["UP", "DOWN", "BALANCED", "NONE", "UNKNOWN"]
+
+ValueAcceptanceState = Literal[
+    "VALUE_NOT_TESTED",
+    "VALUE_TEST_PENDING",
+    "VALUE_REJECTED_UP",
+    "VALUE_REJECTED_DOWN",
+    "ACCEPTED_INSIDE_VALUE",
+    "ACCEPTED_ABOVE_VALUE",
+    "ACCEPTED_BELOW_VALUE",
+    "ACCEPTED_BACK_INSIDE_VALUE",
+    "FAILED_OUTSIDE_VALUE",
+    "UNKNOWN",
+]
+
+DayTypeCandidate = Literal[
+    "NORMAL_DAY_CANDIDATE",
+    "NORMAL_VARIATION_DAY_CANDIDATE",
+    "NEUTRAL_DAY_CANDIDATE",
+    "TREND_DAY_CANDIDATE",
+    "DOUBLE_DISTRIBUTION_DAY_CANDIDATE",
+    "NON_TREND_DAY_CANDIDATE",
+    "UNKNOWN",
+]
 
 ZoneRole = Literal[
     "MAGNET",
@@ -94,9 +170,25 @@ class FirstHourActivity:
     tested_level: str = "NONE"
     test_result: ZoneReaction = "UNCONFIRMED"
 
+    # v1.4 additive diagnostics.
+    open_location: OpenLocation = "UNKNOWN"
+    value_test_occurred: bool = False
+    value_test_level: str = "NONE"
+    value_acceptance_state: ValueAcceptanceState = "UNKNOWN"
+    value_rejection_confirmed: bool = False
+    returned_to_value: bool = False
+    returned_to_range: bool = False
+    accepted_outside_value: bool = False
+    failed_outside_value: bool = False
+    initial_open_behavior: DetailedOpenBehavior = "UNCONFIRMED"
+    current_open_behavior: DetailedOpenBehavior = "UNCONFIRMED"
+    behavior_transition: str | None = None
+    day_type_candidate: DayTypeCandidate = "UNKNOWN"
+
 
 @dataclass(frozen=True)
 class OpenBehaviorResult:
+    version: str
     open_context: OpenContext
     open_behavior: OpenBehavior
     open_behavior_confidence: float
@@ -109,6 +201,19 @@ class OpenBehaviorResult:
     reason: str = ""
     warnings: list[str] = field(default_factory=list)
 
+    # v1.4 additive top-level fields mirrored for easy downstream use.
+    open_location: OpenLocation = "UNKNOWN"
+    initial_open_behavior: DetailedOpenBehavior = "UNCONFIRMED"
+    current_open_behavior: DetailedOpenBehavior = "UNCONFIRMED"
+    behavior_transition: str | None = None
+    value_acceptance_state: ValueAcceptanceState = "UNKNOWN"
+    value_test_occurred: bool = False
+    value_test_level: str = "NONE"
+    value_rejection_confirmed: bool = False
+    day_type_candidate: DayTypeCandidate = "UNKNOWN"
+    auction_state_confidence: float = 0.0
+    auction_state_reason: str = ""
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -117,14 +222,27 @@ def _as_float(value: Any) -> float | None:
     if value is None:
         return None
     try:
-        return float(value)
+        result = float(value)
     except (TypeError, ValueError):
         return None
+    if not math.isfinite(result):
+        return None
+    return result
 
 
 def _as_upper(value: Any, default: str = "") -> str:
     text = str(value or "").strip().upper()
     return text or default
+
+
+def _first_non_empty(*values: Any, default: Any = None) -> Any:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return default
 
 
 def _safe_abs_distance(a: float | None, b: float | None) -> float | None:
@@ -133,13 +251,175 @@ def _safe_abs_distance(a: float | None, b: float | None) -> float | None:
     return abs(a - b)
 
 
-def normalize_open_context(open_relation: Any) -> OpenContext:
+def _open_price(ctx: dict[str, Any]) -> float | None:
+    return _as_float(
+        _first_non_empty(
+            ctx.get("current_open"),
+            ctx.get("open_price"),
+            ctx.get("session_open"),
+            ctx.get("open"),
+        )
+    )
+
+
+def _current_price(ctx: dict[str, Any]) -> float | None:
+    return _as_float(
+        _first_non_empty(
+            ctx.get("current_price"),
+            ctx.get("last_price"),
+            ctx.get("close"),
+        )
+    )
+
+
+def _observed_session_low(ctx: dict[str, Any]) -> float | None:
+    candidates = [
+        _as_float(ctx.get("session_low")),
+        _as_float(ctx.get("current_session_low")),
+        _as_float(ctx.get("day_low")),
+        _as_float(ctx.get("low")),
+        _as_float(ctx.get("ib_low")),
+        _current_price(ctx),
+    ]
+    values = [v for v in candidates if v is not None]
+    return min(values) if values else None
+
+
+def _observed_session_high(ctx: dict[str, Any]) -> float | None:
+    candidates = [
+        _as_float(ctx.get("session_high")),
+        _as_float(ctx.get("current_session_high")),
+        _as_float(ctx.get("day_high")),
+        _as_float(ctx.get("high")),
+        _as_float(ctx.get("ib_high")),
+        _current_price(ctx),
+    ]
+    values = [v for v in candidates if v is not None]
+    return max(values) if values else None
+
+
+def _previous_vah(ctx: dict[str, Any]) -> float | None:
+    return _as_float(_first_non_empty(ctx.get("previous_vah"), ctx.get("prior_vah"), ctx.get("vah")))
+
+
+def _previous_val(ctx: dict[str, Any]) -> float | None:
+    return _as_float(_first_non_empty(ctx.get("previous_val"), ctx.get("prior_val"), ctx.get("val")))
+
+
+def _previous_poc(ctx: dict[str, Any]) -> float | None:
+    return _as_float(_first_non_empty(ctx.get("previous_poc"), ctx.get("prior_poc"), ctx.get("poc")))
+
+
+def _previous_high(ctx: dict[str, Any]) -> float | None:
+    return _as_float(_first_non_empty(ctx.get("previous_high"), ctx.get("prior_high")))
+
+
+def _previous_low(ctx: dict[str, Any]) -> float | None:
+    return _as_float(_first_non_empty(ctx.get("previous_low"), ctx.get("prior_low")))
+
+
+def _value_bounds(ctx: dict[str, Any]) -> tuple[float | None, float | None]:
+    val = _previous_val(ctx)
+    vah = _previous_vah(ctx)
+    if val is None or vah is None:
+        return None, None
+    return min(val, vah), max(val, vah)
+
+
+def _range_bounds(ctx: dict[str, Any]) -> tuple[float | None, float | None]:
+    prev_low = _previous_low(ctx)
+    prev_high = _previous_high(ctx)
+    if prev_low is None or prev_high is None:
+        return None, None
+    return min(prev_low, prev_high), max(prev_low, prev_high)
+
+
+def _distance_threshold(ctx: dict[str, Any]) -> float:
+    """
+    Generic cross-asset threshold for near-zone checks.
+
+    This is not an execution ladder. It only marks an area as worth attention.
+    """
+    price = abs(_current_price(ctx) or _open_price(ctx) or 1.0)
+    tick_size = _as_float(ctx.get("tick_size")) or 0.0
+
+    pct_threshold = price * 0.001  # 0.10%
+    tick_threshold = tick_size * 3 if tick_size > 0 else 0.0
+
+    return max(pct_threshold, tick_threshold)
+
+
+def infer_open_location(ctx: dict[str, Any]) -> OpenLocation:
+    """
+    Detailed open-location classifier.
+
+    Uses numeric levels when available. Falls back to open_relation strings only when
+    numeric context is incomplete.
+    """
+    open_px = _open_price(ctx)
+    value_low, value_high = _value_bounds(ctx)
+    range_low, range_high = _range_bounds(ctx)
+
+    if open_px is not None and value_low is not None and value_high is not None:
+        if value_low <= open_px <= value_high:
+            return "OPEN_INSIDE_VALUE"
+
+        if open_px > value_high:
+            if range_high is not None and open_px > range_high:
+                return "OPEN_ABOVE_RANGE"
+            return "OPEN_ABOVE_VALUE_INSIDE_RANGE"
+
+        if open_px < value_low:
+            if range_low is not None and open_px < range_low:
+                return "OPEN_BELOW_RANGE"
+            return "OPEN_BELOW_VALUE_INSIDE_RANGE"
+
+    relation = _as_upper(ctx.get("open_relation"), "UNKNOWN")
+    if relation in {"INSIDE_VA", "OPEN_INSIDE_VA", "INSIDE_VALUE", "INSIDE_VALUE_AREA"}:
+        return "OPEN_INSIDE_VALUE"
+    if relation in {"ABOVE_RANGE", "OPEN_ABOVE_RANGE"}:
+        return "OPEN_ABOVE_RANGE"
+    if relation in {"BELOW_RANGE", "OPEN_BELOW_RANGE"}:
+        return "OPEN_BELOW_RANGE"
+    if relation in {"ABOVE_VA", "OPEN_ABOVE_VALUE", "OPEN_ABOVE_VA"}:
+        return "OPEN_ABOVE_VALUE_INSIDE_RANGE"
+    if relation in {"BELOW_VA", "OPEN_BELOW_VALUE", "OPEN_BELOW_VA"}:
+        return "OPEN_BELOW_VALUE_INSIDE_RANGE"
+
+    return "UNKNOWN"
+
+
+def normalize_open_context(open_relation: Any, ctx: dict[str, Any] | None = None) -> OpenContext:
+    """
+    Legacy broad open context.
+
+    Kept for existing downstream consumers, but enriched by numeric open_location
+    when ctx is available.
+    """
+    if isinstance(ctx, dict) and ctx:
+        location = infer_open_location(ctx)
+        if location == "OPEN_INSIDE_VALUE":
+            return "OPEN_INSIDE_VA"
+        if location in {"OPEN_ABOVE_RANGE", "OPEN_BELOW_RANGE"}:
+            return "OPEN_OUT_OF_RANGE"
+        if location in {"OPEN_ABOVE_VALUE_INSIDE_RANGE", "OPEN_BELOW_VALUE_INSIDE_RANGE"}:
+            return "OPEN_IN_RANGE"
+
     relation = _as_upper(open_relation, "UNKNOWN")
 
     if relation in {"INSIDE_VA", "OPEN_INSIDE_VA", "INSIDE_VALUE", "INSIDE_VALUE_AREA"}:
         return "OPEN_INSIDE_VA"
 
-    if relation in {"RANGE", "OPEN_IN_RANGE", "IN_RANGE", "INSIDE_RANGE"}:
+    if relation in {
+        "RANGE",
+        "OPEN_IN_RANGE",
+        "IN_RANGE",
+        "INSIDE_RANGE",
+        "ABOVE_VA",
+        "BELOW_VA",
+        "OPEN_ABOVE_VALUE",
+        "OPEN_BELOW_VALUE",
+    }:
         return "OPEN_IN_RANGE"
 
     if relation in {"OUT_OF_RANGE", "OPEN_OUT_OF_RANGE", "ABOVE_RANGE", "BELOW_RANGE"}:
@@ -148,21 +428,18 @@ def normalize_open_context(open_relation: Any) -> OpenContext:
     return "UNKNOWN"
 
 
-def _infer_open_direction(ctx: dict[str, Any]) -> Direction:
-    current_open = _as_float(ctx.get("current_open"))
-    prev_high = _as_float(ctx.get("previous_high"))
-    prev_low = _as_float(ctx.get("previous_low"))
-
-    if current_open is None or prev_high is None or prev_low is None:
-        return "UNKNOWN"
-
-    if current_open > prev_high:
+def _direction_from_open_location(location: OpenLocation) -> Direction:
+    if location in {"OPEN_ABOVE_VALUE_INSIDE_RANGE", "OPEN_ABOVE_RANGE"}:
         return "UP"
-
-    if current_open < prev_low:
+    if location in {"OPEN_BELOW_VALUE_INSIDE_RANGE", "OPEN_BELOW_RANGE"}:
         return "DOWN"
+    if location == "OPEN_INSIDE_VALUE":
+        return "BALANCED"
+    return "UNKNOWN"
 
-    return "BALANCED"
+
+def _infer_open_direction(ctx: dict[str, Any]) -> Direction:
+    return _direction_from_open_location(infer_open_location(ctx))
 
 
 def _infer_ib_direction(ctx: dict[str, Any]) -> Direction:
@@ -207,79 +484,148 @@ def _infer_ib_extension_direction(ctx: dict[str, Any]) -> Direction:
 
 
 def _price_inside_value(ctx: dict[str, Any], price: float | None = None) -> bool:
-    px = price if price is not None else _as_float(ctx.get("current_price"))
-    val = _as_float(ctx.get("previous_val"))
-    vah = _as_float(ctx.get("previous_vah"))
+    px = price if price is not None else _current_price(ctx)
+    value_low, value_high = _value_bounds(ctx)
 
-    if px is None or val is None or vah is None:
+    if px is None or value_low is None or value_high is None:
         return False
 
-    low = min(val, vah)
-    high = max(val, vah)
-    return low <= px <= high
+    return value_low <= px <= value_high
 
 
 def _price_inside_range(ctx: dict[str, Any], price: float | None = None) -> bool:
-    px = price if price is not None else _as_float(ctx.get("current_price"))
-    prev_low = _as_float(ctx.get("previous_low"))
-    prev_high = _as_float(ctx.get("previous_high"))
+    px = price if price is not None else _current_price(ctx)
+    range_low, range_high = _range_bounds(ctx)
 
-    if px is None or prev_low is None or prev_high is None:
+    if px is None or range_low is None or range_high is None:
         return False
 
-    low = min(prev_low, prev_high)
-    high = max(prev_low, prev_high)
-    return low <= px <= high
+    return range_low <= px <= range_high
 
 
 def _accepted_outside_range(ctx: dict[str, Any], open_direction: Direction) -> bool:
-    px = _as_float(ctx.get("current_price"))
-    prev_high = _as_float(ctx.get("previous_high"))
-    prev_low = _as_float(ctx.get("previous_low"))
+    px = _current_price(ctx)
+    range_low, range_high = _range_bounds(ctx)
 
-    if px is None or prev_high is None or prev_low is None:
+    if px is None or range_low is None or range_high is None:
         return False
 
     if open_direction == "UP":
-        return px > prev_high
+        return px > range_high
 
     if open_direction == "DOWN":
-        return px < prev_low
+        return px < range_low
 
     return False
 
 
-def _distance_threshold(ctx: dict[str, Any]) -> float:
+def _accepted_outside_value(ctx: dict[str, Any], open_direction: Direction) -> bool:
+    px = _current_price(ctx)
+    value_low, value_high = _value_bounds(ctx)
+
+    if px is None or value_low is None or value_high is None:
+        return False
+
+    if open_direction == "UP":
+        return px > value_high
+
+    if open_direction == "DOWN":
+        return px < value_low
+
+    return False
+
+
+def _value_test_occurred(ctx: dict[str, Any], location: OpenLocation) -> tuple[bool, str]:
     """
-    Generic cross-asset threshold for near-zone checks.
+    Detect whether price tested the prior value edge.
 
-    This is not an execution ladder. It only marks an area as worth attention.
+    For bullish OTD: open above value → low tests VAH.
+    For bearish OTD: open below value → high tests VAL.
     """
-    price = _as_float(ctx.get("current_price")) or 1.0
-    tick_size = _as_float(ctx.get("tick_size")) or 0.0
+    threshold = _distance_threshold(ctx)
+    value_low, value_high = _value_bounds(ctx)
+    if value_low is None or value_high is None:
+        return False, "NONE"
 
-    pct_threshold = abs(price) * 0.001  # 0.10%
-    tick_threshold = tick_size * 3 if tick_size > 0 else 0.0
+    observed_low = _observed_session_low(ctx)
+    observed_high = _observed_session_high(ctx)
+    current_px = _current_price(ctx)
 
-    return max(pct_threshold, tick_threshold)
+    if location in {"OPEN_ABOVE_VALUE_INSIDE_RANGE", "OPEN_ABOVE_RANGE"}:
+        tested = bool(
+            (observed_low is not None and observed_low <= value_high + threshold)
+            or (current_px is not None and current_px <= value_high + threshold)
+        )
+        return tested, "VAH" if tested else "NONE"
+
+    if location in {"OPEN_BELOW_VALUE_INSIDE_RANGE", "OPEN_BELOW_RANGE"}:
+        tested = bool(
+            (observed_high is not None and observed_high >= value_low - threshold)
+            or (current_px is not None and current_px >= value_low - threshold)
+        )
+        return tested, "VAL" if tested else "NONE"
+
+    # Inside value: touches are rotations, not OTD value tests.
+    return False, "NONE"
+
+
+def _value_acceptance_state(
+    ctx: dict[str, Any],
+    *,
+    location: OpenLocation,
+    open_direction: Direction,
+    value_test_occurred: bool,
+) -> ValueAcceptanceState:
+    px = _current_price(ctx)
+    value_low, value_high = _value_bounds(ctx)
+
+    if px is None or value_low is None or value_high is None:
+        return "UNKNOWN"
+
+    inside_value = value_low <= px <= value_high
+
+    if location == "OPEN_INSIDE_VALUE":
+        return "ACCEPTED_INSIDE_VALUE" if inside_value else "VALUE_TEST_PENDING"
+
+    if inside_value:
+        return "ACCEPTED_BACK_INSIDE_VALUE"
+
+    if open_direction == "UP":
+        if px > value_high:
+            return "VALUE_REJECTED_UP" if value_test_occurred else "ACCEPTED_ABOVE_VALUE"
+        return "FAILED_OUTSIDE_VALUE"
+
+    if open_direction == "DOWN":
+        if px < value_low:
+            return "VALUE_REJECTED_DOWN" if value_test_occurred else "ACCEPTED_BELOW_VALUE"
+        return "FAILED_OUTSIDE_VALUE"
+
+    return "UNKNOWN"
+
+
+def _value_rejection_confirmed(state: ValueAcceptanceState) -> bool:
+    return state in {"VALUE_REJECTED_UP", "VALUE_REJECTED_DOWN"}
+
+
+def _failed_outside_value(state: ValueAcceptanceState) -> bool:
+    return state in {"ACCEPTED_BACK_INSIDE_VALUE", "FAILED_OUTSIDE_VALUE"}
 
 
 def _build_interest_zones(ctx: dict[str, Any]) -> list[InterestZone]:
-    current_price = _as_float(ctx.get("current_price"))
+    current_price = _current_price(ctx)
     threshold = _distance_threshold(ctx)
 
     candidates: list[InterestZone] = []
 
     raw_levels = [
-        ("POC", ctx.get("previous_poc"), "REFERENCE_ZONE", "previous POC"),
-        ("VAH", ctx.get("previous_vah"), "REACTION_ZONE", "previous value area high"),
-        ("VAL", ctx.get("previous_val"), "REACTION_ZONE", "previous value area low"),
-        ("PREVIOUS_HIGH", ctx.get("previous_high"), "REFERENCE_ZONE", "previous session high"),
-        ("PREVIOUS_LOW", ctx.get("previous_low"), "REFERENCE_ZONE", "previous session low"),
+        ("POC", _previous_poc(ctx), "REFERENCE_ZONE", "previous POC"),
+        ("VAH", _previous_vah(ctx), "REACTION_ZONE", "previous value area high"),
+        ("VAL", _previous_val(ctx), "REACTION_ZONE", "previous value area low"),
+        ("PREVIOUS_HIGH", _previous_high(ctx), "REFERENCE_ZONE", "previous session high"),
+        ("PREVIOUS_LOW", _previous_low(ctx), "REFERENCE_ZONE", "previous session low"),
     ]
 
-    for zone_type, raw_price, role, reason in raw_levels:
-        price = _as_float(raw_price)
+    for zone_type, price, role, reason in raw_levels:
         distance = _safe_abs_distance(current_price, price)
         if price is None:
             continue
@@ -356,44 +702,269 @@ def _infer_tested_level(interest_zones: list[InterestZone], ctx: dict[str, Any])
 def _infer_test_result(
     *,
     tested_level: str,
-    open_context: OpenContext,
-    ib_direction: Direction,
-    accepted_back_inside_value: bool,
-    accepted_back_inside_range: bool,
+    value_acceptance_state: ValueAcceptanceState,
 ) -> ZoneReaction:
     if tested_level == "NONE":
         return "NONE"
 
-    if open_context == "OPEN_OUT_OF_RANGE" and (accepted_back_inside_value or accepted_back_inside_range):
+    if value_acceptance_state in {"VALUE_REJECTED_UP", "VALUE_REJECTED_DOWN"}:
         return "REJECTED"
 
-    if ib_direction in {"UP", "DOWN"}:
-        return "REJECTED"
+    if value_acceptance_state in {"ACCEPTED_BACK_INSIDE_VALUE", "ACCEPTED_INSIDE_VALUE"}:
+        return "ACCEPTED"
 
     return "UNCONFIRMED"
 
 
-def _build_first_hour_activity(ctx: dict[str, Any]) -> FirstHourActivity:
+def _infer_day_type_candidate(
+    ctx: dict[str, Any],
+    *,
+    auction_bias: str,
+    ib_extension_direction: Direction,
+    current_behavior: DetailedOpenBehavior,
+) -> DayTypeCandidate:
+    up_pct = _as_float(ctx.get("ib_extension_up_pct")) or 0.0
+    down_pct = _as_float(ctx.get("ib_extension_down_pct")) or 0.0
+
+    # Prefer explicit exporter hints if they exist in the future.
+    explicit = _as_upper(
+        _first_non_empty(ctx.get("day_type"), ctx.get("day_type_candidate"), ctx.get("profile_day_type")),
+        "",
+    )
+    explicit_map: dict[str, DayTypeCandidate] = {
+        "NORMAL_DAY": "NORMAL_DAY_CANDIDATE",
+        "NORMAL_VARIATION_DAY": "NORMAL_VARIATION_DAY_CANDIDATE",
+        "NEUTRAL_DAY": "NEUTRAL_DAY_CANDIDATE",
+        "TREND_DAY": "TREND_DAY_CANDIDATE",
+        "DOUBLE_DISTRIBUTION_DAY": "DOUBLE_DISTRIBUTION_DAY_CANDIDATE",
+        "NON_TREND_DAY": "NON_TREND_DAY_CANDIDATE",
+    }
+    if explicit in explicit_map:
+        return explicit_map[explicit]
+
+    if bool(ctx.get("double_distribution_detected")) or bool(ctx.get("single_prints_present")):
+        return "DOUBLE_DISTRIBUTION_DAY_CANDIDATE"
+
+    if up_pct >= 0.5 and down_pct >= 0.5:
+        return "NEUTRAL_DAY_CANDIDATE"
+
+    if current_behavior in {"OPEN_DRIVE_CONFIRMED", "OPEN_TEST_DRIVE_CONFIRMED"}:
+        if max(up_pct, down_pct) >= 1.25 or auction_bias == "DIRECTIONAL_IMBALANCE":
+            return "TREND_DAY_CANDIDATE"
+        return "NORMAL_VARIATION_DAY_CANDIDATE"
+
+    if ib_extension_direction in {"UP", "DOWN"}:
+        if max(up_pct, down_pct) >= 1.0:
+            return "NORMAL_VARIATION_DAY_CANDIDATE"
+        return "NORMAL_DAY_CANDIDATE"
+
+    if auction_bias == "BALANCE":
+        return "NON_TREND_DAY_CANDIDATE"
+
+    if ib_extension_direction == "NONE":
+        return "NORMAL_DAY_CANDIDATE"
+
+    return "UNKNOWN"
+
+
+def _initial_open_behavior(
+    *,
+    location: OpenLocation,
+    open_direction: Direction,
+    ib_extension_direction: Direction,
+    value_test_occurred: bool,
+) -> DetailedOpenBehavior:
+    if value_test_occurred and open_direction in {"UP", "DOWN"}:
+        return "OPEN_TEST_DRIVE_CANDIDATE"
+
+    if location in {"OPEN_ABOVE_RANGE", "OPEN_BELOW_RANGE"}:
+        if ib_extension_direction == open_direction and open_direction in {"UP", "DOWN"}:
+            return "OPEN_DRIVE_CANDIDATE"
+        return "OPEN_AUCTION_OUT_OF_RANGE"
+
+    if location in {"OPEN_ABOVE_VALUE_INSIDE_RANGE", "OPEN_BELOW_VALUE_INSIDE_RANGE"}:
+        if ib_extension_direction == open_direction and open_direction in {"UP", "DOWN"}:
+            return "OPEN_DRIVE_CANDIDATE"
+        return "OPEN_AUCTION_IN_RANGE"
+
+    if location == "OPEN_INSIDE_VALUE":
+        return "OPEN_AUCTION_IN_RANGE"
+
+    return "UNCONFIRMED"
+
+
+def _behavior_transition(initial: DetailedOpenBehavior, current: DetailedOpenBehavior) -> str | None:
+    if not initial or not current or initial == current:
+        return None
+    if initial == "UNCONFIRMED" or current == "UNCONFIRMED":
+        return None
+    return f"{initial}_TO_{current}"
+
+
+def _classify_current_behavior(
+    *,
+    location: OpenLocation,
+    open_context: OpenContext,
+    open_direction: Direction,
+    ib_extension_direction: Direction,
+    auction_bias: str,
+    value_test_occurred: bool,
+    value_acceptance_state: ValueAcceptanceState,
+    accepted_outside_range: bool,
+    accepted_outside_value: bool,
+) -> tuple[OpenBehavior, DetailedOpenBehavior, float, str, str, str, str]:
+    """
+    Return broad behavior, detailed behavior, confidence, entry_hint,
+    stop_hint, battle_hint, reason.
+    """
+    if value_acceptance_state == "ACCEPTED_BACK_INSIDE_VALUE":
+        return (
+            "OPEN_REJECTION_REVERSE",
+            "OPEN_REJECTION_REVERSE",
+            0.78,
+            "SWEEP_RECLAIM_BOS_RETEST",
+            "BEHIND_SWEEP_EXTREME",
+            "RESEARCH_COUNTERTREND_UNLESS_LTF_CONFIRMED",
+            "Outside-value attempt accepted back inside prior value; rejection-reverse conditions detected.",
+        )
+
+    if value_acceptance_state == "FAILED_OUTSIDE_VALUE":
+        return (
+            "OPEN_REJECTION_REVERSE",
+            "OPEN_REJECTION_REVERSE",
+            0.64,
+            "WAIT_FOR_ACCEPTANCE_BACK_INSIDE_VALUE",
+            "BEHIND_FAILED_OUTSIDE_EXTREME",
+            "RESEARCH_ONLY",
+            "Outside-value attempt is failing, but value acceptance needs confirmation.",
+        )
+
+    if open_direction in {"UP", "DOWN"} and value_test_occurred:
+        if _value_rejection_confirmed(value_acceptance_state) and ib_extension_direction == open_direction:
+            return (
+                "OPEN_TEST_DRIVE",
+                "OPEN_TEST_DRIVE_CONFIRMED",
+                0.76,
+                "FAILED_ACCEPTANCE_RETEST",
+                "BEYOND_FAILED_ACCEPTANCE_ZONE",
+                "ALLOW_IF_HTF_ALIGNED_AND_LTF_CONFIRMED",
+                "Outside/edge-of-value open tested prior value edge, failed to accept back into value, and continued away from value.",
+            )
+        return (
+            "OPEN_TEST_DRIVE",
+            "OPEN_TEST_DRIVE_CANDIDATE",
+            0.58,
+            "WAIT_FOR_VALUE_REJECTION_AND_LTF_CONFIRMATION",
+            "BEYOND_VALUE_EDGE_OR_TEST_EXTREME",
+            "RESEARCH_UNTIL_ACCEPTANCE_CONFIRMED",
+            "Value edge test occurred, but rejection/continuation is not fully confirmed.",
+        )
+
+    if (
+        open_direction in {"UP", "DOWN"}
+        and ib_extension_direction == open_direction
+        and (accepted_outside_range or accepted_outside_value)
+        and auction_bias in {"DIRECTIONAL_IMBALANCE", "RANGE_EXTENSION", "UNKNOWN"}
+    ):
+        return (
+            "OPEN_DRIVE",
+            "OPEN_DRIVE_CONFIRMED",
+            0.80,
+            "PULLBACK_CONTINUATION",
+            "BEHIND_PULLBACK_STRUCTURE_OR_IB_EDGE",
+            "BOOST_IF_HTF_ALIGNED_AND_EXECUTABLE",
+            "Open is holding outside value/range with directional IB extension and no meaningful value test first.",
+        )
+
+    if open_context == "OPEN_OUT_OF_RANGE":
+        return (
+            "OPEN_AUCTION",
+            "OPEN_AUCTION_OUT_OF_RANGE",
+            0.56,
+            "WAIT_FOR_ACCEPTANCE_OR_REJECTION",
+            "NO_STOP_MODEL",
+            "RESEARCH_ONLY",
+            "Out-of-range context is building auction/balance instead of clean initiative continuation.",
+        )
+
+    if open_context in {"OPEN_IN_RANGE", "OPEN_INSIDE_VA"}:
+        return (
+            "OPEN_AUCTION",
+            "OPEN_AUCTION_IN_RANGE",
+            0.62 if open_context == "OPEN_IN_RANGE" else 0.72,
+            "NO_DIRECTIONAL_ENTRY_MODEL",
+            "NO_STOP_MODEL",
+            "RESEARCH_ONLY",
+            "Open is inside prior value/range context without strict OTD or clean drive confirmation.",
+        )
+
+    return (
+        "UNCONFIRMED",
+        "UNCONFIRMED",
+        0.35,
+        "NO_ENTRY_MODEL",
+        "NO_STOP_MODEL",
+        "RESEARCH_ONLY",
+        "Open behavior is not clear enough.",
+    )
+
+
+def _build_first_hour_activity(ctx: dict[str, Any], *, auction_bias: str) -> FirstHourActivity:
+    location = infer_open_location(ctx)
     open_direction = _infer_open_direction(ctx)
     ib_direction = _infer_ib_direction(ctx)
     ib_extension_direction = _infer_ib_extension_direction(ctx)
+
     accepted_back_inside_value = _price_inside_value(ctx)
     accepted_back_inside_range = _price_inside_range(ctx)
     accepted_outside_range = _accepted_outside_range(ctx, open_direction)
+    accepted_outside_value = _accepted_outside_value(ctx, open_direction)
+
+    value_test_occurred, value_test_level = _value_test_occurred(ctx, location)
+    value_acceptance_state = _value_acceptance_state(
+        ctx,
+        location=location,
+        open_direction=open_direction,
+        value_test_occurred=value_test_occurred,
+    )
+    value_rejection_confirmed = _value_rejection_confirmed(value_acceptance_state)
+    failed_outside_value = _failed_outside_value(value_acceptance_state)
 
     interest_zones = _build_interest_zones(ctx)
-    tested_level = _infer_tested_level(interest_zones, ctx)
+    tested_level = value_test_level if value_test_occurred else _infer_tested_level(interest_zones, ctx)
     test_result = _infer_test_result(
         tested_level=tested_level,
-        open_context=normalize_open_context(ctx.get("open_relation")),
-        ib_direction=ib_direction,
-        accepted_back_inside_value=accepted_back_inside_value,
-        accepted_back_inside_range=accepted_back_inside_range,
+        value_acceptance_state=value_acceptance_state,
     )
 
-    failed_auction = bool(
-        open_direction in {"UP", "DOWN"}
-        and (accepted_back_inside_value or accepted_back_inside_range)
+    failed_auction = bool(open_direction in {"UP", "DOWN"} and failed_outside_value)
+
+    open_context = normalize_open_context(ctx.get("open_relation"), ctx)
+    broad_behavior, current_behavior, _confidence, _entry, _stop, _battle, _reason = _classify_current_behavior(
+        location=location,
+        open_context=open_context,
+        open_direction=open_direction,
+        ib_extension_direction=ib_extension_direction,
+        auction_bias=auction_bias,
+        value_test_occurred=value_test_occurred,
+        value_acceptance_state=value_acceptance_state,
+        accepted_outside_range=accepted_outside_range,
+        accepted_outside_value=accepted_outside_value,
+    )
+    del broad_behavior
+
+    initial_behavior = _initial_open_behavior(
+        location=location,
+        open_direction=open_direction,
+        ib_extension_direction=ib_extension_direction,
+        value_test_occurred=value_test_occurred,
+    )
+    transition = _behavior_transition(initial_behavior, current_behavior)
+    day_type = _infer_day_type_candidate(
+        ctx,
+        auction_bias=auction_bias,
+        ib_extension_direction=ib_extension_direction,
+        current_behavior=current_behavior,
     )
 
     return FirstHourActivity(
@@ -411,6 +982,19 @@ def _build_first_hour_activity(ctx: dict[str, Any]) -> FirstHourActivity:
         failed_auction=failed_auction,
         tested_level=tested_level,
         test_result=test_result,
+        open_location=location,
+        value_test_occurred=value_test_occurred,
+        value_test_level=value_test_level,
+        value_acceptance_state=value_acceptance_state,
+        value_rejection_confirmed=value_rejection_confirmed,
+        returned_to_value=accepted_back_inside_value,
+        returned_to_range=accepted_back_inside_range,
+        accepted_outside_value=accepted_outside_value,
+        failed_outside_value=failed_outside_value,
+        initial_open_behavior=initial_behavior,
+        current_open_behavior=current_behavior,
+        behavior_transition=transition,
+        day_type_candidate=day_type,
     )
 
 
@@ -431,7 +1015,6 @@ def classify_tpo_open_behavior(
 
     warnings: list[str] = []
 
-    open_relation = ctx.get("open_relation") or flt.get("open_relation")
     auction_bias = _as_upper(ctx.get("auction_bias") or flt.get("auction_bias"), "UNKNOWN")
     market_status = _as_upper(ctx.get("market_status") or flt.get("market_status"), "UNKNOWN")
     tpo_permission = _as_upper(flt.get("tpo_signal_permission") or ctx.get("tpo_signal_permission"), "UNKNOWN")
@@ -443,8 +1026,9 @@ def classify_tpo_open_behavior(
     )
     htf = _as_upper(htf_bias, "UNKNOWN")
 
-    open_context = normalize_open_context(open_relation)
-    first_hour = _build_first_hour_activity(ctx)
+    open_relation = ctx.get("open_relation") or flt.get("open_relation")
+    open_context = normalize_open_context(open_relation, ctx)
+    first_hour = _build_first_hour_activity(ctx, auction_bias=auction_bias)
     interest_zones = _build_interest_zones(ctx)
     primary_zone = interest_zones[0] if interest_zones else None
 
@@ -455,132 +1039,70 @@ def classify_tpo_open_behavior(
     )
     is_stale = bool(flt.get("is_stale") or ctx.get("is_stale") or ctx.get("market_data_is_stale"))
 
-    if not context_available:
+    def _blocked_result(
+        *,
+        confidence: float,
+        reason: str,
+        warning: str,
+        battle_hint: str = "BLOCK",
+    ) -> dict[str, Any]:
         result = OpenBehaviorResult(
-            open_context="UNKNOWN",
+            version=TPO_OPEN_BEHAVIOR_CLASSIFIER_VERSION,
+            open_context=open_context if context_available else "UNKNOWN",
             open_behavior="UNCONFIRMED",
-            open_behavior_confidence=0.0,
+            open_behavior_confidence=round(confidence, 4),
             first_hour_activity=first_hour,
             interest_zones=interest_zones,
             primary_interest_zone=primary_zone,
-            battle_bias_hint="BLOCK",
-            reason="No auction context available.",
-            warnings=["auction_context_missing"],
+            battle_bias_hint=battle_hint,
+            reason=reason,
+            warnings=[warning],
+            open_location=first_hour.open_location,
+            initial_open_behavior=first_hour.initial_open_behavior,
+            current_open_behavior="UNCONFIRMED",
+            behavior_transition=first_hour.behavior_transition,
+            value_acceptance_state=first_hour.value_acceptance_state,
+            value_test_occurred=first_hour.value_test_occurred,
+            value_test_level=first_hour.value_test_level,
+            value_rejection_confirmed=first_hour.value_rejection_confirmed,
+            day_type_candidate=first_hour.day_type_candidate,
+            auction_state_confidence=round(confidence, 4),
+            auction_state_reason=reason,
         )
         return result.to_dict()
+
+    if not context_available:
+        return _blocked_result(
+            confidence=0.0,
+            reason="No auction context available.",
+            warning="auction_context_missing",
+        )
 
     if market_status not in {"OPEN", "UNKNOWN"}:
-        result = OpenBehaviorResult(
-            open_context=open_context,
-            open_behavior="UNCONFIRMED",
-            open_behavior_confidence=0.1,
-            first_hour_activity=first_hour,
-            interest_zones=interest_zones,
-            primary_interest_zone=primary_zone,
-            battle_bias_hint="BLOCK",
+        return _blocked_result(
+            confidence=0.1,
             reason=f"Market is not open enough for behavior classification: market_status={market_status}.",
-            warnings=[f"market_status_{market_status.lower()}"],
+            warning=f"market_status_{market_status.lower()}",
         )
-        return result.to_dict()
 
     if is_stale or tpo_permission in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"}:
-        result = OpenBehaviorResult(
-            open_context=open_context,
-            open_behavior="UNCONFIRMED",
-            open_behavior_confidence=0.15,
-            first_hour_activity=first_hour,
-            interest_zones=interest_zones,
-            primary_interest_zone=primary_zone,
-            battle_bias_hint="BLOCK",
+        return _blocked_result(
+            confidence=0.15,
             reason="TPO context is stale or degraded.",
-            warnings=["tpo_stale_or_degraded"],
+            warning="tpo_stale_or_degraded",
         )
-        return result.to_dict()
 
-    behavior: OpenBehavior = "UNCONFIRMED"
-    confidence = 0.35
-    entry_hint = "NO_ENTRY_MODEL"
-    stop_hint = "NO_STOP_MODEL"
-    battle_hint = "RESEARCH_ONLY"
-    reason = "Open behavior is not clear enough."
-
-    if open_context == "OPEN_OUT_OF_RANGE":
-        if first_hour.failed_auction or first_hour.accepted_back_inside_value or first_hour.accepted_back_inside_range:
-            behavior = "OPEN_REJECTION_REVERSE"
-            confidence = 0.75
-            entry_hint = "SWEEP_RECLAIM_BOS_RETEST"
-            stop_hint = "BEHIND_SWEEP_EXTREME"
-            battle_hint = "RESEARCH_COUNTERTREND_UNLESS_LTF_CONFIRMED"
-            reason = "Out-of-range open failed to hold outside prior value/range; rejection-reverse conditions detected."
-        elif (
-            auction_bias == "DIRECTIONAL_IMBALANCE"
-            and first_hour.accepted_outside_range
-            and first_hour.ib_extension_direction in {"UP", "DOWN"}
-            and first_hour.ib_extension_direction == first_hour.open_direction
-        ):
-            behavior = "OPEN_DRIVE"
-            confidence = 0.82
-            entry_hint = "PULLBACK_CONTINUATION"
-            stop_hint = "BEHIND_PULLBACK_STRUCTURE_OR_IB_EDGE"
-            battle_hint = "BOOST_IF_HTF_ALIGNED_AND_EXECUTABLE"
-            reason = "Out-of-range open is holding outside prior range with directional IB extension."
-        else:
-            behavior = "UNCONFIRMED"
-            confidence = 0.45
-            entry_hint = "WAIT_FOR_ACCEPTANCE_OR_REJECTION"
-            stop_hint = "NO_STOP_MODEL"
-            battle_hint = "RESEARCH_ONLY"
-            reason = "Out-of-range context exists, but acceptance/rejection is not confirmed yet."
-
-    elif open_context == "OPEN_IN_RANGE":
-        if (
-            first_hour.tested_level in {"VAH", "VAL", "POC", "NPOC"}
-            and first_hour.ib_extension_direction in {"UP", "DOWN"}
-            and first_hour.test_result in {"REJECTED", "UNCONFIRMED"}
-        ):
-            behavior = "OPEN_TEST_DRIVE"
-            confidence = 0.68
-            entry_hint = "FAILED_ACCEPTANCE_RETEST"
-            stop_hint = "BEYOND_FAILED_ACCEPTANCE_ZONE"
-            battle_hint = "ALLOW_IF_HTF_ALIGNED_AND_LTF_CONFIRMED"
-            reason = f"Open-in-range context with test near {first_hour.tested_level} and directional IB extension."
-        elif auction_bias == "RANGE_EXTENSION" and first_hour.ib_extension_direction in {"UP", "DOWN"}:
-            behavior = "OPEN_TEST_DRIVE"
-            confidence = 0.60
-            entry_hint = "PULLBACK_OR_FAILED_ACCEPTANCE_RETEST"
-            stop_hint = "BEYOND_TEST_ZONE_OR_PULLBACK_STRUCTURE"
-            battle_hint = "ALLOW_IF_HTF_ALIGNED_AND_LTF_CONFIRMED"
-            reason = "Range open developed directional range extension; possible open-test-drive behavior."
-        else:
-            behavior = "OPEN_AUCTION"
-            confidence = 0.55
-            entry_hint = "NO_DIRECTIONAL_ENTRY_MODEL"
-            stop_hint = "NO_STOP_MODEL"
-            battle_hint = "RESEARCH_ONLY"
-            reason = "Open-in-range context without clean directional drive; auction behavior preferred."
-
-    elif open_context == "OPEN_INSIDE_VA":
-        if auction_bias == "BALANCE" or modifier == "DOWNGRADE":
-            behavior = "OPEN_AUCTION"
-            confidence = 0.78
-            entry_hint = "ROTATION_ONLY_IF_LTF_CONFIRMED"
-            stop_hint = "BEYOND_VALUE_EDGE_OR_STRUCTURE"
-            battle_hint = "DOWNGRADE_NO_DIRECTIONAL_BATTLE"
-            reason = "Open inside value area with balance/downgrade context; directional edge reduced."
-        elif first_hour.ib_extension_direction in {"UP", "DOWN"}:
-            behavior = "OPEN_TEST_DRIVE"
-            confidence = 0.55
-            entry_hint = "FAILED_ACCEPTANCE_RETEST"
-            stop_hint = "BEYOND_VALUE_EDGE"
-            battle_hint = "RESEARCH_UNTIL_ACCEPTANCE_CONFIRMED"
-            reason = "Inside-VA open has directional IB extension, but acceptance must be confirmed."
-        else:
-            behavior = "OPEN_AUCTION"
-            confidence = 0.70
-            entry_hint = "NO_DIRECTIONAL_ENTRY_MODEL"
-            stop_hint = "NO_STOP_MODEL"
-            battle_hint = "RESEARCH_ONLY"
-            reason = "Open inside value area with no confirmed directional behavior."
+    behavior, current_behavior, confidence, entry_hint, stop_hint, battle_hint, reason = _classify_current_behavior(
+        location=first_hour.open_location,
+        open_context=open_context,
+        open_direction=first_hour.open_direction,
+        ib_extension_direction=first_hour.ib_extension_direction,
+        auction_bias=auction_bias,
+        value_test_occurred=first_hour.value_test_occurred,
+        value_acceptance_state=first_hour.value_acceptance_state,
+        accepted_outside_range=first_hour.accepted_outside_range,
+        accepted_outside_value=first_hour.accepted_outside_value,
+    )
 
     if htf in {"LONG", "SHORT"} and battle_hint.startswith("BOOST"):
         reason += f" HTF bias is available: {htf}."
@@ -591,7 +1113,17 @@ def classify_tpo_open_behavior(
     if modifier == "DOWNGRADE":
         warnings.append("telegram_modifier_downgrade")
 
+    if first_hour.current_open_behavior == "OPEN_AUCTION_OUT_OF_RANGE":
+        warnings.append("outside_range_auction_requires_later_acceptance_or_rejection")
+
+    if first_hour.current_open_behavior == "OPEN_TEST_DRIVE_CANDIDATE":
+        warnings.append("otd_candidate_requires_value_rejection_and_ltf_confirmation")
+
+    if behavior == "OPEN_TEST_DRIVE" and first_hour.current_open_behavior != "OPEN_TEST_DRIVE_CONFIRMED":
+        warnings.append("open_test_drive_not_actionable_without_ltf_confirmation")
+
     result = OpenBehaviorResult(
+        version=TPO_OPEN_BEHAVIOR_CLASSIFIER_VERSION,
         open_context=open_context,
         open_behavior=behavior,
         open_behavior_confidence=round(confidence, 4),
@@ -603,6 +1135,17 @@ def classify_tpo_open_behavior(
         battle_bias_hint=battle_hint,
         reason=reason,
         warnings=warnings,
+        open_location=first_hour.open_location,
+        initial_open_behavior=first_hour.initial_open_behavior,
+        current_open_behavior=current_behavior,
+        behavior_transition=first_hour.behavior_transition,
+        value_acceptance_state=first_hour.value_acceptance_state,
+        value_test_occurred=first_hour.value_test_occurred,
+        value_test_level=first_hour.value_test_level,
+        value_rejection_confirmed=first_hour.value_rejection_confirmed,
+        day_type_candidate=first_hour.day_type_candidate,
+        auction_state_confidence=round(confidence, 4),
+        auction_state_reason=reason,
     )
     return result.to_dict()
 
@@ -628,23 +1171,57 @@ def attach_open_behavior_to_tpo_item(item: dict[str, Any], *, htf_bias: str | No
     ctx = dict(ctx)
     flt = dict(flt)
 
-    ctx["open_context"] = behavior.get("open_context")
-    ctx["open_behavior"] = behavior.get("open_behavior")
-    ctx["open_behavior_confidence"] = behavior.get("open_behavior_confidence")
-    ctx["first_hour_activity"] = behavior.get("first_hour_activity")
-    ctx["primary_interest_zone"] = behavior.get("primary_interest_zone")
-    ctx["interest_zones"] = behavior.get("interest_zones")
-    ctx["entry_model_hint"] = behavior.get("entry_model_hint")
-    ctx["stop_model_hint"] = behavior.get("stop_model_hint")
-    ctx["battle_bias_hint"] = behavior.get("battle_bias_hint")
-    ctx["open_behavior_reason"] = behavior.get("reason")
+    mirror_keys = [
+        "version",
+        "open_context",
+        "open_location",
+        "open_behavior",
+        "open_behavior_confidence",
+        "initial_open_behavior",
+        "current_open_behavior",
+        "behavior_transition",
+        "value_acceptance_state",
+        "value_test_occurred",
+        "value_test_level",
+        "value_rejection_confirmed",
+        "day_type_candidate",
+        "auction_state_confidence",
+        "auction_state_reason",
+        "first_hour_activity",
+        "primary_interest_zone",
+        "interest_zones",
+        "entry_model_hint",
+        "stop_model_hint",
+        "battle_bias_hint",
+    ]
 
-    flt["open_context"] = behavior.get("open_context")
-    flt["open_behavior"] = behavior.get("open_behavior")
-    flt["open_behavior_confidence"] = behavior.get("open_behavior_confidence")
-    flt["entry_model_hint"] = behavior.get("entry_model_hint")
-    flt["stop_model_hint"] = behavior.get("stop_model_hint")
-    flt["battle_bias_hint"] = behavior.get("battle_bias_hint")
+    for key in mirror_keys:
+        if key in behavior:
+            ctx[key] = behavior.get(key)
+
+    ctx["open_behavior_reason"] = behavior.get("reason")
+    ctx["open_behavior_warnings"] = behavior.get("warnings")
+
+    # Filters get compact, high-value routing keys only.
+    for key in [
+        "open_context",
+        "open_location",
+        "open_behavior",
+        "open_behavior_confidence",
+        "initial_open_behavior",
+        "current_open_behavior",
+        "behavior_transition",
+        "value_acceptance_state",
+        "value_test_occurred",
+        "value_test_level",
+        "value_rejection_confirmed",
+        "day_type_candidate",
+        "entry_model_hint",
+        "stop_model_hint",
+        "battle_bias_hint",
+    ]:
+        if key in behavior:
+            flt[key] = behavior.get(key)
 
     output["context"] = ctx
     output["filters"] = flt
