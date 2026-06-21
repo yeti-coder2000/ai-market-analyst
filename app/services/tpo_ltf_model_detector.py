@@ -62,7 +62,7 @@ from typing import Any
 import pandas as pd
 
 
-LTF_MODEL_DETECTOR_VERSION = "tpo-ltf-model-detector-v1.4-target-zone-selector"
+LTF_MODEL_DETECTOR_VERSION = "tpo-ltf-model-detector-v1.5-auction-state-watch-gate"
 
 MIN_CONFIRMED_RR = 2.0
 MIN_BARS = 8
@@ -74,6 +74,29 @@ REQUIRE_REAL_TARGET_FOR_EXECUTABLE = True
 SYNTHETIC_TARGET_SOURCE = "synthetic_2_5r"
 REAL_TARGET_SOURCE = "interest_zone"
 TARGET_SELECTOR_SOURCE = "interest_zone_selector"
+
+ACTIVE_TPO_WATCH_STATE = "LTF_MODEL_PENDING"
+OTD_WATCH_SETUPS = {
+    "OPEN_TEST_DRIVE",
+    "OPEN_TEST_DRIVE_CANDIDATE",
+    "OPEN_TEST_DRIVE_CONFIRMED",
+}
+ORR_WATCH_SETUPS = {
+    "OPEN_REJECTION_REVERSE",
+}
+AUCTION_OBSERVE_STATES = {
+    "OBSERVE_ONLY",
+    "OBSERVE_ROTATION",
+    "NO_WATCH",
+    "RESEARCH_ONLY",
+    "BLOCKED",
+}
+VALUE_ACCEPTANCE_INVALIDATES_OTD = {
+    "ACCEPTED_BACK_INSIDE_VALUE",
+    "ACCEPTED_INSIDE_VALUE",
+    "VALUE_ACCEPTED_INSIDE",
+    "FAILED_OUTSIDE_VALUE",
+}
 
 COMPACT_TO_FULL_STATE = {
     "NO_MODEL": "LTF_MODEL_NO_MODEL",
@@ -116,6 +139,27 @@ class LTFModelResult:
 
     ltf_model_type: str | None = None
     ltf_model_confirmed: bool = False
+
+    # Auction/watch context consumed from tpo_watch_bridge.py.
+    # The LTF detector does not classify auction context; it only confirms
+    # the execution model when the bridge has an active watch.
+    tpo_watch_state: str | None = None
+    tpo_watch_setup: str | None = None
+    tpo_watch_active: bool | None = None
+    auction_ltf_setup: str | None = None
+    open_location: str | None = None
+    open_behavior: str | None = None
+    initial_open_behavior: str | None = None
+    current_open_behavior: str | None = None
+    behavior_transition: str | None = None
+    value_acceptance_state: str | None = None
+    value_test_occurred: bool | None = None
+    value_rejection_confirmed: bool | None = None
+    day_type_candidate: str | None = None
+    ltf_requires_caution: bool = False
+    fresh_retest_exists: bool | None = None
+    fresh_failed_acceptance_exists: bool | None = None
+    fresh_pullback_exists: bool | None = None
 
     direction: str | None = None
     expected_direction: str | None = None
@@ -1085,43 +1129,106 @@ def _build_geometry(
         "geometry_direction": direction,
     }
 
-def _is_active_tpo_otd_watch(payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+def _scalar_from_sources(payload: dict[str, Any], *keys: str) -> Any:
+    """Read the first scalar value from root, metadata and nested context/open_behavior."""
     meta = _metadata(payload)
 
-    tpo_watch_state = _s(
-        _first_non_empty(
-            payload.get("tpo_watch_state"),
-            meta.get("tpo_watch_state"),
-        )
-    )
-    open_behavior = _s(
-        _first_non_empty(
-            payload.get("open_behavior"),
-            meta.get("open_behavior"),
-        )
-    )
-    tpo_watch_active = _bool(
-        _first_non_empty(
-            payload.get("tpo_watch_active"),
-            meta.get("tpo_watch_active"),
-            default=False,
-        ),
-        default=False,
-    )
+    sources: list[Any] = [payload, meta]
+
+    for source in (payload, meta):
+        if not isinstance(source, dict):
+            continue
+        for nested_key in ("context", "filters", "open_behavior", "auction_state"):
+            nested = source.get(nested_key)
+            if isinstance(nested, dict):
+                sources.append(nested)
+
+    for key in keys:
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            value = source.get(key)
+            if value in (None, "", [], {}):
+                continue
+            if isinstance(value, dict):
+                continue
+            return value
+
+    return None
+
+
+def _auction_watch_context(payload: dict[str, Any]) -> dict[str, Any]:
+    tpo_watch_state = _s(_scalar_from_sources(payload, "tpo_watch_state"))
+    tpo_watch_setup = _s(_scalar_from_sources(payload, "tpo_watch_setup"))
+    tpo_watch_active = _bool(_scalar_from_sources(payload, "tpo_watch_active"), default=False)
+
+    open_behavior = _s(_scalar_from_sources(payload, "open_behavior"))
+    initial_open_behavior = _s(_scalar_from_sources(payload, "initial_open_behavior"))
+    current_open_behavior = _s(_scalar_from_sources(payload, "current_open_behavior", "updated_open_behavior"))
+    value_acceptance_state = _s(_scalar_from_sources(payload, "value_acceptance_state"))
+    value_rejection_confirmed = _bool(_scalar_from_sources(payload, "value_rejection_confirmed"), default=False)
+
+    candidates = [
+        tpo_watch_setup,
+        current_open_behavior,
+        open_behavior,
+        initial_open_behavior,
+    ]
+
+    auction_ltf_setup: str | None = None
+    if any(value in OTD_WATCH_SETUPS for value in candidates):
+        auction_ltf_setup = "OPEN_TEST_DRIVE"
+    elif any(value in ORR_WATCH_SETUPS for value in candidates):
+        auction_ltf_setup = "OPEN_REJECTION_REVERSE"
 
     diagnostics = {
         "tpo_watch_state": tpo_watch_state,
-        "open_behavior": open_behavior,
+        "tpo_watch_setup": tpo_watch_setup,
         "tpo_watch_active": tpo_watch_active,
+        "auction_ltf_setup": auction_ltf_setup,
+        "open_location": _s(_scalar_from_sources(payload, "open_location")) or None,
+        "open_behavior": open_behavior,
+        "initial_open_behavior": initial_open_behavior,
+        "current_open_behavior": current_open_behavior,
+        "behavior_transition": _s(_scalar_from_sources(payload, "behavior_transition")) or None,
+        "value_acceptance_state": value_acceptance_state,
+        "value_test_occurred": _bool(_scalar_from_sources(payload, "value_test_occurred"), default=False),
+        "value_rejection_confirmed": value_rejection_confirmed,
+        "day_type_candidate": _s(_scalar_from_sources(payload, "day_type_candidate")) or None,
     }
 
-    active = (
-        tpo_watch_state == "LTF_MODEL_PENDING"
-        and open_behavior == "OPEN_TEST_DRIVE"
-        and tpo_watch_active
-    )
-    return active, diagnostics
+    if tpo_watch_state != ACTIVE_TPO_WATCH_STATE:
+        diagnostics["active_watch"] = False
+        diagnostics["watch_blocker"] = f"tpo_watch_state_not_pending:{tpo_watch_state or 'missing'}"
+        return diagnostics
 
+    if not tpo_watch_active:
+        diagnostics["active_watch"] = False
+        diagnostics["watch_blocker"] = "tpo_watch_not_active"
+        return diagnostics
+
+    if auction_ltf_setup is None:
+        diagnostics["active_watch"] = False
+        diagnostics["watch_blocker"] = "unsupported_auction_watch_setup"
+        return diagnostics
+
+    if (
+        auction_ltf_setup == "OPEN_TEST_DRIVE"
+        and value_acceptance_state in VALUE_ACCEPTANCE_INVALIDATES_OTD
+        and not value_rejection_confirmed
+    ):
+        diagnostics["active_watch"] = False
+        diagnostics["watch_blocker"] = f"otd_invalidated_by_value_acceptance:{value_acceptance_state}"
+        return diagnostics
+
+    diagnostics["active_watch"] = True
+    diagnostics["watch_blocker"] = None
+    return diagnostics
+
+
+def _is_active_tpo_auction_watch(payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+    diagnostics = _auction_watch_context(payload)
+    return bool(diagnostics.get("active_watch")), diagnostics
 
 def detect_ltf_model(
     payload: dict[str, Any],
@@ -1148,7 +1255,25 @@ def detect_ltf_model(
         expected_direction = None
 
     result.expected_direction = expected_direction
-    active_watch, watch_diagnostics = _is_active_tpo_otd_watch(payload)
+    active_watch, watch_diagnostics = _is_active_tpo_auction_watch(payload)
+
+    result.tpo_watch_state = watch_diagnostics.get("tpo_watch_state")
+    result.tpo_watch_setup = watch_diagnostics.get("tpo_watch_setup")
+    result.tpo_watch_active = watch_diagnostics.get("tpo_watch_active")
+    result.auction_ltf_setup = watch_diagnostics.get("auction_ltf_setup")
+    result.open_location = watch_diagnostics.get("open_location")
+    result.open_behavior = watch_diagnostics.get("open_behavior")
+    result.initial_open_behavior = watch_diagnostics.get("initial_open_behavior")
+    result.current_open_behavior = watch_diagnostics.get("current_open_behavior")
+    result.behavior_transition = watch_diagnostics.get("behavior_transition")
+    result.value_acceptance_state = watch_diagnostics.get("value_acceptance_state")
+    result.value_test_occurred = watch_diagnostics.get("value_test_occurred")
+    result.value_rejection_confirmed = watch_diagnostics.get("value_rejection_confirmed")
+    result.day_type_candidate = watch_diagnostics.get("day_type_candidate")
+    result.ltf_requires_caution = result.auction_ltf_setup == "OPEN_REJECTION_REVERSE"
+
+    if result.ltf_requires_caution:
+        result.warnings.append("orr_requires_caution")
 
     result.diagnostics.update(
         {
@@ -1170,23 +1295,41 @@ def detect_ltf_model(
         result.scenario_type = result.scenario
         result.execution_status = str(payload.get("execution_status") or "NOT_EXECUTABLE")
         result.execution_model = str(payload.get("execution_model") or "NONE")
-        result.trigger_reason = "no_active_tpo_otd_watch"
-        result.add_blocker("NO_ACTIVE_TPO_OTD_WATCH", trigger_reason="no_active_tpo_otd_watch")
+        watch_blocker = str(watch_diagnostics.get("watch_blocker") or "no_active_tpo_auction_watch")
+        result.trigger_reason = watch_blocker
+        result.add_blocker("NO_ACTIVE_TPO_AUCTION_WATCH", trigger_reason=watch_blocker)
+        result.diagnostics["watch_blocker"] = watch_blocker
         return result.to_dict()
 
+    setup_family = result.auction_ltf_setup or "OPEN_TEST_DRIVE"
+    if setup_family == "OPEN_REJECTION_REVERSE":
+        watch_scenario = "TPO_OPEN_REJECTION_REVERSE_WATCH"
+        pending_model_type = "RECLAIM_BOS_RETEST"
+        pending_execution_model = "RECLAIM_BOS_RETEST"
+        watch_reason = (
+            "TPO OPEN_REJECTION_REVERSE is active; waiting for a very clean "
+            "15m reclaim/BOS/retest before execution."
+        )
+    else:
+        watch_scenario = "TPO_OPEN_TEST_DRIVE_WATCH"
+        pending_model_type = "FAILED_ACCEPTANCE_RETEST"
+        pending_execution_model = "FAILED_ACCEPTANCE_RETEST"
+        watch_reason = (
+            "TPO OPEN_TEST_DRIVE auction-state is active; waiting for directional "
+            "15m LTF confirmation."
+        )
+
     result.set_state("PENDING", "PENDING_WAITING_FOR_LTF_MODEL_CONFIRMATION")
-    result.ltf_model_type = "FAILED_ACCEPTANCE_RETEST"
+    result.ltf_model_type = pending_model_type
     result.ltf_model_confirmed = False
     result.signal_class = "WATCH"
     result.status = "WATCH"
-    result.scenario = "TPO_OPEN_TEST_DRIVE_WATCH"
-    result.scenario_type = "TPO_OPEN_TEST_DRIVE_WATCH"
+    result.scenario = watch_scenario
+    result.scenario_type = watch_scenario
     result.execution_status = "NOT_EXECUTABLE"
     result.execution_model = "NONE"
     result.trigger_reason = "waiting_for_ltf_model_confirmation"
-    result.reasons.append(
-        "TPO OPEN_TEST_DRIVE is active; waiting for directional 15m LTF confirmation."
-    )
+    result.reasons.append(watch_reason)
 
     df, prepare_diagnostics = _prepare_ohlc(df_15m)
     result.diagnostics["ohlc_prepare"] = prepare_diagnostics
@@ -1256,18 +1399,35 @@ def detect_ltf_model(
     result.target_zone_role = geometry.get("target_zone_role")
     result.target_zone_reason = geometry.get("target_zone_reason")
 
-    result.scenario = f"TPO_OPEN_TEST_DRIVE_{direction}"
+    if setup_family == "OPEN_REJECTION_REVERSE":
+        result.scenario = f"TPO_OPEN_REJECTION_REVERSE_{direction}"
+        confirmed_model_type = "RECLAIM_BOS_RETEST"
+        confirmed_execution_model = "RECLAIM_BOS_RETEST"
+        confirmed_label = "OPEN_REJECTION_REVERSE"
+        result.confidence = 0.62
+        result.probability = 0.62
+    else:
+        result.scenario = f"TPO_OPEN_TEST_DRIVE_{direction}"
+        confirmed_model_type = "FAILED_ACCEPTANCE_RETEST"
+        confirmed_execution_model = "FAILED_ACCEPTANCE_RETEST"
+        confirmed_label = "OPEN_TEST_DRIVE"
+        result.confidence = 0.64
+        result.probability = 0.64
+
     result.scenario_type = result.scenario
 
     result.set_state("CONFIRMED", "CONFIRMED_PENDING_EXECUTION_FILTERS")
     result.ltf_model_confirmed = True
-    result.ltf_model_type = "FAILED_ACCEPTANCE_RETEST"
-    result.confidence = 0.64
-    result.probability = 0.64
-    result.execution_model = "FAILED_ACCEPTANCE_RETEST"
+    result.ltf_model_type = confirmed_model_type
+    result.execution_model = confirmed_execution_model
     selected_method = displacement_diagnostics.get("selected_method") or displacement_diagnostics.get("displacement")
+    result.fresh_retest_exists = True
+    result.fresh_failed_acceptance_exists = bool(
+        selected_method == "zone_reclaim_window" or result.value_rejection_confirmed is True
+    )
+    result.fresh_pullback_exists = bool(selected_method in {"window_structure_break", "last_candle_structure_break"})
     result.reasons.append(
-        f"15m structure confirmed directional OPEN_TEST_DRIVE model: {direction} via {selected_method}."
+        f"15m structure confirmed directional {confirmed_label} model: {direction} via {selected_method}."
     )
 
     if stop_distance is None or stop_distance < min_stop:
@@ -1313,10 +1473,14 @@ def detect_ltf_model(
     result.status = "READY"
     result.signal_class = "READY"
     result.execution_status = "EXECUTABLE"
-    result.execution_model = "FAILED_ACCEPTANCE_RETEST"
-    result.trigger_reason = "ltf_model_confirmed_open_test_drive"
-    result.confidence = 0.68
-    result.probability = 0.68
+    result.execution_model = confirmed_execution_model
+    result.trigger_reason = (
+        "ltf_model_confirmed_open_rejection_reverse"
+        if setup_family == "OPEN_REJECTION_REVERSE"
+        else "ltf_model_confirmed_open_test_drive"
+    )
+    result.confidence = 0.66 if setup_family == "OPEN_REJECTION_REVERSE" else 0.68
+    result.probability = 0.66 if setup_family == "OPEN_REJECTION_REVERSE" else 0.68
     result.set_state("CONFIRMED", "CONFIRMED_EXECUTABLE")
     result.diagnostics["outcome"] = "CONFIRMED_EXECUTABLE"
     result.reasons.append("Execution geometry is valid; payload may continue to Battle Gate.")
@@ -1338,6 +1502,26 @@ def _merge_ltf_result_into_metadata(meta: dict[str, Any], result: dict[str, Any]
     meta["ltf_model_blockers"] = result.get("blockers") or []
     meta["ltf_model_warnings"] = result.get("warnings") or []
     meta["ltf_model_diagnostics"] = result.get("diagnostics") or {}
+    for key in (
+        "tpo_watch_state",
+        "tpo_watch_setup",
+        "tpo_watch_active",
+        "auction_ltf_setup",
+        "open_location",
+        "open_behavior",
+        "initial_open_behavior",
+        "current_open_behavior",
+        "behavior_transition",
+        "value_acceptance_state",
+        "value_test_occurred",
+        "value_rejection_confirmed",
+        "day_type_candidate",
+        "ltf_requires_caution",
+        "fresh_retest_exists",
+        "fresh_failed_acceptance_exists",
+        "fresh_pullback_exists",
+    ):
+        meta[key] = result.get(key)
     meta["target_source"] = result.get("target_source")
     meta["target_zone_type"] = result.get("target_zone_type")
     meta["target_zone_role"] = result.get("target_zone_role")
@@ -1374,6 +1558,27 @@ def enrich_payload_with_ltf_model(
     enriched["ltf_model_blockers"] = result.get("blockers") or []
     enriched["ltf_model_warnings"] = result.get("warnings") or []
     enriched["ltf_model_diagnostics"] = result.get("diagnostics") or {}
+    for key in (
+        "tpo_watch_state",
+        "tpo_watch_setup",
+        "tpo_watch_active",
+        "auction_ltf_setup",
+        "open_location",
+        "open_behavior",
+        "initial_open_behavior",
+        "current_open_behavior",
+        "behavior_transition",
+        "value_acceptance_state",
+        "value_test_occurred",
+        "value_rejection_confirmed",
+        "day_type_candidate",
+        "ltf_requires_caution",
+        "fresh_retest_exists",
+        "fresh_failed_acceptance_exists",
+        "fresh_pullback_exists",
+    ):
+        if result.get(key) is not None:
+            enriched[key] = result.get(key)
     for key in ("target_source", "target_zone_type", "target_zone_role", "target_zone_reason"):
         if result.get(key) is not None:
             enriched[key] = result.get(key)
@@ -1390,8 +1595,13 @@ def enrich_payload_with_ltf_model(
         enriched["status"] = result.get("status")
         enriched["signal_class"] = result.get("signal_class")
         enriched["stage"] = result.get("signal_class")
-        enriched["setup_type"] = "TPO_OPEN_TEST_DRIVE"
-        enriched["setup_name"] = "TPO_OPEN_TEST_DRIVE"
+        setup_name = (
+            "TPO_OPEN_REJECTION_REVERSE"
+            if result.get("auction_ltf_setup") == "OPEN_REJECTION_REVERSE"
+            else "TPO_OPEN_TEST_DRIVE"
+        )
+        enriched["setup_type"] = setup_name
+        enriched["setup_name"] = setup_name
         enriched["execution_status"] = result.get("execution_status")
         enriched["execution_model"] = result.get("execution_model")
         enriched["trigger_reason"] = result.get("trigger_reason")
@@ -1450,6 +1660,14 @@ def enrich_payload_with_ltf_model(
                 "ltf_model_state": result.get("ltf_model_state"),
                 "ltf_model_state_full": result.get("ltf_model_state_full"),
                 "ltf_model_outcome": result.get("ltf_model_outcome"),
+                "auction_ltf_setup": result.get("auction_ltf_setup"),
+                "tpo_watch_state": result.get("tpo_watch_state"),
+                "tpo_watch_setup": result.get("tpo_watch_setup"),
+                "current_open_behavior": result.get("current_open_behavior"),
+                "value_acceptance_state": result.get("value_acceptance_state"),
+                "fresh_retest_exists": result.get("fresh_retest_exists"),
+                "fresh_failed_acceptance_exists": result.get("fresh_failed_acceptance_exists"),
+                "fresh_pullback_exists": result.get("fresh_pullback_exists"),
                 "ltf_model_blockers": result.get("blockers") or [],
             }
         )

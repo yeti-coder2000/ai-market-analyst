@@ -34,7 +34,7 @@ except Exception:  # pragma: no cover
     evaluate_macro_guard = None  # type: ignore[assignment]
 
 
-BATTLE_PERMISSION_VERSION = "battle-permission-v1.10.3-otd-long-stats-downgrade"
+BATTLE_PERMISSION_VERSION = "battle-permission-v1.11-auction-state-ltf-gate"
 
 # Signals that are structurally stale/invalid or post-shock with insufficient
 # reward must stay out of user-facing Telegram delivery. They remain in
@@ -42,6 +42,29 @@ BATTLE_PERMISSION_VERSION = "battle-permission-v1.10.3-otd-long-stats-downgrade"
 POST_SHOCK_STATISTICS_ONLY_MIN_RR = float(os.getenv("POST_SHOCK_STATISTICS_ONLY_MIN_RR", os.getenv("POST_NEWS_OTD_MIN_PRACTICAL_RR", "3.0")))
 TPO_OTD_LONG_STATS_DOWNGRADE_ENABLED = str(os.getenv("TPO_OTD_LONG_STATS_DOWNGRADE_ENABLED", "true")).strip().lower() in {"1", "true", "yes", "on"}
 TPO_OTD_LONG_A_PLUS_MIN_RR = float(os.getenv("TPO_OTD_LONG_A_PLUS_MIN_RR", "3.0"))
+
+OPEN_AUCTION_BEHAVIORS = {
+    "OPEN_AUCTION",
+    "OPEN_AUCTION_IN_RANGE",
+    "OPEN_AUCTION_OUT_OF_RANGE",
+}
+TPO_DIRECTIONAL_AUCTION_BEHAVIORS = {
+    "OPEN_TEST_DRIVE",
+    "OPEN_TEST_DRIVE_CANDIDATE",
+    "OPEN_TEST_DRIVE_CONFIRMED",
+    "OPEN_REJECTION_REVERSE",
+}
+TPO_AUCTION_WATCH_STATES = {
+    "LTF_MODEL_PENDING",
+    "BLOCKED",
+    "OBSERVE_ONLY",
+    "OBSERVE_ROTATION",
+    "RESEARCH_ONLY",
+    "NO_WATCH",
+}
+LTF_EXECUTABLE_OUTCOMES = {
+    "CONFIRMED_EXECUTABLE",
+}
 
 
 class BattlePermission(str, Enum):
@@ -94,6 +117,32 @@ class BattlePermissionResult:
     interest_zone_type: str | None = None
     interest_zone_price: float | None = None
     interest_zone_role: str | None = None
+
+    # Auction-state fields from tpo_open_behavior_classifier.py / tpo_watch_bridge.py.
+    open_location: str | None = None
+    initial_open_behavior: str | None = None
+    current_open_behavior: str | None = None
+    behavior_transition: str | None = None
+    value_acceptance_state: str | None = None
+    value_test_occurred: bool | None = None
+    value_rejection_confirmed: bool | None = None
+    day_type_candidate: str | None = None
+    auction_state_confidence: float | None = None
+    auction_state_reason: str | None = None
+
+    tpo_watch_state: str | None = None
+    tpo_watch_setup: str | None = None
+    tpo_watch_active: bool | None = None
+    auction_ltf_setup: str | None = None
+
+    ltf_model_detector_version: str | None = None
+    ltf_model_state: str | None = None
+    ltf_model_state_full: str | None = None
+    ltf_model_outcome: str | None = None
+    ltf_model_type: str | None = None
+    ltf_model_confirmed: bool | None = None
+    ltf_model_blockers: list[str] = field(default_factory=list)
+    ltf_model_warnings: list[str] = field(default_factory=list)
 
     direction: str | None = None
     htf_bias: str | None = None
@@ -1511,6 +1560,62 @@ def _infer_local_structure_damaged(
     )
 
 
+def _is_tpo_auction_execution_context(inputs: dict[str, Any]) -> bool:
+    """Return True only for payloads that are actually in the TPO auction execution lane.
+
+    Important: battle_permission.py enriches every signal with the current TPO store.
+    Therefore raw open_behavior/current_open_behavior alone must not force a normal
+    SWEEP_RETURN/TREND_CONTINUATION signal into the TPO LTF gate. The hard
+    OPEN_AUCTION block remains global, but the LTF confirmation requirement is
+    applied only when the payload has entered the TPO watch/LTF lane.
+    """
+    scenario_family = _as_upper(inputs.get("scenario_family"))
+    scenario = _as_upper(inputs.get("scenario")) or ""
+    tpo_watch_state = _as_upper(inputs.get("tpo_watch_state"))
+    tpo_watch_setup = _as_upper(inputs.get("tpo_watch_setup"))
+    auction_ltf_setup = _as_upper(inputs.get("auction_ltf_setup"))
+    ltf_model_state = _as_upper(inputs.get("ltf_model_state"))
+    ltf_model_state_full = _as_upper(inputs.get("ltf_model_state_full"))
+    ltf_model_outcome = _as_upper(inputs.get("ltf_model_outcome"))
+
+    if scenario_family == "TPO_OPEN_TEST_DRIVE":
+        return True
+    if any(token in scenario for token in {"TPO_OPEN_TEST_DRIVE", "TPO_OPEN_REJECTION_REVERSE"}):
+        return True
+    if tpo_watch_state in TPO_AUCTION_WATCH_STATES:
+        return True
+    if tpo_watch_setup in TPO_DIRECTIONAL_AUCTION_BEHAVIORS or auction_ltf_setup in {"OPEN_TEST_DRIVE", "OPEN_REJECTION_REVERSE"}:
+        return True
+    if ltf_model_state or ltf_model_state_full or ltf_model_outcome:
+        return True
+
+    return False
+
+
+def _is_open_auction_context(inputs: dict[str, Any]) -> bool:
+    return (
+        _as_upper(inputs.get("open_behavior")) in OPEN_AUCTION_BEHAVIORS
+        or _as_upper(inputs.get("current_open_behavior")) in OPEN_AUCTION_BEHAVIORS
+        or _as_upper(inputs.get("initial_open_behavior")) in OPEN_AUCTION_BEHAVIORS
+        or _as_upper(inputs.get("tpo_watch_setup")) in OPEN_AUCTION_BEHAVIORS
+    )
+
+
+def _ltf_model_executable(inputs: dict[str, Any]) -> bool:
+    ltf_state = _as_upper(inputs.get("ltf_model_state"))
+    ltf_state_full = _as_upper(inputs.get("ltf_model_state_full"))
+    ltf_outcome = _as_upper(inputs.get("ltf_model_outcome"))
+    ltf_confirmed = _as_bool(inputs.get("ltf_model_confirmed"))
+    execution_status = _as_upper(inputs.get("execution_status"))
+
+    return (
+        ltf_confirmed is True
+        and (ltf_state == "CONFIRMED" or ltf_state_full == "LTF_MODEL_CONFIRMED")
+        and ltf_outcome in LTF_EXECUTABLE_OUTCOMES
+        and execution_status == "EXECUTABLE"
+    )
+
+
 def _derive_scenario_family(
     payload: dict[str, Any],
     *,
@@ -1830,6 +1935,59 @@ def _enrich_payload_with_tpo_store(payload: dict[str, Any]) -> dict[str, Any]:
             open_behavior_record.get("confidence"),
             record.get("open_behavior_confidence"),
         ),
+        "open_location": _first_non_empty(
+            context.get("open_location"),
+            open_behavior_record.get("open_location"),
+            record.get("open_location"),
+        ),
+        "initial_open_behavior": _first_non_empty(
+            context.get("initial_open_behavior"),
+            open_behavior_record.get("initial_open_behavior"),
+            record.get("initial_open_behavior"),
+        ),
+        "current_open_behavior": _first_non_empty(
+            context.get("current_open_behavior"),
+            context.get("updated_open_behavior"),
+            open_behavior_record.get("current_open_behavior"),
+            open_behavior_record.get("updated_open_behavior"),
+            record.get("current_open_behavior"),
+            record.get("updated_open_behavior"),
+        ),
+        "behavior_transition": _first_non_empty(
+            context.get("behavior_transition"),
+            open_behavior_record.get("behavior_transition"),
+            record.get("behavior_transition"),
+        ),
+        "value_acceptance_state": _first_non_empty(
+            context.get("value_acceptance_state"),
+            open_behavior_record.get("value_acceptance_state"),
+            record.get("value_acceptance_state"),
+        ),
+        "value_test_occurred": _first_non_empty(
+            context.get("value_test_occurred"),
+            open_behavior_record.get("value_test_occurred"),
+            record.get("value_test_occurred"),
+        ),
+        "value_rejection_confirmed": _first_non_empty(
+            context.get("value_rejection_confirmed"),
+            open_behavior_record.get("value_rejection_confirmed"),
+            record.get("value_rejection_confirmed"),
+        ),
+        "day_type_candidate": _first_non_empty(
+            context.get("day_type_candidate"),
+            open_behavior_record.get("day_type_candidate"),
+            record.get("day_type_candidate"),
+        ),
+        "auction_state_confidence": _first_non_empty(
+            context.get("auction_state_confidence"),
+            open_behavior_record.get("auction_state_confidence"),
+            record.get("auction_state_confidence"),
+        ),
+        "auction_state_reason": _first_non_empty(
+            context.get("auction_state_reason"),
+            open_behavior_record.get("auction_state_reason"),
+            record.get("auction_state_reason"),
+        ),
         "entry_model_hint": _first_non_empty(
             context.get("entry_model_hint"),
             open_behavior_record.get("entry_model_hint"),
@@ -2140,6 +2298,144 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
         )
     )
 
+    open_location = _as_upper(
+        _deep_get(
+            payload,
+            "metadata.open_location",
+            "metadata.context.open_location",
+            "metadata.open_behavior.open_location",
+            "context.open_location",
+            "open_behavior.open_location",
+            "open_location",
+        )
+    )
+
+    initial_open_behavior = _as_upper(
+        _deep_get(
+            payload,
+            "metadata.initial_open_behavior",
+            "metadata.context.initial_open_behavior",
+            "metadata.open_behavior.initial_open_behavior",
+            "context.initial_open_behavior",
+            "open_behavior.initial_open_behavior",
+            "initial_open_behavior",
+        )
+    )
+
+    current_open_behavior = _as_upper(
+        _deep_get(
+            payload,
+            "metadata.current_open_behavior",
+            "metadata.updated_open_behavior",
+            "metadata.context.current_open_behavior",
+            "metadata.context.updated_open_behavior",
+            "metadata.open_behavior.current_open_behavior",
+            "metadata.open_behavior.updated_open_behavior",
+            "context.current_open_behavior",
+            "context.updated_open_behavior",
+            "open_behavior.current_open_behavior",
+            "open_behavior.updated_open_behavior",
+            "current_open_behavior",
+            "updated_open_behavior",
+        )
+    )
+
+    behavior_transition = _as_upper(
+        _deep_get(
+            payload,
+            "metadata.behavior_transition",
+            "metadata.context.behavior_transition",
+            "metadata.open_behavior.behavior_transition",
+            "context.behavior_transition",
+            "open_behavior.behavior_transition",
+            "behavior_transition",
+        )
+    )
+
+    value_acceptance_state = _as_upper(
+        _deep_get(
+            payload,
+            "metadata.value_acceptance_state",
+            "metadata.context.value_acceptance_state",
+            "metadata.open_behavior.value_acceptance_state",
+            "context.value_acceptance_state",
+            "open_behavior.value_acceptance_state",
+            "value_acceptance_state",
+        )
+    )
+
+    value_test_occurred = _as_bool(
+        _deep_get(
+            payload,
+            "metadata.value_test_occurred",
+            "metadata.context.value_test_occurred",
+            "metadata.open_behavior.value_test_occurred",
+            "context.value_test_occurred",
+            "open_behavior.value_test_occurred",
+            "value_test_occurred",
+        )
+    )
+
+    value_rejection_confirmed = _as_bool(
+        _deep_get(
+            payload,
+            "metadata.value_rejection_confirmed",
+            "metadata.context.value_rejection_confirmed",
+            "metadata.open_behavior.value_rejection_confirmed",
+            "context.value_rejection_confirmed",
+            "open_behavior.value_rejection_confirmed",
+            "value_rejection_confirmed",
+        )
+    )
+
+    day_type_candidate = _as_upper(
+        _deep_get(
+            payload,
+            "metadata.day_type_candidate",
+            "metadata.context.day_type_candidate",
+            "metadata.open_behavior.day_type_candidate",
+            "context.day_type_candidate",
+            "open_behavior.day_type_candidate",
+            "day_type_candidate",
+        )
+    )
+
+    auction_state_confidence = _as_float(
+        _deep_get(
+            payload,
+            "metadata.auction_state_confidence",
+            "metadata.context.auction_state_confidence",
+            "metadata.open_behavior.auction_state_confidence",
+            "context.auction_state_confidence",
+            "open_behavior.auction_state_confidence",
+            "auction_state_confidence",
+        )
+    )
+
+    auction_state_reason = _deep_get(
+        payload,
+        "metadata.auction_state_reason",
+        "metadata.context.auction_state_reason",
+        "metadata.open_behavior.auction_state_reason",
+        "context.auction_state_reason",
+        "open_behavior.auction_state_reason",
+        "auction_state_reason",
+    )
+
+    tpo_watch_state = _as_upper(_deep_get(payload, "metadata.tpo_watch_state", "tpo_watch_state"))
+    tpo_watch_setup = _as_upper(_deep_get(payload, "metadata.tpo_watch_setup", "tpo_watch_setup"))
+    tpo_watch_active = _as_bool(_deep_get(payload, "metadata.tpo_watch_active", "tpo_watch_active"))
+    auction_ltf_setup = _as_upper(_deep_get(payload, "metadata.auction_ltf_setup", "auction_ltf_setup"))
+
+    ltf_model_detector_version = _deep_get(payload, "metadata.ltf_model_detector_version", "ltf_model_detector_version")
+    ltf_model_state = _as_upper(_deep_get(payload, "metadata.ltf_model_state", "ltf_model_state"))
+    ltf_model_state_full = _as_upper(_deep_get(payload, "metadata.ltf_model_state_full", "ltf_model_state_full"))
+    ltf_model_outcome = _as_upper(_deep_get(payload, "metadata.ltf_model_outcome", "ltf_model_outcome"))
+    ltf_model_type = _as_upper(_deep_get(payload, "metadata.ltf_model_type", "ltf_model_type"))
+    ltf_model_confirmed = _as_bool(_deep_get(payload, "metadata.ltf_model_confirmed", "ltf_model_confirmed"))
+    ltf_model_blockers = _as_text_list(_deep_get(payload, "metadata.ltf_model_blockers", "ltf_model_blockers"))
+    ltf_model_warnings = _as_text_list(_deep_get(payload, "metadata.ltf_model_warnings", "ltf_model_warnings"))
+
     entry_model_hint = _as_upper(
         _deep_get(
             payload,
@@ -2414,6 +2710,28 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
         "open_context": open_context,
         "open_behavior": open_behavior,
         "open_behavior_confidence": open_behavior_confidence,
+        "open_location": open_location,
+        "initial_open_behavior": initial_open_behavior,
+        "current_open_behavior": current_open_behavior,
+        "behavior_transition": behavior_transition,
+        "value_acceptance_state": value_acceptance_state,
+        "value_test_occurred": value_test_occurred,
+        "value_rejection_confirmed": value_rejection_confirmed,
+        "day_type_candidate": day_type_candidate,
+        "auction_state_confidence": auction_state_confidence,
+        "auction_state_reason": auction_state_reason,
+        "tpo_watch_state": tpo_watch_state,
+        "tpo_watch_setup": tpo_watch_setup,
+        "tpo_watch_active": tpo_watch_active,
+        "auction_ltf_setup": auction_ltf_setup,
+        "ltf_model_detector_version": ltf_model_detector_version,
+        "ltf_model_state": ltf_model_state,
+        "ltf_model_state_full": ltf_model_state_full,
+        "ltf_model_outcome": ltf_model_outcome,
+        "ltf_model_type": ltf_model_type,
+        "ltf_model_confirmed": ltf_model_confirmed,
+        "ltf_model_blockers": ltf_model_blockers,
+        "ltf_model_warnings": ltf_model_warnings,
         "entry_model_hint": entry_model_hint,
         "stop_model_hint": stop_model_hint,
         "battle_bias_hint": battle_bias_hint,
@@ -2589,6 +2907,28 @@ def _build_result(
         interest_zone_type=inputs.get("interest_zone_type"),
         interest_zone_price=inputs.get("interest_zone_price"),
         interest_zone_role=inputs.get("interest_zone_role"),
+        open_location=inputs.get("open_location"),
+        initial_open_behavior=inputs.get("initial_open_behavior"),
+        current_open_behavior=inputs.get("current_open_behavior"),
+        behavior_transition=inputs.get("behavior_transition"),
+        value_acceptance_state=inputs.get("value_acceptance_state"),
+        value_test_occurred=inputs.get("value_test_occurred"),
+        value_rejection_confirmed=inputs.get("value_rejection_confirmed"),
+        day_type_candidate=inputs.get("day_type_candidate"),
+        auction_state_confidence=inputs.get("auction_state_confidence"),
+        auction_state_reason=inputs.get("auction_state_reason"),
+        tpo_watch_state=inputs.get("tpo_watch_state"),
+        tpo_watch_setup=inputs.get("tpo_watch_setup"),
+        tpo_watch_active=inputs.get("tpo_watch_active"),
+        auction_ltf_setup=inputs.get("auction_ltf_setup"),
+        ltf_model_detector_version=inputs.get("ltf_model_detector_version"),
+        ltf_model_state=inputs.get("ltf_model_state"),
+        ltf_model_state_full=inputs.get("ltf_model_state_full"),
+        ltf_model_outcome=inputs.get("ltf_model_outcome"),
+        ltf_model_type=inputs.get("ltf_model_type"),
+        ltf_model_confirmed=inputs.get("ltf_model_confirmed"),
+        ltf_model_blockers=list(inputs.get("ltf_model_blockers") or []),
+        ltf_model_warnings=list(inputs.get("ltf_model_warnings") or []),
         direction=inputs.get("direction"),
         htf_bias=inputs.get("htf_bias"),
         signal_alignment=inputs.get("signal_alignment"),
@@ -2713,6 +3053,21 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
     scenario_family = inputs.get("scenario_family")
     target_quality = inputs.get("target_quality")
     open_behavior = _as_upper(inputs.get("open_behavior"))
+    open_location = _as_upper(inputs.get("open_location"))
+    initial_open_behavior = _as_upper(inputs.get("initial_open_behavior"))
+    current_open_behavior = _as_upper(inputs.get("current_open_behavior"))
+    value_acceptance_state = _as_upper(inputs.get("value_acceptance_state"))
+    tpo_watch_state = _as_upper(inputs.get("tpo_watch_state"))
+    tpo_watch_setup = _as_upper(inputs.get("tpo_watch_setup"))
+    tpo_watch_active = _as_bool(inputs.get("tpo_watch_active"))
+    auction_ltf_setup = _as_upper(inputs.get("auction_ltf_setup"))
+    ltf_model_state = _as_upper(inputs.get("ltf_model_state"))
+    ltf_model_state_full = _as_upper(inputs.get("ltf_model_state_full"))
+    ltf_model_outcome = _as_upper(inputs.get("ltf_model_outcome"))
+    ltf_model_confirmed = _as_bool(inputs.get("ltf_model_confirmed"))
+    ltf_model_blockers = list(inputs.get("ltf_model_blockers") or [])
+    ltf_model_warnings = list(inputs.get("ltf_model_warnings") or [])
+    tpo_auction_context = _is_tpo_auction_execution_context(inputs)
     invalidation_price = inputs.get("invalidation_price")
     current_price = inputs.get("current_price")
 
@@ -2779,6 +3134,18 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
         reasons.append(
             f"first_impulse_state={impulse_state} progress={impulse_progress_pct}% "
             f"fresh_structure_after_impulse={fresh_structure_after_impulse}"
+        )
+
+    if tpo_auction_context:
+        reasons.append(
+            "auction_state="
+            f"open_location={open_location or '-'} "
+            f"initial={initial_open_behavior or '-'} "
+            f"current={current_open_behavior or '-'} "
+            f"value_state={value_acceptance_state or '-'} "
+            f"watch={tpo_watch_state or '-'} "
+            f"ltf={ltf_model_state_full or ltf_model_state or '-'} "
+            f"outcome={ltf_model_outcome or '-'}"
         )
 
     policy_flags = _collect_policy_hint_flags(inputs, v2_policy)
@@ -2959,7 +3326,7 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
     # Future exception can be added only when we explicitly detect:
     # IB break + acceptance + HTF alignment + LTF entry model + real target.
     # Until that model exists, OPEN_AUCTION remains research-only.
-    if open_behavior == "OPEN_AUCTION":
+    if _is_open_auction_context(inputs):
         blockers.append("open_auction_rotation_context")
         modifiers.append("open_auction_hard_block")
         return _build_result(
@@ -2977,6 +3344,83 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
             risk_mode="OPEN_AUCTION_RESEARCH_ONLY",
             caution_flags=caution_flags,
         )
+
+    # 3b. Auction watch / LTF confirmation gate.
+    # Classifier and Watch Bridge define auction context. Battle Gate must not
+    # re-interpret OTD/ORR; it only consumes watch-state + LTF executable outcome.
+    if tpo_auction_context:
+        if tpo_watch_state in {"BLOCKED"}:
+            blockers.append("tpo_watch_blocked")
+            return _build_result(
+                inputs=inputs,
+                auction_score=auction_score,
+                reasons=reasons + ["TPO Watch Bridge blocks this auction context; battle disabled"],
+                blockers=_dedupe_text_list(blockers + ltf_model_blockers),
+                modifiers=_dedupe_text_list(modifiers + ["auction_watch_blocked"]),
+                battle_permission=BattlePermission.BLOCKED_BY_AUCTION.value,
+                telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
+                battle_ready=False,
+                v2_policy=v2_policy,
+                risk_mode="TPO_WATCH_BLOCKED",
+                caution_flags=caution_flags,
+            )
+
+        if tpo_watch_state in {"OBSERVE_ONLY", "OBSERVE_ROTATION", "NO_WATCH", "RESEARCH_ONLY"}:
+            blockers.append(f"tpo_watch_{str(tpo_watch_state or 'unknown').lower()}")
+            return _build_result(
+                inputs=inputs,
+                auction_score=auction_score,
+                reasons=reasons + [
+                    f"TPO watch_state={tpo_watch_state}; auction context is not executable for Battle"
+                ],
+                blockers=_dedupe_text_list(blockers + ltf_model_blockers),
+                modifiers=_dedupe_text_list(modifiers + ["auction_watch_not_executable"]),
+                battle_permission=BattlePermission.RESEARCH_ONLY.value,
+                telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+                battle_ready=False,
+                v2_policy=v2_policy,
+                risk_mode="TPO_WATCH_NOT_EXECUTABLE",
+                caution_flags=caution_flags,
+            )
+
+        if tpo_watch_state != "LTF_MODEL_PENDING":
+            blockers.append("tpo_watch_not_ltf_pending")
+            return _build_result(
+                inputs=inputs,
+                auction_score=auction_score,
+                reasons=reasons + [
+                    f"TPO auction context has no LTF_MODEL_PENDING watch_state: {tpo_watch_state}; no Battle promotion"
+                ],
+                blockers=_dedupe_text_list(blockers + ltf_model_blockers),
+                modifiers=_dedupe_text_list(modifiers + ["missing_ltf_watch_state"]),
+                battle_permission=BattlePermission.NOT_READY.value,
+                telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
+                battle_ready=False,
+                v2_policy=v2_policy,
+                risk_mode="MISSING_LTF_WATCH_STATE",
+                caution_flags=caution_flags,
+            )
+
+        if not _ltf_model_executable(inputs):
+            blockers.append("ltf_model_not_confirmed_executable")
+            return _build_result(
+                inputs=inputs,
+                auction_score=auction_score,
+                reasons=reasons + [
+                    "TPO auction watch is active, but LTF detector has not produced CONFIRMED_EXECUTABLE; no Battle promotion"
+                ],
+                blockers=_dedupe_text_list(blockers + ltf_model_blockers),
+                modifiers=_dedupe_text_list(modifiers + ltf_model_warnings + ["ltf_model_required"]),
+                battle_permission=BattlePermission.NOT_READY.value,
+                telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
+                battle_ready=False,
+                v2_policy=v2_policy,
+                risk_mode="LTF_MODEL_NOT_CONFIRMED_EXECUTABLE",
+                caution_flags=caution_flags,
+            )
+
+        if auction_ltf_setup == "OPEN_REJECTION_REVERSE" or current_open_behavior == "OPEN_REJECTION_REVERSE":
+            caution_flags.append("open_rejection_reverse_cautious_watch")
 
     # 3. Post-news state gate.
     # This is the key layer: first impulse remains NO CHASE, but confirmed retest
@@ -3349,6 +3793,31 @@ def _attach_tpo_open_behavior_fields_to_metadata(metadata: dict[str, Any], resul
     metadata["open_context"] = result.get("open_context")
     metadata["open_behavior"] = result.get("open_behavior")
     metadata["open_behavior_confidence"] = result.get("open_behavior_confidence")
+    for key in (
+        "open_location",
+        "initial_open_behavior",
+        "current_open_behavior",
+        "behavior_transition",
+        "value_acceptance_state",
+        "value_test_occurred",
+        "value_rejection_confirmed",
+        "day_type_candidate",
+        "auction_state_confidence",
+        "auction_state_reason",
+        "tpo_watch_state",
+        "tpo_watch_setup",
+        "tpo_watch_active",
+        "auction_ltf_setup",
+        "ltf_model_detector_version",
+        "ltf_model_state",
+        "ltf_model_state_full",
+        "ltf_model_outcome",
+        "ltf_model_type",
+        "ltf_model_confirmed",
+        "ltf_model_blockers",
+        "ltf_model_warnings",
+    ):
+        metadata[key] = result.get(key)
     metadata["entry_model_hint"] = result.get("entry_model_hint")
     metadata["stop_model_hint"] = result.get("stop_model_hint")
     metadata["battle_bias_hint"] = result.get("battle_bias_hint")
@@ -3498,6 +3967,31 @@ def apply_battle_permission(raw_payload: dict[str, Any]) -> dict[str, Any]:
     payload["open_context"] = result.get("open_context")
     payload["open_behavior"] = result.get("open_behavior")
     payload["open_behavior_confidence"] = result.get("open_behavior_confidence")
+    for key in (
+        "open_location",
+        "initial_open_behavior",
+        "current_open_behavior",
+        "behavior_transition",
+        "value_acceptance_state",
+        "value_test_occurred",
+        "value_rejection_confirmed",
+        "day_type_candidate",
+        "auction_state_confidence",
+        "auction_state_reason",
+        "tpo_watch_state",
+        "tpo_watch_setup",
+        "tpo_watch_active",
+        "auction_ltf_setup",
+        "ltf_model_detector_version",
+        "ltf_model_state",
+        "ltf_model_state_full",
+        "ltf_model_outcome",
+        "ltf_model_type",
+        "ltf_model_confirmed",
+        "ltf_model_blockers",
+        "ltf_model_warnings",
+    ):
+        payload[key] = result.get(key)
     payload["entry_model_hint"] = result.get("entry_model_hint")
     payload["stop_model_hint"] = result.get("stop_model_hint")
     payload["battle_bias_hint"] = result.get("battle_bias_hint")
