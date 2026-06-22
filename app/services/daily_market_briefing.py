@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.19-suppressed-telegram-block"
+BRIEFING_VERSION = "daily-market-briefing-v1.20-fmp-macro-calendar"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -41,6 +41,7 @@ SIGNAL_OUTCOMES_RELATIVE = Path("stats") / "signal_outcomes.json"
 HIGH_IMPACT_EVENTS_RELATIVE = Path("calendar") / "high_impact_events.json"
 ECONOMIC_CALENDAR_CACHE_RELATIVE = Path("calendar")
 TRADING_ECONOMICS_CALENDAR_CACHE_RELATIVE = Path("calendar")
+FMP_ECONOMIC_CALENDAR_CACHE_RELATIVE = Path("calendar")
 MANUAL_HIGH_IMPACT_EVENTS_RELATIVE = Path("macro") / "manual_high_impact_events.json"
 LAST_GOOD_HIGH_IMPACT_EVENTS_RELATIVE = Path("calendar") / "last_good_high_impact_events.json"
 
@@ -499,6 +500,16 @@ def _trading_economics_calendar_cache_path(target_date: date) -> Path:
             return base
         return base / f"tradingeconomics_calendar_{target_date.isoformat()}.json"
     return _runtime_dir() / TRADING_ECONOMICS_CALENDAR_CACHE_RELATIVE / f"tradingeconomics_calendar_{target_date.isoformat()}.json"
+
+
+def _fmp_economic_calendar_cache_path(target_date: date) -> Path:
+    raw = os.getenv("FMP_ECONOMIC_CALENDAR_CACHE_PATH")
+    if raw:
+        base = Path(raw).expanduser().resolve()
+        if base.suffix:
+            return base
+        return base / f"fmp_economic_calendar_{target_date.isoformat()}.json"
+    return _runtime_dir() / FMP_ECONOMIC_CALENDAR_CACHE_RELATIVE / f"fmp_economic_calendar_{target_date.isoformat()}.json"
 
 
 def _manual_high_impact_events_path() -> Path:
@@ -1237,6 +1248,243 @@ def _normalize_trading_economics_event(raw: dict[str, Any], target_date: date, r
     }
 
 
+
+def _fmp_economic_calendar_enabled() -> bool:
+    return str(os.getenv("ENABLE_FMP_ECONOMIC_CALENDAR", "true")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _fmp_economic_calendar_api_key() -> str:
+    for name in (
+        "FMP_API_KEY",
+        "FMP_ECONOMIC_CALENDAR_API_KEY",
+        "FINANCIAL_MODELING_PREP_API_KEY",
+    ):
+        value = str(os.getenv(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _fmp_economic_calendar_endpoint() -> str:
+    return str(
+        os.getenv("FMP_ECONOMIC_CALENDAR_ENDPOINT")
+        or "https://financialmodelingprep.com/stable/economic-calendar"
+    ).strip()
+
+
+def _parse_fmp_datetime(value: Any, target_date: date, default_timezone: str) -> tuple[str, str, str] | None:
+    """Parse FMP economic-calendar date/time into the internal calendar contract."""
+    event_tz = str(default_timezone or DEFAULT_TIMEZONE).strip() or DEFAULT_TIMEZONE
+    if value is None:
+        return target_date.isoformat(), "", event_tz
+
+    text = str(value).strip()
+    if not text:
+        return target_date.isoformat(), "", event_tz
+
+    try:
+        d = date.fromisoformat(text[:10])
+        if len(text) <= 10 or ("T" not in text and ":" not in text):
+            return d.isoformat(), "", event_tz
+    except Exception:
+        pass
+
+    normalized = text.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_tz(event_tz))
+        else:
+            event_tz = str(dt.tzinfo)
+        return dt.date().isoformat(), dt.strftime("%H:%M"), event_tz
+    except Exception:
+        pass
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M"):
+        try:
+            dt = datetime.strptime(text, fmt).replace(tzinfo=_tz(event_tz))
+            return dt.date().isoformat(), dt.strftime("%H:%M"), event_tz
+        except Exception:
+            continue
+
+    return None
+
+
+def _normalize_fmp_calendar_event(raw: dict[str, Any], target_date: date, report_timezone: str) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+
+    title = str(
+        raw.get("event")
+        or raw.get("Event")
+        or raw.get("title")
+        or raw.get("name")
+        or raw.get("type")
+        or ""
+    ).strip()
+    if not title:
+        return None
+
+    country = raw.get("country") or raw.get("Country")
+    currency = _currency_from_event(country, raw.get("currency") or raw.get("Currency"))
+    parsed_dt = _parse_fmp_datetime(
+        raw.get("date") or raw.get("Date") or raw.get("datetime") or raw.get("time"),
+        target_date,
+        os.getenv("FMP_ECONOMIC_CALENDAR_TIMEZONE") or report_timezone or DEFAULT_TIMEZONE,
+    )
+    if parsed_dt is None:
+        return None
+    event_date, event_time, event_tz = parsed_dt
+    if event_date != target_date.isoformat():
+        return None
+
+    # Some FMP calendar payloads include impact; some only include event/country/value fields.
+    # When impact is absent, keep only known market-moving macro titles via HIGH_IMPACT_KEYWORDS.
+    impact = _normalize_impact(
+        raw.get("impact")
+        or raw.get("Impact")
+        or raw.get("importance")
+        or raw.get("volatility"),
+        title,
+    )
+    if impact not in {"HIGH", "RED", "IMPORTANT"}:
+        return None
+
+    symbols = _affected_symbols(currency, title)
+    if not symbols and str(currency).upper() in RELEVANT_RISK_CURRENCIES:
+        symbols = _affected_symbols(str(currency).upper(), title)
+
+    return {
+        "date": event_date,
+        "time": event_time,
+        "timezone": event_tz,
+        "currency": currency,
+        "impact": "HIGH",
+        "title": title,
+        "country": country or "-",
+        "category": raw.get("category") or raw.get("Category") or raw.get("type"),
+        "symbols": symbols,
+        "note": _event_trading_note(currency, title, "HIGH"),
+        "source": "fmp_economic_calendar",
+        "actual": raw.get("actual") if raw.get("actual") is not None else raw.get("Actual"),
+        "forecast": (
+            raw.get("estimate") if raw.get("estimate") is not None else
+            raw.get("forecast") if raw.get("forecast") is not None else
+            raw.get("Forecast")
+        ),
+        "previous": raw.get("previous") if raw.get("previous") is not None else raw.get("Previous"),
+        "change": raw.get("change") if raw.get("change") is not None else raw.get("Change"),
+        "change_percentage": raw.get("changePercentage") or raw.get("change_percentage"),
+        "raw": raw,
+    }
+
+
+def _fetch_fmp_economic_calendar(target_date: date) -> CalendarLoadResult:
+    """Fetch high-impact macro events from Financial Modeling Prep economic calendar."""
+    if not _fmp_economic_calendar_enabled():
+        return CalendarLoadResult(
+            status="UNAVAILABLE",
+            source="fmp_economic_calendar_disabled",
+            message="FMP economic calendar disabled by ENABLE_FMP_ECONOMIC_CALENDAR.",
+        )
+
+    api_key = _fmp_economic_calendar_api_key()
+    if not api_key:
+        return CalendarLoadResult(
+            status="UNAVAILABLE",
+            source="fmp_economic_calendar",
+            message="FMP_API_KEY / FMP_ECONOMIC_CALENDAR_API_KEY is missing.",
+        )
+
+    cache_path = _fmp_economic_calendar_cache_path(target_date)
+    cache_ttl_sec = int(os.getenv("FMP_ECONOMIC_CALENDAR_CACHE_TTL_SEC", os.getenv("ECONOMIC_CALENDAR_CACHE_TTL_SEC", "21600")))
+    force_refresh = str(os.getenv("FMP_ECONOMIC_CALENDAR_FORCE_REFRESH", "false")).strip().lower() in {"1", "true", "yes", "on"}
+
+    if cache_path.exists() and not force_refresh:
+        try:
+            age_sec = (_now_utc().timestamp() - cache_path.stat().st_mtime)
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if age_sec <= cache_ttl_sec and isinstance(cached, dict):
+                events = _extract_list(cached.get("events", []))
+                status = MACRO_OK if events else MACRO_EMPTY
+                return CalendarLoadResult(
+                    status=status,
+                    source=str(cached.get("source") or "fmp_economic_calendar_cache"),
+                    events=events,
+                    message=f"Loaded FMP economic calendar from cache. age_sec={round(age_sec, 1)}",
+                    cache_path=str(cache_path),
+                )
+        except Exception:
+            pass
+
+    endpoint = _fmp_economic_calendar_endpoint()
+    params = urllib.parse.urlencode(
+        {
+            "from": target_date.isoformat(),
+            "to": target_date.isoformat(),
+            "apikey": api_key,
+        }
+    )
+    separator = "&" if "?" in endpoint else "?"
+    url = f"{endpoint}{separator}{params}"
+
+    try:
+        timeout = float(os.getenv("FMP_ECONOMIC_CALENDAR_TIMEOUT_SEC", "12"))
+        req = urllib.request.Request(url, headers={"User-Agent": "AI-Market-Analyst/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+        payload = json.loads(body)
+    except urllib.error.HTTPError as exc:
+        return CalendarLoadResult(
+            status="UNAVAILABLE",
+            source="fmp_economic_calendar",
+            message=f"FMP economic calendar HTTP error: {exc.code}.",
+            provider_error=str(exc),
+            cache_path=str(cache_path),
+        )
+    except Exception as exc:
+        return CalendarLoadResult(
+            status="UNAVAILABLE",
+            source="fmp_economic_calendar",
+            message="FMP economic calendar unavailable.",
+            provider_error=f"{type(exc).__name__}: {exc}",
+            cache_path=str(cache_path),
+        )
+
+    raw_events = _extract_list(payload)
+    report_tz = os.getenv("REPORT_TIMEZONE") or DEFAULT_TIMEZONE
+    normalized: list[dict[str, Any]] = []
+    for raw_event in raw_events:
+        event = _normalize_fmp_calendar_event(raw_event, target_date, report_tz)
+        if event:
+            normalized.append(event)
+
+    normalized = _dedupe_calendar_events(normalized)
+    status = MACRO_OK if normalized else MACRO_EMPTY
+    message = "Loaded from FMP economic calendar API." if normalized else "FMP economic calendar returned no high-impact events for this date."
+    payload_to_cache = {
+        "source": "fmp_economic_calendar",
+        "status": status,
+        "date": target_date.isoformat(),
+        "updated_at_utc": _now_utc().isoformat(),
+        "events": normalized,
+        "raw_count": len(raw_events),
+    }
+    try:
+        _safe_write_json(cache_path, payload_to_cache)
+    except Exception:
+        pass
+
+    return CalendarLoadResult(
+        status=status,
+        source="fmp_economic_calendar",
+        events=normalized,
+        message=message,
+        cache_path=str(cache_path),
+        macro_risk_status=status,
+    )
+
+
 def _fetch_trading_economics_calendar(target_date: date) -> CalendarLoadResult:
     """Fetch high-impact macro events from Trading Economics as automatic backup."""
     if not _trading_economics_enabled():
@@ -1784,20 +2032,37 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
     """
     High-impact macro calendar cascade.
 
-    Order:
-    1) Finnhub primary provider;
-    2) Trading Economics automatic backup provider;
-    3) manual operator JSON backup;
-    4) static fallback file/env/builtin;
-    5) last-good cache;
-    6) MACRO_UNKNOWN_CONSERVATIVE.
+    Order v1.20:
+    1) manual operator JSON override, if populated;
+    2) Financial Modeling Prep economic calendar primary provider;
+    3) Trading Economics automatic backup provider;
+    4) Finnhub legacy backup provider;
+    5) static fallback file/env/builtin;
+    6) last-good cache;
+    7) MACRO_UNKNOWN_CONSERVATIVE.
 
     Provider unavailable is never treated as "no news".
     """
     fallback_chain: list[str] = []
-    result = _fetch_finnhub_calendar(target_date)
-    fallback_chain.append(f"primary:{result.source}:{result.status}")
 
+    manual_events = _load_manual_calendar_events(target_date)
+    fallback_chain.append(f"primary:manual_macro_json:{'OK' if manual_events else 'EMPTY'}")
+    if manual_events:
+        _write_last_good_calendar_cache(target_date, manual_events, source="manual_macro_json")
+        return CalendarLoadResult(
+            status=MACRO_FALLBACK,
+            source="manual_macro_json",
+            events=manual_events,
+            message="Using manual macro JSON override.",
+            cache_path=str(_manual_high_impact_events_path()),
+            macro_risk_status=MACRO_HIGH_FROM_BACKUP_CALENDAR,
+            fallback_chain=fallback_chain,
+            data_freshness="manual_override",
+            last_good_cache_path=str(_last_good_high_impact_events_path()),
+        )
+
+    result = _fetch_fmp_economic_calendar(target_date)
+    fallback_chain.append(f"primary:{result.source}:{result.status}")
     if result.status in {MACRO_OK, MACRO_EMPTY}:
         high_events = [
             e for e in result.events
@@ -1815,7 +2080,7 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
             provider_error=result.provider_error,
             macro_risk_status=MACRO_OK if high_events else MACRO_EMPTY,
             fallback_chain=fallback_chain,
-            data_freshness="fresh_or_valid_cache",
+            data_freshness="fmp_fresh_or_valid_cache",
             last_good_cache_path=str(_last_good_high_impact_events_path()),
         )
 
@@ -1833,7 +2098,7 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
                 status=MACRO_FALLBACK,
                 source=te_result.source,
                 events=high_events,
-                message=f"{result.message or 'Primary provider unavailable'} Using Trading Economics backup calendar.",
+                message=f"{result.message or 'FMP provider unavailable'} Using Trading Economics backup calendar.",
                 cache_path=te_result.cache_path,
                 provider_error=result.provider_error or te_result.provider_error,
                 macro_risk_status=MACRO_HIGH_FROM_BACKUP_CALENDAR,
@@ -1842,20 +2107,26 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
                 last_good_cache_path=str(_last_good_high_impact_events_path()),
             )
 
-    manual_events = _load_manual_calendar_events(target_date)
-    fallback_chain.append(f"backup:manual_macro_json:{'OK' if manual_events else 'EMPTY'}")
-    if manual_events:
-        _write_last_good_calendar_cache(target_date, manual_events, source="manual_macro_json")
+    finnhub_result = _fetch_finnhub_calendar(target_date)
+    fallback_chain.append(f"legacy:{finnhub_result.source}:{finnhub_result.status}")
+    if finnhub_result.status in {MACRO_OK, MACRO_EMPTY}:
+        high_events = [
+            e for e in finnhub_result.events
+            if _normalize_impact(e.get("impact"), str(e.get("title") or "")) in {"HIGH", "RED", "IMPORTANT"}
+        ]
+        high_events = _dedupe_calendar_events(high_events)
+        if high_events:
+            _write_last_good_calendar_cache(target_date, high_events, source=finnhub_result.source)
         return CalendarLoadResult(
-            status=MACRO_FALLBACK,
-            source="manual_macro_json",
-            events=manual_events,
-            message=f"{result.message or 'Primary provider unavailable'} Using manual macro JSON backup.",
-            cache_path=str(_manual_high_impact_events_path()),
-            provider_error=result.provider_error,
-            macro_risk_status=MACRO_HIGH_FROM_BACKUP_CALENDAR,
+            status=MACRO_OK if high_events else MACRO_EMPTY,
+            source=finnhub_result.source,
+            events=high_events,
+            message=f"{result.message or 'FMP provider unavailable'} Using Finnhub legacy calendar.",
+            cache_path=finnhub_result.cache_path,
+            provider_error=result.provider_error or finnhub_result.provider_error,
+            macro_risk_status=MACRO_OK if high_events else MACRO_EMPTY,
             fallback_chain=fallback_chain,
-            data_freshness="manual_backup",
+            data_freshness="finnhub_legacy",
             last_good_cache_path=str(_last_good_high_impact_events_path()),
         )
 
