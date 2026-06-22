@@ -43,6 +43,10 @@ from app.services.radar_journal import (
 from app.services.signal_quality_engine import enrich_payload_with_quality
 from app.services.tpo_watch_bridge import enrich_payload_with_tpo_watch
 from app.services.tpo_ltf_model_detector import enrich_payload_with_ltf_model
+from app.services.ltf_entry_window_detector import (
+    LTF_ENTRY_WINDOW_DETECTOR_VERSION,
+    detect_ltf_entry_window,
+)
 from app.services.post_news_continuation_detector import apply_post_news_continuation
 from app.services.signal_tracker import SignalTracker, SignalTrackerResult
 from app.services.telegram_formatter import format_signal_message
@@ -53,7 +57,7 @@ from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.5.7-continuation-day-guard"
+RUNNER_VERSION = "1.5.8-ltf-entry-window-bridge"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -71,6 +75,9 @@ CONTINUATION_DAY_GUARD_ENABLED = str(
 CONTINUATION_DAY_MIN_AGE_HOURS = float(os.getenv("CONTINUATION_DAY_MIN_AGE_HOURS", "8"))
 CONTINUATION_DAY_ALREADY_MOVED_R_THRESHOLD = float(
     os.getenv("CONTINUATION_DAY_ALREADY_MOVED_R_THRESHOLD", "0.5")
+)
+FRESH_RETEST_MAX_ALREADY_MOVED_R = float(
+    os.getenv("FRESH_RETEST_MAX_ALREADY_MOVED_R", "1.0")
 )
 CONTINUATION_DAY_TOKENS = (
     "FIRST_IMPULSE_GONE",
@@ -603,6 +610,49 @@ def _append_unique_reason(payload: dict[str, Any], reason: str) -> None:
     payload["suppression_reasons"] = reasons
 
 
+def _payload_has_fresh_retest_entry(payload: dict[str, Any]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    fresh_entry_window = any(
+        _safe_bool_for_guard(payload.get(key, metadata.get(key)))
+        for key in (
+            "fresh_entry_window",
+            "continuation_ready_after_retest",
+        )
+    )
+    retest_confirmed = any(
+        _safe_bool_for_guard(payload.get(key, metadata.get(key)))
+        for key in (
+            "retest_confirmed",
+            "post_news_retest_confirmed",
+            "post_news_otd_retest_confirmed",
+        )
+    )
+    acceptance_confirmed = any(
+        _safe_bool_for_guard(payload.get(key, metadata.get(key)))
+        for key in (
+            "acceptance_confirmed",
+            "post_news_acceptance_confirmed",
+            "post_news_otd_acceptance_confirmed",
+        )
+    )
+    ltf_confirmed = any(
+        _safe_bool_for_guard(payload.get(key, metadata.get(key)))
+        for key in (
+            "ltf_confirmed",
+            "ltf_model_confirmed",
+            "post_news_otd_ltf_confirmed",
+        )
+    )
+
+    return fresh_entry_window and retest_confirmed and acceptance_confirmed and ltf_confirmed
+
+
 def _apply_continuation_day_guard_if_needed(
     payload: dict[str, Any],
     *,
@@ -948,21 +998,51 @@ def _is_telegram_trade_alert_allowed(payload: dict[str, Any]) -> tuple[bool, str
             payload["already_moved_R"] = round(already_moved_r, 6)
             payload["execution_timing_guard_version"] = EXECUTION_TIMING_GUARD_VERSION
 
+            fresh_retest_entry = _payload_has_fresh_retest_entry(payload)
+            fresh_retest_override_allowed = (
+                fresh_retest_entry
+                and not _safe_bool_for_guard(payload.get("late_entry_risk"))
+                and already_moved_r <= FRESH_RETEST_MAX_ALREADY_MOVED_R
+            )
+
             if already_moved_r >= TELEGRAM_HARD_LATE_SIGNAL_THRESHOLD_R:
-                payload["entry_timing_status"] = "HARD_LATE_SIGNAL"
-                payload["wait_retest_only"] = True
-                payload["entry_retest_required"] = True
-                payload["late_signal_reason"] = f"price_already_moved_{already_moved_r:.2f}R_from_entry"
-                return False, "blocked_late_signal_wait_retest_only"
+                if not fresh_retest_override_allowed:
+                    payload["entry_timing_status"] = "HARD_LATE_SIGNAL"
+                    payload["wait_retest_only"] = True
+                    payload["entry_retest_required"] = True
+                    payload["late_signal_reason"] = f"price_already_moved_{already_moved_r:.2f}R_from_entry"
+                    return False, "blocked_late_signal_wait_retest_only"
 
-            if already_moved_r >= TELEGRAM_LATE_SIGNAL_THRESHOLD_R:
-                payload["entry_timing_status"] = "LATE_SIGNAL"
-                payload["wait_retest_only"] = True
-                payload["entry_retest_required"] = True
-                payload["late_signal_reason"] = f"price_already_moved_{already_moved_r:.2f}R_from_entry"
-                return False, "blocked_late_signal_wait_retest_only"
+                payload["entry_timing_status"] = "ENTRY_ACTIONABLE_AFTER_FRESH_RETEST"
+                payload["wait_retest_only"] = False
+                payload["entry_retest_required"] = False
+                payload["late_signal_reason"] = None
+                payload["late_signal_overridden_by_fresh_retest"] = True
+                payload["fresh_retest_late_override_max_R"] = FRESH_RETEST_MAX_ALREADY_MOVED_R
 
-            payload["entry_timing_status"] = "ENTRY_ACTIONABLE"
+            elif already_moved_r >= TELEGRAM_LATE_SIGNAL_THRESHOLD_R:
+                if not fresh_retest_override_allowed:
+                    payload["entry_timing_status"] = "LATE_SIGNAL"
+                    payload["wait_retest_only"] = True
+                    payload["entry_retest_required"] = True
+                    payload["late_signal_reason"] = f"price_already_moved_{already_moved_r:.2f}R_from_entry"
+                    return False, "blocked_late_signal_wait_retest_only"
+
+                payload["entry_timing_status"] = "ENTRY_ACTIONABLE_AFTER_FRESH_RETEST"
+                payload["wait_retest_only"] = False
+                payload["entry_retest_required"] = False
+                payload["late_signal_reason"] = None
+                payload["late_signal_overridden_by_fresh_retest"] = True
+                payload["fresh_retest_late_override_max_R"] = FRESH_RETEST_MAX_ALREADY_MOVED_R
+
+            else:
+                payload["entry_timing_status"] = "ENTRY_ACTIONABLE"
+                payload["wait_retest_only"] = False
+                payload["entry_retest_required"] = False
+                payload["late_signal_reason"] = None
+
+            if payload.get("entry_timing_status") != "ENTRY_ACTIONABLE_AFTER_FRESH_RETEST":
+                payload["entry_timing_status"] = "ENTRY_ACTIONABLE"
             payload["wait_retest_only"] = False
             payload["entry_retest_required"] = False
             payload["late_signal_reason"] = None
@@ -1886,6 +1966,10 @@ class StatefulBatchRunner:
             tracker_source_payload = self._enrich_tracker_payload_with_post_news_otd_bridge(
                 payload=tracker_source_payload,
             )
+            tracker_source_payload = self._enrich_tracker_payload_with_ltf_entry_window_bridge(
+                payload=tracker_source_payload,
+                series_by_tf=series_by_tf,
+            )
 
             tracker_result = self.signal_tracker.process(
                 scenario_result=tracker_source_payload,
@@ -1915,6 +1999,10 @@ class StatefulBatchRunner:
                 tracker_result.payload = self._enrich_tracker_payload_with_post_news_otd_bridge(
                     payload=tracker_result.payload,
                 )
+                tracker_result.payload = self._enrich_tracker_payload_with_ltf_entry_window_bridge(
+                    payload=tracker_result.payload,
+                    series_by_tf=series_by_tf,
+                )
 
             if isinstance(tracker_result.previous_payload, dict):
                 tracker_result.previous_payload = self._attach_tpo_policy_to_payload(
@@ -1928,6 +2016,10 @@ class StatefulBatchRunner:
                 )
                 tracker_result.previous_payload = self._enrich_tracker_payload_with_post_news_otd_bridge(
                     payload=tracker_result.previous_payload,
+                )
+                tracker_result.previous_payload = self._enrich_tracker_payload_with_ltf_entry_window_bridge(
+                    payload=tracker_result.previous_payload,
+                    series_by_tf=series_by_tf,
                 )
 
             candidate_payload = tracker_result.payload
@@ -2492,6 +2584,192 @@ class StatefulBatchRunner:
             if not isinstance(metadata, dict):
                 metadata = {}
             metadata["ltf_model_detector_error"] = str(error)
+            payload["metadata"] = metadata
+            return payload
+
+
+    def _dataframe_to_ltf_candles(
+        self,
+        df: pd.DataFrame | None,
+        *,
+        limit: int = 120,
+    ) -> list[dict[str, Any]]:
+        """Convert a recent OHLC dataframe slice into detector-friendly candles."""
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return []
+
+        out: list[dict[str, Any]] = []
+        try:
+            recent = df.tail(limit)
+            for idx, row in recent.iterrows():
+                try:
+                    o = row.get("open", row.get("Open"))
+                    h = row.get("high", row.get("High"))
+                    l = row.get("low", row.get("Low"))
+                    c = row.get("close", row.get("Close"))
+                    v = row.get("volume", row.get("Volume", None))
+
+                    if o is None or h is None or l is None or c is None:
+                        continue
+
+                    ts = idx.isoformat() if hasattr(idx, "isoformat") else str(idx)
+                    item = {
+                        "timestamp": ts,
+                        "open": float(o),
+                        "high": float(h),
+                        "low": float(l),
+                        "close": float(c),
+                    }
+                    if v is not None:
+                        try:
+                            item["volume"] = float(v)
+                        except Exception:
+                            pass
+                    out.append(item)
+                except Exception:
+                    continue
+        except Exception:
+            return []
+
+        return out
+
+
+    def _enrich_tracker_payload_with_ltf_entry_window_bridge(
+        self,
+        *,
+        payload: dict[str, Any],
+        series_by_tf: dict[Timeframe, pd.DataFrame] | None = None,
+    ) -> dict[str, Any]:
+        """Attach the execution-aware LTF entry-window detector result.
+
+        This layer is deliberately separate from the older LTF model detector.
+        It answers the execution question: is the current auction context only a
+        late chase, or has a fresh LTF entry window appeared via sweep/reclaim,
+        continuation retest, or failed-acceptance retest?
+        """
+        if not isinstance(payload, dict):
+            return {}
+
+        try:
+            detector_payload = dict(payload)
+
+            if series_by_tf:
+                candles_5m = self._dataframe_to_ltf_candles(series_by_tf.get(Timeframe.M5))
+                candles_15m = self._dataframe_to_ltf_candles(series_by_tf.get(Timeframe.M15))
+                if candles_5m:
+                    detector_payload["candles_5m"] = candles_5m
+                    payload["ltf_candles_available_5m"] = len(candles_5m)
+                if candles_15m:
+                    detector_payload["candles_15m"] = candles_15m
+                    payload["ltf_candles_available_15m"] = len(candles_15m)
+
+            result = detect_ltf_entry_window(detector_payload)
+            if not isinstance(result, dict):
+                return payload
+
+            metadata = payload.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+
+            existing_retest = _safe_bool_for_guard(
+                payload.get("retest_confirmed", metadata.get("retest_confirmed"))
+            )
+            existing_acceptance = _safe_bool_for_guard(
+                payload.get("acceptance_confirmed", metadata.get("acceptance_confirmed"))
+            )
+            existing_ltf = _safe_bool_for_guard(
+                payload.get("ltf_confirmed", metadata.get("ltf_confirmed"))
+                or payload.get("ltf_model_confirmed", metadata.get("ltf_model_confirmed"))
+            )
+
+            result_retest = _safe_bool_for_guard(result.get("retest_confirmed"))
+            result_acceptance = _safe_bool_for_guard(result.get("acceptance_confirmed"))
+            result_ltf = _safe_bool_for_guard(result.get("ltf_confirmed"))
+
+            payload["ltf_entry_window"] = result
+            payload["ltf_entry_window_detector_version"] = result.get(
+                "detector_version",
+                LTF_ENTRY_WINDOW_DETECTOR_VERSION,
+            )
+            payload["ltf_entry_window_detected"] = bool(result.get("ltf_entry_window_detected"))
+            payload["entry_window_type"] = result.get("entry_window_type")
+            payload["entry_window_state"] = result.get("entry_window_state")
+            payload["entry_window_direction"] = result.get("entry_window_direction")
+            payload["fresh_entry_window"] = bool(result.get("fresh_entry_window"))
+            payload["continuation_ready_after_retest"] = bool(
+                result.get("continuation_ready_after_retest")
+            )
+            payload["late_entry_risk"] = bool(result.get("late_entry_risk"))
+            payload["entry_window_quality"] = result.get("entry_quality")
+            payload["entry_window_confidence"] = result.get("confidence")
+            payload["ltf_entry_model_hint"] = result.get("entry_model_hint")
+            payload["ltf_stop_model_hint"] = result.get("stop_model_hint")
+            payload["ltf_target_model_hint"] = result.get("target_model_hint")
+            payload["ltf_entry_window_blockers"] = result.get("blockers") or []
+            payload["ltf_entry_window_warnings"] = result.get("warnings") or []
+            payload["ltf_entry_window_reasons"] = result.get("reasons") or []
+            payload["ltf_retest_level"] = result.get("retest_level")
+            payload["ltf_reclaim_level"] = result.get("reclaim_level")
+            payload["ltf_liquidity_level"] = result.get("liquidity_level")
+            payload["ltf_sweep_extreme"] = result.get("sweep_extreme")
+            payload["ltf_pullback_extreme"] = result.get("pullback_extreme")
+
+            # Merge confirmations conservatively: detector positives may unlock
+            # a fresh retest entry, but existing upstream positives are preserved.
+            payload["retest_confirmed"] = existing_retest or result_retest
+            payload["acceptance_confirmed"] = existing_acceptance or result_acceptance
+            payload["ltf_confirmed"] = existing_ltf or result_ltf
+
+            if result.get("already_moved_R") is not None and payload.get("already_moved_R") is None:
+                payload["already_moved_R"] = result.get("already_moved_R")
+
+            # Keep original TPO hints, but let a confirmed LTF entry model improve
+            # the human-facing execution hint. This is an enrichment, not a signal.
+            if result.get("entry_model_hint"):
+                metadata.setdefault("tpo_entry_model_hint", payload.get("entry_model_hint"))
+                payload["entry_model_hint"] = result.get("entry_model_hint")
+            if result.get("stop_model_hint"):
+                metadata.setdefault("tpo_stop_model_hint", payload.get("stop_model_hint"))
+                payload["stop_model_hint"] = result.get("stop_model_hint")
+            if result.get("target_model_hint"):
+                payload["target_model_hint"] = result.get("target_model_hint")
+
+            metadata.update(
+                {
+                    "ltf_entry_window": result,
+                    "ltf_entry_window_detector_version": payload["ltf_entry_window_detector_version"],
+                    "ltf_entry_window_detected": payload["ltf_entry_window_detected"],
+                    "entry_window_type": payload["entry_window_type"],
+                    "entry_window_state": payload["entry_window_state"],
+                    "fresh_entry_window": payload["fresh_entry_window"],
+                    "retest_confirmed": payload["retest_confirmed"],
+                    "acceptance_confirmed": payload["acceptance_confirmed"],
+                    "ltf_confirmed": payload["ltf_confirmed"],
+                    "continuation_ready_after_retest": payload["continuation_ready_after_retest"],
+                    "late_entry_risk": payload["late_entry_risk"],
+                    "entry_window_quality": payload["entry_window_quality"],
+                    "entry_window_confidence": payload["entry_window_confidence"],
+                    "ltf_entry_model_hint": payload["ltf_entry_model_hint"],
+                    "ltf_stop_model_hint": payload["ltf_stop_model_hint"],
+                    "ltf_target_model_hint": payload["ltf_target_model_hint"],
+                    "runner_version": RUNNER_VERSION,
+                }
+            )
+            payload["metadata"] = metadata
+
+            return payload
+
+        except Exception as error:  # noqa: BLE001
+            logger.exception(
+                "LTF entry-window detector enrichment failed. symbol=%s error=%s",
+                payload.get("symbol") or payload.get("instrument"),
+                error,
+            )
+            metadata = payload.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata["ltf_entry_window_detector_error"] = str(error)
+            metadata["runner_version"] = RUNNER_VERSION
             payload["metadata"] = metadata
             return payload
 
@@ -4340,6 +4618,27 @@ class StatefulBatchRunner:
             "battle_bias_hint": tracked_payload.get("battle_bias_hint"),
             "tpo_watch_state": tracked_payload.get("tpo_watch_state"),
             "ltf_model_state": tracked_payload.get("ltf_model_state"),
+            "ltf_entry_window_detector_version": tracked_payload.get("ltf_entry_window_detector_version"),
+            "ltf_entry_window_detected": tracked_payload.get("ltf_entry_window_detected"),
+            "entry_window_type": tracked_payload.get("entry_window_type"),
+            "entry_window_state": tracked_payload.get("entry_window_state"),
+            "entry_window_direction": tracked_payload.get("entry_window_direction"),
+            "fresh_entry_window": tracked_payload.get("fresh_entry_window"),
+            "continuation_ready_after_retest": tracked_payload.get("continuation_ready_after_retest"),
+            "late_entry_risk": tracked_payload.get("late_entry_risk"),
+            "entry_window_quality": tracked_payload.get("entry_window_quality"),
+            "entry_window_confidence": tracked_payload.get("entry_window_confidence"),
+            "ltf_entry_model_hint": tracked_payload.get("ltf_entry_model_hint"),
+            "ltf_stop_model_hint": tracked_payload.get("ltf_stop_model_hint"),
+            "ltf_target_model_hint": tracked_payload.get("ltf_target_model_hint"),
+            "ltf_entry_window_blockers": tracked_payload.get("ltf_entry_window_blockers"),
+            "ltf_entry_window_warnings": tracked_payload.get("ltf_entry_window_warnings"),
+            "ltf_entry_window_reasons": tracked_payload.get("ltf_entry_window_reasons"),
+            "ltf_retest_level": tracked_payload.get("ltf_retest_level"),
+            "ltf_reclaim_level": tracked_payload.get("ltf_reclaim_level"),
+            "ltf_liquidity_level": tracked_payload.get("ltf_liquidity_level"),
+            "ltf_sweep_extreme": tracked_payload.get("ltf_sweep_extreme"),
+            "ltf_pullback_extreme": tracked_payload.get("ltf_pullback_extreme"),
             "tpo_watch_active": tracked_payload.get("tpo_watch_active"),
             "tpo_watch_setup": tracked_payload.get("tpo_watch_setup"),
             "tpo_watch_reason": tracked_payload.get("tpo_watch_reason"),
@@ -4359,6 +4658,28 @@ class StatefulBatchRunner:
             "ltf_model_confirmed",
             "ltf_model_reasons",
             "ltf_model_blockers",
+            "ltf_entry_window",
+            "ltf_entry_window_detector_version",
+            "ltf_entry_window_detected",
+            "entry_window_type",
+            "entry_window_state",
+            "entry_window_direction",
+            "fresh_entry_window",
+            "continuation_ready_after_retest",
+            "late_entry_risk",
+            "entry_window_quality",
+            "entry_window_confidence",
+            "ltf_entry_model_hint",
+            "ltf_stop_model_hint",
+            "ltf_target_model_hint",
+            "ltf_entry_window_blockers",
+            "ltf_entry_window_warnings",
+            "ltf_entry_window_reasons",
+            "ltf_retest_level",
+            "ltf_reclaim_level",
+            "ltf_liquidity_level",
+            "ltf_sweep_extreme",
+            "ltf_pullback_extreme",
             "target_source",
             "target_quality",
             "target_zone_type",
@@ -4452,6 +4773,12 @@ class StatefulBatchRunner:
                 "target_reference_price": target_price,
                 "risk_reward_ratio": rr,
                 "practical_rr": rr,
+                "entry_window_type": enriched_payload.get("entry_window_type"),
+                "entry_window_state": enriched_payload.get("entry_window_state"),
+                "fresh_entry_window": enriched_payload.get("fresh_entry_window"),
+                "ltf_entry_model_hint": enriched_payload.get("ltf_entry_model_hint"),
+                "ltf_stop_model_hint": enriched_payload.get("ltf_stop_model_hint"),
+                "ltf_target_model_hint": enriched_payload.get("ltf_target_model_hint"),
                 "execution_timeframe": enriched_payload.get("execution_timeframe"),
                 "trigger_reason": enriched_payload.get("trigger_reason"),
                 "open_behavior": enriched_payload.get("open_behavior"),
