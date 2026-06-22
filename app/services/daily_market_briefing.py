@@ -32,7 +32,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.20-fmp-macro-calendar"
+BRIEFING_VERSION = "daily-market-briefing-v1.21-eodhd-macro-calendar"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -42,6 +42,7 @@ HIGH_IMPACT_EVENTS_RELATIVE = Path("calendar") / "high_impact_events.json"
 ECONOMIC_CALENDAR_CACHE_RELATIVE = Path("calendar")
 TRADING_ECONOMICS_CALENDAR_CACHE_RELATIVE = Path("calendar")
 FMP_ECONOMIC_CALENDAR_CACHE_RELATIVE = Path("calendar")
+EODHD_ECONOMIC_EVENTS_CACHE_RELATIVE = Path("calendar")
 MANUAL_HIGH_IMPACT_EVENTS_RELATIVE = Path("macro") / "manual_high_impact_events.json"
 LAST_GOOD_HIGH_IMPACT_EVENTS_RELATIVE = Path("calendar") / "last_good_high_impact_events.json"
 
@@ -176,6 +177,17 @@ CURRENCY_BY_COUNTRY: dict[str, str] = {
     "AUSTRALIA": "AUD",
     "NEW ZEALAND": "NZD",
     "CHINA": "CNY",
+    # ISO-3166 alpha-2 country codes used by EODHD economic-events API.
+    "GB": "GBP",
+    "JP": "JPY",
+    "CH": "CHF",
+    "CA": "CAD",
+    "AU": "AUD",
+    "CN": "CNY",
+    "DE": "EUR",
+    "FR": "EUR",
+    "IT": "EUR",
+    "ES": "EUR",
 }
 
 AFFECTED_SYMBOLS_BY_CURRENCY: dict[str, list[str]] = {
@@ -510,6 +522,16 @@ def _fmp_economic_calendar_cache_path(target_date: date) -> Path:
             return base
         return base / f"fmp_economic_calendar_{target_date.isoformat()}.json"
     return _runtime_dir() / FMP_ECONOMIC_CALENDAR_CACHE_RELATIVE / f"fmp_economic_calendar_{target_date.isoformat()}.json"
+
+
+def _eodhd_economic_events_cache_path(target_date: date) -> Path:
+    raw = os.getenv("EODHD_ECONOMIC_EVENTS_CACHE_PATH") or os.getenv("EODHD_ECONOMIC_CALENDAR_CACHE_PATH")
+    if raw:
+        base = Path(raw).expanduser().resolve()
+        if base.suffix:
+            return base
+        return base / f"eodhd_economic_events_{target_date.isoformat()}.json"
+    return _runtime_dir() / EODHD_ECONOMIC_EVENTS_CACHE_RELATIVE / f"eodhd_economic_events_{target_date.isoformat()}.json"
 
 
 def _manual_high_impact_events_path() -> Path:
@@ -1247,6 +1269,289 @@ def _normalize_trading_economics_event(raw: dict[str, Any], target_date: date, r
         "raw": raw,
     }
 
+
+
+# =============================================================================
+# EODHD ECONOMIC EVENTS PRIMARY CALENDAR
+# =============================================================================
+
+EODHD_DEFAULT_COUNTRIES: tuple[str, ...] = (
+    "US",
+    "GB",
+    "JP",
+    "CH",
+    "CA",
+    "AU",
+    "CN",
+    "DE",
+)
+
+
+def _eodhd_economic_events_enabled() -> bool:
+    return str(os.getenv("ENABLE_EODHD_ECONOMIC_EVENTS", os.getenv("ENABLE_EODHD_ECONOMIC_CALENDAR", "true"))).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _eodhd_economic_events_api_token() -> str:
+    for name in (
+        "EODHD_API_TOKEN",
+        "EODHD_API_KEY",
+        "EODHD_ECONOMIC_EVENTS_API_TOKEN",
+        "EODHD_ECONOMIC_CALENDAR_API_TOKEN",
+        "EODHISTORICALDATA_API_TOKEN",
+    ):
+        value = str(os.getenv(name) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _eodhd_economic_events_endpoint() -> str:
+    return str(
+        os.getenv("EODHD_ECONOMIC_EVENTS_ENDPOINT")
+        or os.getenv("EODHD_ECONOMIC_CALENDAR_ENDPOINT")
+        or "https://eodhd.com/api/economic-events"
+    ).strip()
+
+
+def _eodhd_economic_events_countries() -> list[str]:
+    raw = os.getenv("EODHD_ECONOMIC_EVENTS_COUNTRIES") or os.getenv("EODHD_ECONOMIC_CALENDAR_COUNTRIES")
+    if raw:
+        countries = [x.strip().upper() for x in raw.split(",") if x.strip()]
+        if countries:
+            return countries
+    # Empty list means one broad API call without a country filter.
+    return []
+
+
+def _parse_eodhd_datetime(value: Any, target_date: date, default_timezone: str) -> tuple[str, str, str] | None:
+    """Parse EODHD economic-events date into internal calendar contract."""
+    event_tz = str(default_timezone or "UTC").strip() or "UTC"
+    if value is None:
+        return target_date.isoformat(), "", event_tz
+
+    text = str(value).strip()
+    if not text:
+        return target_date.isoformat(), "", event_tz
+
+    try:
+        d = date.fromisoformat(text[:10])
+        if len(text) <= 10 or ("T" not in text and ":" not in text):
+            return d.isoformat(), "", event_tz
+    except Exception:
+        pass
+
+    normalized = text.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_tz(event_tz))
+        else:
+            event_tz = str(dt.tzinfo)
+        return dt.date().isoformat(), dt.strftime("%H:%M"), event_tz
+    except Exception:
+        pass
+
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
+        try:
+            dt = datetime.strptime(text, fmt).replace(tzinfo=_tz(event_tz))
+            return dt.date().isoformat(), dt.strftime("%H:%M"), event_tz
+        except Exception:
+            continue
+
+    return None
+
+
+def _normalize_eodhd_event_title(raw: dict[str, Any]) -> str:
+    base = str(raw.get("type") or raw.get("event") or raw.get("title") or raw.get("name") or "").strip()
+    comparison = str(raw.get("comparison") or "").strip()
+    period = str(raw.get("period") or "").strip()
+
+    title = base
+    details: list[str] = []
+    if comparison:
+        details.append(comparison.upper())
+    if period:
+        details.append(period)
+    if details and base:
+        title = f"{base} ({', '.join(details)})"
+    return title.strip()
+
+
+def _normalize_eodhd_economic_event(raw: dict[str, Any], target_date: date, report_timezone: str) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+
+    title = _normalize_eodhd_event_title(raw)
+    if not title:
+        return None
+
+    country = raw.get("country") or raw.get("Country")
+    currency = _currency_from_event(country, raw.get("currency") or raw.get("Currency"))
+    if str(currency or "-").upper() not in RELEVANT_RISK_CURRENCIES:
+        return None
+
+    parsed_dt = _parse_eodhd_datetime(
+        raw.get("date") or raw.get("Date") or raw.get("datetime") or raw.get("time"),
+        target_date,
+        os.getenv("EODHD_ECONOMIC_EVENTS_TIMEZONE") or os.getenv("EODHD_ECONOMIC_CALENDAR_TIMEZONE") or "UTC",
+    )
+    if parsed_dt is None:
+        return None
+    event_date, event_time, event_tz = parsed_dt
+    if event_date != target_date.isoformat():
+        return None
+
+    # EODHD public docs do not expose a direct impact field. Keep only titles
+    # matching our high-impact macro keyword set.
+    impact = _normalize_impact(raw.get("impact") or raw.get("importance"), title)
+    if impact not in {"HIGH", "RED", "IMPORTANT"}:
+        return None
+
+    symbols = _affected_symbols(currency, title)
+    if not symbols and str(currency).upper() in RELEVANT_RISK_CURRENCIES:
+        symbols = _affected_symbols(str(currency).upper(), title)
+
+    return {
+        "date": event_date,
+        "time": event_time,
+        "timezone": event_tz,
+        "currency": currency,
+        "impact": "HIGH",
+        "title": title,
+        "country": country or "-",
+        "category": raw.get("type") or raw.get("category") or raw.get("Category"),
+        "symbols": symbols,
+        "note": _event_trading_note(currency, title, "HIGH"),
+        "source": "eodhd_economic_events",
+        "actual": raw.get("actual") if raw.get("actual") is not None else raw.get("Actual"),
+        "forecast": raw.get("estimate") if raw.get("estimate") is not None else raw.get("forecast"),
+        "previous": raw.get("previous") if raw.get("previous") is not None else raw.get("Previous"),
+        "comparison": raw.get("comparison"),
+        "period": raw.get("period"),
+        "change": raw.get("change"),
+        "change_percentage": raw.get("change_percentage") if raw.get("change_percentage") is not None else raw.get("changePercentage"),
+        "raw": raw,
+    }
+
+
+def _fetch_eodhd_economic_events_calendar(target_date: date) -> CalendarLoadResult:
+    """Fetch high-impact macro events from EODHD Economic Events Data API."""
+    if not _eodhd_economic_events_enabled():
+        return CalendarLoadResult(
+            status="UNAVAILABLE",
+            source="eodhd_economic_events_disabled",
+            message="EODHD economic events calendar disabled by ENABLE_EODHD_ECONOMIC_EVENTS.",
+        )
+
+    api_token = _eodhd_economic_events_api_token()
+    if not api_token:
+        return CalendarLoadResult(
+            status="UNAVAILABLE",
+            source="eodhd_economic_events",
+            message="EODHD_API_TOKEN / EODHD_API_KEY is missing.",
+        )
+
+    cache_path = _eodhd_economic_events_cache_path(target_date)
+    cache_ttl_sec = int(os.getenv("EODHD_ECONOMIC_EVENTS_CACHE_TTL_SEC", os.getenv("ECONOMIC_CALENDAR_CACHE_TTL_SEC", "21600")))
+    force_refresh = str(os.getenv("EODHD_ECONOMIC_EVENTS_FORCE_REFRESH", os.getenv("EODHD_ECONOMIC_CALENDAR_FORCE_REFRESH", "false"))).strip().lower() in {"1", "true", "yes", "on"}
+
+    if cache_path.exists() and not force_refresh:
+        try:
+            age_sec = (_now_utc().timestamp() - cache_path.stat().st_mtime)
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if age_sec <= cache_ttl_sec and isinstance(cached, dict):
+                events = _extract_list(cached.get("events", []))
+                status = MACRO_OK if events else MACRO_EMPTY
+                return CalendarLoadResult(
+                    status=status,
+                    source=str(cached.get("source") or "eodhd_economic_events_cache"),
+                    events=events,
+                    message=f"Loaded EODHD economic events calendar from cache. age_sec={round(age_sec, 1)}",
+                    cache_path=str(cache_path),
+                )
+        except Exception:
+            pass
+
+    endpoint = _eodhd_economic_events_endpoint()
+    countries = _eodhd_economic_events_countries()
+    timeout = float(os.getenv("EODHD_ECONOMIC_EVENTS_TIMEOUT_SEC", os.getenv("EODHD_ECONOMIC_CALENDAR_TIMEOUT_SEC", "12")))
+    limit = str(os.getenv("EODHD_ECONOMIC_EVENTS_LIMIT", "1000"))
+    report_tz = os.getenv("REPORT_TIMEZONE") or DEFAULT_TIMEZONE
+
+    def _request(country: str | None = None) -> list[Any]:
+        params_payload: dict[str, Any] = {
+            "api_token": api_token,
+            "from": target_date.isoformat(),
+            "to": target_date.isoformat(),
+            "limit": limit,
+            "fmt": "json",
+        }
+        if country:
+            params_payload["country"] = country
+        params = urllib.parse.urlencode(params_payload)
+        separator = "&" if "?" in endpoint else "?"
+        url = f"{endpoint}{separator}{params}"
+        req = urllib.request.Request(url, headers={"User-Agent": "AI-Market-Analyst/1.0", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+        payload = json.loads(body)
+        return _extract_list(payload)
+
+    raw_events: list[Any] = []
+    try:
+        if countries:
+            for country in countries:
+                raw_events.extend(_request(country))
+        else:
+            raw_events.extend(_request(None))
+    except urllib.error.HTTPError as exc:
+        return CalendarLoadResult(
+            status="UNAVAILABLE",
+            source="eodhd_economic_events",
+            message=f"EODHD economic events HTTP error: {exc.code}.",
+            provider_error=str(exc),
+            cache_path=str(cache_path),
+        )
+    except Exception as exc:
+        return CalendarLoadResult(
+            status="UNAVAILABLE",
+            source="eodhd_economic_events",
+            message="EODHD economic events calendar unavailable.",
+            provider_error=f"{type(exc).__name__}: {exc}",
+            cache_path=str(cache_path),
+        )
+
+    normalized: list[dict[str, Any]] = []
+    for raw_event in raw_events:
+        event = _normalize_eodhd_economic_event(raw_event, target_date, report_tz)
+        if event:
+            normalized.append(event)
+
+    normalized = _dedupe_calendar_events(normalized)
+    status = MACRO_OK if normalized else MACRO_EMPTY
+    message = "Loaded from EODHD economic events API." if normalized else "EODHD economic events returned no high-impact events for this date."
+    payload_to_cache = {
+        "source": "eodhd_economic_events",
+        "status": status,
+        "date": target_date.isoformat(),
+        "updated_at_utc": _now_utc().isoformat(),
+        "events": normalized,
+        "raw_count": len(raw_events),
+        "country_filter": countries,
+    }
+    try:
+        _safe_write_json(cache_path, payload_to_cache)
+    except Exception:
+        pass
+
+    return CalendarLoadResult(
+        status=status,
+        source="eodhd_economic_events",
+        events=normalized,
+        message=message,
+        cache_path=str(cache_path),
+        macro_risk_status=status,
+    )
 
 
 def _fmp_economic_calendar_enabled() -> bool:
@@ -2032,9 +2337,9 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
     """
     High-impact macro calendar cascade.
 
-    Order v1.20:
+    Order v1.21:
     1) manual operator JSON override, if populated;
-    2) Financial Modeling Prep economic calendar primary provider;
+    2) EODHD Economic Events Data API primary provider;
     3) Trading Economics automatic backup provider;
     4) Finnhub legacy backup provider;
     5) static fallback file/env/builtin;
@@ -2061,7 +2366,7 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
             last_good_cache_path=str(_last_good_high_impact_events_path()),
         )
 
-    result = _fetch_fmp_economic_calendar(target_date)
+    result = _fetch_eodhd_economic_events_calendar(target_date)
     fallback_chain.append(f"primary:{result.source}:{result.status}")
     if result.status in {MACRO_OK, MACRO_EMPTY}:
         high_events = [
@@ -2080,7 +2385,7 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
             provider_error=result.provider_error,
             macro_risk_status=MACRO_OK if high_events else MACRO_EMPTY,
             fallback_chain=fallback_chain,
-            data_freshness="fmp_fresh_or_valid_cache",
+            data_freshness="eodhd_fresh_or_valid_cache",
             last_good_cache_path=str(_last_good_high_impact_events_path()),
         )
 
@@ -2098,7 +2403,7 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
                 status=MACRO_FALLBACK,
                 source=te_result.source,
                 events=high_events,
-                message=f"{result.message or 'FMP provider unavailable'} Using Trading Economics backup calendar.",
+                message=f"{result.message or 'EODHD provider unavailable'} Using Trading Economics backup calendar.",
                 cache_path=te_result.cache_path,
                 provider_error=result.provider_error or te_result.provider_error,
                 macro_risk_status=MACRO_HIGH_FROM_BACKUP_CALENDAR,
@@ -2121,7 +2426,7 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
             status=MACRO_OK if high_events else MACRO_EMPTY,
             source=finnhub_result.source,
             events=high_events,
-            message=f"{result.message or 'FMP provider unavailable'} Using Finnhub legacy calendar.",
+            message=f"{result.message or 'EODHD provider unavailable'} Using Finnhub legacy calendar.",
             cache_path=finnhub_result.cache_path,
             provider_error=result.provider_error or finnhub_result.provider_error,
             macro_risk_status=MACRO_OK if high_events else MACRO_EMPTY,
@@ -3966,7 +4271,7 @@ def build_briefing_report(
             "trading_economics_calendar_cache_path": str(_trading_economics_calendar_cache_path(target_date)),
             "manual_high_impact_events_path": str(_manual_high_impact_events_path()),
             "last_good_high_impact_events_path": str(_last_good_high_impact_events_path()),
-            "economic_calendar_provider": os.getenv("ECONOMIC_CALENDAR_PROVIDER", "finnhub"),
+            "economic_calendar_provider": os.getenv("ECONOMIC_CALENDAR_PROVIDER", "eodhd_economic_events"),
             "economic_calendar_enabled": os.getenv("ENABLE_ECONOMIC_CALENDAR", "true"),
             "tpo_updated_at_utc": tpo.get("updated_at_utc") if isinstance(tpo, dict) else None,
             "daily_summary_updated_at_utc": daily_summary.get("updated_at_utc") if isinstance(daily_summary, dict) else None,
