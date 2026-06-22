@@ -11,7 +11,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-TELEMETRY_SCHEMA_VERSION = "battle-permission-telemetry-v3.4-statistics-only-suppression-fields"
+TELEMETRY_SCHEMA_VERSION = "battle-permission-telemetry-v3.5-ltf-entry-window-fields"
 
 
 # =============================================================================
@@ -983,6 +983,161 @@ def build_battle_permission_event(
             context.get("battle_bias_hint"),
             payload.get("battle_bias_hint"),
             metadata.get("battle_bias_hint"),
+        ),
+
+        # LTF entry-window execution layer (runner v1.5.8+).
+        # These fields separate late-chase continuation from a fresh retest / sweep-reclaim entry window.
+        "ltf_entry_window_detector_version": _first_non_empty(
+            payload.get("ltf_entry_window_detector_version"),
+            metadata.get("ltf_entry_window_detector_version"),
+            context.get("ltf_entry_window_detector_version"),
+        ),
+        "ltf_entry_window_detected": _safe_bool(
+            _first_non_empty(
+                payload.get("ltf_entry_window_detected"),
+                metadata.get("ltf_entry_window_detected"),
+                context.get("ltf_entry_window_detected"),
+            )
+        ),
+        "ltf_entry_window": _first_non_empty(
+            payload.get("ltf_entry_window"),
+            metadata.get("ltf_entry_window"),
+            context.get("ltf_entry_window"),
+        ),
+        "entry_window_type": _first_non_empty(
+            payload.get("entry_window_type"),
+            metadata.get("entry_window_type"),
+            context.get("entry_window_type"),
+        ),
+        "entry_window_state": _first_non_empty(
+            payload.get("entry_window_state"),
+            metadata.get("entry_window_state"),
+            context.get("entry_window_state"),
+        ),
+        "entry_window_direction": _first_non_empty(
+            payload.get("entry_window_direction"),
+            metadata.get("entry_window_direction"),
+            context.get("entry_window_direction"),
+        ),
+        "fresh_entry_window": _safe_bool(
+            _first_non_empty(
+                payload.get("fresh_entry_window"),
+                metadata.get("fresh_entry_window"),
+                context.get("fresh_entry_window"),
+            )
+        ),
+        "retest_confirmed": _safe_bool(
+            _first_non_empty(
+                payload.get("retest_confirmed"),
+                metadata.get("retest_confirmed"),
+                context.get("retest_confirmed"),
+                payload.get("post_news_retest_confirmed"),
+                metadata.get("post_news_retest_confirmed"),
+                context.get("post_news_retest_confirmed"),
+            )
+        ),
+        "acceptance_confirmed": _safe_bool(
+            _first_non_empty(
+                payload.get("acceptance_confirmed"),
+                metadata.get("acceptance_confirmed"),
+                context.get("acceptance_confirmed"),
+                payload.get("post_news_acceptance_confirmed"),
+                metadata.get("post_news_acceptance_confirmed"),
+                context.get("post_news_acceptance_confirmed"),
+            )
+        ),
+        "ltf_confirmed": _safe_bool(
+            _first_non_empty(
+                payload.get("ltf_confirmed"),
+                metadata.get("ltf_confirmed"),
+                context.get("ltf_confirmed"),
+                payload.get("ltf_model_confirmed"),
+                metadata.get("ltf_model_confirmed"),
+                context.get("ltf_model_confirmed"),
+            )
+        ),
+        "continuation_ready_after_retest": _safe_bool(
+            _first_non_empty(
+                payload.get("continuation_ready_after_retest"),
+                metadata.get("continuation_ready_after_retest"),
+                context.get("continuation_ready_after_retest"),
+            )
+        ),
+        "late_entry_risk": _safe_bool(
+            _first_non_empty(
+                payload.get("late_entry_risk"),
+                metadata.get("late_entry_risk"),
+                context.get("late_entry_risk"),
+            )
+        ),
+        "entry_window_quality": _first_non_empty(
+            payload.get("entry_window_quality"),
+            metadata.get("entry_window_quality"),
+            context.get("entry_window_quality"),
+        ),
+        "entry_window_confidence": _safe_float(
+            _first_non_empty(
+                payload.get("entry_window_confidence"),
+                metadata.get("entry_window_confidence"),
+                context.get("entry_window_confidence"),
+            )
+        ),
+        "ltf_entry_model_hint": _first_non_empty(
+            payload.get("ltf_entry_model_hint"),
+            metadata.get("ltf_entry_model_hint"),
+            context.get("ltf_entry_model_hint"),
+        ),
+        "ltf_stop_model_hint": _first_non_empty(
+            payload.get("ltf_stop_model_hint"),
+            metadata.get("ltf_stop_model_hint"),
+            context.get("ltf_stop_model_hint"),
+        ),
+        "ltf_target_model_hint": _first_non_empty(
+            payload.get("ltf_target_model_hint"),
+            metadata.get("ltf_target_model_hint"),
+            context.get("ltf_target_model_hint"),
+        ),
+        "ltf_entry_window_blockers": _safe_text_list(
+            _first_non_empty(
+                payload.get("ltf_entry_window_blockers"),
+                metadata.get("ltf_entry_window_blockers"),
+                context.get("ltf_entry_window_blockers"),
+            )
+        ),
+        "ltf_entry_window_warnings": _safe_text_list(
+            _first_non_empty(
+                payload.get("ltf_entry_window_warnings"),
+                metadata.get("ltf_entry_window_warnings"),
+                context.get("ltf_entry_window_warnings"),
+            )
+        ),
+        "ltf_entry_window_reasons": _safe_text_list(
+            _first_non_empty(
+                payload.get("ltf_entry_window_reasons"),
+                metadata.get("ltf_entry_window_reasons"),
+                context.get("ltf_entry_window_reasons"),
+            )
+        ),
+        "ltf_retest_level": _safe_float(
+            _first_non_empty(payload.get("ltf_retest_level"), metadata.get("ltf_retest_level"), context.get("ltf_retest_level"))
+        ),
+        "ltf_reclaim_level": _safe_float(
+            _first_non_empty(payload.get("ltf_reclaim_level"), metadata.get("ltf_reclaim_level"), context.get("ltf_reclaim_level"))
+        ),
+        "ltf_liquidity_level": _safe_float(
+            _first_non_empty(payload.get("ltf_liquidity_level"), metadata.get("ltf_liquidity_level"), context.get("ltf_liquidity_level"))
+        ),
+        "ltf_sweep_extreme": _safe_float(
+            _first_non_empty(payload.get("ltf_sweep_extreme"), metadata.get("ltf_sweep_extreme"), context.get("ltf_sweep_extreme"))
+        ),
+        "ltf_pullback_extreme": _safe_float(
+            _first_non_empty(payload.get("ltf_pullback_extreme"), metadata.get("ltf_pullback_extreme"), context.get("ltf_pullback_extreme"))
+        ),
+        "ltf_candles_available_5m": _safe_float(
+            _first_non_empty(payload.get("ltf_candles_available_5m"), metadata.get("ltf_candles_available_5m"), context.get("ltf_candles_available_5m"))
+        ),
+        "ltf_candles_available_15m": _safe_float(
+            _first_non_empty(payload.get("ltf_candles_available_15m"), metadata.get("ltf_candles_available_15m"), context.get("ltf_candles_available_15m"))
         ),
         "primary_interest_zone": _first_non_empty(
             context.get("primary_interest_zone"),
