@@ -57,7 +57,7 @@ from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.5.8-ltf-entry-window-bridge"
+RUNNER_VERSION = "1.5.9-ltf-entry-window-safe-timeframe-resolution"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -2634,6 +2634,66 @@ class StatefulBatchRunner:
         return out
 
 
+    @staticmethod
+    def _get_series_by_timeframe_alias(
+        series_by_tf: dict[Timeframe, pd.DataFrame] | None,
+        *aliases: str,
+    ) -> pd.DataFrame | None:
+        """Return a dataframe for a timeframe alias without assuming enum members exist.
+
+        Production currently has Timeframe.M15/M30/H1/H4/D1. Some deployments do
+        not expose Timeframe.M5. The LTF entry-window bridge must therefore be
+        fail-soft: use M5 when it exists, otherwise continue with the available
+        LTF data instead of raising AttributeError and spamming logs.
+        """
+        if not series_by_tf:
+            return None
+
+        def _norm(value: Any) -> str:
+            raw = str(value or "").strip().lower()
+            return (
+                raw.replace("_", "")
+                .replace("-", "")
+                .replace(" ", "")
+                .replace("minutes", "m")
+                .replace("minute", "m")
+                .replace("mins", "m")
+                .replace("min", "m")
+            )
+
+        wanted = {_norm(alias) for alias in aliases if alias}
+        wanted |= {w.replace("m", "") for w in list(wanted) if w.endswith("m")}
+
+        # Try direct enum attributes only when they exist. getattr(..., None) is
+        # the important safety guard: Timeframe.M5 may not be present.
+        for alias in aliases:
+            enum_candidates = {
+                str(alias or "").upper(),
+                _norm(alias).upper(),
+            }
+            for enum_name in enum_candidates:
+                tf = getattr(Timeframe, enum_name, None)
+                if tf is None:
+                    continue
+                df = series_by_tf.get(tf)
+                if df is not None:
+                    return df
+
+        # Fallback: scan the actual keys we received. This also supports plain
+        # string keys such as "5m" if a future data loader starts emitting them.
+        for key, df in series_by_tf.items():
+            key_names = {
+                _norm(key),
+                _norm(getattr(key, "name", "")),
+                _norm(getattr(key, "value", "")),
+            }
+            key_names |= {k.replace("m", "") for k in list(key_names) if k.endswith("m")}
+            if key_names & wanted:
+                return df
+
+        return None
+
+
     def _enrich_tracker_payload_with_ltf_entry_window_bridge(
         self,
         *,
@@ -2654,14 +2714,19 @@ class StatefulBatchRunner:
             detector_payload = dict(payload)
 
             if series_by_tf:
-                candles_5m = self._dataframe_to_ltf_candles(series_by_tf.get(Timeframe.M5))
-                candles_15m = self._dataframe_to_ltf_candles(series_by_tf.get(Timeframe.M15))
+                df_5m = self._get_series_by_timeframe_alias(series_by_tf, "M5", "5m", "5min", "5")
+                df_15m = self._get_series_by_timeframe_alias(series_by_tf, "M15", "15m", "15min", "15")
+
+                candles_5m = self._dataframe_to_ltf_candles(df_5m)
+                candles_15m = self._dataframe_to_ltf_candles(df_15m)
+
+                payload["ltf_candles_available_5m"] = len(candles_5m) if candles_5m else 0
+                payload["ltf_candles_available_15m"] = len(candles_15m) if candles_15m else 0
+
                 if candles_5m:
                     detector_payload["candles_5m"] = candles_5m
-                    payload["ltf_candles_available_5m"] = len(candles_5m)
                 if candles_15m:
                     detector_payload["candles_15m"] = candles_15m
-                    payload["ltf_candles_available_15m"] = len(candles_15m)
 
             result = detect_ltf_entry_window(detector_payload)
             if not isinstance(result, dict):
