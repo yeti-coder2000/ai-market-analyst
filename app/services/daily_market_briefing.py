@@ -20,6 +20,7 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -32,7 +33,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.21-eodhd-macro-calendar"
+BRIEFING_VERSION = "daily-market-briefing-v1.22-faireconomy-forexfactory-calendar"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -43,6 +44,7 @@ ECONOMIC_CALENDAR_CACHE_RELATIVE = Path("calendar")
 TRADING_ECONOMICS_CALENDAR_CACHE_RELATIVE = Path("calendar")
 FMP_ECONOMIC_CALENDAR_CACHE_RELATIVE = Path("calendar")
 EODHD_ECONOMIC_EVENTS_CACHE_RELATIVE = Path("calendar")
+FAIRECONOMY_CALENDAR_CACHE_RELATIVE = Path("calendar")
 MANUAL_HIGH_IMPACT_EVENTS_RELATIVE = Path("macro") / "manual_high_impact_events.json"
 LAST_GOOD_HIGH_IMPACT_EVENTS_RELATIVE = Path("calendar") / "last_good_high_impact_events.json"
 
@@ -532,6 +534,16 @@ def _eodhd_economic_events_cache_path(target_date: date) -> Path:
             return base
         return base / f"eodhd_economic_events_{target_date.isoformat()}.json"
     return _runtime_dir() / EODHD_ECONOMIC_EVENTS_CACHE_RELATIVE / f"eodhd_economic_events_{target_date.isoformat()}.json"
+
+
+def _faireconomy_calendar_cache_path(target_date: date) -> Path:
+    raw = os.getenv("FAIRECONOMY_CALENDAR_CACHE_PATH") or os.getenv("FOREXFACTORY_CALENDAR_CACHE_PATH")
+    if raw:
+        base = Path(raw).expanduser().resolve()
+        if base.suffix:
+            return base
+        return base / f"faireconomy_forexfactory_calendar_{target_date.isoformat()}.json"
+    return _runtime_dir() / FAIRECONOMY_CALENDAR_CACHE_RELATIVE / f"faireconomy_forexfactory_calendar_{target_date.isoformat()}.json"
 
 
 def _manual_high_impact_events_path() -> Path:
@@ -1269,6 +1281,257 @@ def _normalize_trading_economics_event(raw: dict[str, Any], target_date: date, r
         "raw": raw,
     }
 
+
+
+
+# =============================================================================
+# FAIRECONOMY / FOREX FACTORY WEEKLY XML CALENDAR FALLBACK
+# =============================================================================
+
+FAIRECONOMY_DEFAULT_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+FAIRECONOMY_SOURCE = "faireconomy_forexfactory_xml"
+
+
+def _faireconomy_calendar_enabled() -> bool:
+    return _env_bool("ENABLE_FAIRECONOMY_FOREXFACTORY_CALENDAR", True)
+
+
+def _faireconomy_calendar_endpoint() -> str:
+    return (
+        os.getenv("FAIRECONOMY_CALENDAR_URL")
+        or os.getenv("FOREXFACTORY_CALENDAR_URL")
+        or FAIRECONOMY_DEFAULT_URL
+    )
+
+
+def _faireconomy_cache_ttl_seconds() -> int:
+    try:
+        return max(300, int(os.getenv("FAIRECONOMY_CALENDAR_CACHE_TTL_SECONDS", "21600")))
+    except Exception:
+        return 21600
+
+
+def _faireconomy_assumed_timezone() -> str:
+    # The nfs.faireconomy.media weekly XML feed is commonly consumed as GMT/UTC by
+    # trading systems. Keep this explicit and configurable so we never silently
+    # treat feed times as Kyiv/local time.
+    return os.getenv("FAIRECONOMY_CALENDAR_TIMEZONE", "UTC") or "UTC"
+
+
+def _parse_faireconomy_datetime(
+    date_text: Any,
+    time_text: Any,
+    target_date: date,
+    report_timezone: str,
+) -> tuple[str, str, str] | None:
+    raw_date = str(date_text or "").strip()
+    raw_time = str(time_text or "").strip()
+    if not raw_date:
+        return None
+
+    parsed_date: date | None = None
+    for fmt in ("%m-%d-%Y", "%m/%d/%Y", "%Y-%m-%d"):
+        try:
+            parsed_date = datetime.strptime(raw_date, fmt).date()
+            break
+        except Exception:
+            continue
+    if parsed_date is None:
+        return None
+
+    # Parse normal intraday timestamps such as "12:30pm". For all-day/tentative
+    # entries, keep the calendar item at 00:00 UTC so it is visible in the risk
+    # block, but mark raw_time in the normalized payload.
+    local_source_tz = ZoneInfo(_faireconomy_assumed_timezone())
+    event_time = time(0, 0)
+    if raw_time and raw_time.upper() not in {"ALL DAY", "TENTATIVE", "", "-"}:
+        normalized = raw_time.replace(" ", "").lower()
+        parsed_time: time | None = None
+        for fmt in ("%I:%M%p", "%I%p", "%H:%M"):
+            try:
+                parsed_time = datetime.strptime(normalized, fmt).time()
+                break
+            except Exception:
+                continue
+        if parsed_time is not None:
+            event_time = parsed_time
+
+    source_dt = datetime.combine(parsed_date, event_time, tzinfo=local_source_tz)
+    report_dt = source_dt.astimezone(ZoneInfo(report_timezone))
+
+    if report_dt.date() != target_date:
+        return None
+    return report_dt.date().isoformat(), report_dt.strftime("%H:%M"), report_timezone
+
+
+def _normalize_faireconomy_xml_event(raw: dict[str, Any], target_date: date, report_timezone: str) -> dict[str, Any] | None:
+    title = str(raw.get("title") or raw.get("event") or "").strip()
+    if not title:
+        return None
+
+    currency = str(raw.get("country") or raw.get("currency") or "").strip().upper()
+    if currency not in RELEVANT_RISK_CURRENCIES:
+        return None
+
+    impact = _normalize_impact(raw.get("impact"), title)
+    if impact not in {"HIGH", "RED", "IMPORTANT"}:
+        return None
+
+    parsed_dt = _parse_faireconomy_datetime(raw.get("date"), raw.get("time"), target_date, report_timezone)
+    if parsed_dt is None:
+        return None
+    event_date, event_time, event_tz = parsed_dt
+
+    symbols = _affected_symbols(currency, title)
+    return {
+        "date": event_date,
+        "time": event_time,
+        "timezone": event_tz,
+        "currency": currency,
+        "impact": "HIGH",
+        "title": title,
+        "country": currency,
+        "symbols": symbols,
+        "note": _event_trading_note(currency, title, "HIGH"),
+        "source": FAIRECONOMY_SOURCE,
+        "source_reliability": "unofficial_weekly_xml_feed",
+        "raw_time": str(raw.get("time") or "").strip(),
+        "actual": raw.get("actual"),
+        "forecast": raw.get("forecast"),
+        "previous": raw.get("previous"),
+        "raw": raw,
+    }
+
+
+def _parse_faireconomy_xml_payload(body: bytes) -> list[dict[str, Any]]:
+    root = ET.fromstring(body)
+    events: list[dict[str, Any]] = []
+    for ev in root.findall(".//event"):
+        item: dict[str, Any] = {}
+        for child in list(ev):
+            item[child.tag.lower()] = (child.text or "").strip()
+        if item:
+            events.append(item)
+    return events
+
+
+def _fetch_faireconomy_forexfactory_calendar(target_date: date) -> CalendarLoadResult:
+    if not _faireconomy_calendar_enabled():
+        return CalendarLoadResult(
+            status="DISABLED",
+            source=f"{FAIRECONOMY_SOURCE}_disabled",
+            message="Faireconomy / Forex Factory XML calendar disabled.",
+        )
+
+    report_tz = os.getenv("REPORT_TIMEZONE", DEFAULT_TIMEZONE) or DEFAULT_TIMEZONE
+    cache_path = _faireconomy_calendar_cache_path(target_date)
+    ttl_seconds = _faireconomy_cache_ttl_seconds()
+
+    cached = _safe_read_json(cache_path, {})
+    if isinstance(cached, dict):
+        fetched_at = str(cached.get("fetched_at_utc") or "")
+        try:
+            dt = datetime.fromisoformat(fetched_at.replace("Z", "+00:00")) if fetched_at else None
+            if dt and dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if dt and (_now_utc() - dt.astimezone(timezone.utc)).total_seconds() <= ttl_seconds:
+                normalized_events: list[dict[str, Any]] = []
+                for raw_event in _extract_list(cached.get("raw_events", [])):
+                    event = _normalize_faireconomy_xml_event(raw_event, target_date, report_tz)
+                    if event:
+                        normalized_events.append(event)
+                normalized_events = _dedupe_calendar_events(normalized_events)
+                return CalendarLoadResult(
+                    status=MACRO_OK if normalized_events else MACRO_EMPTY,
+                    source=f"{FAIRECONOMY_SOURCE}_cache",
+                    events=normalized_events,
+                    message="Using cached Faireconomy / Forex Factory weekly XML calendar.",
+                    cache_path=str(cache_path),
+                    macro_risk_status=MACRO_OK if normalized_events else MACRO_EMPTY,
+                    data_freshness="faireconomy_cache",
+                )
+        except Exception:
+            pass
+
+    endpoint = _faireconomy_calendar_endpoint()
+    try:
+        request = urllib.request.Request(
+            endpoint,
+            headers={
+                "User-Agent": os.getenv(
+                    "FAIRECONOMY_CALENDAR_USER_AGENT",
+                    "Mozilla/5.0 AI-Market-Analyst macro-calendar",
+                )
+            },
+        )
+        with urllib.request.urlopen(request, timeout=float(os.getenv("FAIRECONOMY_CALENDAR_TIMEOUT_SEC", "20"))) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        return CalendarLoadResult(
+            status=MACRO_UNKNOWN_CONSERVATIVE,
+            source=FAIRECONOMY_SOURCE,
+            events=[],
+            message=f"Faireconomy / Forex Factory XML calendar HTTP error: {exc.code}.",
+            cache_path=str(cache_path),
+            provider_error=str(exc),
+            macro_risk_status=MACRO_UNKNOWN_CONSERVATIVE,
+        )
+    except Exception as exc:
+        return CalendarLoadResult(
+            status=MACRO_UNKNOWN_CONSERVATIVE,
+            source=FAIRECONOMY_SOURCE,
+            events=[],
+            message=f"Faireconomy / Forex Factory XML calendar unavailable: {exc}.",
+            cache_path=str(cache_path),
+            provider_error=str(exc),
+            macro_risk_status=MACRO_UNKNOWN_CONSERVATIVE,
+        )
+
+    try:
+        raw_events = _parse_faireconomy_xml_payload(body)
+    except Exception as exc:
+        return CalendarLoadResult(
+            status=MACRO_UNKNOWN_CONSERVATIVE,
+            source=FAIRECONOMY_SOURCE,
+            events=[],
+            message=f"Faireconomy / Forex Factory XML calendar parse error: {exc}.",
+            cache_path=str(cache_path),
+            provider_error=str(exc),
+            macro_risk_status=MACRO_UNKNOWN_CONSERVATIVE,
+        )
+
+    normalized_events: list[dict[str, Any]] = []
+    for raw_event in raw_events:
+        event = _normalize_faireconomy_xml_event(raw_event, target_date, report_tz)
+        if event:
+            normalized_events.append(event)
+    normalized_events = _dedupe_calendar_events(normalized_events)
+
+    payload = {
+        "source": FAIRECONOMY_SOURCE,
+        "status": MACRO_OK if normalized_events else MACRO_EMPTY,
+        "fetched_at_utc": _now_utc().isoformat(),
+        "target_date": target_date.isoformat(),
+        "endpoint": endpoint,
+        "assumed_source_timezone": _faireconomy_assumed_timezone(),
+        "raw_event_count": len(raw_events),
+        "events": normalized_events,
+        "raw_events": raw_events,
+    }
+    try:
+        _safe_write_json(cache_path, payload)
+    except Exception:
+        pass
+
+    return CalendarLoadResult(
+        status=MACRO_OK if normalized_events else MACRO_EMPTY,
+        source=FAIRECONOMY_SOURCE,
+        events=normalized_events,
+        message="Loaded Faireconomy / Forex Factory weekly XML calendar.",
+        cache_path=str(cache_path),
+        macro_risk_status=MACRO_OK if normalized_events else MACRO_EMPTY,
+        data_freshness="faireconomy_fresh",
+    )
 
 
 # =============================================================================
@@ -2337,14 +2600,15 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
     """
     High-impact macro calendar cascade.
 
-    Order v1.21:
+    Order v1.22:
     1) manual operator JSON override, if populated;
-    2) EODHD Economic Events Data API primary provider;
-    3) Trading Economics automatic backup provider;
-    4) Finnhub legacy backup provider;
-    5) static fallback file/env/builtin;
-    6) last-good cache;
-    7) MACRO_UNKNOWN_CONSERVATIVE.
+    2) Faireconomy / Forex Factory weekly XML calendar primary free fallback;
+    3) EODHD Economic Events Data API provider, if plan allows it;
+    4) Trading Economics automatic backup provider;
+    5) Finnhub legacy backup provider;
+    6) static fallback file/env/builtin;
+    7) last-good cache;
+    8) MACRO_UNKNOWN_CONSERVATIVE.
 
     Provider unavailable is never treated as "no news".
     """
@@ -2366,8 +2630,31 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
             last_good_cache_path=str(_last_good_high_impact_events_path()),
         )
 
+    ff_result = _fetch_faireconomy_forexfactory_calendar(target_date)
+    fallback_chain.append(f"primary:{ff_result.source}:{ff_result.status}")
+    if ff_result.status in {MACRO_OK, MACRO_EMPTY}:
+        high_events = [
+            e for e in ff_result.events
+            if _normalize_impact(e.get("impact"), str(e.get("title") or "")) in {"HIGH", "RED", "IMPORTANT"}
+        ]
+        high_events = _dedupe_calendar_events(high_events)
+        if high_events:
+            _write_last_good_calendar_cache(target_date, high_events, source=ff_result.source)
+        return CalendarLoadResult(
+            status=MACRO_OK if high_events else MACRO_EMPTY,
+            source=ff_result.source,
+            events=high_events,
+            message=ff_result.message,
+            cache_path=ff_result.cache_path,
+            provider_error=ff_result.provider_error,
+            macro_risk_status=MACRO_HIGH_FROM_BACKUP_CALENDAR if high_events else MACRO_EMPTY,
+            fallback_chain=fallback_chain,
+            data_freshness=ff_result.data_freshness or "faireconomy_forexfactory_xml",
+            last_good_cache_path=str(_last_good_high_impact_events_path()),
+        )
+
     result = _fetch_eodhd_economic_events_calendar(target_date)
-    fallback_chain.append(f"primary:{result.source}:{result.status}")
+    fallback_chain.append(f"backup:{result.source}:{result.status}")
     if result.status in {MACRO_OK, MACRO_EMPTY}:
         high_events = [
             e for e in result.events
@@ -2380,12 +2667,12 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
             status=MACRO_OK if high_events else MACRO_EMPTY,
             source=result.source,
             events=high_events,
-            message=result.message,
+            message=(ff_result.message or "Faireconomy provider unavailable") + " Using EODHD backup calendar.",
             cache_path=result.cache_path,
-            provider_error=result.provider_error,
+            provider_error=ff_result.provider_error or result.provider_error,
             macro_risk_status=MACRO_OK if high_events else MACRO_EMPTY,
             fallback_chain=fallback_chain,
-            data_freshness="eodhd_fresh_or_valid_cache",
+            data_freshness="eodhd_backup",
             last_good_cache_path=str(_last_good_high_impact_events_path()),
         )
 
@@ -4271,7 +4558,7 @@ def build_briefing_report(
             "trading_economics_calendar_cache_path": str(_trading_economics_calendar_cache_path(target_date)),
             "manual_high_impact_events_path": str(_manual_high_impact_events_path()),
             "last_good_high_impact_events_path": str(_last_good_high_impact_events_path()),
-            "economic_calendar_provider": os.getenv("ECONOMIC_CALENDAR_PROVIDER", "eodhd_economic_events"),
+            "economic_calendar_provider": os.getenv("ECONOMIC_CALENDAR_PROVIDER", "faireconomy_forexfactory_xml"),
             "economic_calendar_enabled": os.getenv("ENABLE_ECONOMIC_CALENDAR", "true"),
             "tpo_updated_at_utc": tpo.get("updated_at_utc") if isinstance(tpo, dict) else None,
             "daily_summary_updated_at_utc": daily_summary.get("updated_at_utc") if isinstance(daily_summary, dict) else None,
