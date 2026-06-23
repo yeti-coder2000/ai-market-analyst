@@ -33,7 +33,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.24-macro-watch-wording-intermarket"
+BRIEFING_VERSION = "daily-market-briefing-v1.25-macro-affected-assets-post-news-impact"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -3257,6 +3257,48 @@ def _filter_symbols_for_report(symbols: list[str], report_type: str) -> list[str
     return _sort_symbols_by_scope(filtered, report_type)
 
 
+def _sort_symbols_global(symbols: list[str]) -> list[str]:
+    rank = {sym: idx for idx, sym in enumerate(GLOBAL_SYMBOL_ORDER)}
+    clean: list[str] = []
+    seen: set[str] = set()
+    for sym in symbols or []:
+        s = str(sym or "").strip().upper()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        clean.append(s)
+    return sorted(clean, key=lambda x: (rank.get(x, 10_000), x))
+
+
+def _outside_focus_label_for_report(report_type: str) -> str:
+    r = _normalize_report_type(report_type)
+    if r in {"ny", "ny_1h", "new_york"}:
+        return "поза активним NY-фокусом"
+    if r in {"morning", "morning_briefing", "morning_combined", "london", "london_1h"}:
+        return "поза активним London/ранковим фокусом"
+    return "поза активним фокусом звіту"
+
+
+def _macro_affected_symbols_text(symbols: list[str], report_type: str) -> str:
+    """
+    Risk block must show the full macro-affected universe, not only the
+    session-scoped active focus. Session scope is a reporting/priority filter,
+    not a macro-causality filter. Example: EUR PMI in a NY report may actively
+    affect XAUUSD in focus, while EURUSD/GER40 remain relevant but outside NY focus.
+    """
+    full = _sort_symbols_global(symbols or [])
+    if not full:
+        return ""
+
+    scope = set(_symbol_scope_for_report(report_type))
+    outside = [sym for sym in full if sym not in scope]
+
+    text = f" | активи: {', '.join(full[:12])}"
+    if outside:
+        text += f" | {_outside_focus_label_for_report(report_type)}: {', '.join(outside[:8])}"
+    return text
+
+
 def _market_line(
     *,
     sym: str,
@@ -3514,16 +3556,14 @@ def _build_high_impact_section(target_date: date, timezone_name: str, report_typ
         currency = e.get("currency") or "-"
         impact = _calendar_event_impact_display(e)
         title = e.get("title") or e.get("event") or "Unnamed event"
-        symbols = _filter_symbols_for_report(e.get("symbols") or [], report_type)
+        symbols = _sort_symbols_global(e.get("symbols") or [])
         source = e.get("source") or calendar.source
 
         provider_note = _translate_note(e.get("note"))
         operational_note = _time_aware_event_note(e, timezone_name)
         note = operational_note or provider_note
 
-        symbol_text = ""
-        if symbols:
-            symbol_text = f" | активи: {', '.join(symbols[:8])}"
+        symbol_text = _macro_affected_symbols_text(symbols, report_type)
 
         section.lines.append(f"• {local_time} — {currency} {impact}: {title}{symbol_text}")
         if note:
@@ -4407,10 +4447,11 @@ def _build_post_news_reaction_section(
         local_time = _local_dt_from_event(event, timezone_name)
         macro_regime = event.get("macro_regime") or _macro_regime_for_event(event)
 
+        event_impact_display = _calendar_event_impact_display(event)
         if isinstance(minutes, (int, float)) and float(minutes) < 0:
-            section.lines.append(f"Подія: {local_time} — {_raw(event.get('currency'))} {_raw(event.get('impact'))}: {_raw(title)} | до релізу: {event.get('minutes_until_event')} хв")
+            section.lines.append(f"Подія: {local_time} — {_raw(event.get('currency'))} {event_impact_display}: {_raw(title)} | до релізу: {event.get('minutes_until_event')} хв")
         else:
-            section.lines.append(f"Подія: {local_time} — {_raw(event.get('currency'))} {_raw(event.get('impact'))}: {_raw(title)} | минуло: {minutes} хв")
+            section.lines.append(f"Подія: {local_time} — {_raw(event.get('currency'))} {event_impact_display}: {_raw(title)} | минуло: {minutes} хв")
 
         section.lines.append(f"Macro regime: {macro_regime}.")
         if str(macro_regime) == "FOMC_PRESSER_LOCK":
