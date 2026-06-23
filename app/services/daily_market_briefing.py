@@ -33,7 +33,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.23-faireconomy-critical-medium-events"
+BRIEFING_VERSION = "daily-market-briefing-v1.24-macro-watch-wording-intermarket"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -52,6 +52,7 @@ MACRO_OK = "OK"
 MACRO_EMPTY = "EMPTY"
 MACRO_FALLBACK = "FALLBACK"
 MACRO_HIGH_FROM_BACKUP_CALENDAR = "HIGH_FROM_BACKUP_CALENDAR"
+MACRO_WATCH_FROM_BACKUP_CALENDAR = "MACRO_WATCH_FROM_BACKUP_CALENDAR"
 MACRO_LAST_GOOD_CACHE = "LAST_GOOD_CACHE"
 MACRO_UNKNOWN_CONSERVATIVE = "MACRO_UNKNOWN_CONSERVATIVE"
 
@@ -2553,11 +2554,60 @@ def _has_fomc_press_conference(events: list[dict[str, Any]]) -> bool:
     return any(_is_fomc_press_conference(event) for event in events)
 
 
+def _has_source_high_calendar_event(events: list[dict[str, Any]]) -> bool:
+    for event in events:
+        source_impact = _normalize_impact(
+            event.get("source_impact") or event.get("original_impact") or event.get("impact"),
+            str(event.get("title") or event.get("event") or ""),
+        )
+        if source_impact in {"HIGH", "RED", "IMPORTANT"}:
+            return True
+    return False
+
+
+def _has_critical_medium_calendar_event(events: list[dict[str, Any]]) -> bool:
+    return any(bool(event.get("critical_medium")) or str(event.get("risk_tier") or "").upper() == "MACRO_WATCH_CRITICAL_MEDIUM" for event in events)
+
+
+def _calendar_macro_status_for_events(events: list[dict[str, Any]], *, backup: bool = True) -> str:
+    if not events:
+        return MACRO_EMPTY
+    if _has_source_high_calendar_event(events):
+        return MACRO_HIGH_FROM_BACKUP_CALENDAR if backup else MACRO_OK
+    if _has_critical_medium_calendar_event(events):
+        return MACRO_WATCH_FROM_BACKUP_CALENDAR
+    return MACRO_OK if not backup else MACRO_HIGH_FROM_BACKUP_CALENDAR
+
+
+def _calendar_event_impact_display(event: dict[str, Any]) -> str:
+    source_impact = _normalize_impact(
+        event.get("source_impact") or event.get("original_impact") or event.get("impact"),
+        str(event.get("title") or event.get("event") or ""),
+    )
+    risk_tier = str(event.get("risk_tier") or "").upper()
+    if risk_tier == "MACRO_WATCH_CRITICAL_MEDIUM" or bool(event.get("critical_medium")):
+        return f"{source_impact}→SYSTEM WATCH"
+    return source_impact or str(event.get("impact") or "HIGH").upper()
+
+
+def _calendar_event_source_impact_note(event: dict[str, Any]) -> str | None:
+    source_impact = _normalize_impact(
+        event.get("source_impact") or event.get("original_impact") or event.get("impact"),
+        str(event.get("title") or event.get("event") or ""),
+    )
+    risk_tier = str(event.get("risk_tier") or "").upper()
+    if risk_tier == "MACRO_WATCH_CRITICAL_MEDIUM" or bool(event.get("critical_medium")):
+        return f"Source impact: {source_impact}; system risk tier: MACRO_WATCH_CRITICAL_MEDIUM."
+    return None
+
+
 def _macro_risk_status_text(calendar: CalendarLoadResult) -> str:
     if calendar.macro_risk_status == MACRO_HIGH_FROM_BACKUP_CALENDAR:
         return MACRO_HIGH_FROM_BACKUP_CALENDAR
+    if calendar.macro_risk_status == MACRO_WATCH_FROM_BACKUP_CALENDAR:
+        return MACRO_WATCH_FROM_BACKUP_CALENDAR
     if calendar.status == MACRO_FALLBACK and calendar.events:
-        return MACRO_HIGH_FROM_BACKUP_CALENDAR
+        return _calendar_macro_status_for_events(calendar.events, backup=True)
     return str(calendar.macro_risk_status or calendar.status or MACRO_UNKNOWN_CONSERVATIVE)
 
 
@@ -2669,7 +2719,7 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
     """
     High-impact macro calendar cascade.
 
-    Order v1.23:
+    Order v1.24:
     1) manual operator JSON override, if populated;
     2) Faireconomy / Forex Factory weekly XML calendar primary free fallback;
     3) EODHD Economic Events Data API provider, if plan allows it;
@@ -2693,7 +2743,7 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
             events=manual_events,
             message="Using manual macro JSON override.",
             cache_path=str(_manual_high_impact_events_path()),
-            macro_risk_status=MACRO_HIGH_FROM_BACKUP_CALENDAR,
+            macro_risk_status=_calendar_macro_status_for_events(manual_events, backup=True),
             fallback_chain=fallback_chain,
             data_freshness="manual_override",
             last_good_cache_path=str(_last_good_high_impact_events_path()),
@@ -2716,7 +2766,7 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
             message=ff_result.message,
             cache_path=ff_result.cache_path,
             provider_error=ff_result.provider_error,
-            macro_risk_status=MACRO_HIGH_FROM_BACKUP_CALENDAR if high_events else MACRO_EMPTY,
+            macro_risk_status=_calendar_macro_status_for_events(high_events, backup=True),
             fallback_chain=fallback_chain,
             data_freshness=ff_result.data_freshness or "faireconomy_forexfactory_xml",
             last_good_cache_path=str(_last_good_high_impact_events_path()),
@@ -3418,11 +3468,11 @@ def _build_high_impact_section(target_date: date, timezone_name: str, report_typ
 
     if not events:
         if calendar.status == MACRO_EMPTY:
-            section.lines.append("HIGH/RED подій за підключеним календарем не знайдено.")
+            section.lines.append("Actionable macro-watch подій за підключеним календарем не знайдено.")
             section.lines.append("Macro mode: CLEAR_BY_PROVIDER.")
             section.lines.append(f"Джерело: {calendar.source}.")
         elif raw_events:
-            section.lines.append("HIGH/RED подій для нашого торгового фокусу не знайдено.")
+            section.lines.append("Actionable macro-watch подій для нашого торгового фокусу не знайдено.")
             section.lines.append(f"Macro mode: {calendar.macro_risk_status}.")
             section.lines.append(f"Джерело: {calendar.source}.")
         else:
@@ -3462,7 +3512,7 @@ def _build_high_impact_section(target_date: date, timezone_name: str, report_typ
     for e in _select_events_for_high_impact_section(events):
         local_time = _local_dt_from_event(e, timezone_name)
         currency = e.get("currency") or "-"
-        impact = str(e.get("impact") or "HIGH").upper()
+        impact = _calendar_event_impact_display(e)
         title = e.get("title") or e.get("event") or "Unnamed event"
         symbols = _filter_symbols_for_report(e.get("symbols") or [], report_type)
         source = e.get("source") or calendar.source
@@ -3480,6 +3530,9 @@ def _build_high_impact_section(target_date: date, timezone_name: str, report_typ
             section.lines.append(f"  {note}")
         if provider_note and provider_note != note:
             section.lines.append(f"  {provider_note}")
+        source_impact_note = _calendar_event_source_impact_note(e)
+        if source_impact_note:
+            section.lines.append(f"  {source_impact_note}")
         if source:
             section.lines.append(f"  Джерело: {source}")
 
@@ -3899,6 +3952,41 @@ def _activity_direction_label(activity: dict[str, Any]) -> str:
     return "neutral"
 
 
+def _directional_continuation_state(sym: str, data: dict[str, Any]) -> str | None:
+    """Detect active directional continuation hidden behind OPEN_AUCTION/DOWNGRADE wording.
+
+    This is reporting wording only. It does not grant Battle permission. It prevents
+    strong breakdown/continuation days from being described as plain BALANCE_CHOP.
+    """
+    if data.get("provider_error") or data.get("fallback"):
+        return None
+    market_status = str(data.get("market_status") or "").upper()
+    if market_status in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"}:
+        return None
+
+    activity = data.get("first_hour_activity") if isinstance(data.get("first_hour_activity"), dict) else {}
+    direction = _post_news_direction_from_activity(activity)
+    entry_hint = str(data.get("entry_hint") or "").upper()
+    reason = str(data.get("trigger_reason") or data.get("tpo_signal_reason") or "").upper()
+    open_behavior = str(data.get("open_behavior") or "").upper()
+    modifier = str(data.get("modifier") or "").upper()
+
+    directional_hint = any(token in entry_hint or token in reason for token in (
+        "RETEST", "PULLBACK", "SWEEP", "RECLAIM", "BOS", "FAILED_ACCEPTANCE",
+        "VALUE_REJECTION", "OPEN_TEST_DRIVE", "CONTINUATION",
+    ))
+    failed_or_accepted = any(_boolish(activity.get(k)) for k in (
+        "failed_auction", "accepted_outside_range", "accepted_back_inside_value", "accepted_back_inside_range"
+    ))
+    downgraded_auction = open_behavior in {"OPEN_AUCTION", "UNCONFIRMED", "UNKNOWN"} and modifier == "DOWNGRADE"
+
+    if direction == "DOWN" and (directional_hint or failed_or_accepted or downgraded_auction):
+        return "BEARISH_CONTINUATION_WAIT_RETEST"
+    if direction == "UP" and (directional_hint or failed_or_accepted or downgraded_auction):
+        return "BULLISH_CONTINUATION_WAIT_RETEST"
+    return None
+
+
 def _auction_subtype(sym: str, data: dict[str, Any], *, post_news_active: bool = False, macro_unknown: bool = False) -> str:
     market_status = str(data.get("market_status") or "").upper()
     permission = str(data.get("permission") or "").upper()
@@ -3913,6 +4001,9 @@ def _auction_subtype(sym: str, data: dict[str, Any], *, post_news_active: bool =
         return "PROVIDER_STALE"
     if macro_unknown:
         return "MACRO_UNKNOWN"
+    directional_state = _directional_continuation_state(sym, data)
+    if directional_state:
+        return directional_state
     if entry_timing_status in {"LATE_SIGNAL", "HARD_LATE_SIGNAL"}:
         return "FIRST_IMPULSE_GONE"
     if any("FIRST_IMPULSE" in x or "IMPULSE_ALREADY_GONE" in x for x in warnings) or "FIRST_IMPULSE" in trigger_reason:
@@ -3948,6 +4039,11 @@ def _bias_without_trade(sym: str, data: dict[str, Any], *, post_news_active: boo
     direction = _activity_direction_label(activity)
     open_behavior = str(data.get("open_behavior") or "").upper()
 
+    directional_state = _directional_continuation_state(sym, data)
+    if directional_state == "BEARISH_CONTINUATION_WAIT_RETEST":
+        return "bearish continuation active / wait fresh retest"
+    if directional_state == "BULLISH_CONTINUATION_WAIT_RETEST":
+        return "bullish continuation active / wait fresh pullback"
     if direction == "bearish":
         return "bearish bias / wait retest"
     if direction == "bullish":
@@ -4083,6 +4179,9 @@ def _brief_verdict(
         detail += bias_text
         if post_news_active:
             detail += " | post-news: тільки після retest/acceptance, без chase"
+        if subtype_text in {"BEARISH_CONTINUATION_WAIT_RETEST", "BULLISH_CONTINUATION_WAIT_RETEST"}:
+            detail += " | no chase; потрібен fresh retest + LTF model + context-invalidation stop"
+            return "WATCH", f"• {sym} — WAIT_FRESH_RETEST | {detail}"
         return "NO_TRADE", f"• {sym} — {reason} + DOWNGRADE | {detail}"
 
     # WATCH means there is a behavior candidate, but still no entry without 5m–15m confirmation.
@@ -4355,6 +4454,59 @@ def _build_post_news_reaction_section(
     return section
 
 
+def _build_intermarket_context_section(tpo: dict[str, Any], report_type: str) -> BriefingSection | None:
+    symbols = tpo.get("symbols") if isinstance(tpo, dict) else {}
+    symbols = symbols if isinstance(symbols, dict) else {}
+    scope = list(_symbol_scope_for_report(report_type))
+
+    data_by_symbol: dict[str, dict[str, Any]] = {}
+    for sym in scope:
+        item = symbols.get(sym)
+        if isinstance(item, dict):
+            data_by_symbol[sym] = _brief_symbol_context(item)
+
+    if not data_by_symbol:
+        return None
+
+    usd_strength_votes = 0
+    risk_off_votes = 0
+    bearish_pressure: list[str] = []
+    bullish_usd_pairs: list[str] = []
+
+    for sym, data in data_by_symbol.items():
+        bias = _bias_without_trade(sym, data)
+        direction = _post_news_direction_from_activity(data.get("first_hour_activity") if isinstance(data.get("first_hour_activity"), dict) else {})
+        if sym in {"EURUSD", "GBPUSD", "AUDUSD", "XAUUSD", "BTCUSD", "ETHUSD"} and ("bearish" in bias or direction == "DOWN"):
+            bearish_pressure.append(sym)
+        if sym in {"USDJPY", "USDCHF", "USDCAD"} and ("bullish" in bias or direction == "UP"):
+            bullish_usd_pairs.append(sym)
+
+    if len(bearish_pressure) >= 2:
+        usd_strength_votes += 1
+    if bullish_usd_pairs:
+        usd_strength_votes += 1
+    if any(sym in bearish_pressure for sym in {"BTCUSD", "ETHUSD"}) and any(sym in bearish_pressure for sym in {"XAUUSD", "EURUSD", "GBPUSD"}):
+        risk_off_votes += 1
+
+    section = BriefingSection("🧩 Intermarket context")
+    if usd_strength_votes:
+        section.lines.append(
+            "USD bid / defensive tone: pressure підтверджується кількома інструментами; "
+            "short-side ідеї по EUR/GBP/XAU/crypto не chase, тільки fresh retest."
+        )
+        if bearish_pressure:
+            section.lines.append(f"Під тиском: {', '.join(bearish_pressure[:8])}.")
+        if bullish_usd_pairs:
+            section.lines.append(f"USD-пари підтримують імпульс: {', '.join(bullish_usd_pairs[:5])}.")
+    elif risk_off_votes:
+        section.lines.append("Risk-off tone: risk assets під тиском; потрібен fresh retest, не вхід у перший імпульс.")
+    else:
+        section.lines.append("Єдиного cross-asset імпульсу немає; оцінювати setups окремо через LTF confirmation.")
+
+    section.lines.append("Intermarket context — це bias-фільтр, не entry trigger.")
+    return section
+
+
 def _build_tpo_snapshot_section(
     tpo: dict[str, Any],
     report_type: str,
@@ -4562,7 +4714,7 @@ def _build_focus_section(report_type: str, target_date: date | None = None) -> B
             section.lines.extend(
                 [
                     "POC/nPOC = зона інтересу, не кнопка входу.",
-                    "Battle тільки після HTF alignment + LTF 5m–15m model + stop + RR.",
+                    "Battle тільки після HTF alignment + LTF 5m–15m model + context-invalidation stop + RR.",
                     "До high-impact news не вважати ранню структуру стабільною.",
                 ]
             )
@@ -4588,7 +4740,7 @@ def _build_focus_section(report_type: str, target_date: date | None = None) -> B
                 [
                     "NY +1h: не наздоганяємо перший імпульс.",
                     "FOMC / high-impact news: NO BATTLE до завершення lock; після — тільки acceptance + retest.",
-                    "Потрібні open behavior + LTF model + stop + Battle Gate.",
+                    "Потрібні open behavior + LTF model + context-invalidation stop + Battle Gate.",
                     "POC/nPOC = зона інтересу, не entry trigger.",
                 ]
             )
@@ -4640,6 +4792,10 @@ def build_briefing_report(
     post_news_section = _build_post_news_reaction_section(tpo, target_date, tz_name, normalized_type)
     if post_news_section is not None:
         report.sections.append(post_news_section)
+
+    intermarket_section = _build_intermarket_context_section(tpo, normalized_type)
+    if intermarket_section is not None:
+        report.sections.append(intermarket_section)
 
     report.sections.append(_build_tpo_snapshot_section(tpo, normalized_type, target_date, tz_name))
     report.sections.append(_build_suppressed_telegram_section())
