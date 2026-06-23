@@ -33,7 +33,7 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.22-faireconomy-forexfactory-calendar"
+BRIEFING_VERSION = "daily-market-briefing-v1.23-faireconomy-critical-medium-events"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -237,6 +237,65 @@ HIGH_IMPACT_KEYWORDS: tuple[str, ...] = (
     "OPEC",
     "CRUDE OIL INVENTORIES",
 )
+
+
+CRITICAL_MEDIUM_EVENT_KEYWORDS: tuple[str, ...] = (
+    # ForexFactory/Faireconomy often marks market-moving flash PMIs and
+    # housing/oil data as Medium even though they are session-relevant for our
+    # NY/London instruments. Keep these as calendar risk/watch events instead
+    # of returning a false EMPTY calendar.
+    "FLASH MANUFACTURING PMI",
+    "FLASH SERVICES PMI",
+    "MANUFACTURING PMI",
+    "SERVICES PMI",
+    "COMPOSITE PMI",
+    "ISM",
+    "GDP",
+    "PCE",
+    "CORE PCE",
+    "CPI",
+    "RETAIL SALES",
+    "DURABLE GOODS",
+    "JOBLESS CLAIMS",
+    "UNEMPLOYMENT",
+    "PAYROLL",
+    "JOLTS",
+    "CONSUMER CONFIDENCE",
+    "NEW HOME SALES",
+    "EXISTING HOME SALES",
+    "CRUDE OIL INVENTORIES",
+    "OIL INVENTORIES",
+    "EIA",
+    "OPEC",
+    "FOMC",
+    "FED",
+    "BOC",
+    "ECB",
+    "BOE",
+    "BOJ",
+    "SNB",
+    "RBA",
+)
+
+
+def _is_critical_medium_macro_event(impact: str, title: str, currency: str = "") -> bool:
+    normalized_impact = str(impact or "").strip().upper()
+    if normalized_impact not in {"MEDIUM", "ORANGE", "2", "2.0"}:
+        return False
+
+    title_upper = str(title or "").upper()
+    if any(keyword in title_upper for keyword in CRITICAL_MEDIUM_EVENT_KEYWORDS):
+        return True
+
+    # Central-bank speeches are not all equal, but Governor/President/Chair
+    # speeches can move FX/index/gold intraday. Keep them as watch risk.
+    cur = str(currency or "").upper()
+    if cur in {"USD", "EUR", "GBP", "JPY", "CAD", "CHF", "AUD"}:
+        if any(word in title_upper for word in ("SPEAKS", "TESTIFIES", "PRESS CONFERENCE")):
+            if any(bank in title_upper for bank in ("FED", "FOMC", "ECB", "BOE", "BOJ", "BOC", "SNB", "RBA", "CHAIR", "PRESIDENT", "GOV")):
+                return True
+
+    return False
 
 
 @dataclass
@@ -1373,9 +1432,15 @@ def _normalize_faireconomy_xml_event(raw: dict[str, Any], target_date: date, rep
     if currency not in RELEVANT_RISK_CURRENCIES:
         return None
 
-    impact = _normalize_impact(raw.get("impact"), title)
-    if impact not in {"HIGH", "RED", "IMPORTANT"}:
+    source_impact = _normalize_impact(raw.get("impact"), title)
+    critical_medium = _is_critical_medium_macro_event(source_impact, title, currency)
+    if source_impact not in {"HIGH", "RED", "IMPORTANT"} and not critical_medium:
         return None
+
+    # Keep critical Medium events in the same risk pipeline to avoid false
+    # EMPTY calendars, but preserve the original feed impact for transparency.
+    impact = "HIGH" if critical_medium else "HIGH"
+    risk_tier = "MACRO_WATCH_CRITICAL_MEDIUM" if critical_medium else "HIGH_IMPACT"
 
     parsed_dt = _parse_faireconomy_datetime(raw.get("date"), raw.get("time"), target_date, report_timezone)
     if parsed_dt is None:
@@ -1388,11 +1453,15 @@ def _normalize_faireconomy_xml_event(raw: dict[str, Any], target_date: date, rep
         "time": event_time,
         "timezone": event_tz,
         "currency": currency,
-        "impact": "HIGH",
+        "impact": impact,
+        "source_impact": source_impact,
+        "original_impact": source_impact,
+        "risk_tier": risk_tier,
+        "critical_medium": critical_medium,
         "title": title,
         "country": currency,
         "symbols": symbols,
-        "note": _event_trading_note(currency, title, "HIGH"),
+        "note": _event_trading_note(currency, title, impact),
         "source": FAIRECONOMY_SOURCE,
         "source_reliability": "unofficial_weekly_xml_feed",
         "raw_time": str(raw.get("time") or "").strip(),
@@ -1527,7 +1596,7 @@ def _fetch_faireconomy_forexfactory_calendar(target_date: date) -> CalendarLoadR
         status=MACRO_OK if normalized_events else MACRO_EMPTY,
         source=FAIRECONOMY_SOURCE,
         events=normalized_events,
-        message="Loaded Faireconomy / Forex Factory weekly XML calendar.",
+        message="Loaded Faireconomy / Forex Factory weekly XML calendar, including critical Medium macro watch events.",
         cache_path=str(cache_path),
         macro_risk_status=MACRO_OK if normalized_events else MACRO_EMPTY,
         data_freshness="faireconomy_fresh",
@@ -2600,7 +2669,7 @@ def load_high_impact_calendar(target_date: date) -> CalendarLoadResult:
     """
     High-impact macro calendar cascade.
 
-    Order v1.22:
+    Order v1.23:
     1) manual operator JSON override, if populated;
     2) Faireconomy / Forex Factory weekly XML calendar primary free fallback;
     3) EODHD Economic Events Data API provider, if plan allows it;
