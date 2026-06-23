@@ -57,7 +57,7 @@ from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.5.9-ltf-entry-window-safe-timeframe-resolution"
+RUNNER_VERSION = "1.6.0-context-invalidation-stop-bridge"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -556,6 +556,93 @@ def _safe_bool_for_guard(value: Any) -> bool:
     text = str(value).strip().lower()
     return text in {"1", "true", "yes", "y", "on", "confirmed", "ok"}
 
+
+def _compute_context_rr(direction: str, entry: float | None, stop: float | None, target: float | None) -> float | None:
+    if direction not in {"LONG", "SHORT"} or entry is None or stop is None or target is None:
+        return None
+    risk = abs(stop - entry)
+    if risk <= 0:
+        return None
+    if direction == "LONG":
+        if not (stop < entry < target):
+            return None
+        reward = target - entry
+    else:
+        if not (target < entry < stop):
+            return None
+        reward = entry - target
+    if reward <= 0:
+        return None
+    return reward / risk
+
+
+def _apply_context_invalidation_stop_to_payload(payload: dict[str, Any], detector_result: dict[str, Any]) -> None:
+    """Replace micro/noise stop with universal context-invalidation stop when available.
+
+    Rule: the stop belongs beyond the zone that invalidates the setup context.
+    This is asset-agnostic. If the context stop makes RR invalid, downstream RR
+    gates will block the trade instead of moving the stop closer.
+    """
+    if not isinstance(payload, dict) or not isinstance(detector_result, dict):
+        return
+
+    if not _safe_bool_for_guard(detector_result.get("context_stop_valid")):
+        return
+
+    direction = str(
+        payload.get("direction")
+        or payload.get("side")
+        or detector_result.get("entry_window_direction")
+        or ""
+    ).upper()
+    if direction not in {"LONG", "SHORT"}:
+        return
+
+    context_stop = _safe_float_for_alert(detector_result.get("context_stop_price"))
+    entry = _safe_float_for_alert(
+        payload.get("entry_reference_price")
+        or payload.get("entry")
+        or payload.get("entry_price")
+        or payload.get("planned_entry")
+    )
+    target = _safe_float_for_alert(
+        payload.get("target_reference_price")
+        or payload.get("take_profit")
+        or payload.get("target")
+        or payload.get("planned_target")
+    )
+    current_stop = _safe_float_for_alert(
+        payload.get("invalidation_reference_price")
+        or payload.get("stop_loss")
+        or payload.get("stop")
+        or payload.get("planned_stop")
+    )
+
+    if context_stop is None or entry is None:
+        return
+
+    # Context stop must be on the correct side of entry. If it is not, do not
+    # silently repair with a closer/micro stop. Let normal gates reject later.
+    if direction == "LONG" and not context_stop < entry:
+        payload["context_stop_invalid_reason"] = "context_stop_not_below_long_entry"
+        return
+    if direction == "SHORT" and not context_stop > entry:
+        payload["context_stop_invalid_reason"] = "context_stop_not_above_short_entry"
+        return
+
+    payload["original_invalidation_reference_price"] = current_stop
+    payload["invalidation_reference_price"] = round(context_stop, 8)
+    payload["context_stop_applied"] = True
+    payload["context_stop_model_version"] = RUNNER_VERSION
+    payload["stop_model_hint"] = "CONTEXT_INVALIDATION_STOP"
+    payload["stop_quality"] = "OK"
+
+    rr = _compute_context_rr(direction, entry, context_stop, target)
+    if rr is not None:
+        rr = round(float(rr), 4)
+        payload["risk_reward_ratio"] = rr
+        payload["practical_rr"] = rr
+        payload["context_stop_practical_rr"] = rr
 
 def _parse_guard_datetime(value: Any) -> datetime | None:
     if value is None:
@@ -2778,6 +2865,16 @@ class StatefulBatchRunner:
             payload["ltf_liquidity_level"] = result.get("liquidity_level")
             payload["ltf_sweep_extreme"] = result.get("sweep_extreme")
             payload["ltf_pullback_extreme"] = result.get("pullback_extreme")
+            payload["stop_anchor"] = result.get("stop_anchor")
+            payload["context_invalidation_zone"] = result.get("context_invalidation_zone")
+            payload["context_invalidation_price"] = result.get("context_invalidation_price")
+            payload["context_stop_price"] = result.get("context_stop_price")
+            payload["context_stop_buffer"] = result.get("context_stop_buffer")
+            payload["context_stop_side"] = result.get("context_stop_side")
+            payload["context_stop_valid"] = bool(result.get("context_stop_valid"))
+            payload["context_stop_reason"] = result.get("context_stop_reason")
+
+            _apply_context_invalidation_stop_to_payload(payload, result)
 
             # Merge confirmations conservatively: detector positives may unlock
             # a fresh retest entry, but existing upstream positives are preserved.
@@ -2817,6 +2914,17 @@ class StatefulBatchRunner:
                     "ltf_entry_model_hint": payload["ltf_entry_model_hint"],
                     "ltf_stop_model_hint": payload["ltf_stop_model_hint"],
                     "ltf_target_model_hint": payload["ltf_target_model_hint"],
+                    "stop_anchor": payload.get("stop_anchor"),
+                    "context_invalidation_zone": payload.get("context_invalidation_zone"),
+                    "context_invalidation_price": payload.get("context_invalidation_price"),
+                    "context_stop_price": payload.get("context_stop_price"),
+                    "context_stop_buffer": payload.get("context_stop_buffer"),
+                    "context_stop_side": payload.get("context_stop_side"),
+                    "context_stop_valid": payload.get("context_stop_valid"),
+                    "context_stop_reason": payload.get("context_stop_reason"),
+                    "context_stop_applied": payload.get("context_stop_applied"),
+                    "original_invalidation_reference_price": payload.get("original_invalidation_reference_price"),
+                    "context_stop_practical_rr": payload.get("context_stop_practical_rr"),
                     "runner_version": RUNNER_VERSION,
                 }
             )
@@ -4704,6 +4812,17 @@ class StatefulBatchRunner:
             "ltf_liquidity_level": tracked_payload.get("ltf_liquidity_level"),
             "ltf_sweep_extreme": tracked_payload.get("ltf_sweep_extreme"),
             "ltf_pullback_extreme": tracked_payload.get("ltf_pullback_extreme"),
+            "stop_anchor": tracked_payload.get("stop_anchor"),
+            "context_invalidation_zone": tracked_payload.get("context_invalidation_zone"),
+            "context_invalidation_price": tracked_payload.get("context_invalidation_price"),
+            "context_stop_price": tracked_payload.get("context_stop_price"),
+            "context_stop_buffer": tracked_payload.get("context_stop_buffer"),
+            "context_stop_side": tracked_payload.get("context_stop_side"),
+            "context_stop_valid": tracked_payload.get("context_stop_valid"),
+            "context_stop_reason": tracked_payload.get("context_stop_reason"),
+            "context_stop_applied": tracked_payload.get("context_stop_applied"),
+            "original_invalidation_reference_price": tracked_payload.get("original_invalidation_reference_price"),
+            "context_stop_practical_rr": tracked_payload.get("context_stop_practical_rr"),
             "tpo_watch_active": tracked_payload.get("tpo_watch_active"),
             "tpo_watch_setup": tracked_payload.get("tpo_watch_setup"),
             "tpo_watch_reason": tracked_payload.get("tpo_watch_reason"),
@@ -4745,6 +4864,17 @@ class StatefulBatchRunner:
             "ltf_liquidity_level",
             "ltf_sweep_extreme",
             "ltf_pullback_extreme",
+            "stop_anchor",
+            "context_invalidation_zone",
+            "context_invalidation_price",
+            "context_stop_price",
+            "context_stop_buffer",
+            "context_stop_side",
+            "context_stop_valid",
+            "context_stop_reason",
+            "context_stop_applied",
+            "original_invalidation_reference_price",
+            "context_stop_practical_rr",
             "target_source",
             "target_quality",
             "target_zone_type",
@@ -4843,6 +4973,9 @@ class StatefulBatchRunner:
                 "fresh_entry_window": enriched_payload.get("fresh_entry_window"),
                 "ltf_entry_model_hint": enriched_payload.get("ltf_entry_model_hint"),
                 "ltf_stop_model_hint": enriched_payload.get("ltf_stop_model_hint"),
+                "context_invalidation_zone": enriched_payload.get("context_invalidation_zone"),
+                "context_stop_price": enriched_payload.get("context_stop_price"),
+                "context_stop_applied": enriched_payload.get("context_stop_applied"),
                 "ltf_target_model_hint": enriched_payload.get("ltf_target_model_hint"),
                 "execution_timeframe": enriched_payload.get("execution_timeframe"),
                 "trigger_reason": enriched_payload.get("trigger_reason"),

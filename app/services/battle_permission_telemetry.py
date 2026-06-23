@@ -11,7 +11,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-TELEMETRY_SCHEMA_VERSION = "battle-permission-telemetry-v3.5-ltf-entry-window-fields"
+TELEMETRY_SCHEMA_VERSION = "battle-permission-telemetry-v3.6-context-invalidation-stop-fields"
 
 
 # =============================================================================
@@ -985,7 +985,7 @@ def build_battle_permission_event(
             metadata.get("battle_bias_hint"),
         ),
 
-        # LTF entry-window execution layer (runner v1.5.8+).
+        # LTF entry-window execution layer (runner v1.5.8+ / context stop runner v1.6.0+).
         # These fields separate late-chase continuation from a fresh retest / sweep-reclaim entry window.
         "ltf_entry_window_detector_version": _first_non_empty(
             payload.get("ltf_entry_window_detector_version"),
@@ -1132,6 +1132,43 @@ def build_battle_permission_event(
         ),
         "ltf_pullback_extreme": _safe_float(
             _first_non_empty(payload.get("ltf_pullback_extreme"), metadata.get("ltf_pullback_extreme"), context.get("ltf_pullback_extreme"))
+        ),
+        "stop_anchor": _first_non_empty(
+            payload.get("stop_anchor"), metadata.get("stop_anchor"), context.get("stop_anchor")
+        ),
+        "context_invalidation_zone": _first_non_empty(
+            payload.get("context_invalidation_zone"), metadata.get("context_invalidation_zone"), context.get("context_invalidation_zone")
+        ),
+        "context_invalidation_price": _safe_float(
+            _first_non_empty(payload.get("context_invalidation_price"), metadata.get("context_invalidation_price"), context.get("context_invalidation_price"))
+        ),
+        "context_stop_price": _safe_float(
+            _first_non_empty(payload.get("context_stop_price"), metadata.get("context_stop_price"), context.get("context_stop_price"))
+        ),
+        "context_stop_buffer": _safe_float(
+            _first_non_empty(payload.get("context_stop_buffer"), metadata.get("context_stop_buffer"), context.get("context_stop_buffer"))
+        ),
+        "context_stop_side": _first_non_empty(
+            payload.get("context_stop_side"), metadata.get("context_stop_side"), context.get("context_stop_side")
+        ),
+        "context_stop_valid": _safe_bool(
+            _first_non_empty(payload.get("context_stop_valid"), metadata.get("context_stop_valid"), context.get("context_stop_valid"))
+        ),
+        "context_stop_reason": _first_non_empty(
+            payload.get("context_stop_reason"), metadata.get("context_stop_reason"), context.get("context_stop_reason")
+        ),
+        "context_stop_applied": _safe_bool(
+            _first_non_empty(payload.get("context_stop_applied"), metadata.get("context_stop_applied"), context.get("context_stop_applied"))
+        ),
+        "original_invalidation_reference_price": _safe_float(
+            _first_non_empty(
+                payload.get("original_invalidation_reference_price"),
+                metadata.get("original_invalidation_reference_price"),
+                context.get("original_invalidation_reference_price"),
+            )
+        ),
+        "context_stop_practical_rr": _safe_float(
+            _first_non_empty(payload.get("context_stop_practical_rr"), metadata.get("context_stop_practical_rr"), context.get("context_stop_practical_rr"))
         ),
         "ltf_candles_available_5m": _safe_float(
             _first_non_empty(payload.get("ltf_candles_available_5m"), metadata.get("ltf_candles_available_5m"), context.get("ltf_candles_available_5m"))

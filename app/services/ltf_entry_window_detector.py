@@ -1,6 +1,6 @@
 """LTF entry-window detector for AI Market Analyst.
 
-Version: ltf-entry-window-detector-v1.0-auction-execution-layer
+Version: ltf-entry-window-detector-v1.1-context-invalidation-stop-model
 
 Purpose
 -------
@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 
-LTF_ENTRY_WINDOW_DETECTOR_VERSION = "ltf-entry-window-detector-v1.0-auction-execution-layer"
+LTF_ENTRY_WINDOW_DETECTOR_VERSION = "ltf-entry-window-detector-v1.1-context-invalidation-stop-model"
 
 # Entry window types
 ENTRY_WINDOW_NONE = "ENTRY_WINDOW_NONE"
@@ -64,6 +64,7 @@ STOP_BEHIND_SWEEP_EXTREME = "BEHIND_SWEEP_EXTREME"
 STOP_BEHIND_PULLBACK_STRUCTURE = "BEHIND_PULLBACK_STRUCTURE"
 STOP_BEHIND_FAILED_ACCEPTANCE_EXTREME = "BEHIND_FAILED_ACCEPTANCE_EXTREME"
 STOP_UNDEFINED = "UNDEFINED"
+STOP_CONTEXT_INVALIDATION = "CONTEXT_INVALIDATION_STOP"
 
 TARGET_TO_VALUE_EDGE_OR_LIQUIDITY = "TO_VALUE_EDGE_OR_LIQUIDITY"
 TARGET_TO_NEXT_INTEREST_ZONE = "TO_NEXT_INTEREST_ZONE"
@@ -120,6 +121,18 @@ class LtfEntryWindowResult:
     sweep_extreme: Optional[float] = None
     pullback_extreme: Optional[float] = None
 
+    # Universal stop model: stop is anchored beyond the zone where the
+    # current trade idea is invalidated. This is context-based for every
+    # asset, not symbol-specific micro-stop logic.
+    stop_anchor: Optional[str] = None
+    context_invalidation_zone: Optional[str] = None
+    context_invalidation_price: Optional[float] = None
+    context_stop_price: Optional[float] = None
+    context_stop_buffer: Optional[float] = None
+    context_stop_side: Optional[str] = None
+    context_stop_valid: bool = False
+    context_stop_reason: Optional[str] = None
+
     blockers: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
     reasons: List[str] = field(default_factory=list)
@@ -132,6 +145,9 @@ class LtfEntryWindowResult:
         data["confidence"] = round(float(data.get("confidence") or 0.0), 4)
         if data.get("already_moved_R") is not None:
             data["already_moved_R"] = round(float(data["already_moved_R"]), 4)
+        for key in ("context_invalidation_price", "context_stop_price", "context_stop_buffer"):
+            if data.get(key) is not None:
+                data[key] = round(float(data[key]), 8)
         return data
 
 
@@ -317,7 +333,7 @@ def _detect_sweep_reclaim_retest(
     extreme = candle_signal.get("sweep_extreme")
     retest_level = candle_signal.get("retest_level") or liquidity_level
 
-    return LtfEntryWindowResult(
+    result = LtfEntryWindowResult(
         ltf_entry_window_detected=detected,
         entry_window_type=window_type,
         entry_window_state=state,
@@ -342,6 +358,14 @@ def _detect_sweep_reclaim_retest(
         warnings=warnings,
         reasons=reasons,
         relevant_levels=dict(levels),
+    )
+    return _apply_context_invalidation_stop_model(
+        result,
+        payload=payload,
+        direction=direction,
+        anchor="SWEEP_EXTREME",
+        invalidation_price=extreme,
+        zone_label="sweep_extreme",
     )
 
 
@@ -417,7 +441,7 @@ def _detect_continuation_retest(
     if not retest_confirmed:
         warnings.append("Continuation context exists, but pullback/retest is not confirmed yet.")
 
-    return LtfEntryWindowResult(
+    result = LtfEntryWindowResult(
         ltf_entry_window_detected=detected,
         entry_window_type=window_type,
         entry_window_state=state,
@@ -440,6 +464,14 @@ def _detect_continuation_retest(
         warnings=warnings,
         reasons=reasons,
         relevant_levels=dict(levels),
+    )
+    return _apply_context_invalidation_stop_model(
+        result,
+        payload=payload,
+        direction=direction,
+        anchor="PULLBACK_STRUCTURE_EXTREME",
+        invalidation_price=candle_signal.get("pullback_extreme"),
+        zone_label="pullback_structure_extreme",
     )
 
 
@@ -512,7 +544,7 @@ def _detect_failed_acceptance_retest(
         detected = False
         blockers.append("failed_acceptance_entry_too_late_without_retest")
 
-    return LtfEntryWindowResult(
+    result = LtfEntryWindowResult(
         ltf_entry_window_detected=detected,
         entry_window_type=window_type,
         entry_window_state=state,
@@ -536,6 +568,66 @@ def _detect_failed_acceptance_retest(
         reasons=reasons,
         relevant_levels=dict(levels),
     )
+    return _apply_context_invalidation_stop_model(
+        result,
+        payload=payload,
+        direction=direction,
+        anchor="FAILED_ACCEPTANCE_EXTREME",
+        invalidation_price=candle_signal.get("failed_acceptance_extreme"),
+        zone_label="failed_acceptance_extreme",
+    )
+
+
+def _apply_context_invalidation_stop_model(
+    result: LtfEntryWindowResult,
+    *,
+    payload: Mapping[str, Any],
+    direction: str,
+    anchor: str,
+    invalidation_price: Optional[float],
+    zone_label: str,
+) -> LtfEntryWindowResult:
+    """Attach the universal context-invalidation stop model.
+
+    The stop is not symbol-specific and not optimized to make RR look better.
+    It is placed beyond the level/zone where the setup is objectively wrong:
+    sweep extreme, pullback/test extreme, failed-acceptance extreme, or value
+    edge depending on the active setup.
+    """
+    result.stop_model_hint = STOP_CONTEXT_INVALIDATION
+    result.stop_anchor = anchor
+    result.context_invalidation_zone = zone_label
+    result.context_invalidation_price = invalidation_price
+
+    if direction == "LONG":
+        result.context_stop_side = "BELOW_CONTEXT_INVALIDATION_ZONE"
+    elif direction == "SHORT":
+        result.context_stop_side = "ABOVE_CONTEXT_INVALIDATION_ZONE"
+    else:
+        result.context_stop_side = None
+
+    if direction not in {"LONG", "SHORT"} or invalidation_price is None:
+        result.context_stop_valid = False
+        result.context_stop_reason = "Context invalidation stop could not be computed: missing direction or invalidation price."
+        if "context_invalidation_stop_missing" not in result.warnings:
+            result.warnings.append("context_invalidation_stop_missing")
+        return result
+
+    buffer_value = _price_tolerance(payload, invalidation_price)
+    if buffer_value <= 0:
+        buffer_value = max(abs(invalidation_price) * DEFAULT_SYMBOL_TOLERANCE_PCT, DEFAULT_SYMBOL_TOLERANCE_PCT)
+
+    result.context_stop_buffer = buffer_value
+    if direction == "LONG":
+        result.context_stop_price = invalidation_price - buffer_value
+    else:
+        result.context_stop_price = invalidation_price + buffer_value
+
+    result.context_stop_valid = True
+    result.context_stop_reason = (
+        f"Stop is anchored beyond {zone_label}; context is invalidated beyond this zone."
+    )
+    return result
 
 
 def _detect_late_chase(
@@ -1128,6 +1220,7 @@ __all__ = [
     "STATE_CONFIRMED",
     "STATE_LATE",
     "STATE_INVALID",
+    "STOP_CONTEXT_INVALIDATION",
     "ENTRY_QUALITY_GOOD",
     "ENTRY_QUALITY_WEAK",
     "ENTRY_QUALITY_LATE",
