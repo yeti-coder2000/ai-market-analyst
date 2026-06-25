@@ -62,7 +62,7 @@ from typing import Any
 import pandas as pd
 
 
-LTF_MODEL_DETECTOR_VERSION = "tpo-ltf-model-detector-v1.5-auction-state-watch-gate"
+LTF_MODEL_DETECTOR_VERSION = "tpo-ltf-model-detector-v1.6-dalton-setup-families"
 
 MIN_CONFIRMED_RR = 2.0
 MIN_BARS = 8
@@ -83,6 +83,40 @@ OTD_WATCH_SETUPS = {
 }
 ORR_WATCH_SETUPS = {
     "OPEN_REJECTION_REVERSE",
+}
+OD_WATCH_SETUPS = {
+    "OPEN_DRIVE",
+    "OPEN_DRIVE_CONFIRMED",
+}
+AUCTION_BREAKOUT_WATCH_SETUPS = {
+    "OPEN_AUCTION_ACCEPTED_BREAKOUT",
+    "OPEN_AUCTION_OUT_OF_RANGE_ACCEPTED_BREAKOUT",
+}
+AUCTION_BACK_TO_VALUE_WATCH_SETUPS = {
+    "OPEN_AUCTION_OUT_OF_RANGE_FAILED_ACCEPTANCE",
+    "OPEN_AUCTION_FAILED_ACCEPTANCE",
+    "FAILED_ACCEPTANCE_BACK_TO_VALUE",
+}
+VALUE_ACCEPTED_OUTSIDE_STATES = {
+    "ACCEPTED_OUTSIDE_VALUE",
+    "ACCEPTED_OUTSIDE_PRIOR_VALUE",
+    "ACCEPTED_OUTSIDE_RANGE",
+    "ACCEPTED_OUTSIDE_PRIOR_RANGE",
+    "ACCEPTED_ABOVE_VALUE",
+    "ACCEPTED_BELOW_VALUE",
+    "ACCEPTED_BREAKOUT",
+    "ACCEPTED_EXTENSION",
+    "IB_ACCEPTED_EXTENSION",
+}
+VALUE_REJECTED_BACK_STATES = {
+    "REJECTED_BACK_INTO_PRIOR_VALUE",
+    "REJECTED_BACK_INTO_PRIOR_RANGE",
+    "FAILED_ACCEPTANCE_INTO_PRIOR_VALUE",
+    "FAILED_ACCEPTANCE_INTO_PRIOR_RANGE",
+    "ACCEPTED_BACK_INSIDE_VALUE",
+    "ACCEPTED_INSIDE_VALUE",
+    "VALUE_ACCEPTED_INSIDE",
+    "FAILED_OUTSIDE_VALUE",
 }
 AUCTION_OBSERVE_STATES = {
     "OBSERVE_ONLY",
@@ -1176,10 +1210,16 @@ def _auction_watch_context(payload: dict[str, Any]) -> dict[str, Any]:
     ]
 
     auction_ltf_setup: str | None = None
-    if any(value in OTD_WATCH_SETUPS for value in candidates):
+    if any(value in OD_WATCH_SETUPS for value in candidates):
+        auction_ltf_setup = "OPEN_DRIVE"
+    elif any(value in OTD_WATCH_SETUPS for value in candidates):
         auction_ltf_setup = "OPEN_TEST_DRIVE"
     elif any(value in ORR_WATCH_SETUPS for value in candidates):
         auction_ltf_setup = "OPEN_REJECTION_REVERSE"
+    elif any(value in AUCTION_BREAKOUT_WATCH_SETUPS for value in candidates) or value_acceptance_state in VALUE_ACCEPTED_OUTSIDE_STATES:
+        auction_ltf_setup = "OPEN_AUCTION_BREAKOUT"
+    elif any(value in AUCTION_BACK_TO_VALUE_WATCH_SETUPS for value in candidates) or value_acceptance_state in VALUE_REJECTED_BACK_STATES:
+        auction_ltf_setup = "OPEN_AUCTION_BACK_TO_VALUE"
 
     diagnostics = {
         "tpo_watch_state": tpo_watch_state,
@@ -1221,6 +1261,16 @@ def _auction_watch_context(payload: dict[str, Any]) -> dict[str, Any]:
         diagnostics["watch_blocker"] = f"otd_invalidated_by_value_acceptance:{value_acceptance_state}"
         return diagnostics
 
+    if auction_ltf_setup == "OPEN_AUCTION_BREAKOUT" and value_acceptance_state not in VALUE_ACCEPTED_OUTSIDE_STATES:
+        diagnostics["active_watch"] = False
+        diagnostics["watch_blocker"] = f"open_auction_breakout_without_acceptance:{value_acceptance_state or 'missing'}"
+        return diagnostics
+
+    if auction_ltf_setup == "OPEN_AUCTION_BACK_TO_VALUE" and value_acceptance_state not in VALUE_REJECTED_BACK_STATES:
+        diagnostics["active_watch"] = False
+        diagnostics["watch_blocker"] = f"open_auction_back_to_value_without_failed_acceptance:{value_acceptance_state or 'missing'}"
+        return diagnostics
+
     diagnostics["active_watch"] = True
     diagnostics["watch_blocker"] = None
     return diagnostics
@@ -1229,6 +1279,100 @@ def _auction_watch_context(payload: dict[str, Any]) -> dict[str, Any]:
 def _is_active_tpo_auction_watch(payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
     diagnostics = _auction_watch_context(payload)
     return bool(diagnostics.get("active_watch")), diagnostics
+
+
+def _auction_setup_profile(setup_family: str | None) -> dict[str, Any]:
+    """Return operational labels for each Dalton-style auction setup family."""
+    family = _s(setup_family or "OPEN_TEST_DRIVE")
+
+    profiles: dict[str, dict[str, Any]] = {
+        "OPEN_DRIVE": {
+            "watch_scenario": "TPO_OPEN_DRIVE_WATCH",
+            "pending_model_type": "PULLBACK_CONTINUATION",
+            "pending_execution_model": "PULLBACK_CONTINUATION",
+            "watch_reason": (
+                "TPO OPEN_DRIVE is active; wait for early continuation or pullback/retest hold, "
+                "never late chase after the first impulse is gone."
+            ),
+            "confirmed_scenario_prefix": "TPO_OPEN_DRIVE",
+            "confirmed_model_type": "PULLBACK_CONTINUATION",
+            "confirmed_execution_model": "PULLBACK_CONTINUATION",
+            "confirmed_label": "OPEN_DRIVE",
+            "pending_confidence": 0.56,
+            "confirmed_confidence": 0.70,
+            "ready_confidence": 0.72,
+            "requires_caution": False,
+        },
+        "OPEN_TEST_DRIVE": {
+            "watch_scenario": "TPO_OPEN_TEST_DRIVE_WATCH",
+            "pending_model_type": "FAILED_ACCEPTANCE_RETEST",
+            "pending_execution_model": "FAILED_ACCEPTANCE_RETEST",
+            "watch_reason": (
+                "TPO OPEN_TEST_DRIVE auction-state is active; waiting for failed probe/reclaim "
+                "and directional 15m confirmation."
+            ),
+            "confirmed_scenario_prefix": "TPO_OPEN_TEST_DRIVE",
+            "confirmed_model_type": "FAILED_ACCEPTANCE_RETEST",
+            "confirmed_execution_model": "FAILED_ACCEPTANCE_RETEST",
+            "confirmed_label": "OPEN_TEST_DRIVE",
+            "pending_confidence": 0.55,
+            "confirmed_confidence": 0.64,
+            "ready_confidence": 0.68,
+            "requires_caution": False,
+        },
+        "OPEN_REJECTION_REVERSE": {
+            "watch_scenario": "TPO_OPEN_REJECTION_REVERSE_WATCH",
+            "pending_model_type": "RECLAIM_BOS_RETEST",
+            "pending_execution_model": "RECLAIM_BOS_RETEST",
+            "watch_reason": (
+                "TPO OPEN_REJECTION_REVERSE is active; waiting for a very clean 15m reclaim/BOS/retest. "
+                "ORR has lower conviction than OD/OTD, so no chase."
+            ),
+            "confirmed_scenario_prefix": "TPO_OPEN_REJECTION_REVERSE",
+            "confirmed_model_type": "RECLAIM_BOS_RETEST",
+            "confirmed_execution_model": "RECLAIM_BOS_RETEST",
+            "confirmed_label": "OPEN_REJECTION_REVERSE",
+            "pending_confidence": 0.53,
+            "confirmed_confidence": 0.62,
+            "ready_confidence": 0.66,
+            "requires_caution": True,
+        },
+        "OPEN_AUCTION_BREAKOUT": {
+            "watch_scenario": "TPO_OPEN_AUCTION_BREAKOUT_WATCH",
+            "pending_model_type": "ACCEPTED_BREAKOUT_RETEST",
+            "pending_execution_model": "ACCEPTED_BREAKOUT_RETEST",
+            "watch_reason": (
+                "Open auction selected accepted-breakout branch; wait for hold/retest outside old value/range."
+            ),
+            "confirmed_scenario_prefix": "TPO_OPEN_AUCTION_BREAKOUT",
+            "confirmed_model_type": "ACCEPTED_BREAKOUT_RETEST",
+            "confirmed_execution_model": "ACCEPTED_BREAKOUT_RETEST",
+            "confirmed_label": "OPEN_AUCTION_BREAKOUT",
+            "pending_confidence": 0.54,
+            "confirmed_confidence": 0.63,
+            "ready_confidence": 0.67,
+            "requires_caution": False,
+        },
+        "OPEN_AUCTION_BACK_TO_VALUE": {
+            "watch_scenario": "TPO_OPEN_AUCTION_BACK_TO_VALUE_WATCH",
+            "pending_model_type": "FAILED_ACCEPTANCE_BACK_TO_VALUE",
+            "pending_execution_model": "FAILED_ACCEPTANCE_BACK_TO_VALUE",
+            "watch_reason": (
+                "Open auction out of range/value failed to build acceptance outside; waiting for back-to-value LTF confirmation."
+            ),
+            "confirmed_scenario_prefix": "TPO_OPEN_AUCTION_BACK_TO_VALUE",
+            "confirmed_model_type": "FAILED_ACCEPTANCE_BACK_TO_VALUE",
+            "confirmed_execution_model": "FAILED_ACCEPTANCE_BACK_TO_VALUE",
+            "confirmed_label": "OPEN_AUCTION_BACK_TO_VALUE",
+            "pending_confidence": 0.52,
+            "confirmed_confidence": 0.61,
+            "ready_confidence": 0.65,
+            "requires_caution": True,
+        },
+    }
+
+    return profiles.get(family, profiles["OPEN_TEST_DRIVE"])
+
 
 def detect_ltf_model(
     payload: dict[str, Any],
@@ -1270,10 +1414,15 @@ def detect_ltf_model(
     result.value_test_occurred = watch_diagnostics.get("value_test_occurred")
     result.value_rejection_confirmed = watch_diagnostics.get("value_rejection_confirmed")
     result.day_type_candidate = watch_diagnostics.get("day_type_candidate")
-    result.ltf_requires_caution = result.auction_ltf_setup == "OPEN_REJECTION_REVERSE"
+    result.ltf_requires_caution = bool(_auction_setup_profile(result.auction_ltf_setup).get("requires_caution"))
 
     if result.ltf_requires_caution:
-        result.warnings.append("orr_requires_caution")
+        if result.auction_ltf_setup == "OPEN_REJECTION_REVERSE":
+            result.warnings.append("orr_requires_caution")
+        elif result.auction_ltf_setup == "OPEN_AUCTION_BACK_TO_VALUE":
+            result.warnings.append("open_auction_back_to_value_requires_caution")
+        else:
+            result.warnings.append("auction_setup_requires_caution")
 
     result.diagnostics.update(
         {
@@ -1302,22 +1451,11 @@ def detect_ltf_model(
         return result.to_dict()
 
     setup_family = result.auction_ltf_setup or "OPEN_TEST_DRIVE"
-    if setup_family == "OPEN_REJECTION_REVERSE":
-        watch_scenario = "TPO_OPEN_REJECTION_REVERSE_WATCH"
-        pending_model_type = "RECLAIM_BOS_RETEST"
-        pending_execution_model = "RECLAIM_BOS_RETEST"
-        watch_reason = (
-            "TPO OPEN_REJECTION_REVERSE is active; waiting for a very clean "
-            "15m reclaim/BOS/retest before execution."
-        )
-    else:
-        watch_scenario = "TPO_OPEN_TEST_DRIVE_WATCH"
-        pending_model_type = "FAILED_ACCEPTANCE_RETEST"
-        pending_execution_model = "FAILED_ACCEPTANCE_RETEST"
-        watch_reason = (
-            "TPO OPEN_TEST_DRIVE auction-state is active; waiting for directional "
-            "15m LTF confirmation."
-        )
+    profile = _auction_setup_profile(setup_family)
+    watch_scenario = str(profile["watch_scenario"])
+    pending_model_type = str(profile["pending_model_type"])
+    pending_execution_model = str(profile["pending_execution_model"])
+    watch_reason = str(profile["watch_reason"])
 
     result.set_state("PENDING", "PENDING_WAITING_FOR_LTF_MODEL_CONFIRMATION")
     result.ltf_model_type = pending_model_type
@@ -1399,20 +1537,14 @@ def detect_ltf_model(
     result.target_zone_role = geometry.get("target_zone_role")
     result.target_zone_reason = geometry.get("target_zone_reason")
 
-    if setup_family == "OPEN_REJECTION_REVERSE":
-        result.scenario = f"TPO_OPEN_REJECTION_REVERSE_{direction}"
-        confirmed_model_type = "RECLAIM_BOS_RETEST"
-        confirmed_execution_model = "RECLAIM_BOS_RETEST"
-        confirmed_label = "OPEN_REJECTION_REVERSE"
-        result.confidence = 0.62
-        result.probability = 0.62
-    else:
-        result.scenario = f"TPO_OPEN_TEST_DRIVE_{direction}"
-        confirmed_model_type = "FAILED_ACCEPTANCE_RETEST"
-        confirmed_execution_model = "FAILED_ACCEPTANCE_RETEST"
-        confirmed_label = "OPEN_TEST_DRIVE"
-        result.confidence = 0.64
-        result.probability = 0.64
+    confirmed_prefix = str(profile["confirmed_scenario_prefix"])
+    confirmed_model_type = str(profile["confirmed_model_type"])
+    confirmed_execution_model = str(profile["confirmed_execution_model"])
+    confirmed_label = str(profile["confirmed_label"])
+    confirmed_confidence = float(profile.get("confirmed_confidence", 0.64))
+    result.scenario = f"{confirmed_prefix}_{direction}"
+    result.confidence = confirmed_confidence
+    result.probability = confirmed_confidence
 
     result.scenario_type = result.scenario
 
@@ -1474,13 +1606,10 @@ def detect_ltf_model(
     result.signal_class = "READY"
     result.execution_status = "EXECUTABLE"
     result.execution_model = confirmed_execution_model
-    result.trigger_reason = (
-        "ltf_model_confirmed_open_rejection_reverse"
-        if setup_family == "OPEN_REJECTION_REVERSE"
-        else "ltf_model_confirmed_open_test_drive"
-    )
-    result.confidence = 0.66 if setup_family == "OPEN_REJECTION_REVERSE" else 0.68
-    result.probability = 0.66 if setup_family == "OPEN_REJECTION_REVERSE" else 0.68
+    result.trigger_reason = f"ltf_model_confirmed_{str(setup_family).lower()}"
+    ready_confidence = float(profile.get("ready_confidence", result.confidence))
+    result.confidence = ready_confidence
+    result.probability = ready_confidence
     result.set_state("CONFIRMED", "CONFIRMED_EXECUTABLE")
     result.diagnostics["outcome"] = "CONFIRMED_EXECUTABLE"
     result.reasons.append("Execution geometry is valid; payload may continue to Battle Gate.")
@@ -1595,11 +1724,14 @@ def enrich_payload_with_ltf_model(
         enriched["status"] = result.get("status")
         enriched["signal_class"] = result.get("signal_class")
         enriched["stage"] = result.get("signal_class")
-        setup_name = (
-            "TPO_OPEN_REJECTION_REVERSE"
-            if result.get("auction_ltf_setup") == "OPEN_REJECTION_REVERSE"
-            else "TPO_OPEN_TEST_DRIVE"
-        )
+        setup_name_map = {
+            "OPEN_DRIVE": "TPO_OPEN_DRIVE",
+            "OPEN_TEST_DRIVE": "TPO_OPEN_TEST_DRIVE",
+            "OPEN_REJECTION_REVERSE": "TPO_OPEN_REJECTION_REVERSE",
+            "OPEN_AUCTION_BREAKOUT": "TPO_OPEN_AUCTION_BREAKOUT",
+            "OPEN_AUCTION_BACK_TO_VALUE": "TPO_OPEN_AUCTION_BACK_TO_VALUE",
+        }
+        setup_name = setup_name_map.get(result.get("auction_ltf_setup"), "TPO_OPEN_TEST_DRIVE")
         enriched["setup_type"] = setup_name
         enriched["setup_name"] = setup_name
         enriched["execution_status"] = result.get("execution_status")

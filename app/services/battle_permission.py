@@ -34,7 +34,7 @@ except Exception:  # pragma: no cover
     evaluate_macro_guard = None  # type: ignore[assignment]
 
 
-BATTLE_PERMISSION_VERSION = "battle-permission-v1.11-auction-state-ltf-gate"
+BATTLE_PERMISSION_VERSION = "battle-permission-v1.12-dalton-auction-branch-gate"
 
 # Signals that are structurally stale/invalid or post-shock with insufficient
 # reward must stay out of user-facing Telegram delivery. They remain in
@@ -49,10 +49,27 @@ OPEN_AUCTION_BEHAVIORS = {
     "OPEN_AUCTION_OUT_OF_RANGE",
 }
 TPO_DIRECTIONAL_AUCTION_BEHAVIORS = {
+    "OPEN_DRIVE",
+    "OPEN_DRIVE_CONFIRMED",
     "OPEN_TEST_DRIVE",
     "OPEN_TEST_DRIVE_CANDIDATE",
     "OPEN_TEST_DRIVE_CONFIRMED",
     "OPEN_REJECTION_REVERSE",
+    "OPEN_AUCTION_ACCEPTED_BREAKOUT",
+    "OPEN_AUCTION_OUT_OF_RANGE_ACCEPTED_BREAKOUT",
+    "OPEN_AUCTION_OUT_OF_RANGE_FAILED_ACCEPTANCE",
+    "OPEN_AUCTION_FAILED_ACCEPTANCE",
+}
+TPO_AUCTION_LTF_SETUP_FAMILIES = {
+    "OPEN_DRIVE",
+    "OPEN_TEST_DRIVE",
+    "OPEN_REJECTION_REVERSE",
+    "OPEN_AUCTION_BREAKOUT",
+    "OPEN_AUCTION_BACK_TO_VALUE",
+}
+OPEN_AUCTION_LTF_EXCEPTION_SETUPS = {
+    "OPEN_AUCTION_BREAKOUT",
+    "OPEN_AUCTION_BACK_TO_VALUE",
 }
 TPO_AUCTION_WATCH_STATES = {
     "LTF_MODEL_PENDING",
@@ -127,6 +144,8 @@ class BattlePermissionResult:
     value_test_occurred: bool | None = None
     value_rejection_confirmed: bool | None = None
     day_type_candidate: str | None = None
+    structure_state: str | None = None
+    one_timeframing_state: str | None = None
     auction_state_confidence: float | None = None
     auction_state_reason: str | None = None
 
@@ -515,7 +534,7 @@ def _policy_hint_requires_research_only(*, inputs: dict[str, Any], policy_flags:
     if entry_model_hint in {"NO_DIRECTIONAL_ENTRY_MODEL", "NO_ENTRY_MODEL", "ROTATION_ONLY_IF_LTF_CONFIRMED"}:
         hard.append(f"policy_hint_entry_{entry_model_hint.lower()}")
 
-    if open_behavior == "OPEN_AUCTION":
+    if open_behavior == "OPEN_AUCTION" and not _open_auction_ltf_exception(inputs):
         hard.append("policy_hint_open_auction_requires_late_continuation")
 
     return bool(hard), hard
@@ -1090,9 +1109,9 @@ def _is_tpo_otd_long_stats_downgrade_required(inputs: dict[str, Any]) -> tuple[b
     if direction != "LONG":
         return False, None
 
-    scenario_family = _as_upper(inputs.get("scenario_family"))
-    scenario = _as_upper(inputs.get("scenario"))
-    open_behavior = _as_upper(inputs.get("open_behavior"))
+    scenario_family = _as_upper(inputs.get("scenario_family")) or ""
+    scenario = _as_upper(inputs.get("scenario")) or ""
+    open_behavior = _as_upper(inputs.get("open_behavior")) or ""
 
     is_otd = (
         scenario_family == "TPO_OPEN_TEST_DRIVE"
@@ -1578,13 +1597,13 @@ def _is_tpo_auction_execution_context(inputs: dict[str, Any]) -> bool:
     ltf_model_state_full = _as_upper(inputs.get("ltf_model_state_full"))
     ltf_model_outcome = _as_upper(inputs.get("ltf_model_outcome"))
 
-    if scenario_family == "TPO_OPEN_TEST_DRIVE":
+    if scenario_family in {"TPO_OPEN_DRIVE", "TPO_OPEN_TEST_DRIVE", "TPO_OPEN_REJECTION_REVERSE", "TPO_OPEN_AUCTION_BREAKOUT", "TPO_OPEN_AUCTION_BACK_TO_VALUE"}:
         return True
-    if any(token in scenario for token in {"TPO_OPEN_TEST_DRIVE", "TPO_OPEN_REJECTION_REVERSE"}):
+    if any(token in scenario for token in {"TPO_OPEN_DRIVE", "TPO_OPEN_TEST_DRIVE", "TPO_OPEN_REJECTION_REVERSE", "TPO_OPEN_AUCTION_BREAKOUT", "TPO_OPEN_AUCTION_BACK_TO_VALUE"}):
         return True
     if tpo_watch_state in TPO_AUCTION_WATCH_STATES:
         return True
-    if tpo_watch_setup in TPO_DIRECTIONAL_AUCTION_BEHAVIORS or auction_ltf_setup in {"OPEN_TEST_DRIVE", "OPEN_REJECTION_REVERSE"}:
+    if tpo_watch_setup in TPO_DIRECTIONAL_AUCTION_BEHAVIORS or auction_ltf_setup in TPO_AUCTION_LTF_SETUP_FAMILIES:
         return True
     if ltf_model_state or ltf_model_state_full or ltf_model_outcome:
         return True
@@ -1614,6 +1633,44 @@ def _ltf_model_executable(inputs: dict[str, Any]) -> bool:
         and ltf_outcome in LTF_EXECUTABLE_OUTCOMES
         and execution_status == "EXECUTABLE"
     )
+
+
+def _open_auction_ltf_exception(inputs: dict[str, Any]) -> bool:
+    """Allow an OPEN_AUCTION context through only after a proven branch + executable LTF model."""
+    if not _ltf_model_executable(inputs):
+        return False
+
+    tpo_watch_state = _as_upper(inputs.get("tpo_watch_state"))
+    auction_ltf_setup = _as_upper(inputs.get("auction_ltf_setup"))
+    tpo_watch_setup = _as_upper(inputs.get("tpo_watch_setup")) or ""
+
+    return (
+        tpo_watch_state == "LTF_MODEL_PENDING"
+        and (
+            auction_ltf_setup in OPEN_AUCTION_LTF_EXCEPTION_SETUPS
+            or "OPEN_AUCTION" in tpo_watch_setup
+        )
+    )
+
+
+def _trend_day_counter_fade_block(inputs: dict[str, Any]) -> tuple[bool, str | None]:
+    """Never fade a confirmed Trend/DD day while one-timeframing has not broken."""
+    direction = _normalize_direction(inputs.get("direction"))
+    signal_alignment = _as_upper(inputs.get("signal_alignment"))
+    day_type = _as_upper(inputs.get("day_type_candidate"))
+    structure_state = _as_upper(inputs.get("structure_state"))
+    one_timeframing_state = _as_upper(inputs.get("one_timeframing_state"))
+
+    haystack = " ".join(x for x in [day_type, structure_state, one_timeframing_state] if x)
+    if "ONE_TIMEFRAMING_UP" in haystack and direction == "SHORT":
+        return True, "short_against_active_one_timeframing_up"
+    if "ONE_TIMEFRAMING_DOWN" in haystack and direction == "LONG":
+        return True, "long_against_active_one_timeframing_down"
+
+    if day_type in {"TREND_DAY", "DOUBLE_DISTRIBUTION_TREND_DAY"} and signal_alignment == "COUNTER_TREND":
+        return True, f"counter_trend_against_{day_type.lower()}"
+
+    return False, None
 
 
 def _derive_scenario_family(
@@ -1649,8 +1706,20 @@ def _derive_scenario_family(
             return "POST_NEWS_RECLAIM"
         return "POST_LIQUIDATION_RECLAIM"
 
+    if "OPEN_AUCTION_BACK_TO_VALUE" in text:
+        return "TPO_OPEN_AUCTION_BACK_TO_VALUE"
+
+    if "OPEN_AUCTION_BREAKOUT" in text:
+        return "TPO_OPEN_AUCTION_BREAKOUT"
+
+    if "OPEN_REJECTION_REVERSE" in text:
+        return "TPO_OPEN_REJECTION_REVERSE"
+
     if "OPEN_TEST_DRIVE" in text:
         return "TPO_OPEN_TEST_DRIVE"
+
+    if "OPEN_DRIVE" in text:
+        return "TPO_OPEN_DRIVE"
 
     if "SWEEP_RETURN" in text:
         return "SWEEP_RETURN"
@@ -2400,6 +2469,34 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
         )
     )
 
+    structure_state = _as_upper(
+        _deep_get(
+            payload,
+            "metadata.structure_state",
+            "metadata.local_structure_state",
+            "metadata.auction_context.structure_state",
+            "metadata.context.structure_state",
+            "metadata.open_behavior.structure_state",
+            "context.structure_state",
+            "open_behavior.structure_state",
+            "structure_state",
+            "local_structure_state",
+        )
+    )
+
+    one_timeframing_state = _as_upper(
+        _deep_get(
+            payload,
+            "metadata.one_timeframing_state",
+            "metadata.auction_context.one_timeframing_state",
+            "metadata.context.one_timeframing_state",
+            "metadata.open_behavior.one_timeframing_state",
+            "context.one_timeframing_state",
+            "open_behavior.one_timeframing_state",
+            "one_timeframing_state",
+        )
+    )
+
     auction_state_confidence = _as_float(
         _deep_get(
             payload,
@@ -2718,6 +2815,8 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
         "value_test_occurred": value_test_occurred,
         "value_rejection_confirmed": value_rejection_confirmed,
         "day_type_candidate": day_type_candidate,
+        "structure_state": structure_state,
+        "one_timeframing_state": one_timeframing_state,
         "auction_state_confidence": auction_state_confidence,
         "auction_state_reason": auction_state_reason,
         "tpo_watch_state": tpo_watch_state,
@@ -2915,6 +3014,8 @@ def _build_result(
         value_test_occurred=inputs.get("value_test_occurred"),
         value_rejection_confirmed=inputs.get("value_rejection_confirmed"),
         day_type_candidate=inputs.get("day_type_candidate"),
+        structure_state=inputs.get("structure_state"),
+        one_timeframing_state=inputs.get("one_timeframing_state"),
         auction_state_confidence=inputs.get("auction_state_confidence"),
         auction_state_reason=inputs.get("auction_state_reason"),
         tpo_watch_state=inputs.get("tpo_watch_state"),
@@ -3057,6 +3158,8 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
     initial_open_behavior = _as_upper(inputs.get("initial_open_behavior"))
     current_open_behavior = _as_upper(inputs.get("current_open_behavior"))
     value_acceptance_state = _as_upper(inputs.get("value_acceptance_state"))
+    structure_state = _as_upper(inputs.get("structure_state"))
+    one_timeframing_state = _as_upper(inputs.get("one_timeframing_state"))
     tpo_watch_state = _as_upper(inputs.get("tpo_watch_state"))
     tpo_watch_setup = _as_upper(inputs.get("tpo_watch_setup"))
     tpo_watch_active = _as_bool(inputs.get("tpo_watch_active"))
@@ -3143,6 +3246,7 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
             f"initial={initial_open_behavior or '-'} "
             f"current={current_open_behavior or '-'} "
             f"value_state={value_acceptance_state or '-'} "
+            f"structure={structure_state or one_timeframing_state or '-'} "
             f"watch={tpo_watch_state or '-'} "
             f"ltf={ltf_model_state_full or ltf_model_state or '-'} "
             f"outcome={ltf_model_outcome or '-'}"
@@ -3326,14 +3430,15 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
     # Future exception can be added only when we explicitly detect:
     # IB break + acceptance + HTF alignment + LTF entry model + real target.
     # Until that model exists, OPEN_AUCTION remains research-only.
-    if _is_open_auction_context(inputs):
+    open_auction_ltf_exception = _open_auction_ltf_exception(inputs)
+    if _is_open_auction_context(inputs) and not open_auction_ltf_exception:
         blockers.append("open_auction_rotation_context")
         modifiers.append("open_auction_hard_block")
         return _build_result(
             inputs=inputs,
             auction_score=auction_score,
             reasons=reasons + [
-                "OPEN_AUCTION is observe/rotation context; battle disabled until IB break + acceptance + LTF model + real target are explicitly confirmed"
+                "OPEN_AUCTION is observe/rotation context; battle disabled until acceptance/rejection branch + LTF model + real target are explicitly confirmed"
             ],
             blockers=_dedupe_text_list(blockers),
             modifiers=_dedupe_text_list(modifiers + policy_flags[:12]),
@@ -3343,6 +3448,12 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
             v2_policy=v2_policy,
             risk_mode="OPEN_AUCTION_RESEARCH_ONLY",
             caution_flags=caution_flags,
+        )
+
+    if open_auction_ltf_exception:
+        modifiers.append("open_auction_ltf_branch_exception")
+        reasons.append(
+            "OPEN_AUCTION branch exception: accepted breakout or failed-acceptance back-to-value has CONFIRMED_EXECUTABLE LTF model."
         )
 
     # 3b. Auction watch / LTF confirmation gate.
@@ -3525,6 +3636,26 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
             telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
             battle_ready=False,
             v2_policy=v2_policy,
+        )
+
+    trend_fade_blocked, trend_fade_reason = _trend_day_counter_fade_block(inputs)
+    if trend_fade_blocked:
+        blockers.append("fade_against_confirmed_trend_day")
+        modifiers.append("trend_day_no_counter_fade")
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
+            reasons=reasons + [
+                f"confirmed Trend/DD day or active one-timeframing blocks counter-fade: {trend_fade_reason}"
+            ],
+            blockers=_dedupe_text_list(blockers),
+            modifiers=_dedupe_text_list(modifiers),
+            battle_permission=BattlePermission.BLOCKED_BY_CONTEXT.value,
+            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
+            risk_mode="TREND_DAY_NO_COUNTER_FADE",
+            caution_flags=caution_flags,
         )
 
     # 5. Signal lifecycle / stale READY protection.

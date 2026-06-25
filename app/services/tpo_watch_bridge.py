@@ -37,7 +37,7 @@ import re
 from typing import Any
 
 
-TPO_WATCH_BRIDGE_VERSION = "tpo-watch-bridge-v1.2-auction-state-fields"
+TPO_WATCH_BRIDGE_VERSION = "tpo-watch-bridge-v1.3-dalton-acceptance-branching"
 
 
 BLOCK_MARKET_STATUSES = {
@@ -92,6 +92,45 @@ OPEN_AUCTION_DETAILED_STATES = {
 OPEN_DRIVE_DETAILED_STATES = {
     "OPEN_DRIVE_CANDIDATE",
     "OPEN_DRIVE_CONFIRMED",
+}
+
+VALUE_ACCEPTED_OUTSIDE_STATES = {
+    "ACCEPTED_OUTSIDE_VALUE",
+    "ACCEPTED_OUTSIDE_PRIOR_VALUE",
+    "ACCEPTED_OUTSIDE_RANGE",
+    "ACCEPTED_OUTSIDE_PRIOR_RANGE",
+    "ACCEPTED_ABOVE_VALUE",
+    "ACCEPTED_BELOW_VALUE",
+    "ACCEPTED_BREAKOUT",
+    "ACCEPTED_EXTENSION",
+    "IB_ACCEPTED_EXTENSION",
+}
+
+VALUE_REJECTED_BACK_STATES = {
+    "REJECTED_BACK_INTO_PRIOR_VALUE",
+    "REJECTED_BACK_INTO_PRIOR_RANGE",
+    "FAILED_ACCEPTANCE_INTO_PRIOR_VALUE",
+    "FAILED_ACCEPTANCE_INTO_PRIOR_RANGE",
+    "ACCEPTED_BACK_INSIDE_VALUE",
+    "ACCEPTED_INSIDE_VALUE",
+    "VALUE_ACCEPTED_INSIDE",
+    "FAILED_OUTSIDE_VALUE",
+}
+
+DIRECTIONAL_BREAK_TRANSITIONS = {
+    "OPEN_AUCTION_TO_DIRECTIONAL_BREAK",
+    "OPEN_AUCTION_TO_OPEN_DRIVE",
+    "ROTATION_TO_DIRECTIONAL_BREAK",
+    "ROTATION_TO_ACCEPTED_BREAKOUT",
+    "OAOR_TO_ACCEPTED_BREAKOUT",
+    "OAIR_TO_ACCEPTED_BREAKOUT",
+}
+
+FAILED_ACCEPTANCE_TRANSITIONS = {
+    "OAOR_TO_FAILED_ACCEPTANCE",
+    "OUTSIDE_RANGE_TO_BACK_TO_VALUE",
+    "OUTSIDE_VALUE_TO_BACK_TO_VALUE",
+    "OPEN_AUCTION_TO_FAILED_ACCEPTANCE",
 }
 
 _QUOTED_ENUM_VALUE_RE = re.compile(r":\s*['\"]([^'\"]+)['\"]")
@@ -727,12 +766,88 @@ def evaluate_tpo_watch_bridge(
 
     # v1.2 detailed auction-state gates first.
     if current_behavior in OPEN_AUCTION_DETAILED_STATES or result.open_behavior == "OPEN_AUCTION":
+        # Dalton-style open auction is not a signal by itself. It becomes a
+        # directional watch only after the auction chooses a branch:
+        # accepted breakout/IB extension, or failed acceptance back into value/range.
         result.tpo_watch_setup = current_behavior or "OPEN_AUCTION"
-        state = "OBSERVE_ROTATION" if current_behavior == "OPEN_AUCTION_IN_RANGE" else "OBSERVE_ONLY"
+
+        accepted_outside = bool(
+            value_state in VALUE_ACCEPTED_OUTSIDE_STATES
+            or value_state.startswith("ACCEPTED_OUTSIDE")
+            or result.behavior_transition in DIRECTIONAL_BREAK_TRANSITIONS
+        )
+        rejected_back = bool(
+            value_state in VALUE_REJECTED_BACK_STATES
+            or value_state.startswith("REJECTED_BACK")
+            or result.behavior_transition in FAILED_ACCEPTANCE_TRANSITIONS
+        )
+
+        if current_behavior == "OPEN_AUCTION_IN_RANGE":
+            if accepted_outside:
+                result.tpo_watch_setup = "OPEN_AUCTION_ACCEPTED_BREAKOUT"
+                result.entry_model_hint = result.entry_model_hint or "ACCEPTED_BREAKOUT_RETEST"
+                result.stop_model_hint = result.stop_model_hint or "BEHIND_RETEST_OR_BACK_INSIDE_VALUE"
+                result.battle_bias_hint = result.battle_bias_hint or "DIRECTIONAL_AFTER_ACCEPTANCE"
+                result.warnings.append("open_auction_in_range_requires_accepted_breakout_retest")
+                return _activate_ltf_pending(
+                    result,
+                    reason=(
+                        "OPEN_AUCTION_IN_RANGE has shifted into accepted breakout/extension; "
+                        "activate LTF watch only for retest/hold, not for the first poke."
+                    ),
+                )
+
+            return _set_blocked(
+                result,
+                state="OBSERVE_ROTATION",
+                reason=(
+                    "OPEN_AUCTION_IN_RANGE is rotational until value/range break is accepted; "
+                    "POC/VAH/VAL are interest zones, not entry triggers."
+                ),
+            )
+
+        if current_behavior == "OPEN_AUCTION_OUT_OF_RANGE":
+            if accepted_outside:
+                result.tpo_watch_setup = "OPEN_AUCTION_OUT_OF_RANGE_ACCEPTED_BREAKOUT"
+                result.entry_model_hint = result.entry_model_hint or "ACCEPTED_BREAKOUT_RETEST"
+                result.stop_model_hint = result.stop_model_hint or "BEHIND_RETEST_OR_BACK_INSIDE_OLD_RANGE"
+                result.battle_bias_hint = result.battle_bias_hint or "DIRECTIONAL_OUT_OF_BALANCE"
+                result.warnings.append("oaor_breakout_branch_requires_retest_hold")
+                return _activate_ltf_pending(
+                    result,
+                    reason=(
+                        "OPEN_AUCTION_OUT_OF_RANGE chose accepted-outside branch; "
+                        "wait for LTF breakout/retest/hold before Battle."
+                    ),
+                )
+
+            if rejected_back:
+                result.tpo_watch_setup = "OPEN_AUCTION_OUT_OF_RANGE_FAILED_ACCEPTANCE"
+                result.entry_model_hint = result.entry_model_hint or "FAILED_ACCEPTANCE_BACK_TO_VALUE"
+                result.stop_model_hint = result.stop_model_hint or "BEHIND_FAILED_PROBE_EXTREME"
+                result.battle_bias_hint = result.battle_bias_hint or "BACK_TO_VALUE_AFTER_FAILED_ACCEPTANCE"
+                result.warnings.append("oaor_failed_acceptance_branch_requires_inside_acceptance")
+                return _activate_ltf_pending(
+                    result,
+                    reason=(
+                        "OPEN_AUCTION_OUT_OF_RANGE rejected outside range/value and is back inside accepted area; "
+                        "watch for failed-acceptance/back-to-value LTF model."
+                    ),
+                )
+
+            return _set_blocked(
+                result,
+                state="OBSERVE_ONLY",
+                reason=(
+                    "OPEN_AUCTION_OUT_OF_RANGE has not selected acceptance-outside or rejection-back branch yet; "
+                    "observe until the auction proves a branch."
+                ),
+            )
+
         return _set_blocked(
             result,
-            state=state,
-            reason="Open auction context is observe/rotation only; no directional LTF watch yet.",
+            state="OBSERVE_ONLY",
+            reason="Broad OPEN_AUCTION is observe-only until detailed acceptance/rejection branch is known.",
         )
 
     if current_behavior == "OPEN_REJECTION_REVERSE" or result.open_behavior == "OPEN_REJECTION_REVERSE":
@@ -796,12 +911,28 @@ def evaluate_tpo_watch_bridge(
                 blocker="otd_contradicted_by_value_acceptance",
             )
 
+        if current_behavior == "OPEN_TEST_DRIVE_CANDIDATE" and result.value_test_occurred is not True:
+            return _set_blocked(
+                result,
+                state="OBSERVE_ONLY",
+                reason="OPEN_TEST_DRIVE_CANDIDATE needs a confirmed test of value/reference before LTF watch can activate.",
+                blocker="otd_candidate_reference_test_pending",
+            )
+
         if current_behavior == "OPEN_TEST_DRIVE_CANDIDATE" and not value_rejected:
             return _set_blocked(
                 result,
                 state="OBSERVE_ONLY",
-                reason="OPEN_TEST_DRIVE_CANDIDATE needs value rejection before LTF watch can activate.",
+                reason="OPEN_TEST_DRIVE_CANDIDATE needs value/reference rejection before LTF watch can activate.",
                 blocker="otd_candidate_value_rejection_pending",
+            )
+
+        if (not current_behavior or current_behavior == "UNCONFIRMED") and result.open_behavior == "OPEN_TEST_DRIVE" and result.value_test_occurred is False:
+            return _set_blocked(
+                result,
+                state="OBSERVE_ONLY",
+                reason="Legacy OPEN_TEST_DRIVE lacks confirmed reference/value test; keep observe-only.",
+                blocker="legacy_otd_missing_reference_test",
             )
 
         if initial_behavior == "OPEN_TEST_DRIVE_CANDIDATE" and current_behavior in {"", "UNCONFIRMED"}:
