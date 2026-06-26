@@ -51,13 +51,14 @@ from app.services.post_news_continuation_detector import apply_post_news_continu
 from app.services.signal_tracker import SignalTracker, SignalTrackerResult
 from app.services.telegram_formatter import format_signal_message
 from app.services.telegram_notifier import build_telegram_notifier
+from app.services.battle_permission import apply_battle_permission
 from app.services.battle_permission_telemetry import record_battle_permission_event
 from app.services.telegram_alert_store import record_telegram_alert
 from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.6.0-context-invalidation-stop-bridge"
+RUNNER_VERSION = "1.6.1-suppressed-battle-permission-telemetry"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -4421,6 +4422,11 @@ class StatefulBatchRunner:
         It is intentionally limited to non-sent / suppressed payloads to avoid
         duplicating BATTLE_ALERT / RESEARCH_ALERT events recorded by
         telegram_notifier.py.
+
+        Since v1.6.1 this hook also runs Battle Permission enrichment on a
+        telemetry-only copy of the payload before writing the event. This keeps
+        suppressed events auditable with battle_permission_version/reasons while
+        preserving the original runner suppression as authoritative.
         """
         if not isinstance(payload, dict) or not payload:
             return False
@@ -4465,6 +4471,8 @@ class StatefulBatchRunner:
         if not is_suppressed:
             return False
 
+        # Mark the original payload so repeated dispatch attempts do not create
+        # duplicate telemetry. The Battle Gate enrichment below uses a copy.
         payload["_runner_suppressed_telemetry_recorded"] = True
         payload.setdefault("telegram_delivery_mode", "SUPPRESS")
         payload.setdefault("sent_to_telegram", False)
@@ -4489,21 +4497,94 @@ class StatefulBatchRunner:
         payload["runner_version"] = RUNNER_VERSION
         payload["telemetry_source"] = "stateful_batch_runner_suppressed_hook"
 
+        # Build a telemetry-only copy. apply_battle_permission() can set
+        # telegram_delivery_mode/battle_ready according to Battle Gate, but the
+        # runner suppression must remain final for this event.
+        telemetry_payload = dict(payload)
+        telemetry_payload["metadata"] = dict(metadata)
+
+        battle_delivery_before_runner_override = None
+        battle_ready_before_runner_override = None
+        battle_permission_before_runner_override = None
+
+        try:
+            telemetry_payload = apply_battle_permission(telemetry_payload)
+            battle_delivery_before_runner_override = telemetry_payload.get("telegram_delivery_mode")
+            battle_ready_before_runner_override = telemetry_payload.get("battle_ready")
+            battle_permission_before_runner_override = telemetry_payload.get("battle_permission")
+        except Exception as error:  # noqa: BLE001
+            logger.exception(
+                "Battle permission enrichment failed for runner suppressed telemetry. "
+                "symbol=%s signal_id=%s reason=%s error=%s",
+                payload.get("symbol"),
+                payload.get("signal_id"),
+                block_reason,
+                error,
+            )
+            telemetry_payload = dict(payload)
+            telemetry_payload["metadata"] = dict(metadata)
+            telemetry_payload["battle_permission_enrichment_error"] = str(error)
+
+        # Restore runner-level suppression as the authoritative delivery state.
+        telemetry_payload["_runner_suppressed_telemetry_recorded"] = True
+        telemetry_payload["telegram_delivery_mode"] = "SUPPRESS"
+        telemetry_payload["sent_to_telegram"] = False
+        telemetry_payload["battle_ready"] = False
+        telemetry_payload["runner_suppressed_after_battle_enrichment"] = True
+        telemetry_payload["runner_suppressed_reason"] = str(block_reason)
+        telemetry_payload["suppression_reason"] = str(block_reason)
+        telemetry_payload["suppression_reasons"] = suppression_reasons
+        telemetry_payload["runner_version"] = RUNNER_VERSION
+        telemetry_payload["telemetry_source"] = "stateful_batch_runner_suppressed_hook"
+
+        # Preserve the original runner flags where they were meaningful.
+        if statistics_only:
+            telemetry_payload["statistics_only"] = True
+        elif payload.get("statistics_only") is None and "statistics_only" in telemetry_payload:
+            telemetry_payload["statistics_only"] = payload.get("statistics_only")
+
+        if telegram_allowed is False:
+            telemetry_payload["telegram_allowed"] = False
+        if should_alert is False:
+            telemetry_payload["should_alert"] = False
+
+        telemetry_metadata = telemetry_payload.get("metadata")
+        if not isinstance(telemetry_metadata, dict):
+            telemetry_metadata = {}
+
+        telemetry_metadata["runner_suppressed_telemetry_hook"] = True
+        telemetry_metadata["runner_suppressed_telemetry_hook_version"] = RUNNER_VERSION
+        telemetry_metadata["runner_suppressed_telemetry_reason"] = str(block_reason)
+        telemetry_metadata["runner_suppressed_after_battle_enrichment"] = True
+        telemetry_metadata["runner_suppressed_battle_delivery_before_override"] = (
+            battle_delivery_before_runner_override
+        )
+        telemetry_metadata["runner_suppressed_battle_ready_before_override"] = (
+            battle_ready_before_runner_override
+        )
+        telemetry_metadata["runner_suppressed_battle_permission_before_override"] = (
+            battle_permission_before_runner_override
+        )
+        telemetry_metadata["runner_version"] = RUNNER_VERSION
+        telemetry_payload["metadata"] = telemetry_metadata
+
         try:
             recorded = record_battle_permission_event(
-                payload,
+                telemetry_payload,
                 source="stateful_batch_runner_suppressed_hook",
                 sent_to_telegram=False,
                 note=str(block_reason),
             )
             if recorded:
                 logger.info(
-                    "Runner suppressed telemetry recorded. symbol=%s signal_id=%s reason=%s mode=%s statistics_only=%s",
-                    payload.get("symbol"),
-                    payload.get("signal_id"),
+                    "Runner suppressed telemetry recorded. symbol=%s signal_id=%s reason=%s mode=%s statistics_only=%s battle_version=%s battle_permission=%s",
+                    telemetry_payload.get("symbol"),
+                    telemetry_payload.get("signal_id"),
                     block_reason,
-                    payload.get("telegram_delivery_mode"),
-                    payload.get("statistics_only"),
+                    telemetry_payload.get("telegram_delivery_mode"),
+                    telemetry_payload.get("statistics_only"),
+                    telemetry_payload.get("battle_permission_version"),
+                    telemetry_payload.get("battle_permission"),
                 )
             return bool(recorded)
 
