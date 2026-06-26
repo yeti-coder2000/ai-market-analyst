@@ -53,12 +53,17 @@ from app.services.telegram_formatter import format_signal_message
 from app.services.telegram_notifier import build_telegram_notifier
 from app.services.battle_permission import apply_battle_permission
 from app.services.battle_permission_telemetry import record_battle_permission_event
+from app.services.statistical_cell_stats import (
+    STATISTICAL_CELL_STATS_VERSION,
+    get_cell_stats_for_payload,
+)
+from app.services.statistical_permission_gate import attach_statistical_permission_fields
 from app.services.telegram_alert_store import record_telegram_alert
 from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.6.1-suppressed-battle-permission-telemetry"
+RUNNER_VERSION = "1.6.2-statistical-shadow-telemetry"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -4405,6 +4410,80 @@ class StatefulBatchRunner:
             return "INVALIDATED"
         return None
 
+    def _attach_statistical_shadow_permission(
+        self,
+        payload: dict[str, Any],
+        *,
+        context_reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Attach Bayesian/statistical gate diagnostics without changing delivery.
+
+        This is the shadow-mode bridge for the second research implementation:
+        structural/Battle permission stays authoritative, while the statistical
+        layer writes cell evidence, posterior lower bound, expectancy and
+        evidence tier into telemetry.
+
+        The method must never promote Telegram delivery. It may only annotate.
+        """
+        if not isinstance(payload, dict) or not payload:
+            return payload
+
+        try:
+            # Live payloads already carry batch_group/session for production
+            # alerts. Suppressed counterfactual records in signal_outcomes.json
+            # may be keyed by RESEARCH_COUNTERFACTUAL when no batch_group was
+            # persisted historically, so the cell lookup helper may return None
+            # for older cells. In that case attach_statistical_permission_fields
+            # still emits a stable NO_DATA/RESEARCH_ONLY shadow decision.
+            cell_stats = get_cell_stats_for_payload(payload)
+            enriched = attach_statistical_permission_fields(
+                payload,
+                cell_stats,
+                shadow_mode=True,
+            )
+
+            lookup_status = "hit" if isinstance(cell_stats, dict) else "miss"
+
+            metadata = enriched.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+
+            metadata["statistical_shadow_mode"] = True
+            metadata["statistical_shadow_source"] = "stateful_batch_runner"
+            metadata["statistical_cell_stats_version"] = STATISTICAL_CELL_STATS_VERSION
+            metadata["statistical_cell_stats_lookup"] = lookup_status
+            metadata["runner_version"] = RUNNER_VERSION
+            if context_reason:
+                metadata["statistical_shadow_context_reason"] = str(context_reason)
+
+            enriched["metadata"] = metadata
+            enriched["statistical_shadow_mode"] = True
+            enriched["statistical_shadow_source"] = "stateful_batch_runner"
+            enriched["statistical_cell_stats_version"] = STATISTICAL_CELL_STATS_VERSION
+            enriched["statistical_cell_stats_lookup"] = lookup_status
+            return enriched
+
+        except Exception as error:  # noqa: BLE001
+            logger.exception(
+                "Statistical shadow enrichment failed. symbol=%s signal_id=%s reason=%s error=%s",
+                payload.get("symbol"),
+                payload.get("signal_id"),
+                context_reason,
+                error,
+            )
+            metadata = payload.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata["statistical_shadow_enrichment_error"] = str(error)
+            metadata["statistical_shadow_mode"] = True
+            metadata["statistical_cell_stats_version"] = STATISTICAL_CELL_STATS_VERSION
+            metadata["runner_version"] = RUNNER_VERSION
+            payload["metadata"] = metadata
+            payload["statistical_shadow_enrichment_error"] = str(error)
+            payload["statistical_shadow_mode"] = True
+            return payload
+
+
     def _record_suppressed_battle_telemetry_once(
         self,
         payload: dict[str, Any],
@@ -4525,7 +4604,14 @@ class StatefulBatchRunner:
             telemetry_payload["metadata"] = dict(metadata)
             telemetry_payload["battle_permission_enrichment_error"] = str(error)
 
+        telemetry_payload = self._attach_statistical_shadow_permission(
+            telemetry_payload,
+            context_reason=str(block_reason),
+        )
+
         # Restore runner-level suppression as the authoritative delivery state.
+        # Statistical shadow mode and Battle Gate diagnostics must never promote
+        # a payload that the runner already classified as suppressed.
         telemetry_payload["_runner_suppressed_telemetry_recorded"] = True
         telemetry_payload["telegram_delivery_mode"] = "SUPPRESS"
         telemetry_payload["sent_to_telegram"] = False
@@ -4650,6 +4736,11 @@ class StatefulBatchRunner:
                 payload.get("signal_quality_score"),
             )
             return False
+
+        payload = self._attach_statistical_shadow_permission(
+            payload,
+            context_reason="telegram_dispatch_shadow",
+        )
 
         try:
             sent = self.telegram.send_alert_payload(payload)
@@ -5026,6 +5117,11 @@ class StatefulBatchRunner:
             enriched_payload["should_alert"] = False
             enriched_payload["telegram_block_reason"] = enriched_payload.get("signal_quality_reason")
             return enriched_payload
+
+        enriched_payload = self._attach_statistical_shadow_permission(
+            enriched_payload,
+            context_reason="alert_payload_ready_shadow",
+        )
 
         fmt = format_signal_message(
             {
