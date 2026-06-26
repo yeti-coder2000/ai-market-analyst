@@ -3,7 +3,7 @@ from __future__ import annotations
 """
 Statistical Cell Stats builder for AI Market Analyst.
 
-Version: statistical-cell-stats-v1.0-signal-outcomes-aggregator
+Version: statistical-cell-stats-v1.1-dedup-evaluated-cells
 
 Purpose
 -------
@@ -41,7 +41,7 @@ from app.services.statistical_permission_gate import (
 )
 
 
-STATISTICAL_CELL_STATS_VERSION = "statistical-cell-stats-v1.0-signal-outcomes-aggregator"
+STATISTICAL_CELL_STATS_VERSION = "statistical-cell-stats-v1.1-dedup-evaluated-cells"
 
 STATS_DIR = settings.runtime_dir / "stats"
 SIGNAL_OUTCOMES_PATH = STATS_DIR / "signal_outcomes.json"
@@ -337,6 +337,51 @@ def _payload_for_cell_key(record: Mapping[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _record_deduplication_key(record: Mapping[str, Any]) -> str:
+    """Return a stable key for one trade/counterfactual observation.
+
+    signal_outcomes.json can contain repeated research counterfactual records
+    created from repeated telemetry evaluations of the same signal. For
+    statistical permission gating, one signal_id must count as one observation
+    inside its cell, otherwise repeated blocked telemetry can artificially
+    inflate the sample and distort posterior/expectancy.
+    """
+    payload = _payload_for_cell_key(record)
+    cell_key = build_statistical_cell_key(payload)
+    signal_id = normalize_text(record.get("signal_id"))
+    tracking_scope = normalize_text(
+        first_non_empty(record.get("tracking_scope"), record.get("scope"), default="UNKNOWN"),
+        "UNKNOWN",
+    )
+
+    if signal_id:
+        return f"{cell_key}|{tracking_scope}|{signal_id}"
+
+    # Fallback for older/manual rows without signal_id: only exact duplicates
+    # collapse. This avoids accidentally merging unrelated unknown rows.
+    outcome = normalize_status(first_non_empty(record.get("outcome_status"), record.get("status")))
+    closed_at = normalize_text(first_non_empty(record.get("closed_at_utc"), record.get("updated_at_utc"), record.get("ts_utc")))
+    result_r = normalize_text(first_non_empty(record.get("result_R"), record.get("outcome_R"), record.get("net_r")))
+    symbol = normalize_text(first_non_empty(record.get("symbol"), record.get("instrument")), "UNKNOWN")
+    direction = normalize_text(first_non_empty(record.get("direction"), record.get("side")), "UNKNOWN")
+    return f"{cell_key}|NO_SIGNAL_ID|{symbol}|{direction}|{tracking_scope}|{outcome}|{closed_at}|{result_r}"
+
+
+def _deduplicate_records_for_cells(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Keep the latest record per statistical cell + signal_id + tracking scope."""
+    deduped: dict[str, dict[str, Any]] = {}
+    skipped = 0
+
+    for record in sorted(records, key=_record_sort_timestamp):
+        key = _record_deduplication_key(record)
+        if key in deduped:
+            skipped += 1
+        # Input is sorted ascending, so later/final material state wins.
+        deduped[key] = record
+
+    return list(deduped.values()), skipped
+
+
 def _counter_add(counter: Counter[str], value: Any, default: str = "UNKNOWN") -> None:
     text = normalize_text(value, default)
     counter[text] += 1
@@ -353,12 +398,19 @@ def build_cell_stats_from_records(records: Iterable[Mapping[str, Any]]) -> dict[
         key=_record_sort_timestamp,
     )
 
+    non_synthetic_records: list[dict[str, Any]] = []
     for record in sorted_records:
         total_records += 1
         if is_synthetic_record(record):
             synthetic_excluded += 1
             continue
+        non_synthetic_records.append(record)
 
+    records_for_stats, deduplicated_records_skipped = _deduplicate_records_for_cells(
+        non_synthetic_records
+    )
+
+    for record in records_for_stats:
         payload = _payload_for_cell_key(record)
         cell_key = build_statistical_cell_key(payload)
         acc = cells.setdefault(cell_key, StatisticalCellAccumulator(cell_key=cell_key))
@@ -430,15 +482,44 @@ def build_cell_stats_from_records(records: Iterable[Mapping[str, Any]]) -> dict[
 
     cell_payloads = {key: acc.to_gate_stats() for key, acc in sorted(cells.items())}
 
+    # Persist the shadow statistical gate decision per cell. The CLI already
+    # displays these values, but live lookup/debugging should not require a
+    # second ad-hoc evaluation step.
+    for key, cell in cell_payloads.items():
+        result = evaluate_statistical_permission({}, cell, cell_key=key).to_dict()
+        for result_key in (
+            "evidence_tier",
+            "posterior_alpha",
+            "posterior_beta",
+            "posterior_mean",
+            "posterior_lower_95",
+            "posterior_upper_95",
+            "raw_winrate",
+            "avg_win_r",
+            "avg_loss_r",
+            "gross_expectancy_r",
+            "net_expectancy_r",
+            "statistical_permission",
+            "statistical_status",
+            "statistical_multiplier",
+            "allows_ready",
+            "blockers",
+            "reasons",
+            "modifiers",
+        ):
+            cell[f"stat_{result_key}"] = result.get(result_key)
+
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "version": STATISTICAL_CELL_STATS_VERSION,
         "statistical_permission_gate_version": STATISTICAL_PERMISSION_GATE_VERSION,
         "generated_at_utc": utc_now_iso(),
         "source": "signal_outcomes.json",
         "total_records_seen": total_records,
         "synthetic_excluded": synthetic_excluded,
-        "production_records_used": total_records - synthetic_excluded,
+        "raw_production_records_seen": total_records - synthetic_excluded,
+        "deduplicated_records_skipped": deduplicated_records_skipped,
+        "production_records_used": len(records_for_stats),
         "closed_tp_sl_used": closed_tp_sl,
         "cell_count": len(cell_payloads),
         "cells": cell_payloads,
