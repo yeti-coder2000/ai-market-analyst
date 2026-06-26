@@ -2950,6 +2950,51 @@ def _production_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return result
 
 
+def _dedup_signal_outcome_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Deduplicate signal outcome records before report aggregation.
+
+    signal_outcomes.json can contain repeated research/counterfactual rows for
+    the same logical observation. Counting them raw inflates missed/expired
+    statistics, especially RESEARCH_COUNTERFACTUAL buckets.
+
+    Dedup key intentionally keeps tracking_scope and outcome_status:
+    - TELEGRAM_ALERT and RESEARCH_COUNTERFACTUAL remain separate;
+    - TP_HIT / SL_HIT / MISSED / EXPIRED states remain explicit;
+    - repeated snapshots of the same signal state collapse to one observation.
+    """
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+
+        signal_id = str(record.get("signal_id") or "").strip()
+        tracking_scope = str(record.get("tracking_scope") or "UNKNOWN").strip().upper()
+        outcome_status = str(
+            record.get("outcome_status") or record.get("status") or "UNKNOWN"
+        ).strip().upper()
+
+        if signal_id:
+            key = (signal_id, tracking_scope, outcome_status)
+        else:
+            # Conservative fallback for legacy rows without signal_id.
+            key = (
+                str(record.get("created_at_utc") or record.get("closed_at_utc") or ""),
+                tracking_scope,
+                outcome_status,
+            )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        result.append(record)
+
+    return result
+
+
 def _safe_avg(values: list[float]) -> float | None:
     if not values:
         return None
@@ -3043,7 +3088,7 @@ def _record_is_research_counterfactual(record: dict[str, Any]) -> bool:
 
 def _yesterday_grouped_metrics(timezone_name: str, target_date: date) -> tuple[dict[str, Any], str]:
     outcomes = load_signal_outcomes()
-    records = _production_records(_signals_from_outcomes(outcomes))
+    records = _dedup_signal_outcome_records(_production_records(_signals_from_outcomes(outcomes)))
 
     yesterday = target_date - timedelta(days=1)
     dated = [r for r in records if _record_local_date(r, timezone_name) == yesterday]
@@ -3110,7 +3155,7 @@ def _overall_grouped_metrics() -> tuple[dict[str, Any], str]:
     production Battle/Telegram quality line.
     """
     outcomes = load_signal_outcomes()
-    records = _production_records(_signals_from_outcomes(outcomes))
+    records = _dedup_signal_outcome_records(_production_records(_signals_from_outcomes(outcomes)))
 
     if not records:
         return {
