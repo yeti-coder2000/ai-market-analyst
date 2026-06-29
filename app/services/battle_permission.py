@@ -317,6 +317,13 @@ def _deep_get(data: dict[str, Any], *paths: str) -> Any:
     return None
 
 
+def _as_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def _as_upper(value: Any) -> str | None:
     if value in (None, "", [], {}):
         return None
