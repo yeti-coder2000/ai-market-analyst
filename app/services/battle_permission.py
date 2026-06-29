@@ -34,7 +34,7 @@ except Exception:  # pragma: no cover
     evaluate_macro_guard = None  # type: ignore[assignment]
 
 
-BATTLE_PERMISSION_VERSION = "battle-permission-v1.12-dalton-auction-branch-gate"
+BATTLE_PERMISSION_VERSION = "battle-permission-v1.13-session-normalization-brain"
 
 # Signals that are structurally stale/invalid or post-shock with insufficient
 # reward must stay out of user-facing Telegram delivery. They remain in
@@ -148,6 +148,25 @@ class BattlePermissionResult:
     one_timeframing_state: str | None = None
     auction_state_confidence: float | None = None
     auction_state_reason: str | None = None
+
+    # Session Normalization Brain v1 fields.
+    session_normalization_version: str | None = None
+    session_scope: str | None = None
+    primary_session: str | None = None
+    prior_value_scope: str | None = None
+    prior_range_scope: str | None = None
+    open_event: str | None = None
+    open_event_type: str | None = None
+    reference_profile_id: str | None = None
+    active_participation_center: str | None = None
+    profile_reliability_score: float | None = None
+    profile_reliability_state: str | None = None
+    session_status: str | None = None
+    holiday_mode: str | None = None
+    weekend_flag: bool | None = None
+    synthetic_open: bool | None = None
+    synthetic_open_confirmed: bool | None = None
+    true_otd_allowed: bool | None = None
 
     tpo_watch_state: str | None = None
     tpo_watch_setup: str | None = None
@@ -2057,6 +2076,23 @@ def _enrich_payload_with_tpo_store(payload: dict[str, Any]) -> dict[str, Any]:
             open_behavior_record.get("auction_state_reason"),
             record.get("auction_state_reason"),
         ),
+        "session_normalization_version": _first_non_empty(context.get("session_normalization_version"), open_behavior_record.get("session_normalization_version"), record.get("session_normalization_version")),
+        "session_scope": _first_non_empty(context.get("session_scope"), open_behavior_record.get("session_scope"), record.get("session_scope")),
+        "primary_session": _first_non_empty(context.get("primary_session"), open_behavior_record.get("primary_session"), record.get("primary_session")),
+        "prior_value_scope": _first_non_empty(context.get("prior_value_scope"), open_behavior_record.get("prior_value_scope"), record.get("prior_value_scope")),
+        "prior_range_scope": _first_non_empty(context.get("prior_range_scope"), open_behavior_record.get("prior_range_scope"), record.get("prior_range_scope")),
+        "open_event": _first_non_empty(context.get("open_event"), open_behavior_record.get("open_event"), record.get("open_event")),
+        "open_event_type": _first_non_empty(context.get("open_event_type"), open_behavior_record.get("open_event_type"), record.get("open_event_type")),
+        "reference_profile_id": _first_non_empty(context.get("reference_profile_id"), open_behavior_record.get("reference_profile_id"), record.get("reference_profile_id")),
+        "active_participation_center": _first_non_empty(context.get("active_participation_center"), open_behavior_record.get("active_participation_center"), record.get("active_participation_center")),
+        "profile_reliability_score": _first_non_empty(context.get("profile_reliability_score"), open_behavior_record.get("profile_reliability_score"), record.get("profile_reliability_score")),
+        "profile_reliability_state": _first_non_empty(context.get("profile_reliability_state"), open_behavior_record.get("profile_reliability_state"), record.get("profile_reliability_state")),
+        "session_status": _first_non_empty(context.get("session_status"), open_behavior_record.get("session_status"), record.get("session_status")),
+        "holiday_mode": _first_non_empty(context.get("holiday_mode"), open_behavior_record.get("holiday_mode"), record.get("holiday_mode")),
+        "weekend_flag": _first_non_empty(context.get("weekend_flag"), open_behavior_record.get("weekend_flag"), record.get("weekend_flag")),
+        "synthetic_open": _first_non_empty(context.get("synthetic_open"), open_behavior_record.get("synthetic_open"), record.get("synthetic_open")),
+        "synthetic_open_confirmed": _first_non_empty(context.get("synthetic_open_confirmed"), open_behavior_record.get("synthetic_open_confirmed"), record.get("synthetic_open_confirmed")),
+        "true_otd_allowed": _first_non_empty(context.get("true_otd_allowed"), open_behavior_record.get("true_otd_allowed"), record.get("true_otd_allowed")),
         "entry_model_hint": _first_non_empty(
             context.get("entry_model_hint"),
             open_behavior_record.get("entry_model_hint"),
@@ -2519,6 +2555,24 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
         "auction_state_reason",
     )
 
+    session_normalization_version = _as_text(_deep_get(payload, "metadata.session_normalization_version", "session_normalization_version"))
+    session_scope = _as_upper(_deep_get(payload, "metadata.session_scope", "session_scope"))
+    primary_session = _as_upper(_deep_get(payload, "metadata.primary_session", "primary_session"))
+    prior_value_scope = _as_upper(_deep_get(payload, "metadata.prior_value_scope", "prior_value_scope"))
+    prior_range_scope = _as_upper(_deep_get(payload, "metadata.prior_range_scope", "prior_range_scope"))
+    open_event = _as_upper(_deep_get(payload, "metadata.open_event", "open_event"))
+    open_event_type = _as_upper(_deep_get(payload, "metadata.open_event_type", "open_event_type"))
+    reference_profile_id = _as_text(_deep_get(payload, "metadata.reference_profile_id", "reference_profile_id"))
+    active_participation_center = _as_upper(_deep_get(payload, "metadata.active_participation_center", "active_participation_center"))
+    profile_reliability_score = _as_float(_deep_get(payload, "metadata.profile_reliability_score", "profile_reliability_score"))
+    profile_reliability_state = _as_upper(_deep_get(payload, "metadata.profile_reliability_state", "profile_reliability_state"))
+    session_status = _as_upper(_deep_get(payload, "metadata.session_status", "session_status"))
+    holiday_mode = _as_upper(_deep_get(payload, "metadata.holiday_mode", "holiday_mode"))
+    weekend_flag = _as_bool(_deep_get(payload, "metadata.weekend_flag", "weekend_flag"))
+    synthetic_open = _as_bool(_deep_get(payload, "metadata.synthetic_open", "synthetic_open"))
+    synthetic_open_confirmed = _as_bool(_deep_get(payload, "metadata.synthetic_open_confirmed", "synthetic_open_confirmed"))
+    true_otd_allowed = _as_bool(_deep_get(payload, "metadata.true_otd_allowed", "true_otd_allowed"))
+
     tpo_watch_state = _as_upper(_deep_get(payload, "metadata.tpo_watch_state", "tpo_watch_state"))
     tpo_watch_setup = _as_upper(_deep_get(payload, "metadata.tpo_watch_setup", "tpo_watch_setup"))
     tpo_watch_active = _as_bool(_deep_get(payload, "metadata.tpo_watch_active", "tpo_watch_active"))
@@ -2819,6 +2873,23 @@ def extract_battle_inputs(raw_payload: dict[str, Any]) -> dict[str, Any]:
         "one_timeframing_state": one_timeframing_state,
         "auction_state_confidence": auction_state_confidence,
         "auction_state_reason": auction_state_reason,
+        "session_normalization_version": session_normalization_version,
+        "session_scope": session_scope,
+        "primary_session": primary_session,
+        "prior_value_scope": prior_value_scope,
+        "prior_range_scope": prior_range_scope,
+        "open_event": open_event,
+        "open_event_type": open_event_type,
+        "reference_profile_id": reference_profile_id,
+        "active_participation_center": active_participation_center,
+        "profile_reliability_score": profile_reliability_score,
+        "profile_reliability_state": profile_reliability_state,
+        "session_status": session_status,
+        "holiday_mode": holiday_mode,
+        "weekend_flag": weekend_flag,
+        "synthetic_open": synthetic_open,
+        "synthetic_open_confirmed": synthetic_open_confirmed,
+        "true_otd_allowed": true_otd_allowed,
         "tpo_watch_state": tpo_watch_state,
         "tpo_watch_setup": tpo_watch_setup,
         "tpo_watch_active": tpo_watch_active,
@@ -3018,6 +3089,23 @@ def _build_result(
         one_timeframing_state=inputs.get("one_timeframing_state"),
         auction_state_confidence=inputs.get("auction_state_confidence"),
         auction_state_reason=inputs.get("auction_state_reason"),
+        session_normalization_version=inputs.get("session_normalization_version"),
+        session_scope=inputs.get("session_scope"),
+        primary_session=inputs.get("primary_session"),
+        prior_value_scope=inputs.get("prior_value_scope"),
+        prior_range_scope=inputs.get("prior_range_scope"),
+        open_event=inputs.get("open_event"),
+        open_event_type=inputs.get("open_event_type"),
+        reference_profile_id=inputs.get("reference_profile_id"),
+        active_participation_center=inputs.get("active_participation_center"),
+        profile_reliability_score=inputs.get("profile_reliability_score"),
+        profile_reliability_state=inputs.get("profile_reliability_state"),
+        session_status=inputs.get("session_status"),
+        holiday_mode=inputs.get("holiday_mode"),
+        weekend_flag=inputs.get("weekend_flag"),
+        synthetic_open=inputs.get("synthetic_open"),
+        synthetic_open_confirmed=inputs.get("synthetic_open_confirmed"),
+        true_otd_allowed=inputs.get("true_otd_allowed"),
         tpo_watch_state=inputs.get("tpo_watch_state"),
         tpo_watch_setup=inputs.get("tpo_watch_setup"),
         tpo_watch_active=inputs.get("tpo_watch_active"),
@@ -3333,6 +3421,76 @@ def evaluate_battle_permission(raw_payload: dict[str, Any]) -> BattlePermissionR
             telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
             battle_ready=False,
             v2_policy=v2_policy,
+        )
+
+
+    profile_reliability_state_norm = _as_upper(inputs.get("profile_reliability_state"))
+    true_otd_allowed_flag = inputs.get("true_otd_allowed")
+    scenario_or_behavior_text = " ".join(str(x or "") for x in [
+        inputs.get("scenario_family"),
+        inputs.get("scenario"),
+        inputs.get("scenario_type"),
+        inputs.get("open_behavior"),
+        inputs.get("current_open_behavior"),
+        inputs.get("tpo_watch_setup"),
+    ]).upper()
+
+    if profile_reliability_state_norm in {"MARKET_CLOSED", "SUPPRESS", "PROFILE_UNRELIABLE"}:
+        blockers.append(f"session_reliability_{profile_reliability_state_norm.lower()}")
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
+            reasons=reasons + [
+                f"session normalization blocks battle: profile_reliability_state={profile_reliability_state_norm}"
+            ],
+            blockers=_dedupe_text_list(blockers),
+            modifiers=_dedupe_text_list(modifiers + ["session_reliability_hard_block"]),
+            battle_permission=BattlePermission.BLOCKED_BY_CONTEXT.value,
+            telegram_delivery_mode=TelegramDeliveryMode.SUPPRESS.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
+            risk_mode="SESSION_PROFILE_UNRELIABLE",
+            caution_flags=caution_flags,
+        )
+
+    if profile_reliability_state_norm == "RESEARCH_ONLY":
+        blockers.append("session_reliability_research_only")
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
+            reasons=reasons + [
+                "session normalization marks this setup as RESEARCH_ONLY; no user-facing battle permission"
+            ],
+            blockers=_dedupe_text_list(blockers),
+            modifiers=_dedupe_text_list(modifiers + ["session_reliability_research_only"]),
+            battle_permission=BattlePermission.RESEARCH_ONLY.value,
+            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
+            risk_mode="SESSION_RESEARCH_ONLY",
+            caution_flags=caution_flags,
+        )
+
+    if profile_reliability_state_norm == "CAUTION":
+        caution_flags.append("session_reliability_caution")
+        modifiers.append("session_reliability_caution")
+
+    if true_otd_allowed_flag is False and "OPEN_TEST_DRIVE" in scenario_or_behavior_text:
+        blockers.append("true_otd_not_allowed_by_session_scope")
+        return _build_result(
+            inputs=inputs,
+            auction_score=auction_score,
+            reasons=reasons + [
+                "session normalization does not allow TRUE_OPEN_TEST_DRIVE; keep broad/in-range OTD as research only"
+            ],
+            blockers=_dedupe_text_list(blockers),
+            modifiers=_dedupe_text_list(modifiers + ["true_otd_session_scope_block"]),
+            battle_permission=BattlePermission.RESEARCH_ONLY.value,
+            telegram_delivery_mode=TelegramDeliveryMode.RESEARCH_ALERT.value,
+            battle_ready=False,
+            v2_policy=v2_policy,
+            risk_mode="TRUE_OTD_NOT_ALLOWED_BY_SESSION_SCOPE",
+            caution_flags=caution_flags,
         )
 
     # 1b. Statistics-only delivery suppression.
@@ -3935,6 +4093,23 @@ def _attach_tpo_open_behavior_fields_to_metadata(metadata: dict[str, Any], resul
         "day_type_candidate",
         "auction_state_confidence",
         "auction_state_reason",
+        "session_normalization_version",
+        "session_scope",
+        "primary_session",
+        "prior_value_scope",
+        "prior_range_scope",
+        "open_event",
+        "open_event_type",
+        "reference_profile_id",
+        "active_participation_center",
+        "profile_reliability_score",
+        "profile_reliability_state",
+        "session_status",
+        "holiday_mode",
+        "weekend_flag",
+        "synthetic_open",
+        "synthetic_open_confirmed",
+        "true_otd_allowed",
         "tpo_watch_state",
         "tpo_watch_setup",
         "tpo_watch_active",
@@ -4109,6 +4284,23 @@ def apply_battle_permission(raw_payload: dict[str, Any]) -> dict[str, Any]:
         "day_type_candidate",
         "auction_state_confidence",
         "auction_state_reason",
+        "session_normalization_version",
+        "session_scope",
+        "primary_session",
+        "prior_value_scope",
+        "prior_range_scope",
+        "open_event",
+        "open_event_type",
+        "reference_profile_id",
+        "active_participation_center",
+        "profile_reliability_score",
+        "profile_reliability_state",
+        "session_status",
+        "holiday_mode",
+        "weekend_flag",
+        "synthetic_open",
+        "synthetic_open_confirmed",
+        "true_otd_allowed",
         "tpo_watch_state",
         "tpo_watch_setup",
         "tpo_watch_active",

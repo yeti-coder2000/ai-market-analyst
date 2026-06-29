@@ -55,9 +55,18 @@ from dataclasses import asdict, dataclass, field
 import math
 from typing import Any, Literal
 
+try:
+    from app.services.session_normalization import (
+        SESSION_NORMALIZATION_VERSION,
+        resolve_session_context,
+    )
+except Exception:  # pragma: no cover
+    SESSION_NORMALIZATION_VERSION = "session-normalization-unavailable"
+    resolve_session_context = None  # type: ignore[assignment]
+
 
 TPO_OPEN_BEHAVIOR_CLASSIFIER_VERSION = (
-    "tpo-open-behavior-classifier-v1.4-auction-state-transitions"
+    "tpo-open-behavior-classifier-v1.5-session-normalization-brain"
 )
 
 
@@ -213,6 +222,25 @@ class OpenBehaviorResult:
     day_type_candidate: DayTypeCandidate = "UNKNOWN"
     auction_state_confidence: float = 0.0
     auction_state_reason: str = ""
+
+    # v1.5 session-normalization fields.
+    session_normalization_version: str | None = None
+    session_scope: str | None = None
+    primary_session: str | None = None
+    prior_value_scope: str | None = None
+    prior_range_scope: str | None = None
+    open_event: str | None = None
+    open_event_type: str | None = None
+    reference_profile_id: str | None = None
+    active_participation_center: str | None = None
+    profile_reliability_score: int | None = None
+    profile_reliability_state: str | None = None
+    session_status: str | None = None
+    holiday_mode: str | None = None
+    weekend_flag: bool | None = None
+    synthetic_open: bool | None = None
+    synthetic_open_confirmed: bool | None = None
+    true_otd_allowed: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -812,6 +840,7 @@ def _classify_current_behavior(
     value_acceptance_state: ValueAcceptanceState,
     accepted_outside_range: bool,
     accepted_outside_value: bool,
+    true_otd_allowed: bool = True,
 ) -> tuple[OpenBehavior, DetailedOpenBehavior, float, str, str, str, str]:
     """
     Return broad behavior, detailed behavior, confidence, entry_hint,
@@ -837,6 +866,18 @@ def _classify_current_behavior(
             "BEHIND_FAILED_OUTSIDE_EXTREME",
             "RESEARCH_ONLY",
             "Outside-value attempt is failing, but value acceptance needs confirmation.",
+        )
+
+    if open_direction in {"UP", "DOWN"} and value_test_occurred and not true_otd_allowed:
+        detailed = "OPEN_AUCTION_IN_RANGE" if open_context in {"OPEN_IN_RANGE", "OPEN_INSIDE_VA"} else "OPEN_AUCTION_OUT_OF_RANGE"
+        return (
+            "OPEN_AUCTION",
+            detailed,
+            0.52,
+            "WAIT_FOR_TRUE_SESSION_ACCEPTANCE",
+            "NO_STOP_MODEL",
+            "RESEARCH_ONLY",
+            "Value/reference test exists, but session normalization does not allow TRUE_OPEN_TEST_DRIVE; keep as observe/research until correct session acceptance is proven.",
         )
 
     if open_direction in {"UP", "DOWN"} and value_test_occurred:
@@ -950,6 +991,7 @@ def _build_first_hour_activity(ctx: dict[str, Any], *, auction_bias: str) -> Fir
         value_acceptance_state=value_acceptance_state,
         accepted_outside_range=accepted_outside_range,
         accepted_outside_value=accepted_outside_value,
+        true_otd_allowed=True,
     )
     del broad_behavior
 
@@ -1015,6 +1057,14 @@ def classify_tpo_open_behavior(
 
     warnings: list[str] = []
 
+    symbol = _first_non_empty(
+        ctx.get("symbol"),
+        ctx.get("instrument"),
+        flt.get("symbol"),
+        flt.get("instrument"),
+        default=None,
+    )
+
     auction_bias = _as_upper(ctx.get("auction_bias") or flt.get("auction_bias"), "UNKNOWN")
     market_status = _as_upper(ctx.get("market_status") or flt.get("market_status"), "UNKNOWN")
     tpo_permission = _as_upper(flt.get("tpo_signal_permission") or ctx.get("tpo_signal_permission"), "UNKNOWN")
@@ -1029,6 +1079,28 @@ def classify_tpo_open_behavior(
     open_relation = ctx.get("open_relation") or flt.get("open_relation")
     open_context = normalize_open_context(open_relation, ctx)
     first_hour = _build_first_hour_activity(ctx, auction_bias=auction_bias)
+
+    session_context: dict[str, Any]
+    if resolve_session_context is not None:
+        ctx_for_session = dict(ctx)
+        flt_for_session = dict(flt)
+        ctx_for_session.setdefault("open_location", first_hour.open_location)
+        ctx_for_session.setdefault("value_test_occurred", first_hour.value_test_occurred)
+        session_context = resolve_session_context(symbol=symbol, context=ctx_for_session, filters=flt_for_session)
+    else:
+        session_context = {
+            "version": SESSION_NORMALIZATION_VERSION,
+            "profile_reliability_score": 70,
+            "profile_reliability_state": "CAUTION",
+            "true_otd_allowed": True,
+            "warnings": ["session_normalization_unavailable"],
+            "blockers": [],
+            "reasons": [],
+        }
+
+    true_otd_allowed = bool(session_context.get("true_otd_allowed", True))
+    warnings.extend(str(w) for w in (session_context.get("warnings") or []) if w)
+
     interest_zones = _build_interest_zones(ctx)
     primary_zone = interest_zones[0] if interest_zones else None
 
@@ -1068,6 +1140,23 @@ def classify_tpo_open_behavior(
             day_type_candidate=first_hour.day_type_candidate,
             auction_state_confidence=round(confidence, 4),
             auction_state_reason=reason,
+            session_normalization_version=session_context.get("version"),
+            session_scope=session_context.get("session_scope"),
+            primary_session=session_context.get("primary_session"),
+            prior_value_scope=session_context.get("prior_value_scope"),
+            prior_range_scope=session_context.get("prior_range_scope"),
+            open_event=session_context.get("open_event"),
+            open_event_type=session_context.get("open_event_type"),
+            reference_profile_id=session_context.get("reference_profile_id"),
+            active_participation_center=session_context.get("active_participation_center"),
+            profile_reliability_score=session_context.get("profile_reliability_score"),
+            profile_reliability_state=session_context.get("profile_reliability_state"),
+            session_status=session_context.get("session_status"),
+            holiday_mode=session_context.get("holiday_mode"),
+            weekend_flag=session_context.get("weekend_flag"),
+            synthetic_open=session_context.get("synthetic_open"),
+            synthetic_open_confirmed=session_context.get("synthetic_open_confirmed"),
+            true_otd_allowed=session_context.get("true_otd_allowed"),
         )
         return result.to_dict()
 
@@ -1102,6 +1191,7 @@ def classify_tpo_open_behavior(
         value_acceptance_state=first_hour.value_acceptance_state,
         accepted_outside_range=first_hour.accepted_outside_range,
         accepted_outside_value=first_hour.accepted_outside_value,
+        true_otd_allowed=true_otd_allowed,
     )
 
     if htf in {"LONG", "SHORT"} and battle_hint.startswith("BOOST"):
@@ -1146,6 +1236,23 @@ def classify_tpo_open_behavior(
         day_type_candidate=first_hour.day_type_candidate,
         auction_state_confidence=round(confidence, 4),
         auction_state_reason=reason,
+        session_normalization_version=session_context.get("version"),
+        session_scope=session_context.get("session_scope"),
+        primary_session=session_context.get("primary_session"),
+        prior_value_scope=session_context.get("prior_value_scope"),
+        prior_range_scope=session_context.get("prior_range_scope"),
+        open_event=session_context.get("open_event"),
+        open_event_type=session_context.get("open_event_type"),
+        reference_profile_id=session_context.get("reference_profile_id"),
+        active_participation_center=session_context.get("active_participation_center"),
+        profile_reliability_score=session_context.get("profile_reliability_score"),
+        profile_reliability_state=session_context.get("profile_reliability_state"),
+        session_status=session_context.get("session_status"),
+        holiday_mode=session_context.get("holiday_mode"),
+        weekend_flag=session_context.get("weekend_flag"),
+        synthetic_open=session_context.get("synthetic_open"),
+        synthetic_open_confirmed=session_context.get("synthetic_open_confirmed"),
+        true_otd_allowed=session_context.get("true_otd_allowed"),
     )
     return result.to_dict()
 
@@ -1163,13 +1270,29 @@ def attach_open_behavior_to_tpo_item(item: dict[str, Any], *, htf_bias: str | No
     ctx = output.get("context") if isinstance(output.get("context"), dict) else {}
     flt = output.get("filters") if isinstance(output.get("filters"), dict) else {}
 
+    # Make session normalization symbol-aware even when symbol lives at item root.
+    ctx = dict(ctx)
+    flt = dict(flt)
+
+    item_symbol = _first_non_empty(
+        output.get("symbol"),
+        output.get("instrument"),
+        output.get("ticker"),
+        ctx.get("symbol"),
+        ctx.get("instrument"),
+        flt.get("symbol"),
+        flt.get("instrument"),
+        default=None,
+    )
+    if item_symbol:
+        ctx.setdefault("symbol", item_symbol)
+        flt.setdefault("symbol", item_symbol)
+
     behavior = classify_tpo_open_behavior(ctx, flt, htf_bias=htf_bias)
 
     output["open_behavior"] = behavior
 
     # Mirror the most important fields into context/filters for easier downstream use.
-    ctx = dict(ctx)
-    flt = dict(flt)
 
     mirror_keys = [
         "version",
@@ -1193,6 +1316,23 @@ def attach_open_behavior_to_tpo_item(item: dict[str, Any], *, htf_bias: str | No
         "entry_model_hint",
         "stop_model_hint",
         "battle_bias_hint",
+        "session_normalization_version",
+        "session_scope",
+        "primary_session",
+        "prior_value_scope",
+        "prior_range_scope",
+        "open_event",
+        "open_event_type",
+        "reference_profile_id",
+        "active_participation_center",
+        "profile_reliability_score",
+        "profile_reliability_state",
+        "session_status",
+        "holiday_mode",
+        "weekend_flag",
+        "synthetic_open",
+        "synthetic_open_confirmed",
+        "true_otd_allowed",
     ]
 
     for key in mirror_keys:
@@ -1219,6 +1359,23 @@ def attach_open_behavior_to_tpo_item(item: dict[str, Any], *, htf_bias: str | No
         "entry_model_hint",
         "stop_model_hint",
         "battle_bias_hint",
+        "session_normalization_version",
+        "session_scope",
+        "primary_session",
+        "prior_value_scope",
+        "prior_range_scope",
+        "open_event",
+        "open_event_type",
+        "reference_profile_id",
+        "active_participation_center",
+        "profile_reliability_score",
+        "profile_reliability_state",
+        "session_status",
+        "holiday_mode",
+        "weekend_flag",
+        "synthetic_open",
+        "synthetic_open_confirmed",
+        "true_otd_allowed",
     ]:
         if key in behavior:
             flt[key] = behavior.get(key)

@@ -37,7 +37,7 @@ import re
 from typing import Any
 
 
-TPO_WATCH_BRIDGE_VERSION = "tpo-watch-bridge-v1.3-dalton-acceptance-branching"
+TPO_WATCH_BRIDGE_VERSION = "tpo-watch-bridge-v1.4-session-normalization-brain"
 
 
 BLOCK_MARKET_STATUSES = {
@@ -165,6 +165,25 @@ class TPOWatchResult:
     day_type_candidate: str | None = None
     auction_state_confidence: float | None = None
     auction_state_reason: str | None = None
+
+    # v1.4 session-normalization fields from classifier v1.5.
+    session_normalization_version: str | None = None
+    session_scope: str | None = None
+    primary_session: str | None = None
+    prior_value_scope: str | None = None
+    prior_range_scope: str | None = None
+    open_event: str | None = None
+    open_event_type: str | None = None
+    reference_profile_id: str | None = None
+    active_participation_center: str | None = None
+    profile_reliability_score: int | None = None
+    profile_reliability_state: str | None = None
+    session_status: str | None = None
+    holiday_mode: str | None = None
+    weekend_flag: bool | None = None
+    synthetic_open: bool | None = None
+    synthetic_open_confirmed: bool | None = None
+    true_otd_allowed: bool | None = None
 
     market_status: str | None = None
     tpo_signal_permission: str | None = None
@@ -674,6 +693,62 @@ def evaluate_tpo_watch_bridge(
         )
     ) or None
 
+    result.session_normalization_version = _raw_s(_first_non_empty(
+        signal_payload.get("session_normalization_version"),
+        record.get("session_normalization_version"),
+        ctx.get("session_normalization_version"),
+        flt.get("session_normalization_version"),
+        ob.get("session_normalization_version"),
+    )) or None
+    result.session_scope = _s(_first_non_empty(
+        signal_payload.get("session_scope"), record.get("session_scope"), ctx.get("session_scope"), flt.get("session_scope"), ob.get("session_scope")
+    )) or None
+    result.primary_session = _s(_first_non_empty(
+        signal_payload.get("primary_session"), record.get("primary_session"), ctx.get("primary_session"), flt.get("primary_session"), ob.get("primary_session")
+    )) or None
+    result.prior_value_scope = _s(_first_non_empty(
+        signal_payload.get("prior_value_scope"), record.get("prior_value_scope"), ctx.get("prior_value_scope"), flt.get("prior_value_scope"), ob.get("prior_value_scope")
+    )) or None
+    result.prior_range_scope = _s(_first_non_empty(
+        signal_payload.get("prior_range_scope"), record.get("prior_range_scope"), ctx.get("prior_range_scope"), flt.get("prior_range_scope"), ob.get("prior_range_scope")
+    )) or None
+    result.open_event = _s(_first_non_empty(
+        signal_payload.get("open_event"), record.get("open_event"), ctx.get("open_event"), flt.get("open_event"), ob.get("open_event")
+    )) or None
+    result.open_event_type = _s(_first_non_empty(
+        signal_payload.get("open_event_type"), record.get("open_event_type"), ctx.get("open_event_type"), flt.get("open_event_type"), ob.get("open_event_type")
+    )) or None
+    result.reference_profile_id = _raw_s(_first_non_empty(
+        signal_payload.get("reference_profile_id"), record.get("reference_profile_id"), ctx.get("reference_profile_id"), flt.get("reference_profile_id"), ob.get("reference_profile_id")
+    )) or None
+    result.active_participation_center = _s(_first_non_empty(
+        signal_payload.get("active_participation_center"), record.get("active_participation_center"), ctx.get("active_participation_center"), flt.get("active_participation_center"), ob.get("active_participation_center")
+    )) or None
+    result.profile_reliability_score = _f(_first_non_empty(
+        signal_payload.get("profile_reliability_score"), record.get("profile_reliability_score"), ctx.get("profile_reliability_score"), flt.get("profile_reliability_score"), ob.get("profile_reliability_score")
+    ))
+    result.profile_reliability_state = _s(_first_non_empty(
+        signal_payload.get("profile_reliability_state"), record.get("profile_reliability_state"), ctx.get("profile_reliability_state"), flt.get("profile_reliability_state"), ob.get("profile_reliability_state")
+    )) or None
+    result.session_status = _s(_first_non_empty(
+        signal_payload.get("session_status"), record.get("session_status"), ctx.get("session_status"), flt.get("session_status"), ob.get("session_status")
+    )) or None
+    result.holiday_mode = _s(_first_non_empty(
+        signal_payload.get("holiday_mode"), record.get("holiday_mode"), ctx.get("holiday_mode"), flt.get("holiday_mode"), ob.get("holiday_mode")
+    )) or None
+    result.weekend_flag = _bool(_first_non_empty(
+        signal_payload.get("weekend_flag"), record.get("weekend_flag"), ctx.get("weekend_flag"), flt.get("weekend_flag"), ob.get("weekend_flag")
+    ), None)
+    result.synthetic_open = _bool(_first_non_empty(
+        signal_payload.get("synthetic_open"), record.get("synthetic_open"), ctx.get("synthetic_open"), flt.get("synthetic_open"), ob.get("synthetic_open")
+    ), None)
+    result.synthetic_open_confirmed = _bool(_first_non_empty(
+        signal_payload.get("synthetic_open_confirmed"), record.get("synthetic_open_confirmed"), ctx.get("synthetic_open_confirmed"), flt.get("synthetic_open_confirmed"), ob.get("synthetic_open_confirmed")
+    ), None)
+    result.true_otd_allowed = _bool(_first_non_empty(
+        signal_payload.get("true_otd_allowed"), record.get("true_otd_allowed"), ctx.get("true_otd_allowed"), flt.get("true_otd_allowed"), ob.get("true_otd_allowed")
+    ), None)
+
     result.entry_model_hint = _s(
         _first_non_empty(
             signal_payload.get("entry_model_hint"),
@@ -763,6 +838,33 @@ def evaluate_tpo_watch_bridge(
         or value_state in VALUE_REJECTION_STATES
     )
     value_accepted_back = value_state in VALUE_ACCEPTED_BACK_STATES
+
+    # v1.4 session-normalization reliability gate.
+    reliability_state = _s(result.profile_reliability_state)
+    if reliability_state in {"MARKET_CLOSED", "SUPPRESS", "PROFILE_UNRELIABLE"}:
+        return _set_blocked(
+            result,
+            state="BLOCKED",
+            reason=(
+                f"Session normalization blocks auction watch: profile_reliability_state={reliability_state}; "
+                "do not activate LTF/Battle from unreliable session scope."
+            ),
+            blocker=f"session_reliability_{reliability_state.lower()}",
+        )
+
+    if reliability_state == "RESEARCH_ONLY":
+        return _set_blocked(
+            result,
+            state="RESEARCH_ONLY",
+            reason=(
+                "Session normalization marks this profile as RESEARCH_ONLY; "
+                "levels may be useful for journal/statistics, but not for actionable watch."
+            ),
+            blocker="session_reliability_research_only",
+        )
+
+    if reliability_state == "CAUTION":
+        result.warnings.append("session_reliability_caution")
 
     # v1.2 detailed auction-state gates first.
     if current_behavior in OPEN_AUCTION_DETAILED_STATES or result.open_behavior == "OPEN_AUCTION":
@@ -899,6 +1001,28 @@ def evaluate_tpo_watch_bridge(
 
     if current_behavior in OTD_DETAILED_STATES or result.open_behavior == "OPEN_TEST_DRIVE":
         result.tpo_watch_setup = current_behavior or "OPEN_TEST_DRIVE"
+
+        if result.true_otd_allowed is False:
+            return _set_blocked(
+                result,
+                state="RESEARCH_ONLY",
+                reason=(
+                    "Session normalization does not allow TRUE_OPEN_TEST_DRIVE for this context; "
+                    "likely in-range rejection/continuation-through-session-change, not a full OTD license."
+                ),
+                blocker="true_otd_not_allowed_by_session_scope",
+            )
+
+        if result.synthetic_open is True and result.synthetic_open_confirmed is False:
+            return _set_blocked(
+                result,
+                state="OBSERVE_ONLY",
+                reason=(
+                    "Synthetic open is required/active but not confirmed; "
+                    "do not promote continuation-through-session-change into OTD watch."
+                ),
+                blocker="synthetic_open_not_confirmed",
+            )
 
         if value_accepted_back:
             return _set_blocked(
