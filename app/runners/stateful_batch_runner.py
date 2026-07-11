@@ -1014,7 +1014,8 @@ def _is_telegram_trade_alert_allowed(payload: dict[str, Any]) -> tuple[bool, str
             "MACRO_RISK_POST_SHOCK_CAUTION",
             "FAILED_ACCEPTANCE_RETEST_AFTER_SHOCK",
             "POST_SHOCK",
-            "POST_NEWS",
+            "POST_NEWS_ACCEPTANCE_REQUIRED",
+            "OIL_POST_NEWS_ACCEPTANCE_REQUIRED",
         )
     )
     if post_shock_context and rr < 3.0:

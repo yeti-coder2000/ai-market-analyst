@@ -407,13 +407,19 @@ def _normalize_tpo_record(
 
 def _open_behavior_value(*values: Any) -> str | None:
     """
-    Extract a broad open_behavior value from strings or nested behavior dicts.
+    Extract the safest current open-behavior value from strings or nested behavior dicts.
+
+    For nested auction-state records prefer current_open_behavior over the broad
+    legacy open_behavior. The broad field can intentionally remain OPEN_TEST_DRIVE
+    for backward compatibility while the current state is still CANDIDATE,
+    OPEN_AUCTION_IN_RANGE, or otherwise downgraded by session normalization.
     """
     for value in values:
         if isinstance(value, dict):
             candidate = _first_non_empty(
-                value.get("open_behavior"),
                 value.get("current_open_behavior"),
+                value.get("updated_open_behavior"),
+                value.get("open_behavior"),
                 value.get("initial_open_behavior"),
             )
             text = _s(candidate)

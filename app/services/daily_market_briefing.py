@@ -123,14 +123,14 @@ GLOBAL_SYMBOL_ORDER: tuple[str, ...] = (
 )
 
 REPORT_SCOPE_LABELS_UK: dict[str, str] = {
-    "morning": "London / ранкова сесія. NY cash/risk-активи винесені у звіт NY +1h.",
-    "morning_briefing": "London / ранкова сесія. NY cash/risk-активи винесені у звіт NY +1h.",
-    "morning_combined": "London + ранковий брифінг. NY cash/risk-активи винесені у звіт NY +1h.",
+    "morning": "London / ранкова сесія. NY cash/risk-активи винесені у NY post-open звіт.",
+    "morning_briefing": "London / ранкова сесія. NY cash/risk-активи винесені у NY post-open звіт.",
+    "morning_combined": "London + ранковий брифінг. NY cash/risk-активи винесені у NY post-open звіт.",
     "london": "London +1h. NY cash/risk-активи тут не показуються як активний фокус.",
     "london_1h": "London +1h. NY cash/risk-активи тут не показуються як активний фокус.",
-    "ny": "New York +1h. London-only активи тут не показуються як активний фокус.",
-    "ny_1h": "New York +1h. London-only активи тут не показуються як активний фокус.",
-    "new_york": "New York +1h. London-only активи тут не показуються як активний фокус.",
+    "ny": "New York post-open / NY active focus. London-only активи тут не показуються як активний фокус.",
+    "ny_1h": "New York post-open / NY active focus. London-only активи тут не показуються як активний фокус.",
+    "new_york": "New York post-open / NY active focus. London-only активи тут не показуються як активний фокус.",
     "holiday_warning": "Глобальне попередження про свята / закриті ринки. Можуть показуватись усі релевантні інструменти.",
     "pre_market": "Глобальне попередження про свята / закриті ринки. Можуть показуватись усі релевантні інструменти.",
 }
@@ -3255,13 +3255,39 @@ def _normalize_report_type(report_type: str) -> str:
     return str(report_type or "morning").strip().lower()
 
 
-def _section_header_for_type(report_type: str) -> str:
+def _briefing_minutes_from_hhmm(value: Any) -> int | None:
+    text = str(value or "").strip()
+    if "T" in text:
+        text = text.split("T", 1)[1]
+    text = text[:5]
+    try:
+        hh, mm = text.split(":", 1)
+        return int(hh) * 60 + int(mm)
+    except Exception:
+        return None
+
+
+def _ny_report_delay_minutes(generated_at_local: Any) -> int | None:
+    actual = _briefing_minutes_from_hhmm(generated_at_local)
+    scheduled = _briefing_minutes_from_hhmm(os.getenv("REPORT_TIME_NY_1H", "17:35"))
+    if actual is None or scheduled is None:
+        return None
+    delta = actual - scheduled
+    if delta < 0:
+        return None
+    return delta
+
+
+def _section_header_for_type(report_type: str, generated_at_local: Any = None) -> str:
     r = _normalize_report_type(report_type)
     if r in {"morning", "morning_briefing", "morning_combined"}:
         return "🌅 Ранковий брифінг"
     if r in {"london_1h", "london"}:
         return "🇬🇧 Звіт London +1 година"
     if r in {"ny_1h", "ny", "new_york"}:
+        delay_minutes = _ny_report_delay_minutes(generated_at_local)
+        if delay_minutes is not None and delay_minutes > 60:
+            return "🇺🇸 Звіт NY delayed / mid-session"
         return "🇺🇸 Звіт NY +1 година"
     if r in {"holiday_warning", "pre_market"}:
         return "🗓 Попередження про свята / ризики ринку"
@@ -3946,9 +3972,30 @@ def _brief_symbol_context(item: dict[str, Any]) -> dict[str, Any]:
         _first_from_sources(("open_context", "open_relation"), behavior_sources + context_sources + filter_sources),
         "UNKNOWN",
     )
-    open_behavior = _upper(
+    raw_open_behavior = _upper(
         _first_from_sources(("open_behavior",), behavior_sources + context_sources + filter_sources),
         "UNKNOWN",
+    )
+    current_open_behavior = _upper(
+        _first_from_sources(("current_open_behavior", "updated_open_behavior"), behavior_sources + context_sources + filter_sources),
+        "",
+    )
+    initial_open_behavior = _upper(
+        _first_from_sources(("initial_open_behavior",), behavior_sources + context_sources + filter_sources),
+        "",
+    )
+    true_otd_allowed = _first_from_sources(("true_otd_allowed",), behavior_sources + context_sources + filter_sources)
+    synthetic_open = _first_from_sources(("synthetic_open",), behavior_sources + context_sources + filter_sources)
+    synthetic_open_confirmed = _first_from_sources(("synthetic_open_confirmed",), behavior_sources + context_sources + filter_sources)
+    profile_reliability_state = _upper(
+        _first_from_sources(("profile_reliability_state",), behavior_sources + context_sources + filter_sources),
+        "",
+    )
+    open_behavior = _safe_briefing_open_behavior(
+        raw_open_behavior,
+        current_open_behavior=current_open_behavior,
+        initial_open_behavior=initial_open_behavior,
+        true_otd_allowed=true_otd_allowed,
     )
     entry_hint = _upper(
         _first_from_sources(("entry_model_hint",), behavior_sources + context_sources + filter_sources),
@@ -3975,6 +4022,13 @@ def _brief_symbol_context(item: dict[str, Any]) -> dict[str, Any]:
         "modifier": modifier,
         "open_context": open_context,
         "open_behavior": open_behavior,
+        "raw_open_behavior": raw_open_behavior,
+        "initial_open_behavior": initial_open_behavior,
+        "current_open_behavior": current_open_behavior,
+        "true_otd_allowed": true_otd_allowed,
+        "synthetic_open": synthetic_open,
+        "synthetic_open_confirmed": synthetic_open_confirmed,
+        "profile_reliability_state": profile_reliability_state,
         "entry_hint": entry_hint,
         "battle_hint": battle_hint,
         "primary_zone": primary_zone,
@@ -3989,6 +4043,63 @@ def _brief_symbol_context(item: dict[str, Any]) -> dict[str, Any]:
         "status_source_guard": "fresh_context_open_overrides_closed" if fresh_context_open else "normal",
     }
 
+
+
+
+def _briefing_falseish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value is False
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"false", "0", "no", "n", "off"}
+
+
+def _briefing_current_behavior_to_display(value: Any) -> str | None:
+    current = _upper(value, "")
+    if not current:
+        return None
+    if current.startswith("OPEN_AUCTION"):
+        return "OPEN_AUCTION"
+    if current == "OPEN_TEST_DRIVE_CONFIRMED":
+        return "OPEN_TEST_DRIVE"
+    if current == "OPEN_TEST_DRIVE_CANDIDATE":
+        return "OPEN_TEST_DRIVE_CANDIDATE"
+    if current.startswith("OPEN_REJECTION_REVERSE"):
+        return "OPEN_REJECTION_REVERSE"
+    if current.startswith("OPEN_DRIVE"):
+        return "OPEN_DRIVE"
+    return current
+
+
+def _safe_briefing_open_behavior(
+    raw_open_behavior: Any,
+    current_open_behavior: Any = None,
+    initial_open_behavior: Any = None,
+    true_otd_allowed: Any = None,
+) -> str:
+    """
+    Resolve a human/reporting-safe open_behavior.
+
+    Broad legacy open_behavior can remain OPEN_TEST_DRIVE for compatibility even
+    when the current auction state is only a candidate or was downgraded by
+    session normalization. Briefings should not print confident OTD in that case.
+    """
+    raw = _upper(raw_open_behavior, "")
+    current_display = _briefing_current_behavior_to_display(current_open_behavior)
+    initial_display = _briefing_current_behavior_to_display(initial_open_behavior)
+
+    if raw == "OPEN_TEST_DRIVE":
+        if _briefing_falseish(true_otd_allowed):
+            return current_display or "OPEN_AUCTION"
+        if current_display in {"OPEN_AUCTION", "OPEN_TEST_DRIVE_CANDIDATE"}:
+            return current_display
+        if current_display:
+            return current_display
+
+    if raw in {"", "UNKNOWN", "UNCONFIRMED"}:
+        return current_display or initial_display or raw or "UNKNOWN"
+
+    return raw or current_display or initial_display or "UNKNOWN"
 
 
 def _calendar_status_for_context(target_date: date | None, timezone_name: str | None, report_type: str) -> CalendarLoadResult | None:
@@ -4824,7 +4935,7 @@ def _build_focus_section(report_type: str, target_date: date | None = None) -> B
         else:
             section.lines.extend(
                 [
-                    "NY +1h: не наздоганяємо перший імпульс.",
+                    "NY post-open: не наздоганяємо перший імпульс.",
                     "FOMC / high-impact news: NO BATTLE до завершення lock; після — тільки acceptance + retest.",
                     "Потрібні open behavior + LTF model + context-invalidation stop + Battle Gate.",
                     "POC/nPOC = зона інтересу, не entry trigger.",
@@ -4833,6 +4944,153 @@ def _build_focus_section(report_type: str, target_date: date | None = None) -> B
     else:
         section.lines.append("Battle Gate — фінальний дозвіл для Telegram.")
     return section
+
+
+
+def _tpo_audit_sources(record: Any) -> list[dict[str, Any]]:
+    if not isinstance(record, dict):
+        return []
+
+    context = record.get("context") if isinstance(record.get("context"), dict) else {}
+    filters = record.get("filters") if isinstance(record.get("filters"), dict) else {}
+    behavior = record.get("open_behavior") if isinstance(record.get("open_behavior"), dict) else {}
+    auction_state = record.get("auction_state") if isinstance(record.get("auction_state"), dict) else {}
+
+    # Prefer normalized/context-rich sources, but keep root as fallback.
+    return [behavior, auction_state, context, filters, record]
+
+
+def _tpo_audit_pick(record: Any, *keys: str) -> Any:
+    for source in _tpo_audit_sources(record):
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, "", [], {}):
+                return value
+    return None
+
+
+def _looks_like_tpo_symbol_record(key: Any, record: Any) -> bool:
+    if not isinstance(record, dict):
+        return False
+    if str(key).lower() in {
+        "updated_at_utc",
+        "created_at_utc",
+        "version",
+        "schema_version",
+        "metadata",
+        "provider",
+        "providers",
+        "errors",
+        "warnings",
+    }:
+        return False
+
+    if isinstance(record.get("context"), dict) or isinstance(record.get("filters"), dict) or isinstance(record.get("open_behavior"), dict):
+        return True
+
+    return any(
+        _tpo_audit_pick(record, field) is not None
+        for field in (
+            "previous_vah",
+            "previous_val",
+            "previous_poc",
+            "current_open",
+            "open_relation",
+            "open_context",
+            "open_behavior",
+        )
+    )
+
+
+def _build_tpo_audit_snapshot(tpo: Any, report_type: str | None = None) -> dict[str, Any]:
+    """
+    Persist compact per-briefing TPO audit data.
+
+    This snapshot makes historical VAH/VAL/POC/open-behavior reviews possible
+    even after runtime/tpo/tpo_latest.json moves on to a later session.
+    """
+    if not isinstance(tpo, dict):
+        return {
+            "version": "tpo-audit-snapshot-v1",
+            "report_type": report_type,
+            "updated_at_utc": None,
+            "symbols": {},
+        }
+
+    container = None
+    for key in ("symbols", "items", "records", "data"):
+        if isinstance(tpo.get(key), dict):
+            container = tpo.get(key)
+            break
+    if container is None:
+        container = tpo
+
+    fields = (
+        "symbol",
+        "current_session_id",
+        "previous_session_id",
+        "current_price",
+        "previous_poc",
+        "previous_vah",
+        "previous_val",
+        "previous_high",
+        "previous_low",
+        "current_open",
+        "open_relation",
+        "open_context",
+        "open_location",
+        "open_behavior",
+        "open_behavior_confidence",
+        "initial_open_behavior",
+        "current_open_behavior",
+        "behavior_transition",
+        "value_acceptance_state",
+        "value_test_occurred",
+        "value_test_level",
+        "value_rejection_confirmed",
+        "day_type_candidate",
+        "auction_state_confidence",
+        "session_normalization_version",
+        "session_scope",
+        "primary_session",
+        "prior_value_scope",
+        "prior_range_scope",
+        "open_event",
+        "open_event_type",
+        "reference_profile_id",
+        "active_participation_center",
+        "profile_reliability_score",
+        "profile_reliability_state",
+        "session_status",
+        "market_status",
+        "synthetic_open",
+        "synthetic_open_confirmed",
+        "true_otd_allowed",
+        "entry_model_hint",
+        "stop_model_hint",
+        "battle_bias_hint",
+        "open_behavior_reason",
+        "open_behavior_warnings",
+        "warnings",
+    )
+
+    symbols: dict[str, Any] = {}
+    for key, record in container.items():
+        if not _looks_like_tpo_symbol_record(key, record):
+            continue
+
+        symbol = str(_tpo_audit_pick(record, "symbol") or key).upper()
+        row = {field: _tpo_audit_pick(record, field) for field in fields}
+        row["symbol"] = symbol
+        symbols[symbol] = row
+
+    return {
+        "version": "tpo-audit-snapshot-v1",
+        "report_type": report_type,
+        "updated_at_utc": tpo.get("updated_at_utc"),
+        "symbol_count": len(symbols),
+        "symbols": symbols,
+    }
 
 
 def build_briefing_report(
@@ -4869,6 +5127,7 @@ def build_briefing_report(
             "economic_calendar_enabled": os.getenv("ENABLE_ECONOMIC_CALENDAR", "true"),
             "tpo_updated_at_utc": tpo.get("updated_at_utc") if isinstance(tpo, dict) else None,
             "daily_summary_updated_at_utc": daily_summary.get("updated_at_utc") if isinstance(daily_summary, dict) else None,
+            "tpo_audit_snapshot": _build_tpo_audit_snapshot(tpo, normalized_type),
         },
     )
 
@@ -4900,7 +5159,7 @@ def build_briefing_report(
 
 
 def render_briefing_text(report: BriefingReport) -> str:
-    header = _section_header_for_type(report.report_type)
+    header = _section_header_for_type(report.report_type, report.generated_at_local)
     lines = [
         f"<b>{_esc(header)} — {_esc(report.report_date)}</b>",
         f"Згенеровано: {_esc(report.generated_at_local)}",

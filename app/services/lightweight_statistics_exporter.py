@@ -702,6 +702,92 @@ def extract_tpo_fields_from_item(item: dict[str, Any]) -> dict[str, Any]:
             ),
             None,
         ),
+        "initial_open_behavior": first_non_empty(
+            pick_from_candidates(
+                candidates,
+                "initial_open_behavior",
+                "tpo_initial_open_behavior",
+            )
+        ),
+        "current_open_behavior": first_non_empty(
+            pick_from_candidates(
+                candidates,
+                "current_open_behavior",
+                "updated_open_behavior",
+                "tpo_current_open_behavior",
+                "tpo_updated_open_behavior",
+            )
+        ),
+        "value_acceptance_state": first_non_empty(
+            pick_from_candidates(
+                candidates,
+                "value_acceptance_state",
+                "acceptance_state",
+            )
+        ),
+        "value_test_occurred": pick_from_candidates(
+            candidates,
+            "value_test_occurred",
+        ),
+        "value_test_level": first_non_empty(
+            pick_from_candidates(
+                candidates,
+                "value_test_level",
+            )
+        ),
+        "value_rejection_confirmed": pick_from_candidates(
+            candidates,
+            "value_rejection_confirmed",
+        ),
+        "session_scope": first_non_empty(
+            pick_from_candidates(
+                candidates,
+                "session_scope",
+            )
+        ),
+        "prior_value_scope": first_non_empty(
+            pick_from_candidates(
+                candidates,
+                "prior_value_scope",
+            )
+        ),
+        "prior_range_scope": first_non_empty(
+            pick_from_candidates(
+                candidates,
+                "prior_range_scope",
+            )
+        ),
+        "open_event_type": first_non_empty(
+            pick_from_candidates(
+                candidates,
+                "open_event_type",
+            )
+        ),
+        "profile_reliability_score": safe_float(
+            pick_from_candidates(
+                candidates,
+                "profile_reliability_score",
+            ),
+            None,
+        ),
+        "profile_reliability_state": first_non_empty(
+            pick_from_candidates(
+                candidates,
+                "profile_reliability_state",
+            )
+        ),
+        "synthetic_open": pick_from_candidates(
+            candidates,
+            "synthetic_open",
+        ),
+        "synthetic_open_confirmed": pick_from_candidates(
+            candidates,
+            "synthetic_open_confirmed",
+        ),
+        "true_otd_allowed": pick_from_candidates(
+            candidates,
+            "true_otd_allowed",
+        ),
         "entry_model_hint": first_non_empty(
             pick_from_candidates(
                 candidates,
@@ -1255,6 +1341,21 @@ def normalize_flat_signal(
         "open_context": battle_fields["open_context"],
         "open_behavior": battle_fields["open_behavior"],
         "open_behavior_confidence": battle_fields["open_behavior_confidence"],
+        "initial_open_behavior": battle_fields.get("initial_open_behavior"),
+        "current_open_behavior": battle_fields.get("current_open_behavior"),
+        "value_acceptance_state": battle_fields.get("value_acceptance_state"),
+        "value_test_occurred": battle_fields.get("value_test_occurred"),
+        "value_test_level": battle_fields.get("value_test_level"),
+        "value_rejection_confirmed": battle_fields.get("value_rejection_confirmed"),
+        "session_scope": battle_fields.get("session_scope"),
+        "prior_value_scope": battle_fields.get("prior_value_scope"),
+        "prior_range_scope": battle_fields.get("prior_range_scope"),
+        "open_event_type": battle_fields.get("open_event_type"),
+        "profile_reliability_score": battle_fields.get("profile_reliability_score"),
+        "profile_reliability_state": battle_fields.get("profile_reliability_state"),
+        "synthetic_open": battle_fields.get("synthetic_open"),
+        "synthetic_open_confirmed": battle_fields.get("synthetic_open_confirmed"),
+        "true_otd_allowed": battle_fields.get("true_otd_allowed"),
         "entry_model_hint": battle_fields["entry_model_hint"],
         "stop_model_hint": battle_fields["stop_model_hint"],
         "battle_bias_hint": battle_fields["battle_bias_hint"],

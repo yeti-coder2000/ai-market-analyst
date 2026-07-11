@@ -1078,22 +1078,67 @@ def _is_invalidated_before_alert(inputs: dict[str, Any]) -> tuple[bool, str | No
     return False, None
 
 
+def _macro_guard_affects_symbol(inputs: dict[str, Any]) -> bool:
+    """
+    Return True when the current symbol is explicitly affected by the active macro guard.
+
+    If no affected-symbol list is available, keep legacy conservative behavior and
+    allow the post-shock gate to use explicit post-news/post-shock regimes.
+    """
+    affected_raw = inputs.get("macro_guard_affected_symbols") or []
+    if not affected_raw:
+        return True
+
+    if not isinstance(affected_raw, (list, tuple, set)):
+        affected_raw = [affected_raw]
+
+    affected = {_as_upper(x) for x in affected_raw if _as_upper(x)}
+    symbol = _as_upper(inputs.get("symbol"))
+
+    if not affected or not symbol:
+        return True
+
+    return symbol in affected
+
+
 def _is_post_shock_or_post_news_context(inputs: dict[str, Any]) -> bool:
+    if not _macro_guard_affects_symbol(inputs):
+        return False
+
     if inputs.get("macro_shock_recent") is True:
         return True
 
     macro_regime = _as_upper(inputs.get("macro_regime"))
-    if macro_regime and macro_regime not in {"NO_MACRO_SHOCK", "NONE", "UNKNOWN"}:
+    if macro_regime in {
+        "POST_SHOCK",
+        "POST_NEWS",
+        "POST_NEWS_ACCEPTANCE_REQUIRED",
+        "OIL_POST_NEWS_ACCEPTANCE_REQUIRED",
+        "MACRO_RISK_POST_SHOCK_CAUTION",
+        "FAILED_ACCEPTANCE_RETEST_AFTER_SHOCK",
+    }:
         return True
 
     post_news_regime = _as_upper(inputs.get("post_news_regime"))
-    if post_news_regime and post_news_regime not in {"NOT_POST_NEWS", "NONE", "UNKNOWN"}:
+    if post_news_regime in {
+        "POST_NEWS",
+        "POST_SHOCK",
+        "POST_NEWS_ACCEPTANCE_REQUIRED",
+        "OIL_POST_NEWS_ACCEPTANCE_REQUIRED",
+        "ACCEPTANCE_REQUIRED",
+        "FAILED_ACCEPTANCE_RETEST_AFTER_SHOCK",
+    }:
         return True
 
     macro_guard_status = _as_upper(inputs.get("macro_guard_status"))
-    if macro_guard_status and any(token in macro_guard_status for token in ("POST_NEWS", "FOMC", "PRE_NEWS")):
+    if macro_guard_status in {
+        "POST_NEWS_ACCEPTANCE_REQUIRED",
+        "OIL_POST_NEWS_ACCEPTANCE_REQUIRED",
+    }:
         return True
 
+    # Do not treat PRE_NEWS or generic FOMC lock as post-shock RR scope.
+    # Those states are already handled by the macro event guard hard gate.
     haystack = _payload_flag_haystack(inputs)
     return any(
         token in haystack
@@ -1102,7 +1147,8 @@ def _is_post_shock_or_post_news_context(inputs: dict[str, Any]) -> bool:
             "MACRO_RISK_POST_SHOCK_CAUTION",
             "FAILED_ACCEPTANCE_RETEST_AFTER_SHOCK",
             "POST_SHOCK",
-            "POST_NEWS",
+            "POST_NEWS_ACCEPTANCE_REQUIRED",
+            "OIL_POST_NEWS_ACCEPTANCE_REQUIRED",
         )
     )
 
