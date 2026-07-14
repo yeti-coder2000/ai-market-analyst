@@ -3001,6 +3001,43 @@ def _safe_avg(values: list[float]) -> float | None:
     return round(sum(values) / len(values), 4)
 
 
+
+def _positioning_enrich_records_for_reporting(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Attach Positioning Intelligence metadata to reporting/statistics records.
+
+    v0.1 safety:
+    - in-memory reporting enrichment only;
+    - does not write back to signal_outcomes.json;
+    - does not allow signals;
+    - does not block signals;
+    - does not modify Battle Gate decisions.
+    """
+    if not records:
+        return records
+
+    try:
+        from app.services.positioning.positioning_record_enricher import enrich_records_with_positioning
+
+        return enrich_records_with_positioning(records, mutate=False)
+    except Exception as exc:
+        # Fail-open: reporting must not break if positioning context is unavailable.
+        out: list[dict[str, Any]] = []
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            copy = dict(record)
+            copy.setdefault("positioning_primary_tag", "DATA_UNAVAILABLE")
+            copy.setdefault("positioning_mode", "RESEARCH_ONLY")
+            copy.setdefault("positioning_battle_gate_impact", "none")
+            copy.setdefault("positioning_telegram_signal_impact", "none")
+            copy.setdefault("positioning_can_allow_signal", False)
+            copy.setdefault("positioning_can_block_signal", False)
+            copy.setdefault("positioning_enrichment_error", f"{type(exc).__name__}: {exc}")
+            out.append(copy)
+        return out
+
+
 def _metric_from_records(records: list[dict[str, Any]]) -> dict[str, Any]:
     tp = sl = missed = expired = invalid = pending = 0
     result_values: list[float] = []
@@ -3089,6 +3126,7 @@ def _record_is_research_counterfactual(record: dict[str, Any]) -> bool:
 def _yesterday_grouped_metrics(timezone_name: str, target_date: date) -> tuple[dict[str, Any], str]:
     outcomes = load_signal_outcomes()
     records = _dedup_signal_outcome_records(_production_records(_signals_from_outcomes(outcomes)))
+    records = _positioning_enrich_records_for_reporting(records)
 
     yesterday = target_date - timedelta(days=1)
     dated = [r for r in records if _record_local_date(r, timezone_name) == yesterday]
@@ -3156,6 +3194,7 @@ def _overall_grouped_metrics() -> tuple[dict[str, Any], str]:
     """
     outcomes = load_signal_outcomes()
     records = _dedup_signal_outcome_records(_production_records(_signals_from_outcomes(outcomes)))
+    records = _positioning_enrich_records_for_reporting(records)
 
     if not records:
         return {
@@ -4780,6 +4819,172 @@ def _fmt_count(value: Any) -> int:
         return 0
 
 
+
+def _briefing_section_add_line(section: "BriefingSection", line: str) -> None:
+    """
+    Compatibility helper for BriefingSection.
+
+    Different versions of daily_market_briefing.py may store section body
+    in different attributes. Keep this adapter defensive so positioning
+    context cannot break report rendering.
+    """
+    if hasattr(section, "lines") and isinstance(getattr(section, "lines"), list):
+        section.lines.append(line)
+        return
+
+    if hasattr(section, "items") and isinstance(getattr(section, "items"), list):
+        section.items.append(line)
+        return
+
+    if hasattr(section, "body") and isinstance(getattr(section, "body"), list):
+        section.body.append(line)
+        return
+
+    if hasattr(section, "append"):
+        section.append(line)
+        return
+
+    # Last-resort fallback. Most project versions use `.lines`, but keep
+    # a fallback for older/newer shapes.
+    try:
+        setattr(section, "lines", [line])
+    except Exception:
+        pass
+
+
+def _build_positioning_context_section() -> "BriefingSection":
+    """
+    Build optional Positioning Intelligence section.
+
+    v0.1 rules:
+    - context only;
+    - no Battle Gate impact;
+    - no Telegram signal permission impact;
+    - fail-open: if positioning layer is unavailable, report still renders.
+    """
+    section = BriefingSection("📊 Positioning Context")
+
+    try:
+        from app.services.positioning.positioning_service import get_latest_positioning_context
+        from app.services.positioning.positioning_briefing_renderer import render_positioning_block
+
+        snapshot = get_latest_positioning_context()
+        block = render_positioning_block(snapshot, max_items=7)
+    except Exception as exc:
+        block = f"📊 Positioning Context: дані недоступні. ({type(exc).__name__})"
+
+    lines = str(block).splitlines()
+
+    # Renderer already includes the same header. Since BriefingSection also has
+    # a title, remove duplicate heading if present.
+    if lines and lines[0].strip().startswith("📊 Positioning Context"):
+        lines = lines[1:]
+
+    if not lines:
+        lines = ["дані недоступні."]
+
+    for line in lines:
+        _briefing_section_add_line(section, line)
+
+    return section
+
+
+
+def _build_positioning_diagnostics_section() -> "BriefingSection":
+    """
+    Build diagnostics for Positioning Intelligence metadata in reporting records.
+
+    v0.1 safety:
+    - diagnostics only;
+    - no signal generation;
+    - no Battle Gate impact;
+    - no writes to signal_outcomes.json.
+    """
+    section = BriefingSection("📊 Positioning Diagnostics")
+
+    try:
+        from collections import Counter
+
+        outcomes = load_signal_outcomes()
+        records = _dedup_signal_outcome_records(_production_records(_signals_from_outcomes(outcomes)))
+        records = _positioning_enrich_records_for_reporting(records)
+
+        if not records:
+            _briefing_section_add_line(
+                section,
+                "Поки немає production/research records для оцінки positioning tags."
+            )
+            _briefing_section_add_line(
+                section,
+                "Режим: research-only. Battle Gate не змінюється."
+            )
+            return section
+
+        tag_counts = Counter(
+            str(r.get("positioning_primary_tag") or "DATA_UNAVAILABLE")
+            for r in records
+            if isinstance(r, dict)
+        )
+        alignment_counts = Counter(
+            str(r.get("positioning_alignment") or "UNKNOWN")
+            for r in records
+            if isinstance(r, dict)
+        )
+        quality_counts = Counter(
+            str(r.get("positioning_data_quality") or "UNKNOWN")
+            for r in records
+            if isinstance(r, dict)
+        )
+
+        unsafe_allow = sum(1 for r in records if bool(r.get("positioning_can_allow_signal")))
+        unsafe_block = sum(1 for r in records if bool(r.get("positioning_can_block_signal")))
+        non_none_bg = sum(
+            1
+            for r in records
+            if str(r.get("positioning_battle_gate_impact") or "none").lower() != "none"
+        )
+
+        _briefing_section_add_line(section, f"Records enriched: {len(records)}")
+        _briefing_section_add_line(section, f"Tags: {_format_counter_inline(tag_counts)}")
+        _briefing_section_add_line(section, f"Alignment: {_format_counter_inline(alignment_counts)}")
+        _briefing_section_add_line(section, f"Data quality: {_format_counter_inline(quality_counts)}")
+        _briefing_section_add_line(
+            section,
+            f"Safety: allow=True {unsafe_allow} | block=True {unsafe_block} | battle_gate_impact!=none {non_none_bg}"
+        )
+        _briefing_section_add_line(
+            section,
+            "Висновок: це лише діагностика контексту участі. Сигнали й Battle Gate не змінюються."
+        )
+        return section
+
+    except Exception as exc:
+        _briefing_section_add_line(
+            section,
+            f"Positioning diagnostics unavailable: {type(exc).__name__}"
+        )
+        _briefing_section_add_line(
+            section,
+            "Fail-open: reporting продовжено без positioning diagnostics."
+        )
+        return section
+
+
+def _format_counter_inline(counter: "Counter[str]", limit: int = 6) -> str:
+    if not counter:
+        return "none"
+
+    parts = []
+    for key, value in counter.most_common(limit):
+        parts.append(f"{key}={value}")
+
+    remaining = sum(counter.values()) - sum(value for _, value in counter.most_common(limit))
+    if remaining > 0:
+        parts.append(f"other={remaining}")
+
+    return ", ".join(parts)
+
+
 def _build_suppressed_telegram_section() -> BriefingSection:
     section = BriefingSection("🧹 Відфільтровано з Telegram")
     summary = load_daily_summary()
@@ -5143,7 +5348,9 @@ def build_briefing_report(
         report.sections.append(intermarket_section)
 
     report.sections.append(_build_tpo_snapshot_section(tpo, normalized_type, target_date, tz_name))
+    report.sections.append(_build_positioning_context_section())
     report.sections.append(_build_suppressed_telegram_section())
+    report.sections.append(_build_positioning_diagnostics_section())
 
     if normalized_type in {"morning", "morning_briefing", "morning_combined", "holiday_warning", "pre_market"}:
         report.sections.append(_build_yesterday_section(target_date, tz_name))
