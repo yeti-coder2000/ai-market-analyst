@@ -30,7 +30,7 @@ from app.services.daily_market_briefing import (
 from app.services.telegram_notifier import TelegramNotifier
 
 
-REPORTER_VERSION = "telegram-daily-reporter-v1.1-positioning-second-message"
+REPORTER_VERSION = "telegram-daily-reporter-v1.2-main-and-positioning-split"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -58,7 +58,9 @@ class ReporterResult:
     telegram_sent: bool
     dry_run: bool
     message_length: int
-    artifact_json: str | None
+    telegram_main_parts: int = 0
+    telegram_main_part_lengths: list[int] | None = None
+    artifact_json: str | None = None
     artifact_text: str | None
     refresh_results: list[dict[str, Any]]
     positioning_delivery: dict[str, Any] | None = None
@@ -73,6 +75,8 @@ class ReporterResult:
             "telegram_sent": self.telegram_sent,
             "dry_run": self.dry_run,
             "message_length": self.message_length,
+            "telegram_main_parts": self.telegram_main_parts,
+            "telegram_main_part_lengths": self.telegram_main_part_lengths or [],
             "artifact_json": self.artifact_json,
             "artifact_text": self.artifact_text,
             "refresh_results": self.refresh_results,
@@ -143,6 +147,138 @@ def refresh_runtime_artifacts(*, include_tpo: bool | None = None) -> list[dict[s
         modules.append("app.services.lightweight_statistics_exporter")
 
     return [_run_module(module, timeout_sec=timeout_sec) for module in modules]
+
+
+
+
+TELEGRAM_MAIN_MESSAGE_SAFE_LIMIT = 3900
+
+
+def _split_main_telegram_message(text: str, max_chars: int | None = None) -> list[str]:
+    """
+    Split main daily/session Telegram briefing below Telegram hard limit.
+
+    Telegram sendMessage hard limit is 4096 chars. We use 3900 by default.
+    Prefer paragraph/line boundaries and hard-split only as final fallback.
+    """
+    limit = max_chars or _env_int("REPORT_MAIN_TELEGRAM_SPLIT_LIMIT", TELEGRAM_MAIN_MESSAGE_SAFE_LIMIT)
+    raw = str(text or "").strip()
+
+    if not raw:
+        return []
+
+    if len(raw) <= limit:
+        return [raw]
+
+    chunks: list[str] = []
+    current = ""
+
+    for block in raw.split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+
+        candidate = block if not current else current + "\n\n" + block
+
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+
+        if current:
+            chunks.append(current)
+            current = ""
+
+        if len(block) <= limit:
+            current = block
+            continue
+
+        for line_chunk in _split_main_long_block(block, limit=limit):
+            if len(line_chunk) <= limit:
+                chunks.append(line_chunk)
+            else:
+                chunks.extend(_hard_split_text(line_chunk, limit=limit))
+
+    if current:
+        chunks.append(current)
+
+    return [chunk for chunk in chunks if chunk.strip()]
+
+
+def _split_main_long_block(block: str, limit: int) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+
+    for line in str(block or "").splitlines():
+        line = line.rstrip()
+
+        if len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(_hard_split_text(line, limit=limit))
+            continue
+
+        candidate = line if not current else current + "\n" + line
+
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = line
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def _hard_split_text(text: str, limit: int) -> list[str]:
+    raw = str(text or "")
+    if len(raw) <= limit:
+        return [raw]
+
+    out: list[str] = []
+    start = 0
+    while start < len(raw):
+        out.append(raw[start:start + limit])
+        start += limit
+    return out
+
+
+def _send_main_telegram_message(
+    notifier: TelegramNotifier,
+    message: str,
+    *,
+    split_limit: int | None = None,
+) -> tuple[bool, list[int]]:
+    """
+    Send main market briefing in safe chunks.
+
+    Returns:
+    - overall send status
+    - list of sent/attempted chunk lengths
+    """
+    chunks = _split_main_telegram_message(message, max_chars=split_limit)
+
+    if not chunks:
+        return False, []
+
+    total = len(chunks)
+    lengths: list[int] = []
+
+    for idx, chunk in enumerate(chunks, start=1):
+        if total > 1:
+            chunk_text = f"{chunk}\n\n<i>Main briefing part {idx}/{total}</i>"
+        else:
+            chunk_text = chunk
+
+        lengths.append(len(chunk_text))
+
+        if not notifier.send_text(chunk_text):
+            return False, lengths
+
+    return True, lengths
 
 
 
@@ -327,10 +463,12 @@ def send_daily_report(
     sent = False
     notifier: TelegramNotifier | None = None
     positioning_delivery: dict[str, Any] | None = None
+    main_chunks = _split_main_telegram_message(message)
+    main_part_lengths = [len(chunk) for chunk in main_chunks]
 
     if not dry_run:
         notifier = TelegramNotifier()
-        sent = notifier.send_text(message)
+        sent, main_part_lengths = _send_main_telegram_message(notifier, message)
 
     if dry_run or sent:
         positioning_delivery = _send_positioning_second_message(
@@ -360,6 +498,8 @@ def send_daily_report(
         telegram_sent=sent,
         dry_run=dry_run,
         message_length=len(message),
+        telegram_main_parts=len(main_part_lengths),
+        telegram_main_part_lengths=main_part_lengths,
         artifact_json=str(json_path),
         artifact_text=str(txt_path),
         refresh_results=refresh_results,
