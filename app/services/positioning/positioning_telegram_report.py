@@ -14,6 +14,10 @@ from .positioning_store import get_positioning_dir
 POSITIONING_TELEGRAM_REPORT_VERSION = "positioning-telegram-report-v0.1-separate-message"
 
 DEFAULT_POSITIONING_TELEGRAM_REPORT_FILENAME = "positioning_telegram_latest.txt"
+DEFAULT_POSITIONING_TELEGRAM_PART_PREFIX = "positioning_telegram_part"
+
+TELEGRAM_MESSAGE_HARD_LIMIT = 4096
+TELEGRAM_MESSAGE_SAFE_LIMIT = 3900
 
 
 def render_positioning_telegram_message(
@@ -125,6 +129,197 @@ def render_positioning_telegram_message(
     lines.append(_safety_footer())
 
     return "\n".join(lines).strip()
+
+
+
+def split_telegram_message(
+    text: str,
+    limit: int = TELEGRAM_MESSAGE_SAFE_LIMIT,
+    title: str = "<b>📊 Positioning Intelligence Briefing</b>",
+) -> list[str]:
+    """
+    Split Telegram HTML message into safe parts.
+
+    Rules:
+    - default safe limit is 3900 chars, below Telegram hard limit 4096;
+    - split prefers paragraph boundaries;
+    - then line boundaries;
+    - final fallback hard-splits very long lines;
+    - every part gets a title + Part X/Y marker;
+    - does not send Telegram, only prepares text chunks.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+
+    if limit <= 500:
+        raise ValueError("Telegram split limit is too small; use > 500 chars.")
+
+    if len(raw) <= limit:
+        return [raw]
+
+    body = raw
+    if body.startswith(title):
+        body = body[len(title):].lstrip()
+
+    # Reserve space for title + Part X/Y header.
+    content_limit = max(500, limit - 140)
+
+    chunks = _split_text_blocks(body, limit=content_limit)
+    total = len(chunks)
+
+    parts: list[str] = []
+    for idx, chunk in enumerate(chunks, start=1):
+        header = f"{title}\n<i>Part {idx}/{total}</i>\n\n"
+        part = header + chunk.strip()
+
+        if len(part) <= limit:
+            parts.append(part)
+            continue
+
+        # Extremely defensive fallback if header pushed it over the limit.
+        sub_limit = max(500, limit - len(header) - 5)
+        sub_chunks = _split_text_blocks(chunk, limit=sub_limit)
+        for sub in sub_chunks:
+            parts.append(header + sub.strip())
+
+    # If defensive fallback changed count, normalize headers.
+    if len(parts) != total:
+        normalized: list[str] = []
+        total = len(parts)
+        for idx, part in enumerate(parts, start=1):
+            body_part = _strip_positioning_part_header(part, title=title)
+            normalized.append(f"{title}\n<i>Part {idx}/{total}</i>\n\n{body_part.strip()}")
+        parts = normalized
+
+    return parts
+
+
+def write_positioning_telegram_report_parts(
+    text: str,
+    runtime_dir: str | None = None,
+    output_dir: str | None = None,
+    limit: int = TELEGRAM_MESSAGE_SAFE_LIMIT,
+) -> list[Path]:
+    """
+    Write split Telegram parts to runtime/positioning.
+
+    Existing positioning_telegram_part_* files are removed first to prevent
+    stale parts from previous longer reports.
+    """
+    directory = Path(output_dir) if output_dir else get_positioning_dir(runtime_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+
+    for old in directory.glob(f"{DEFAULT_POSITIONING_TELEGRAM_PART_PREFIX}_*_of_*.txt"):
+        try:
+            old.unlink()
+        except FileNotFoundError:
+            pass
+
+    parts = split_telegram_message(text, limit=limit)
+    total = len(parts)
+
+    paths: list[Path] = []
+    for idx, part in enumerate(parts, start=1):
+        path = directory / f"{DEFAULT_POSITIONING_TELEGRAM_PART_PREFIX}_{idx:02d}_of_{total:02d}.txt"
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(part + "\n", encoding="utf-8")
+        tmp.replace(path)
+        paths.append(path)
+
+    return paths
+
+
+def _split_text_blocks(text: str, limit: int) -> list[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+
+    chunks: list[str] = []
+    current = ""
+
+    for block in raw.split("\n\n"):
+        block = block.strip()
+        if not block:
+            continue
+
+        candidate = block if not current else current + "\n\n" + block
+
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+
+        if current:
+            chunks.append(current)
+            current = ""
+
+        if len(block) <= limit:
+            current = block
+            continue
+
+        line_chunks = _split_long_block_by_lines(block, limit=limit)
+        if line_chunks:
+            chunks.extend(line_chunks[:-1])
+            current = line_chunks[-1]
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def _split_long_block_by_lines(block: str, limit: int) -> list[str]:
+    chunks: list[str] = []
+    current = ""
+
+    for line in block.splitlines():
+        line = line.rstrip()
+
+        if len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(_hard_split_line(line, limit=limit))
+            continue
+
+        candidate = line if not current else current + "\n" + line
+
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = line
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+
+def _hard_split_line(line: str, limit: int) -> list[str]:
+    text = str(line or "")
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        chunks.append(text[start:start + limit])
+        start += limit
+    return chunks
+
+
+def _strip_positioning_part_header(text: str, title: str) -> str:
+    raw = str(text or "").strip()
+    if raw.startswith(title):
+        raw = raw[len(title):].lstrip()
+
+    lines = raw.splitlines()
+    if lines and lines[0].strip().startswith("<i>Part "):
+        lines = lines[1:]
+    return "\n".join(lines).lstrip()
+
 
 
 def write_positioning_telegram_report(
@@ -292,6 +487,17 @@ def main() -> None:
     parser.add_argument("--max-items", type=int, default=12, help="Max assets to render.")
     parser.add_argument("--stdout", action="store_true", help="Print report text to stdout.")
     parser.add_argument("--no-save", action="store_true", help="Do not save report text.")
+    parser.add_argument(
+        "--split-limit",
+        type=int,
+        default=TELEGRAM_MESSAGE_SAFE_LIMIT,
+        help="Safe Telegram split limit. Default: 3900.",
+    )
+    parser.add_argument(
+        "--parts-dir",
+        default=None,
+        help="Directory for split Telegram part files. Default: runtime/positioning.",
+    )
 
     args = parser.parse_args()
 
@@ -302,6 +508,8 @@ def main() -> None:
         max_items=args.max_items,
     )
 
+    parts = split_telegram_message(text, limit=args.split_limit)
+
     if not args.no_save:
         path = write_positioning_telegram_report(
             text,
@@ -309,6 +517,21 @@ def main() -> None:
             output_path=args.output,
         )
         print(f"positioning_telegram_report={path}")
+
+        part_paths = write_positioning_telegram_report_parts(
+            text,
+            runtime_dir=args.runtime_dir,
+            output_dir=args.parts_dir,
+            limit=args.split_limit,
+        )
+        print(f"split_parts={len(part_paths)}")
+        for idx, part_path in enumerate(part_paths, start=1):
+            part_text = part_path.read_text(encoding="utf-8")
+            print(f"part_{idx}={part_path} chars={len(part_text.strip())}")
+    else:
+        print(f"split_parts={len(parts)}")
+        for idx, part in enumerate(parts, start=1):
+            print(f"part_{idx}_chars={len(part)}")
 
     print(f"chars={len(text)}")
     print(f"lines={len(text.splitlines())}")
