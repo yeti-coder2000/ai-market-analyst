@@ -302,6 +302,9 @@ def send_daily_report(
     dry_run: bool = False,
     refresh: bool = True,
     include_tpo_refresh: bool | None = None,
+    send_positioning_report: bool | None = None,
+    positioning_max_items: int | None = None,
+    positioning_split_limit: int | None = None,
 ) -> ReporterResult:
     refresh_results: list[dict[str, Any]] = []
 
