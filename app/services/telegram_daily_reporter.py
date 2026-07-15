@@ -58,11 +58,11 @@ class ReporterResult:
     telegram_sent: bool
     dry_run: bool
     message_length: int
-    telegram_main_parts: int = 0
-    telegram_main_part_lengths: list[int] | None = None
-    artifact_json: str | None = None
+    artifact_json: str | None
     artifact_text: str | None
     refresh_results: list[dict[str, Any]]
+    telegram_main_parts: int = 0
+    telegram_main_part_lengths: list[int] | None = None
     positioning_delivery: dict[str, Any] | None = None
     error_message: str | None = None
 
