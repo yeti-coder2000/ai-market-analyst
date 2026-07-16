@@ -8,7 +8,7 @@ services:
       pip install -r requirements.txt
 
     startCommand: |
-      python -m app.runners.main_worker
+      python -m app.runners.render_supervisor
 
     autoDeploy: true
     maxShutdownDelaySeconds: 30
@@ -43,6 +43,16 @@ services:
 
       - key: FAIL_FAST
         value: "false"
+
+      - key: ENABLE_MARKET_WORKER
+        value: "true"
+
+      - key: ENABLE_DAILY_REPORTING_WORKER
+        value: "true"
+
+      - key: ENABLE_RUNTIME_RETENTION
+        value: "true"
+
 
       # 🔥 ВАЖЛИВО (додано)
       - key: PAPER_MODE

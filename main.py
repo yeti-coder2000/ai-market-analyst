@@ -1,17 +1,21 @@
-# This is a sample Python script.
+from __future__ import annotations
 
-# Press ⌃F5 to execute it or replace it with your code.
-# Press Double ⇧ to search everywhere for classes, files, tool windows, actions, and settings.
+"""
+Production entrypoint for AI Market Analyst.
+
+Keeping this module as a thin wrapper lets local operators run `python main.py`
+while Render and process supervisors can continue to use module entrypoints.
+"""
+
+import sys
+
+from app.runners.main_worker import main as run_main_worker
 
 
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press F9 to toggle the breakpoint.
+def main() -> int:
+    """Run the production market-analysis worker."""
+    return int(run_main_worker() or 0)
 
 
-# Press the green button in the gutter to run the script.
-if __name__ == '__main__':
-    print_hi('PyCharm')
-
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
-
+if __name__ == "__main__":
+    sys.exit(main())
