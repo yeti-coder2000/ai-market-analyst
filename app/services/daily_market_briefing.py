@@ -4188,10 +4188,11 @@ def _activity_direction_label(activity: dict[str, Any]) -> str:
 
 
 def _directional_continuation_state(sym: str, data: dict[str, Any]) -> str | None:
-    """Detect active directional continuation hidden behind OPEN_AUCTION/DOWNGRADE wording.
+    """Detect a directional continuation candidate hidden behind OPEN_AUCTION/DOWNGRADE wording.
 
     This is reporting wording only. It does not grant Battle permission. It prevents
-    strong breakdown/continuation days from being described as plain BALANCE_CHOP.
+    directional evidence from being described as plain BALANCE_CHOP, but it must
+    not label a continuation as active before acceptance is explicitly confirmed.
     """
     if data.get("provider_error") or data.get("fallback"):
         return None
@@ -4276,9 +4277,9 @@ def _bias_without_trade(sym: str, data: dict[str, Any], *, post_news_active: boo
 
     directional_state = _directional_continuation_state(sym, data)
     if directional_state == "BEARISH_CONTINUATION_WAIT_RETEST":
-        return "bearish continuation active / wait fresh retest"
+        return "bearish continuation candidate / WAIT fresh retest"
     if directional_state == "BULLISH_CONTINUATION_WAIT_RETEST":
-        return "bullish continuation active / wait fresh pullback"
+        return "bullish continuation candidate / WAIT fresh pullback"
     if direction == "bearish":
         return "bearish bias / wait retest"
     if direction == "bullish":
