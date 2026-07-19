@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date as calendar_date
 from typing import Any
 
 from .positioning_models import (
@@ -23,42 +24,39 @@ def build_daily_positioning_context(
     runtime_dir: str | None = None,
     feed_path: str | None = None,
     persist: bool = True,
+    fallback_date: str | None = None,
 ) -> dict[str, Any]:
     """
-    Build daily positioning context from manual feed.
+    Build daily Positioning Intelligence context from a normalized feed.
 
-    v0.1 behavior:
-    - read manual JSON feed;
-    - normalize items;
-    - generate research-only tags;
-    - save latest/history/source_health;
-    - return snapshot dict.
-
-    This function must not affect Battle Gate or signal permission.
+    The feed may be manual, collector-generated, or merged. This function is
+    research/context only and must not affect Battle Gate or signal permission.
     """
 
     path = get_manual_feed_path(runtime_dir=runtime_dir, feed_path=feed_path)
+    resolved_fallback_date = str(fallback_date or calendar_date.today().isoformat())
     warnings: list[str] = []
     source_health: dict[str, Any] = {
-        "status": "UNKNOWN",
+        "status": "NO_DATA",
         "input_path": str(path),
         "feed_exists": path.exists(),
         "feed_date": None,
         "item_count": 0,
         "errors": [],
+        "pipeline": {},
+        "merge": {},
     }
 
     if not path.exists():
-        source_health["status"] = "MISSING_FEED"
-        source_health["errors"].append("manual_daily_positioning_feed.json not found")
+        source_health["status"] = "NO_DATA"
         snapshot = PositioningSnapshot(
             version=POSITIONING_LAYER_VERSION,
             generated_at=utc_now_iso(),
-            date="unknown",
-            status="DATA_UNAVAILABLE",
+            date=resolved_fallback_date,
+            status="NO_DATA",
             items=[],
             source_health=source_health,
-            warnings=["Positioning manual feed not found. Context unavailable."],
+            warnings=["Positioning feed not found. Context unavailable."],
         )
         if persist:
             save_source_health(source_health, runtime_dir)
@@ -68,13 +66,13 @@ def build_daily_positioning_context(
     try:
         feed = read_json_file(path)
     except Exception as exc:
-        source_health["status"] = "BAD_FEED"
+        source_health["status"] = "ERROR"
         source_health["errors"].append(f"{type(exc).__name__}: {exc}")
         snapshot = PositioningSnapshot(
             version=POSITIONING_LAYER_VERSION,
             generated_at=utc_now_iso(),
-            date="unknown",
-            status="DATA_UNAVAILABLE",
+            date=resolved_fallback_date,
+            status="ERROR",
             items=[],
             source_health=source_health,
             warnings=["Positioning feed could not be read."],
@@ -84,11 +82,21 @@ def build_daily_positioning_context(
             save_snapshot(snapshot, runtime_dir)
         return snapshot.to_dict()
 
-    date = str(feed.get("date") or "unknown")
+    date_value = str(feed.get("date") or resolved_fallback_date)
     raw_items = feed.get("items") or []
+    pipeline_meta = feed.get("pipeline_meta") if isinstance(feed.get("pipeline_meta"), dict) else {}
+    merge_meta = feed.get("merge_meta") if isinstance(feed.get("merge_meta"), dict) else {}
+
+    source_health["pipeline"] = pipeline_meta
+    source_health["merge"] = merge_meta
+
+    for value in pipeline_meta.get("warnings") or []:
+        warnings.append(str(value))
+    for value in merge_meta.get("warnings") or []:
+        warnings.append(str(value))
 
     if not isinstance(raw_items, list):
-        source_health["status"] = "BAD_FEED"
+        source_health["status"] = "ERROR"
         source_health["errors"].append("feed.items must be a list")
         raw_items = []
 
@@ -108,7 +116,7 @@ def build_daily_positioning_context(
 
         context_items.append(
             PositioningContextItem(
-                date=date,
+                date=date_value,
                 symbol=item.symbol,
                 market_proxy={
                     "proxy_type": "daily_participation_proxy",
@@ -139,18 +147,24 @@ def build_daily_positioning_context(
             )
         )
 
-    source_health["status"] = "OK" if context_items else "NO_VALID_ITEMS"
-    source_health["feed_date"] = date
+    status_hint = str(pipeline_meta.get("status_hint") or "").strip().upper()
+    if context_items:
+        snapshot_status = status_hint if status_hint in {"OK", "PARTIAL", "STALE"} else "OK"
+    else:
+        snapshot_status = "ERROR" if status_hint == "ERROR" or source_health["errors"] else "NO_DATA"
+
+    source_health["status"] = snapshot_status
+    source_health["feed_date"] = date_value
     source_health["item_count"] = len(context_items)
 
     snapshot = PositioningSnapshot(
         version=POSITIONING_LAYER_VERSION,
         generated_at=utc_now_iso(),
-        date=date,
-        status="OK" if context_items else "DATA_UNAVAILABLE",
+        date=date_value,
+        status=snapshot_status,
         items=context_items,
         source_health=source_health,
-        warnings=warnings,
+        warnings=_dedupe_strings(warnings),
     )
 
     if persist:
@@ -159,6 +173,16 @@ def build_daily_positioning_context(
 
     return snapshot.to_dict()
 
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in values:
+        cleaned = str(value or "").strip()
+        if cleaned and cleaned not in seen:
+            seen.add(cleaned)
+            out.append(cleaned)
+    return out
 
 def get_latest_positioning_context(runtime_dir: str | None = None) -> dict[str, Any] | None:
     return load_latest_snapshot(runtime_dir)

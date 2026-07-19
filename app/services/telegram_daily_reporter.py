@@ -19,8 +19,10 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from app.services.daily_market_briefing import (
     build_briefing_report,
@@ -30,7 +32,7 @@ from app.services.daily_market_briefing import (
 from app.services.telegram_notifier import TelegramNotifier
 
 
-REPORTER_VERSION = "telegram-daily-reporter-v1.2-main-and-positioning-split"
+REPORTER_VERSION = "telegram-daily-reporter-v1.3-positioning-runtime-refresh"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -48,6 +50,57 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def _resolve_report_date(report_date: str | None, timezone_name: str | None) -> str:
+    explicit = str(report_date or "").strip()
+    if explicit:
+        return explicit
+
+    timezone_value = str(
+        timezone_name
+        or os.getenv("REPORT_TIMEZONE")
+        or "Europe/Kyiv"
+    ).strip()
+    try:
+        return datetime.now(ZoneInfo(timezone_value)).date().isoformat()
+    except Exception:
+        return datetime.now(ZoneInfo("Europe/Kyiv")).date().isoformat()
+
+
+def _refresh_positioning_runtime(
+    *,
+    runtime_dir: str | None,
+    report_date: str,
+) -> dict[str, Any]:
+    try:
+        from app.services.positioning.positioning_pipeline import (
+            POSITIONING_PIPELINE_VERSION,
+            refresh_positioning_runtime,
+        )
+
+        result = refresh_positioning_runtime(
+            runtime_dir=runtime_dir,
+            report_date=report_date,
+        )
+        return {
+            "module": "app.services.positioning.positioning_pipeline",
+            "version": POSITIONING_PIPELINE_VERSION,
+            "returncode": 0 if result.get("status") != "ERROR" else 1,
+            "ok": bool(result.get("ok")),
+            "result": result,
+            "error_message": None,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "module": "app.services.positioning.positioning_pipeline",
+            "returncode": None,
+            "ok": False,
+            "result": None,
+            "error_message": f"{type(exc).__name__}: {exc}",
+            "battle_gate_impact": "none",
+            "telegram_signal_impact": "none",
+        }
 
 
 @dataclass
@@ -443,13 +496,26 @@ def send_daily_report(
     positioning_split_limit: int | None = None,
 ) -> ReporterResult:
     refresh_results: list[dict[str, Any]] = []
+    runtime_dir = os.getenv("POSITIONING_RUNTIME_DIR") or os.getenv("RUNTIME_DIR")
+    resolved_report_date = _resolve_report_date(report_date, timezone_name)
 
     if refresh:
         refresh_results = refresh_runtime_artifacts(include_tpo=include_tpo_refresh)
 
+        if (
+            _env_bool("REPORT_REFRESH_POSITIONING", True)
+            and _positioning_delivery_enabled(report_type, explicit=send_positioning_report)
+        ):
+            refresh_results.append(
+                _refresh_positioning_runtime(
+                    runtime_dir=runtime_dir,
+                    report_date=resolved_report_date,
+                )
+            )
+
     report = build_briefing_report(
         report_type=report_type,
-        report_date=report_date,
+        report_date=resolved_report_date,
         timezone_name=timezone_name,
     )
 
@@ -475,7 +541,7 @@ def send_daily_report(
             notifier=notifier,
             report_type=report.report_type,
             dry_run=dry_run,
-            runtime_dir=os.getenv("POSITIONING_RUNTIME_DIR") or os.getenv("RUNTIME_DIR"),
+            runtime_dir=runtime_dir,
             send_positioning_report=send_positioning_report,
             positioning_max_items=positioning_max_items,
             positioning_split_limit=positioning_split_limit,
