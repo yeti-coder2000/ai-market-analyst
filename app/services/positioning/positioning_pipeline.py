@@ -2,10 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import date
 from pathlib import Path
 from typing import Any
 
+from .collectors.binance_usdm_collector import (
+    BINANCE_USDM_SYMBOLS,
+    collect_and_write_binance_usdm_snapshot,
+)
 from .collectors.crypto_derivatives_collector import (
     DEFAULT_SNAPSHOT_FILENAME,
     build_crypto_manual_feed_payload,
@@ -21,7 +26,7 @@ from .positioning_store import (
 )
 
 
-POSITIONING_PIPELINE_VERSION = "positioning-pipeline-v0.1-runtime-orchestration"
+POSITIONING_PIPELINE_VERSION = "positioning-pipeline-v0.2-live-binance-usdm"
 CRYPTO_FEED_FILENAME = "crypto_daily_positioning_feed.json"
 PIPELINE_HEALTH_FILENAME = "positioning_pipeline_health.json"
 
@@ -29,14 +34,19 @@ PIPELINE_HEALTH_FILENAME = "positioning_pipeline_health.json"
 def refresh_positioning_runtime(
     runtime_dir: str | None = None,
     report_date: str | None = None,
+    collect_live_crypto: bool | None = None,
+    crypto_session: Any | None = None,
 ) -> dict[str, Any]:
     """
-    Refresh Positioning Intelligence runtime artifacts from currently available
-    local sources.
+    Refresh Positioning Intelligence runtime artifacts.
 
-    Sources in v0.1:
-    - offline crypto derivatives snapshot, when present;
-    - manual daily positioning feed, when present.
+    Automatic source:
+    - Binance USD-M public REST for BTCUSD and ETHUSD.
+
+    Optional/fallback sources:
+    - last usable crypto derivatives snapshot;
+    - manual daily positioning feed, which remains the final duplicate-symbol
+      override.
 
     The function is fail-open and research-only. It cannot allow or block a
     signal and cannot modify Battle Gate.
@@ -56,8 +66,25 @@ def refresh_positioning_runtime(
     errors: list[str] = []
     warnings: list[str] = []
 
-    # Automatic baseline first. Manual feed is appended second and therefore
-    # remains an explicit operator override for duplicate symbols.
+    live_enabled = (
+        _env_bool("POSITIONING_CRYPTO_LIVE_ENABLED", True)
+        if collect_live_crypto is None
+        else bool(collect_live_crypto)
+    )
+
+    _refresh_live_crypto_snapshot(
+        enabled=live_enabled,
+        runtime_dir=runtime_dir,
+        snapshot_path=crypto_snapshot_path,
+        target_date=target_date,
+        session=crypto_session,
+        sources=sources,
+        errors=errors,
+        warnings=warnings,
+    )
+
+    # Automatic/fallback baseline first. Manual feed is appended second and
+    # therefore remains an explicit operator override for duplicate symbols.
     _prepare_crypto_source(
         snapshot_path=crypto_snapshot_path,
         output_path=crypto_feed_path,
@@ -73,13 +100,21 @@ def refresh_positioning_runtime(
         errors=errors,
     )
 
-    usable_sources = [source for source in sources if int(source.get("items") or 0) > 0]
-    available_sources = [source for source in sources if source.get("status") in {"OK", "EMPTY"}]
+    crypto_source = _source_by_name(sources, "crypto_snapshot")
+    manual_source = _source_by_name(sources, "manual_feed")
+    live_source = _source_by_name(sources, "binance_usdm_live")
 
-    if len(usable_sources) >= 2 and not errors:
+    crypto_items = int((crypto_source or {}).get("items") or 0)
+    manual_items = int((manual_source or {}).get("items") or 0)
+    live_status = str((live_source or {}).get("status") or "DISABLED")
+
+    if (
+        crypto_items >= len(BINANCE_USDM_SYMBOLS)
+        and live_status == "OK"
+    ):
         status_hint = "OK"
-    elif usable_sources:
-        status_hint = "PARTIAL"
+    elif crypto_items or manual_items:
+        status_hint = "STALE" if live_status == "ERROR" and crypto_items else "PARTIAL"
     elif errors:
         status_hint = "ERROR"
     else:
@@ -89,6 +124,18 @@ def refresh_positioning_runtime(
         warnings.append(f"missing_optional_source:{manual_feed_path}")
     if not crypto_snapshot_path.exists():
         warnings.append(f"missing_optional_source:{crypto_snapshot_path}")
+
+    usable_sources = [
+        source
+        for source in sources
+        if source.get("name") in {"crypto_snapshot", "manual_feed"}
+        and int(source.get("items") or 0) > 0
+    ]
+    available_sources = [
+        source
+        for source in sources
+        if source.get("status") in {"OK", "PARTIAL", "EMPTY", "STALE"}
+    ]
 
     merged = merge_positioning_feeds(
         feed_paths=feed_paths,
@@ -101,7 +148,9 @@ def refresh_positioning_runtime(
         "report_date": target_date,
         "runtime_dir": str(positioning_dir.parent),
         "status_hint": status_hint,
-        "sources_expected": ["crypto_snapshot", "manual_feed"],
+        "live_crypto_enabled": live_enabled,
+        "sources_expected": ["binance_usdm_live"],
+        "sources_optional": ["manual_feed"],
         "sources_available": [str(source.get("name")) for source in available_sources],
         "sources_usable": [str(source.get("name")) for source in usable_sources],
         "sources": sources,
@@ -128,6 +177,7 @@ def refresh_positioning_runtime(
         "positioning_dir": str(positioning_dir),
         "merged_feed": str(merged_path),
         "latest_snapshot": str(positioning_dir / "daily_positioning_latest.json"),
+        "live_crypto_enabled": live_enabled,
         "sources": sources,
         "errors": errors,
         "warnings": warnings,
@@ -137,6 +187,80 @@ def refresh_positioning_runtime(
     }
     write_json_atomic(health_path, result)
     return result
+
+
+def _refresh_live_crypto_snapshot(
+    *,
+    enabled: bool,
+    runtime_dir: str | None,
+    snapshot_path: Path,
+    target_date: str,
+    session: Any | None,
+    sources: list[dict[str, Any]],
+    errors: list[str],
+    warnings: list[str],
+) -> None:
+    if not enabled:
+        sources.append(
+            {
+                "name": "binance_usdm_live",
+                "status": "DISABLED",
+                "path": str(snapshot_path),
+                "items": 0,
+            }
+        )
+        return
+
+    try:
+        path, payload = collect_and_write_binance_usdm_snapshot(
+            runtime_dir=runtime_dir,
+            output_path=str(snapshot_path),
+            target_date=target_date,
+            session=session,
+            persist_empty=False,
+        )
+        collector = payload.get("collector") if isinstance(payload.get("collector"), dict) else {}
+        item_count = len(payload.get("items") or [])
+        status = str(collector.get("status") or ("OK" if item_count else "ERROR"))
+        collector_errors = [str(value) for value in collector.get("errors") or []]
+        collector_warnings = [str(value) for value in collector.get("warnings") or []]
+
+        if status == "ERROR":
+            errors.extend(f"binance_usdm_live:{value}" for value in collector_errors)
+        elif status == "PARTIAL":
+            warnings.extend(f"binance_usdm_live:{value}" for value in collector_errors)
+            warnings.extend(f"binance_usdm_live:{value}" for value in collector_warnings)
+
+        sources.append(
+            {
+                "name": "binance_usdm_live",
+                "status": status,
+                "path": str(path),
+                "items": item_count,
+                "snapshot_written": bool(item_count),
+                "symbols_requested": collector.get("symbols_requested") or [],
+                "symbols_collected": collector.get("symbols_collected") or [],
+                "errors": collector_errors,
+                "warnings": collector_warnings,
+                "battle_gate_impact": "none",
+                "telegram_signal_impact": "none",
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        message = f"binance_usdm_live:{type(exc).__name__}:{exc}"
+        errors.append(message)
+        sources.append(
+            {
+                "name": "binance_usdm_live",
+                "status": "ERROR",
+                "path": str(snapshot_path),
+                "items": 0,
+                "snapshot_written": False,
+                "error": message,
+                "battle_gate_impact": "none",
+                "telegram_signal_impact": "none",
+            }
+        )
 
 
 def _prepare_crypto_source(
@@ -162,16 +286,26 @@ def _prepare_crypto_source(
     try:
         snapshot = load_crypto_snapshot(snapshot_path)
         payload = build_crypto_manual_feed_payload(snapshot, target_date=target_date)
+        _enrich_crypto_feed_payload(payload=payload, snapshot=snapshot)
         write_json_atomic(output_path, payload)
         item_count = len(payload.get("items") or [])
         feed_paths.append(output_path)
+        collector = snapshot.get("collector") if isinstance(snapshot.get("collector"), dict) else {}
+        collector_status = str(collector.get("status") or "").upper()
+        snapshot_status = (
+            collector_status
+            if collector_status in {"OK", "PARTIAL", "STALE"}
+            else ("OK" if item_count else "EMPTY")
+        )
         sources.append(
             {
                 "name": "crypto_snapshot",
-                "status": "OK" if item_count else "EMPTY",
+                "status": snapshot_status,
                 "path": str(snapshot_path),
                 "feed_path": str(output_path),
                 "source_date": snapshot.get("date"),
+                "generated_at": snapshot.get("generated_at"),
+                "collector": collector.get("name"),
                 "items": item_count,
             }
         )
@@ -188,6 +322,54 @@ def _prepare_crypto_source(
             }
         )
 
+
+
+def _enrich_crypto_feed_payload(
+    *,
+    payload: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> None:
+    """Preserve absolute audit fields and honest upstream collector metadata."""
+
+    raw_items = snapshot.get("items") or []
+    raw_by_symbol: dict[str, dict[str, Any]] = {}
+    if isinstance(raw_items, list):
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            symbol = _canonical_crypto_symbol(raw.get("symbol"))
+            if symbol:
+                raw_by_symbol[symbol] = raw
+
+    feed_items = payload.get("items") or []
+    if isinstance(feed_items, list):
+        for item in feed_items:
+            if not isinstance(item, dict):
+                continue
+            raw = raw_by_symbol.get(_canonical_crypto_symbol(item.get("symbol"))) or {}
+            for field in ("price", "volume", "open_interest"):
+                if raw.get(field) is not None:
+                    item[field] = raw.get(field)
+
+    upstream = snapshot.get("collector") if isinstance(snapshot.get("collector"), dict) else {}
+    payload["collector"] = {
+        "name": "crypto_derivatives_positioning_adapter",
+        "mode": upstream.get("mode") or "offline_snapshot",
+        "status": upstream.get("status"),
+        "upstream_name": upstream.get("name"),
+        "upstream_version": snapshot.get("version"),
+        "battle_gate_impact": "none",
+        "telegram_signal_impact": "none",
+    }
+
+
+def _canonical_crypto_symbol(value: Any) -> str:
+    raw = str(value or "").strip().upper().replace("-", "").replace("/", "")
+    if raw in {"BTC", "BTCUSD", "BTCUSDT"}:
+        return "BTCUSD"
+    if raw in {"ETH", "ETHUSD", "ETHUSDT"}:
+        return "ETHUSD"
+    return raw
 
 def _prepare_manual_source(
     *,
@@ -236,15 +418,38 @@ def _prepare_manual_source(
         )
 
 
+def _source_by_name(
+    sources: list[dict[str, Any]],
+    name: str,
+) -> dict[str, Any] | None:
+    for source in sources:
+        if source.get("name") == name:
+            return source
+    return None
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Refresh Positioning Intelligence runtime artifacts.")
     parser.add_argument("--runtime-dir", default=None, help="Runtime directory.")
     parser.add_argument("--date", default=None, help="Report date YYYY-MM-DD.")
+    parser.add_argument(
+        "--no-live-crypto",
+        action="store_true",
+        help="Disable Binance live collection and use only local fallback sources.",
+    )
     args = parser.parse_args()
 
     result = refresh_positioning_runtime(
         runtime_dir=args.runtime_dir,
         report_date=args.date,
+        collect_live_crypto=not args.no_live_crypto,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result.get("status") != "ERROR" else 1
