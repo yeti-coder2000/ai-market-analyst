@@ -29,8 +29,8 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 import pandas as pd
 
 
-BACKFILL_VERSION = "otd-orr-ltf-backfill-v0.1-research-only"
-ARTIFACT_SCHEMA_VERSION = "otd-orr-ltf-dataset-v0.1"
+BACKFILL_VERSION = "otd-orr-ltf-backfill-v0.1.1-research-only"
+ARTIFACT_SCHEMA_VERSION = "otd-orr-ltf-dataset-v0.1.1"
 ARTIFACT_MODE = "RESEARCH_ONLY_VERSIONED_NON_OVERWRITING"
 
 RESEARCH_SCOPE = "RESEARCH_COUNTERFACTUAL"
@@ -115,6 +115,10 @@ class CohortRecord:
     direction: str | None
     signal_created_at_utc: datetime
     decision_time_utc: datetime
+    selected_evaluation_at_utc: datetime
+    selected_evaluation_within_original_lifecycle: bool
+    selected_evaluation_lag_minutes: float
+    selected_evaluation_after_expiry_minutes: float | None
     expires_at_utc: datetime
     htf_bias: str | None
     signal_alignment: str | None
@@ -132,6 +136,26 @@ class CohortRecord:
             "direction": self.direction,
             "signal_created_at_utc": _iso_utc(self.signal_created_at_utc),
             "decision_time_utc": _iso_utc(self.decision_time_utc),
+            "decision_time_source": "signal_created_at_utc",
+            "selected_evaluation_audit": {
+                "selected_evaluation_at_utc": _iso_utc(
+                    self.selected_evaluation_at_utc
+                ),
+                "within_original_lifecycle": (
+                    self.selected_evaluation_within_original_lifecycle
+                ),
+                "lag_from_signal_creation_minutes": (
+                    self.selected_evaluation_lag_minutes
+                ),
+                "after_expiry_minutes": (
+                    self.selected_evaluation_after_expiry_minutes
+                ),
+                "context_use": (
+                    "AUDIT_ONLY_UNTIL_SELECTED_EVALUATION_TIMESTAMP"
+                    if self.selected_evaluation_within_original_lifecycle
+                    else "AUDIT_ONLY_OUTSIDE_ORIGINAL_LIFECYCLE"
+                ),
+            },
             "expires_at_utc": _iso_utc(self.expires_at_utc),
             "htf_bias": self.htf_bias,
             "signal_alignment": self.signal_alignment,
@@ -288,9 +312,8 @@ def extract_clean_cohort(
             or row.get("source_event_ts_utc"),
             field_name="signal_created_at_utc",
         )
-        decision_time = _parse_utc(
+        selected_evaluation = _parse_utc(
             row.get("source_event_ts_utc")
-            or row.get("signal_created_at_utc")
             or row.get("created_at_utc"),
             field_name="source_event_ts_utc",
         )
@@ -299,10 +322,28 @@ def extract_clean_cohort(
             field_name="expires_at_utc",
         )
 
-        if expires_at <= decision_time:
+        if expires_at <= signal_created:
             raise CohortIntegrityError(
-                f"Expiry must be after decision time for signal_id={signal_id}"
+                f"Expiry must be after signal creation for signal_id={signal_id}"
             )
+        if selected_evaluation < signal_created:
+            raise CohortIntegrityError(
+                f"Selected evaluation predates signal creation for signal_id={signal_id}"
+            )
+
+        evaluation_lag_minutes = round(
+            (selected_evaluation - signal_created).total_seconds() / 60.0,
+            4,
+        )
+        evaluation_within_lifecycle = selected_evaluation < expires_at
+        evaluation_after_expiry_minutes = (
+            None
+            if evaluation_within_lifecycle
+            else round(
+                (selected_evaluation - expires_at).total_seconds() / 60.0,
+                4,
+            )
+        )
 
         records.append(
             CohortRecord(
@@ -312,7 +353,15 @@ def extract_clean_cohort(
                 scenario_type=_safe_text(row.get("scenario_type") or row.get("scenario")),
                 direction=_safe_text(row.get("direction")),
                 signal_created_at_utc=signal_created,
-                decision_time_utc=decision_time,
+                decision_time_utc=signal_created,
+                selected_evaluation_at_utc=selected_evaluation,
+                selected_evaluation_within_original_lifecycle=(
+                    evaluation_within_lifecycle
+                ),
+                selected_evaluation_lag_minutes=evaluation_lag_minutes,
+                selected_evaluation_after_expiry_minutes=(
+                    evaluation_after_expiry_minutes
+                ),
                 expires_at_utc=expires_at,
                 htf_bias=_safe_text(row.get("htf_bias")),
                 signal_alignment=_safe_text(row.get("signal_alignment")),
@@ -958,6 +1007,10 @@ def write_versioned_artifact(
 
     family_counts = Counter(record.scenario_family for record in records)
     direction_counts = Counter(str(record.direction) for record in records)
+    evaluations_within_lifecycle = sum(
+        record.selected_evaluation_within_original_lifecycle for record in records
+    )
+    evaluations_at_or_after_expiry = len(records) - evaluations_within_lifecycle
     manifest: dict[str, Any] = {
         "version": BACKFILL_VERSION,
         "schema_version": ARTIFACT_SCHEMA_VERSION,
@@ -973,8 +1026,19 @@ def write_versioned_artifact(
             "signals": len(records),
             "scenario_families": dict(sorted(family_counts.items())),
             "directions": dict(sorted(direction_counts.items())),
+            "decision_time_source": "signal_created_at_utc",
+            "selected_evaluation_audit": {
+                "within_original_lifecycle": evaluations_within_lifecycle,
+                "at_or_after_original_expiry": evaluations_at_or_after_expiry,
+                "context_use_rule": (
+                    "selected evaluation metadata is audit-only and must not be "
+                    "used before selected_evaluation_at_utc; an evaluation at or "
+                    "after expiry is never replay-eligible context"
+                ),
+            },
         },
         "bar_availability_rule": {
+            "decision_time_source": "signal_created_at_utc",
             "timestamp_semantics": "bar_open_utc",
             "5m_available_at": "bar_open_utc + 5 minutes",
             "15m_available_at": "bar_open_utc + 15 minutes",
