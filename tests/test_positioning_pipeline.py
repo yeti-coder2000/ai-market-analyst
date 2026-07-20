@@ -11,6 +11,7 @@ def test_positioning_pipeline_persists_honest_no_data_snapshot(tmp_path: Path) -
         runtime_dir=str(tmp_path),
         report_date="2026-07-20",
         collect_live_crypto=False,
+        collect_weekly_cot=False,
     )
 
     assert result["status"] == "NO_DATA"
@@ -46,6 +47,7 @@ def test_positioning_pipeline_builds_manual_context(tmp_path: Path) -> None:
         runtime_dir=str(tmp_path),
         report_date="2026-07-20",
         collect_live_crypto=False,
+        collect_weekly_cot=False,
     )
 
     assert result["status"] == "PARTIAL"
@@ -124,6 +126,7 @@ def test_positioning_pipeline_builds_live_binance_context(
         runtime_dir=str(tmp_path),
         report_date="2026-07-20",
         collect_live_crypto=True,
+        collect_weekly_cot=False,
     )
 
     assert result["status"] == "OK"
@@ -145,3 +148,147 @@ def test_positioning_pipeline_builds_live_binance_context(
         item["auction_usage"]["battle_gate_impact"] == "none"
         for item in latest["items"]
     )
+
+
+def test_positioning_pipeline_persists_weekly_cot_context(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from app.services.positioning import positioning_pipeline
+    from app.services.positioning.positioning_store import write_json_atomic
+
+    def fake_cot(**kwargs):
+        path = Path(kwargs["output_path"])
+        payload = {
+            "version": "test-cftc",
+            "date": "2026-07-19",
+            "status": "OK",
+            "report_date_latest": "2026-07-14",
+            "items": [
+                {
+                    "symbol": "XAUUSD",
+                    "report_date": "2026-07-14",
+                    "history_weeks": 104,
+                    "positions": {
+                        "project_net_contracts": 100000,
+                        "weekly_change_net_contracts": 5000,
+                        "net_pct_open_interest": 24.0,
+                        "weekly_change_net_pct_open_interest": 1.2,
+                    },
+                    "normalization": {"percentile": 92.0, "zscore": 1.8},
+                    "interpretation": {
+                        "primary_tag": "COT_EXTREME_NET_LONG",
+                        "confidence": 0.75,
+                        "battle_gate_impact": "none",
+                        "telegram_signal_impact": "none",
+                    },
+                    "data_quality": {"status": "GOOD", "flags": ["CFTC_WEEKLY_COT"]},
+                    "battle_gate_impact": "none",
+                    "telegram_signal_impact": "none",
+                }
+            ],
+            "collector": {
+                "name": "cftc_official_cot_collector",
+                "status": "OK",
+                "symbols_collected": ["XAUUSD"],
+                "errors": [],
+                "warnings": [],
+            },
+            "battle_gate_impact": "none",
+            "telegram_signal_impact": "none",
+        }
+        write_json_atomic(path, payload)
+        return path, payload
+
+    monkeypatch.setattr(
+        positioning_pipeline,
+        "collect_and_write_cftc_cot_snapshot",
+        fake_cot,
+    )
+
+    result = positioning_pipeline.refresh_positioning_runtime(
+        runtime_dir=str(tmp_path),
+        report_date="2026-07-19",
+        collect_live_crypto=False,
+        collect_weekly_cot=True,
+    )
+
+    assert result["weekly_cot_status"] == "OK"
+    assert result["weekly_cot_items"] == 1
+    latest = json.loads(
+        (tmp_path / "positioning" / "daily_positioning_latest.json").read_text(encoding="utf-8")
+    )
+    assert latest["weekly_cot"]["items"][0]["symbol"] == "XAUUSD"
+    history = (tmp_path / "positioning" / "daily_positioning_history.jsonl").read_text(encoding="utf-8")
+    assert '"weekly_cot"' in history
+
+
+def test_positioning_pipeline_uses_stale_weekly_cot_fallback(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    from app.services.positioning import positioning_pipeline
+    from app.services.positioning.positioning_store import write_json_atomic
+
+    cot_path = tmp_path / "positioning" / "cftc_weekly_positioning_snapshot.json"
+    previous = {
+        "version": "test-cftc",
+        "date": "2026-07-12",
+        "status": "OK",
+        "report_date_latest": "2026-07-07",
+        "items": [
+            {
+                "symbol": "EURUSD",
+                "report_date": "2026-07-07",
+                "positions": {"project_net_contracts": 1000},
+                "normalization": {"history_weeks": 104},
+                "interpretation": {
+                    "primary_tag": "COT_NEUTRAL",
+                    "battle_gate_impact": "none",
+                    "telegram_signal_impact": "none",
+                },
+                "data_quality": {"status": "GOOD", "flags": ["CFTC_WEEKLY_COT"]},
+                "battle_gate_impact": "none",
+                "telegram_signal_impact": "none",
+            }
+        ],
+        "battle_gate_impact": "none",
+        "telegram_signal_impact": "none",
+    }
+    write_json_atomic(cot_path, previous)
+
+    def failed_cot(**kwargs):
+        return Path(kwargs["output_path"]), {
+            "version": "test-cftc",
+            "date": "2026-07-19",
+            "status": "ERROR",
+            "items": [],
+            "collector": {
+                "status": "ERROR",
+                "errors": ["provider unavailable"],
+                "warnings": [],
+            },
+            "battle_gate_impact": "none",
+            "telegram_signal_impact": "none",
+        }
+
+    monkeypatch.setattr(
+        positioning_pipeline,
+        "collect_and_write_cftc_cot_snapshot",
+        failed_cot,
+    )
+
+    result = positioning_pipeline.refresh_positioning_runtime(
+        runtime_dir=str(tmp_path),
+        report_date="2026-07-19",
+        collect_live_crypto=False,
+        collect_weekly_cot=True,
+    )
+
+    assert result["weekly_cot_status"] == "STALE"
+    latest = json.loads(
+        (tmp_path / "positioning" / "daily_positioning_latest.json").read_text(encoding="utf-8")
+    )
+    assert latest["weekly_cot"]["status"] == "STALE"
+    assert latest["weekly_cot"]["items"][0]["symbol"] == "EURUSD"
+    assert latest["weekly_cot"]["runtime_fallback"]["reason"] == "live_cftc_refresh_unavailable"

@@ -11,7 +11,7 @@ from .positioning_service import get_latest_positioning_context
 from .positioning_store import get_positioning_dir
 
 
-POSITIONING_TELEGRAM_REPORT_VERSION = "positioning-telegram-report-v0.1-separate-message"
+POSITIONING_TELEGRAM_REPORT_VERSION = "positioning-telegram-report-v0.2-weekly-cftc"
 
 DEFAULT_POSITIONING_TELEGRAM_REPORT_FILENAME = "positioning_telegram_latest.txt"
 DEFAULT_POSITIONING_TELEGRAM_PART_PREFIX = "positioning_telegram_part"
@@ -47,6 +47,13 @@ def render_positioning_telegram_message(
     if not isinstance(items, list):
         items = []
 
+    weekly_cot = source_snapshot.get("weekly_cot") or {}
+    if not isinstance(weekly_cot, dict):
+        weekly_cot = {}
+    weekly_items = weekly_cot.get("items") or []
+    if not isinstance(weekly_items, list):
+        weekly_items = []
+
     lines: list[str] = []
 
     lines.append("<b>📊 Positioning Intelligence Briefing</b>")
@@ -64,9 +71,16 @@ def render_positioning_telegram_message(
     lines.append("Delivery: <b>separate Telegram message</b>")
     lines.append("")
 
+    if weekly_items:
+        lines.extend(_render_weekly_cot_section(weekly_cot, max_items=max_items))
+        lines.append("")
+
     if not items:
-        lines.append("<b>Summary</b>")
-        lines.append("Positioning data unavailable or empty.")
+        lines.append("<b>Daily participation</b>" if weekly_items else "<b>Summary</b>")
+        if weekly_items:
+            lines.append("Daily participation data unavailable; weekly CFTC COT remains available above.")
+        else:
+            lines.append("Positioning data unavailable or empty.")
         lines.append("Main market briefing must continue without this layer.")
         lines.append("")
         lines.append(_safety_footer())
@@ -81,7 +95,7 @@ def render_positioning_telegram_message(
         "telegram_not_none": 0,
     }
 
-    lines.append("<b>Summary</b>")
+    lines.append("<b>Daily participation</b>" if weekly_items else "<b>Summary</b>")
     lines.append(f"Assets covered: <b>{len(items)}</b>")
 
     for item in items:
@@ -352,6 +366,136 @@ def build_and_write_positioning_telegram_report(
         output_path=output_path,
     )
     return path, text
+
+
+def _render_weekly_cot_section(
+    weekly_cot: dict[str, Any],
+    max_items: int,
+) -> list[str]:
+    items = weekly_cot.get("items") or []
+    if not isinstance(items, list):
+        items = []
+
+    status = str(weekly_cot.get("status") or "UNKNOWN")
+    latest_report = str(weekly_cot.get("report_date_latest") or "unknown")
+    tag_counts: Counter[str] = Counter()
+    quality_counts: Counter[str] = Counter()
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        interpretation = item.get("interpretation") or {}
+        quality = item.get("data_quality") or {}
+        tag_counts[str(interpretation.get("primary_tag") or "COT_UNKNOWN")] += 1
+        quality_counts[str(quality.get("status") or "UNKNOWN")] += 1
+
+    out: list[str] = [
+        "<b>Weekly CFTC COT</b>",
+        f"Status: <b>{_h(status)}</b>",
+        f"Latest report: <b>{_h(latest_report)}</b>",
+        f"Contracts covered: <b>{len(items)}</b>",
+        f"Tags: {_h(_format_counter(tag_counts))}",
+        f"Data quality: {_h(_format_counter(quality_counts))}",
+        "Horizon: slow weekly context; Tuesday positions published after the reporting cutoff.",
+        "",
+    ]
+
+    for item in items[:max_items]:
+        if not isinstance(item, dict):
+            continue
+        out.extend(_render_weekly_cot_item(item))
+        out.append("")
+
+    remaining = len(items) - max_items
+    if remaining > 0:
+        out.append(f"...ще {remaining} weekly COT contracts не показано через max_items={max_items}.")
+
+    while out and out[-1] == "":
+        out.pop()
+    return out
+
+
+def _render_weekly_cot_item(item: dict[str, Any]) -> list[str]:
+    symbol = str(item.get("symbol") or "UNKNOWN")
+    report_date = str(item.get("report_date") or "unknown")
+    report_age = item.get("report_age_days")
+    group = str(item.get("trader_group") or "UNKNOWN")
+    positions = item.get("positions") or {}
+    normalization = item.get("normalization") or {}
+    interpretation = item.get("interpretation") or {}
+    quality = item.get("data_quality") or {}
+
+    net_contracts = positions.get("project_net_contracts")
+    weekly_delta = positions.get("weekly_change_net_contracts")
+    net_pct_oi = positions.get("net_pct_open_interest")
+    delta_pct_oi = positions.get("weekly_change_net_pct_open_interest")
+    percentile = normalization.get("percentile")
+    zscore = normalization.get("zscore")
+    history_weeks = normalization.get("history_weeks") or item.get("history_weeks")
+    primary_tag = str(interpretation.get("primary_tag") or "COT_UNKNOWN")
+    confidence = interpretation.get("confidence")
+    interpretation_text = str(interpretation.get("text") or "")
+    usage = str(interpretation.get("recommended_usage") or "")
+    quality_status = str(quality.get("status") or "UNKNOWN")
+    flags = quality.get("flags") or item.get("flags") or []
+
+    out = [
+        f"<b>{_h(symbol)} · weekly COT</b>",
+        f"Group: {_h(group)} | report {_h(report_date)} | age {_fmt_integer(report_age)}d",
+        "Net: "
+        f"{_fmt_signed_contracts(net_contracts)} contracts | "
+        f"Δ {_fmt_signed_contracts(weekly_delta)} | "
+        f"Net/OI {_fmt_signed_pct(net_pct_oi)} | "
+        f"Δ/OI {_fmt_signed_pct(delta_pct_oi)}",
+        "Normalization: "
+        f"percentile {_fmt_one_decimal(percentile)} | "
+        f"z {_fmt_signed_decimal(zscore)} | "
+        f"history {_fmt_integer(history_weeks)}w",
+        f"Tag: <b>{_h(primary_tag)}</b> / conf {_fmt_confidence(confidence)} / quality {_h(quality_status)}",
+    ]
+
+    if flags:
+        out.append(f"Flags: {_h(', '.join(str(value) for value in flags))}")
+    if interpretation_text:
+        out.append(f"Read: {_h(interpretation_text)}")
+    if usage:
+        out.append(f"Usage: {_h(usage)}")
+    return out
+
+
+def _fmt_signed_contracts(value: Any) -> str:
+    number = _to_float(value)
+    if number is None:
+        return "n/a"
+    return f"{number:+,.0f}"
+
+
+def _fmt_signed_pct(value: Any) -> str:
+    number = _to_float(value)
+    if number is None:
+        return "n/a"
+    return f"{number:+.2f}%"
+
+
+def _fmt_signed_decimal(value: Any) -> str:
+    number = _to_float(value)
+    if number is None:
+        return "n/a"
+    return f"{number:+.2f}"
+
+
+def _fmt_one_decimal(value: Any) -> str:
+    number = _to_float(value)
+    if number is None:
+        return "n/a"
+    return f"{number:.1f}"
+
+
+def _fmt_integer(value: Any) -> str:
+    number = _to_float(value)
+    if number is None:
+        return "n/a"
+    return f"{number:.0f}"
 
 
 def _render_asset_block(item: dict[str, Any]) -> list[str]:
