@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -95,6 +96,15 @@ RESEARCH_BATTLE_PERMISSION_PREFIXES = (
     "BLOCKED_BY_",
 )
 
+RESEARCH_INTEGRITY_V2_EXACT_PERMISSIONS = {
+    "RESEARCH_ONLY",
+}
+
+RESEARCH_INTEGRITY_V2_ACTIONABLE_TIMING_STATUSES = {
+    "ENTRY_ACTIONABLE",
+    "ENTRY_ACTIONABLE_AFTER_FRESH_RETEST",
+}
+
 RESEARCH_TRACKING_SCOPE = "RESEARCH_COUNTERFACTUAL"
 TELEGRAM_TRACKING_SCOPE = "TELEGRAM_ALERT"
 SYNTHETIC_TRACKING_SCOPE = "SYNTHETIC_TEST"
@@ -103,6 +113,11 @@ SYNTHETIC_SIGNAL_PREFIXES = ("TEST_", "SYNTHETIC_")
 SYNTHETIC_CYCLE_IDS = {"SYNTHETIC_TEST", "TEST"}
 
 OUTCOME_TRACKER_VERSION = "signal-outcome-tracker-v2.3-near-target-strict-touch"
+RESEARCH_INTEGRITY_V2_TRACKER_VERSION = (
+    "signal-outcome-tracker-v2.4-research-counterfactual-integrity-dry-run"
+)
+RESEARCH_INTEGRITY_V2_RECORD_SCHEMA = "research-counterfactual-v2-integrity"
+RESEARCH_INTEGRITY_V2_OUTPUT_SCHEMA = "2.1-research-counterfactual-integrity-dry-run"
 
 MATERIAL_FIELDS = (
     "outcome_status",
@@ -450,7 +465,11 @@ def apply_synthetic_flags(record: dict[str, Any]) -> dict[str, Any]:
 # =============================================================================
 
 
-def is_research_battle_event(event: dict[str, Any]) -> bool:
+def is_research_battle_event(
+    event: dict[str, Any],
+    *,
+    integrity_v2: bool = False,
+) -> bool:
     if not isinstance(event, dict):
         return False
 
@@ -469,12 +488,27 @@ def is_research_battle_event(event: dict[str, Any]) -> bool:
     if delivery_mode not in RESEARCH_TELEGRAM_DELIVERY_MODES:
         return False
 
-    if not battle_permission.startswith(RESEARCH_BATTLE_PERMISSION_PREFIXES):
+    if integrity_v2:
+        if battle_permission == "NOT_READY":
+            return False
+
+        permission_is_eligible = (
+            battle_permission in RESEARCH_INTEGRITY_V2_EXACT_PERMISSIONS
+            or battle_permission.startswith(RESEARCH_BATTLE_PERMISSION_PREFIXES)
+        )
+        if not permission_is_eligible:
+            return False
+    elif not battle_permission.startswith(RESEARCH_BATTLE_PERMISSION_PREFIXES):
         return False
 
     execution_status = normalize_text(event.get("execution_status")).upper()
     if execution_status != "EXECUTABLE":
         return False
+
+    if integrity_v2:
+        entry_timing_status = normalize_text(event.get("entry_timing_status")).upper()
+        if entry_timing_status not in RESEARCH_INTEGRITY_V2_ACTIONABLE_TIMING_STATUSES:
+            return False
 
     return True
 
@@ -511,30 +545,96 @@ def validate_battle_event_execution_plan(event: dict[str, Any]) -> tuple[bool, s
     return True, "ok"
 
 
-def research_alert_id(event: dict[str, Any]) -> str:
+def research_alert_id(
+    event: dict[str, Any],
+    *,
+    integrity_v2: bool = False,
+) -> str:
     signal_id = str(event.get("signal_id") or "")
+
+    if integrity_v2:
+        return f"RESEARCH_{signal_id}"
+
     ts_raw = str(event.get("ts_utc") or "")
     ts_safe = ts_raw.replace(":", "-").replace("+", "_").replace(".", "_")
     return f"RESEARCH_{signal_id}_{ts_safe}"
 
 
-def build_research_alert_from_battle_event(event: dict[str, Any]) -> dict[str, Any] | None:
-    if not is_research_battle_event(event):
+def resolve_research_event_expiry(event: dict[str, Any]) -> tuple[datetime | None, str]:
+    sent_at = parse_utc(event.get("ts_utc"))
+    if sent_at is None:
+        return None, "invalid_event_timestamp"
+
+    for key in (
+        "entry_actionable_until_utc",
+        "entry_window_expires_at_utc",
+        "expires_at_utc",
+        "ttl_expires_at_utc",
+    ):
+        explicit = parse_utc(event.get(key))
+        if explicit is not None:
+            return explicit, key
+
+    max_age_minutes = safe_float(event.get("signal_max_age_minutes"))
+    if max_age_minutes is not None and max_age_minutes > 0:
+        created_at = parse_utc(event.get("signal_created_at_utc"))
+        if created_at is not None:
+            return (
+                created_at + timedelta(minutes=max_age_minutes),
+                "signal_created_at_utc_plus_signal_max_age_minutes",
+            )
+
+        signal_age_minutes = safe_float(event.get("signal_age_minutes"))
+        if signal_age_minutes is not None and signal_age_minutes >= 0:
+            return (
+                sent_at + timedelta(minutes=max_age_minutes - signal_age_minutes),
+                "event_time_plus_remaining_signal_age",
+            )
+
+        return (
+            sent_at + timedelta(minutes=max_age_minutes),
+            "event_time_plus_signal_max_age_minutes",
+        )
+
+    return (
+        sent_at + timedelta(hours=DEFAULT_EXPIRY_HOURS),
+        "event_time_plus_default_expiry",
+    )
+
+
+def build_research_alert_from_battle_event(
+    event: dict[str, Any],
+    *,
+    integrity_v2: bool = False,
+) -> dict[str, Any] | None:
+    if not is_research_battle_event(event, integrity_v2=integrity_v2):
         return None
 
     valid, _reason = validate_battle_event_execution_plan(event)
     if not valid:
         return None
 
+    if integrity_v2 and parse_utc(event.get("ts_utc")) is None:
+        return None
+
     sent_at = event.get("ts_utc") or utc_now()
     rr = safe_float(event.get("risk_reward_ratio"))
     practical_rr = safe_float(event.get("practical_rr"))
 
+    expires_at: datetime | None = None
+    expiry_source: str | None = None
+    if integrity_v2:
+        expires_at, expiry_source = resolve_research_event_expiry(event)
+
     alert = {
-        "schema_version": "research-counterfactual-v1",
+        "schema_version": (
+            RESEARCH_INTEGRITY_V2_RECORD_SCHEMA
+            if integrity_v2
+            else "research-counterfactual-v1"
+        ),
         "tracking_scope": RESEARCH_TRACKING_SCOPE,
         "source": "battle_permission_events",
-        "alert_id": research_alert_id(event),
+        "alert_id": research_alert_id(event, integrity_v2=integrity_v2),
         "signal_id": event.get("signal_id"),
         "cycle_id": event.get("cycle_id"),
         "symbol": event.get("symbol"),
@@ -621,28 +721,97 @@ def build_research_alert_from_battle_event(event: dict[str, Any]) -> dict[str, A
         ],
     }
 
+    if integrity_v2:
+        alert.update(
+            {
+                "expires_at_utc": expires_at.isoformat() if expires_at is not None else None,
+                "expiry_source": expiry_source,
+                "source_event_ts_utc": sent_at,
+                "deduplication_key": str(event.get("signal_id") or ""),
+                "selection_policy": "first_eligible_executable_actionable_plan_per_signal_id",
+                "entry_timing_status": event.get("entry_timing_status"),
+                "signal_created_at_utc": event.get("signal_created_at_utc"),
+                "signal_age_minutes": safe_float(event.get("signal_age_minutes")),
+                "signal_max_age_minutes": safe_float(event.get("signal_max_age_minutes")),
+                "signal_freshness_status": event.get("signal_freshness_status"),
+            }
+        )
+        add_note(
+            alert,
+            "Integrity v2: first eligible executable/actionable Battle evaluation selected per signal_id.",
+        )
+        add_note(
+            alert,
+            "Integrity v2: snapshots at or after expires_at_utc cannot trigger or resolve this plan.",
+        )
+
     return alert
+
+
+def research_event_order_key(indexed_event: tuple[int, dict[str, Any]]) -> tuple[int, float, int]:
+    index, event = indexed_event
+    event_time = parse_utc(event.get("ts_utc"))
+    if event_time is None:
+        return 1, 0.0, index
+    return 0, event_time.timestamp(), index
 
 
 def load_research_counterfactual_alerts(
     path: Path = BATTLE_PERMISSION_EVENTS_PATH,
+    *,
+    integrity_v2: bool = False,
+    selection_audit: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     events = read_ndjson(path)
+
+    if selection_audit is not None:
+        selection_audit.clear()
+        selection_audit["raw_events"] = len(events)
+        selection_audit["eligible_evaluations"] = 0
+        selection_audit["invalid_execution_plans"] = 0
+        selection_audit["duplicate_eligible_evaluations_discarded"] = 0
+        selection_audit["selected_unique_signals"] = 0
+
+    if integrity_v2:
+        indexed_events = list(enumerate(events))
+        indexed_events.sort(key=research_event_order_key)
+        events = [event for _index, event in indexed_events]
 
     alerts: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
 
     for event in events:
-        alert = build_research_alert_from_battle_event(event)
-        if alert is None:
+        event_is_eligible = is_research_battle_event(
+            event,
+            integrity_v2=integrity_v2,
+        )
+        if not event_is_eligible:
             continue
 
-        key = str(alert.get("alert_id") or alert.get("signal_id") or "")
+        if selection_audit is not None:
+            selection_audit["eligible_evaluations"] += 1
+
+        alert = build_research_alert_from_battle_event(event, integrity_v2=integrity_v2)
+        if alert is None:
+            if selection_audit is not None:
+                selection_audit["invalid_execution_plans"] += 1
+            continue
+
+        key = str(
+            alert.get("signal_id")
+            if integrity_v2
+            else alert.get("alert_id") or alert.get("signal_id") or ""
+        )
         if not key or key in seen_ids:
+            if selection_audit is not None:
+                selection_audit["duplicate_eligible_evaluations_discarded"] += 1
             continue
 
         seen_ids.add(key)
         alerts.append(alert)
+
+    if selection_audit is not None:
+        selection_audit["selected_unique_signals"] = len(alerts)
 
     return alerts
 
@@ -1379,7 +1548,34 @@ def get_tracking_start_time(active_alerts: list[dict[str, Any]]) -> datetime | N
     return min(times)
 
 
-def apply_expiry(alerts: list[dict[str, Any]], *, now_dt: datetime) -> set[str]:
+def expire_research_alert_before_snapshot(
+    alert: dict[str, Any],
+    *,
+    snapshot_ts: datetime,
+) -> bool:
+    if alert.get("tracking_scope") != RESEARCH_TRACKING_SCOPE or is_final(alert):
+        return False
+
+    expiry = get_alert_expiry(alert)
+    if expiry is None or snapshot_ts < expiry:
+        return False
+
+    before = material_fingerprint(alert)
+    price = safe_float(alert.get("last_price"))
+    mark_expired(alert, ts=expiry, price=price)
+    add_note(
+        alert,
+        "Integrity v2 ignored a snapshot at or after the research plan expiry boundary.",
+    )
+    return has_material_change(before, alert)
+
+
+def apply_expiry(
+    alerts: list[dict[str, Any]],
+    *,
+    now_dt: datetime,
+    research_integrity_v2: bool = False,
+) -> set[str]:
     changed_alerts: set[str] = set()
 
     for alert in alerts:
@@ -1396,7 +1592,18 @@ def apply_expiry(alerts: list[dict[str, Any]], *, now_dt: datetime) -> set[str]:
         if now_dt >= expiry:
             before = material_fingerprint(alert)
             price = safe_float(alert.get("last_price"))
-            mark_expired(alert, ts=now_dt, price=price)
+            expiry_ts = (
+                expiry
+                if research_integrity_v2 and alert.get("tracking_scope") == RESEARCH_TRACKING_SCOPE
+                else now_dt
+            )
+            mark_expired(alert, ts=expiry_ts, price=price)
+
+            if research_integrity_v2 and alert.get("tracking_scope") == RESEARCH_TRACKING_SCOPE:
+                add_note(
+                    alert,
+                    "Integrity v2 closed the research plan at its actual expiry boundary.",
+                )
 
             if has_material_change(before, alert):
                 changed_alerts.add(alert_key(alert))
@@ -1433,9 +1640,34 @@ def track_outcomes(
     outcomes_path: Path = SIGNAL_OUTCOMES_PATH,
     battle_events_path: Path = BATTLE_PERMISSION_EVENTS_PATH,
     dry_run: bool = False,
+    research_integrity_v2: bool = False,
+    dry_run_output_path: Path | None = None,
 ) -> dict[str, Any]:
+    if research_integrity_v2 and not dry_run:
+        raise ValueError("research_integrity_v2 is dry-run only")
+
+    if dry_run_output_path is not None and not research_integrity_v2:
+        raise ValueError("dry_run_output_path requires research_integrity_v2")
+
+    protected_paths = {
+        Path(alerts_path),
+        Path(snapshot_path),
+        Path(outcomes_path),
+        Path(battle_events_path),
+    }
+    if dry_run_output_path is not None:
+        validate_versioned_dry_run_output_path(
+            path=dry_run_output_path,
+            protected_paths=protected_paths,
+        )
+
     telegram_alerts = load_telegram_alerts(alerts_path)
-    research_alerts = load_research_counterfactual_alerts(battle_events_path)
+    selection_audit: dict[str, int] = {}
+    research_alerts = load_research_counterfactual_alerts(
+        battle_events_path,
+        integrity_v2=research_integrity_v2,
+        selection_audit=selection_audit if research_integrity_v2 else None,
+    )
 
     normalization_changed_alerts = normalize_existing_alert_metrics(telegram_alerts)
 
@@ -1477,6 +1709,15 @@ def track_outcomes(
                 if sent_at is not None and ts < sent_at:
                     continue
 
+                if research_integrity_v2 and expire_research_alert_before_snapshot(
+                    alert,
+                    snapshot_ts=ts,
+                ):
+                    changed_alerts.add(alert_key(alert))
+
+                if is_final(alert):
+                    continue
+
                 if update_single_alert_from_snapshot(
                     alert,
                     ts=ts,
@@ -1486,7 +1727,11 @@ def track_outcomes(
                 ):
                     changed_alerts.add(alert_key(alert))
 
-    expiry_changed_alerts = apply_expiry(all_records, now_dt=now_dt)
+    expiry_changed_alerts = apply_expiry(
+        all_records,
+        now_dt=now_dt,
+        research_integrity_v2=research_integrity_v2,
+    )
     changed_alerts.update(expiry_changed_alerts)
 
     summary = build_summary(all_records)
@@ -1498,14 +1743,23 @@ def track_outcomes(
             telegram_alerts.sort(key=lambda x: str(x.get("sent_at_utc") or ""))
             save_telegram_alerts(telegram_alerts, alerts_path)
 
-    write_outcomes_report(
-        alerts=all_records,
-        summary=summary,
-        path=outcomes_path,
-        dry_run=dry_run,
-    )
+    if dry_run_output_path is not None:
+        write_versioned_dry_run_report(
+            alerts=all_records,
+            summary=summary,
+            path=dry_run_output_path,
+            protected_paths=protected_paths,
+            selection_audit=selection_audit,
+        )
+    else:
+        write_outcomes_report(
+            alerts=all_records,
+            summary=summary,
+            path=outcomes_path,
+            dry_run=dry_run,
+        )
 
-    return {
+    result = {
         "status": "ok",
         "tracker_version": OUTCOME_TRACKER_VERSION,
         "dry_run": dry_run,
@@ -1517,6 +1771,18 @@ def track_outcomes(
         "normalization_changes": len(normalization_changed_alerts),
         "summary": summary,
     }
+
+    if research_integrity_v2:
+        result.update(
+            {
+                "tracker_version": RESEARCH_INTEGRITY_V2_TRACKER_VERSION,
+                "research_integrity_v2": True,
+                "dry_run_output_path": str(dry_run_output_path) if dry_run_output_path else None,
+                "research_selection_audit": selection_audit,
+            }
+        )
+
+    return result
 
 
 # =============================================================================
@@ -1776,10 +2042,104 @@ def write_outcomes_report(
     tmp_path.replace(path)
 
 
-def main() -> None:
-    dry_run = env_bool("OUTCOME_TRACKER_DRY_RUN", False)
+def validate_versioned_dry_run_output_path(
+    *,
+    path: Path,
+    protected_paths: set[Path],
+) -> Path:
+    output_path = Path(path).expanduser()
+    resolved_output = output_path.resolve()
+    resolved_protected = {Path(item).expanduser().resolve() for item in protected_paths}
 
-    result = track_outcomes(dry_run=dry_run)
+    if resolved_output in resolved_protected:
+        raise ValueError("versioned dry-run output must not replace an input or existing outcomes file")
+
+    if output_path.suffix.lower() != ".json":
+        raise ValueError("versioned dry-run output must use a .json filename")
+
+    if output_path.exists():
+        raise FileExistsError(
+            f"refusing to overwrite existing versioned dry-run output: {output_path}"
+        )
+
+    return output_path
+
+
+def write_versioned_dry_run_report(
+    *,
+    alerts: list[dict[str, Any]],
+    summary: dict[str, Any],
+    path: Path,
+    protected_paths: set[Path],
+    selection_audit: dict[str, int],
+) -> None:
+    output_path = validate_versioned_dry_run_output_path(
+        path=path,
+        protected_paths=protected_paths,
+    )
+
+    ensure_parent_dir(output_path)
+
+    payload = {
+        "schema_version": RESEARCH_INTEGRITY_V2_OUTPUT_SCHEMA,
+        "tracker_version": RESEARCH_INTEGRITY_V2_TRACKER_VERSION,
+        "artifact_mode": "VERSIONED_DRY_RUN_REBUILD",
+        "updated_at_utc": utc_now(),
+        "integrity_policy": {
+            "event_selection": "first_eligible_executable_actionable_plan_per_signal_id",
+            "eligible_battle_permissions": ["RESEARCH_ONLY", "BLOCKED_BY_*"],
+            "excluded_battle_permissions": ["NOT_READY"],
+            "eligible_entry_timing_statuses": sorted(
+                RESEARCH_INTEGRITY_V2_ACTIONABLE_TIMING_STATUSES
+            ),
+            "snapshot_expiry_enforced": True,
+            "raw_telemetry_modified": False,
+            "existing_runtime_files_overwritten": False,
+        },
+        "research_selection_audit": dict(selection_audit),
+        "summary": summary,
+        "signals": alerts,
+    }
+
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+
+    try:
+        with output_path.open("x", encoding="utf-8") as output_file:
+            output_file.write(serialized)
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"refusing to overwrite existing versioned dry-run output: {output_path}"
+        ) from exc
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Track AI Market Analyst signal outcomes.")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=env_bool("OUTCOME_TRACKER_DRY_RUN", False),
+        help="Run the existing tracker without writing signal_outcomes.json.",
+    )
+    parser.add_argument(
+        "--research-integrity-v2-output",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Run the research-counterfactual integrity-v2 rebuild and create PATH "
+            "without overwriting any existing file."
+        ),
+    )
+    args = parser.parse_args()
+
+    integrity_output = args.research_integrity_v2_output
+    dry_run = bool(args.dry_run or integrity_output is not None)
+
+    result = track_outcomes(
+        dry_run=dry_run,
+        research_integrity_v2=integrity_output is not None,
+        dry_run_output_path=integrity_output,
+    )
 
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
 
