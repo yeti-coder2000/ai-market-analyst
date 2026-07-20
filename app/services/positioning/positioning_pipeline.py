@@ -11,6 +11,11 @@ from .collectors.binance_usdm_collector import (
     BINANCE_USDM_SYMBOLS,
     collect_and_write_binance_usdm_snapshot,
 )
+from .collectors.cftc_cot_collector import (
+    DEFAULT_CFTC_SNAPSHOT_FILENAME,
+    collect_and_write_cftc_cot_snapshot,
+    load_cftc_cot_snapshot,
+)
 from .collectors.crypto_derivatives_collector import (
     DEFAULT_SNAPSHOT_FILENAME,
     build_crypto_manual_feed_payload,
@@ -19,14 +24,18 @@ from .collectors.crypto_derivatives_collector import (
 from .positioning_feed_merger import merge_positioning_feeds, write_merged_feed
 from .positioning_service import build_daily_positioning_context
 from .positioning_store import (
+    append_jsonl,
+    get_history_path,
+    get_latest_path,
     get_manual_feed_path,
     get_positioning_dir,
     read_json_file,
+    save_source_health,
     write_json_atomic,
 )
 
 
-POSITIONING_PIPELINE_VERSION = "positioning-pipeline-v0.2-live-binance-usdm"
+POSITIONING_PIPELINE_VERSION = "positioning-pipeline-v0.3-weekly-cftc"
 CRYPTO_FEED_FILENAME = "crypto_daily_positioning_feed.json"
 PIPELINE_HEALTH_FILENAME = "positioning_pipeline_health.json"
 
@@ -36,12 +45,15 @@ def refresh_positioning_runtime(
     report_date: str | None = None,
     collect_live_crypto: bool | None = None,
     crypto_session: Any | None = None,
+    collect_weekly_cot: bool | None = None,
+    cot_session: Any | None = None,
 ) -> dict[str, Any]:
     """
     Refresh Positioning Intelligence runtime artifacts.
 
-    Automatic source:
-    - Binance USD-M public REST for BTCUSD and ETHUSD.
+    Automatic sources:
+    - Binance USD-M public REST for BTCUSD and ETHUSD daily participation;
+    - official CFTC weekly COT for financial, metals, and Brent contracts.
 
     Optional/fallback sources:
     - last usable crypto derivatives snapshot;
@@ -59,6 +71,7 @@ def refresh_positioning_runtime(
     manual_feed_path = get_manual_feed_path(runtime_dir=runtime_dir)
     crypto_snapshot_path = positioning_dir / DEFAULT_SNAPSHOT_FILENAME
     crypto_feed_path = positioning_dir / CRYPTO_FEED_FILENAME
+    cftc_snapshot_path = positioning_dir / DEFAULT_CFTC_SNAPSHOT_FILENAME
     health_path = positioning_dir / PIPELINE_HEALTH_FILENAME
 
     feed_paths: list[Path] = []
@@ -70,6 +83,21 @@ def refresh_positioning_runtime(
         _env_bool("POSITIONING_CRYPTO_LIVE_ENABLED", True)
         if collect_live_crypto is None
         else bool(collect_live_crypto)
+    )
+    cot_enabled = (
+        _env_bool("POSITIONING_CFTC_LIVE_ENABLED", True)
+        if collect_weekly_cot is None
+        else bool(collect_weekly_cot)
+    )
+
+    weekly_cot = _refresh_weekly_cot_snapshot(
+        enabled=cot_enabled,
+        runtime_dir=runtime_dir,
+        snapshot_path=cftc_snapshot_path,
+        target_date=target_date,
+        session=cot_session,
+        sources=sources,
+        warnings=warnings,
     )
 
     _refresh_live_crypto_snapshot(
@@ -149,7 +177,10 @@ def refresh_positioning_runtime(
         "runtime_dir": str(positioning_dir.parent),
         "status_hint": status_hint,
         "live_crypto_enabled": live_enabled,
-        "sources_expected": ["binance_usdm_live"],
+        "weekly_cot_enabled": cot_enabled,
+        "weekly_cot_status": weekly_cot.get("status"),
+        "weekly_cot_items": len(weekly_cot.get("items") or []),
+        "sources_expected": ["binance_usdm_live", "cftc_cot_live"],
         "sources_optional": ["manual_feed"],
         "sources_available": [str(source.get("name")) for source in available_sources],
         "sources_usable": [str(source.get("name")) for source in usable_sources],
@@ -164,9 +195,11 @@ def refresh_positioning_runtime(
     snapshot = build_daily_positioning_context(
         runtime_dir=runtime_dir,
         feed_path=str(merged_path),
-        persist=True,
+        persist=False,
         fallback_date=target_date,
     )
+    snapshot["weekly_cot"] = weekly_cot
+    _persist_enriched_snapshot(snapshot=snapshot, runtime_dir=runtime_dir)
 
     result = {
         "version": POSITIONING_PIPELINE_VERSION,
@@ -178,6 +211,9 @@ def refresh_positioning_runtime(
         "merged_feed": str(merged_path),
         "latest_snapshot": str(positioning_dir / "daily_positioning_latest.json"),
         "live_crypto_enabled": live_enabled,
+        "weekly_cot_enabled": cot_enabled,
+        "weekly_cot_status": weekly_cot.get("status"),
+        "weekly_cot_items": len(weekly_cot.get("items") or []),
         "sources": sources,
         "errors": errors,
         "warnings": warnings,
@@ -187,6 +223,153 @@ def refresh_positioning_runtime(
     }
     write_json_atomic(health_path, result)
     return result
+
+
+def _refresh_weekly_cot_snapshot(
+    *,
+    enabled: bool,
+    runtime_dir: str | None,
+    snapshot_path: Path,
+    target_date: str,
+    session: Any | None,
+    sources: list[dict[str, Any]],
+    warnings: list[str],
+) -> dict[str, Any]:
+    if not enabled:
+        payload = {
+            "version": "cftc-cot-disabled",
+            "date": target_date,
+            "status": "DISABLED",
+            "items": [],
+            "battle_gate_impact": "none",
+            "telegram_signal_impact": "none",
+        }
+        sources.append({
+            "name": "cftc_cot_live",
+            "status": "DISABLED",
+            "path": str(snapshot_path),
+            "items": 0,
+        })
+        return payload
+
+    try:
+        path, payload = collect_and_write_cftc_cot_snapshot(
+            runtime_dir=runtime_dir,
+            output_path=str(snapshot_path),
+            target_date=target_date,
+            session=session,
+            persist_empty=False,
+        )
+        collector = payload.get("collector") if isinstance(payload.get("collector"), dict) else {}
+        status = str(payload.get("status") or collector.get("status") or "NO_DATA")
+        item_count = len(payload.get("items") or [])
+        collector_errors = [str(value) for value in collector.get("errors") or []]
+        collector_warnings = [str(value) for value in collector.get("warnings") or []]
+
+        if item_count:
+            warnings.extend(f"cftc_cot_live:{value}" for value in collector_warnings)
+            warnings.extend(f"cftc_cot_live:{value}" for value in collector_errors)
+            sources.append({
+                "name": "cftc_cot_live",
+                "status": status,
+                "path": str(path),
+                "items": item_count,
+                "report_date_latest": payload.get("report_date_latest"),
+                "symbols_collected": collector.get("symbols_collected") or [],
+                "errors": collector_errors,
+                "warnings": collector_warnings,
+                "battle_gate_impact": "none",
+                "telegram_signal_impact": "none",
+            })
+            return payload
+
+        if snapshot_path.exists():
+            fallback = load_cftc_cot_snapshot(snapshot_path)
+            fallback = dict(fallback)
+            fallback["status"] = "STALE"
+            fallback["runtime_fallback"] = {
+                "reason": "live_cftc_refresh_unavailable",
+                "target_date": target_date,
+                "live_errors": collector_errors,
+            }
+            warnings.append("cftc_cot_live:using_last_persisted_snapshot")
+            warnings.extend(f"cftc_cot_live:{value}" for value in collector_errors)
+            sources.append({
+                "name": "cftc_cot_live",
+                "status": "STALE",
+                "path": str(snapshot_path),
+                "items": len(fallback.get("items") or []),
+                "fallback": True,
+                "errors": collector_errors,
+                "battle_gate_impact": "none",
+                "telegram_signal_impact": "none",
+            })
+            return fallback
+
+        warnings.extend(f"cftc_cot_live:{value}" for value in collector_errors)
+        sources.append({
+            "name": "cftc_cot_live",
+            "status": status,
+            "path": str(snapshot_path),
+            "items": 0,
+            "errors": collector_errors,
+            "warnings": collector_warnings,
+            "battle_gate_impact": "none",
+            "telegram_signal_impact": "none",
+        })
+        return payload
+    except Exception as exc:  # noqa: BLE001
+        message = f"cftc_cot_live:{type(exc).__name__}:{exc}"
+        warnings.append(message)
+        if snapshot_path.exists():
+            fallback = dict(load_cftc_cot_snapshot(snapshot_path))
+            fallback["status"] = "STALE"
+            fallback["runtime_fallback"] = {
+                "reason": "live_cftc_refresh_exception",
+                "target_date": target_date,
+                "live_errors": [message],
+            }
+            sources.append({
+                "name": "cftc_cot_live",
+                "status": "STALE",
+                "path": str(snapshot_path),
+                "items": len(fallback.get("items") or []),
+                "fallback": True,
+                "error": message,
+                "battle_gate_impact": "none",
+                "telegram_signal_impact": "none",
+            })
+            return fallback
+        sources.append({
+            "name": "cftc_cot_live",
+            "status": "ERROR",
+            "path": str(snapshot_path),
+            "items": 0,
+            "error": message,
+            "battle_gate_impact": "none",
+            "telegram_signal_impact": "none",
+        })
+        return {
+            "version": "cftc-cot-runtime-error",
+            "date": target_date,
+            "status": "ERROR",
+            "items": [],
+            "errors": [message],
+            "battle_gate_impact": "none",
+            "telegram_signal_impact": "none",
+        }
+
+
+def _persist_enriched_snapshot(
+    *,
+    snapshot: dict[str, Any],
+    runtime_dir: str | None,
+) -> None:
+    source_health = snapshot.get("source_health")
+    if isinstance(source_health, dict):
+        save_source_health(source_health, runtime_dir)
+    write_json_atomic(get_latest_path(runtime_dir), snapshot)
+    append_jsonl(get_history_path(runtime_dir), snapshot)
 
 
 def _refresh_live_crypto_snapshot(
@@ -444,12 +627,18 @@ def main() -> int:
         action="store_true",
         help="Disable Binance live collection and use only local fallback sources.",
     )
+    parser.add_argument(
+        "--no-live-cot",
+        action="store_true",
+        help="Disable official CFTC weekly collection and use only persisted fallback.",
+    )
     args = parser.parse_args()
 
     result = refresh_positioning_runtime(
         runtime_dir=args.runtime_dir,
         report_date=args.date,
         collect_live_crypto=not args.no_live_crypto,
+        collect_weekly_cot=not args.no_live_cot,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result.get("status") != "ERROR" else 1
