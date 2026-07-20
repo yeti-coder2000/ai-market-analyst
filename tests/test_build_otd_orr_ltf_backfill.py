@@ -153,16 +153,70 @@ class OtdOrrLtfBackfillBuilderTest(unittest.TestCase):
             dry_run=dry_run,
         )
 
-    def test_clean_cohort_uses_exact_decision_time_and_original_expiry(self) -> None:
+    def test_clean_cohort_anchors_decision_to_signal_creation_and_original_expiry(self) -> None:
         records = extract_clean_cohort(
             self.outcomes,
             expected_cohort_size=1,
         )
 
         self.assertEqual(len(records), 1)
-        self.assertEqual(records[0].decision_time_utc.isoformat(), "2026-06-18T10:02:00+00:00")
+        self.assertEqual(records[0].decision_time_utc.isoformat(), "2026-06-18T09:30:00+00:00")
+        self.assertEqual(
+            records[0].selected_evaluation_at_utc.isoformat(),
+            "2026-06-18T10:02:00+00:00",
+        )
+        self.assertTrue(records[0].selected_evaluation_within_original_lifecycle)
+        self.assertEqual(records[0].selected_evaluation_lag_minutes, 32.0)
+        self.assertIsNone(records[0].selected_evaluation_after_expiry_minutes)
         self.assertEqual(records[0].expires_at_utc.isoformat(), "2026-06-18T10:30:00+00:00")
         self.assertEqual(records[0].scenario_family, "TPO_OPEN_TEST_DRIVE")
+
+    def test_evaluation_after_expiry_is_audited_and_never_used_as_decision(self) -> None:
+        late_evaluation = {
+            **self.row,
+            "created_at_utc": "2026-06-18T10:45:00+00:00",
+            "source_event_ts_utc": "2026-06-18T10:45:00+00:00",
+        }
+        self._write_outcomes([late_evaluation])
+
+        record = extract_clean_cohort(self.outcomes, expected_cohort_size=1)[0]
+        serialized = record.to_dict()
+
+        self.assertEqual(record.decision_time_utc.isoformat(), "2026-06-18T09:30:00+00:00")
+        self.assertEqual(
+            record.selected_evaluation_at_utc.isoformat(),
+            "2026-06-18T10:45:00+00:00",
+        )
+        self.assertFalse(record.selected_evaluation_within_original_lifecycle)
+        self.assertEqual(record.selected_evaluation_after_expiry_minutes, 15.0)
+        self.assertEqual(
+            serialized["selected_evaluation_audit"]["context_use"],
+            "AUDIT_ONLY_OUTSIDE_ORIGINAL_LIFECYCLE",
+        )
+
+        result = self._build(dry_run=True)
+        manifest = result["manifest"]
+
+        self.assertEqual(result["status"], "DRY_RUN_OK")
+        self.assertFalse(result["output_created"])
+        self.assertFalse(self.output.exists())
+        self.assertEqual(
+            manifest["cohort"]["selected_evaluation_audit"],
+            {
+                "within_original_lifecycle": 0,
+                "at_or_after_original_expiry": 1,
+                "context_use_rule": (
+                    "selected evaluation metadata is audit-only and must not be "
+                    "used before selected_evaluation_at_utc; an evaluation at or "
+                    "after expiry is never replay-eligible context"
+                ),
+            },
+        )
+        self.assertEqual(
+            manifest["coverage"][0]["decision_time_utc"],
+            "2026-06-18T09:30:00+00:00",
+        )
+        self.assertTrue(manifest["coverage"][0]["coverage_complete"])
 
     def test_duplicate_signal_id_is_rejected(self) -> None:
         duplicate = dict(self.row)
@@ -296,11 +350,28 @@ class OtdOrrLtfBackfillBuilderTest(unittest.TestCase):
         )
 
         manifest = json.loads((self.output / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            manifest["version"],
+            "otd-orr-ltf-backfill-v0.1.1-research-only",
+        )
         self.assertTrue(manifest["research_only"])
         self.assertFalse(manifest["executable_signal"])
         self.assertEqual(manifest["battle_gate_impact"], "none")
         self.assertEqual(manifest["telegram_signal_impact"], "none")
         self.assertEqual(manifest["source_outcomes_sha256"], original_outcomes_hash)
+        self.assertEqual(manifest["cohort"]["decision_time_source"], "signal_created_at_utc")
+        self.assertEqual(
+            manifest["cohort"]["selected_evaluation_audit"],
+            {
+                "within_original_lifecycle": 1,
+                "at_or_after_original_expiry": 0,
+                "context_use_rule": (
+                    "selected evaluation metadata is audit-only and must not be "
+                    "used before selected_evaluation_at_utc; an evaluation at or "
+                    "after expiry is never replay-eligible context"
+                ),
+            },
+        )
         self.assertTrue(manifest["coverage"][0]["coverage_complete"])
         self.assertEqual(manifest["audit_5m"]["source"], "local_versioned_input")
         self.assertEqual(manifest["audit_15m"]["source"], "production_parquet_cache")
