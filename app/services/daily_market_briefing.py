@@ -27,13 +27,15 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from app.services.tpo_watch_bridge import evaluate_tpo_watch_bridge
+
 try:
     from app.core.settings import settings
 except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.25-macro-affected-assets-post-news-impact"
+BRIEFING_VERSION = "daily-market-briefing-v1.26-state-consistent-watch-renderer"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
@@ -76,6 +78,10 @@ FINAL_SL = "SL_HIT"
 MISSED = "MISSED_TARGET_BEFORE_ENTRY"
 EXPIRED = "EXPIRED"
 INVALID = "INVALID"
+
+NON_DIRECTIONAL_TPO_WATCH_STATES = frozenset(
+    {"OBSERVE_ONLY", "OBSERVE_ROTATION", "NO_WATCH", "RESEARCH_ONLY", "BLOCKED"}
+)
 
 
 # =============================================================================
@@ -4023,6 +4029,18 @@ def _brief_symbol_context(item: dict[str, Any]) -> dict[str, Any]:
         _first_from_sources(("initial_open_behavior",), behavior_sources + context_sources + filter_sources),
         "",
     )
+    behavior_transition = _upper(
+        _first_from_sources(("behavior_transition",), behavior_sources + context_sources + filter_sources),
+        "",
+    )
+    value_acceptance_state = _upper(
+        _first_from_sources(("value_acceptance_state",), behavior_sources + context_sources + filter_sources),
+        "UNKNOWN",
+    )
+    value_rejection_confirmed = _first_from_sources(
+        ("value_rejection_confirmed",),
+        behavior_sources + context_sources + filter_sources,
+    )
     true_otd_allowed = _first_from_sources(("true_otd_allowed",), behavior_sources + context_sources + filter_sources)
     synthetic_open = _first_from_sources(("synthetic_open",), behavior_sources + context_sources + filter_sources)
     synthetic_open_confirmed = _first_from_sources(("synthetic_open_confirmed",), behavior_sources + context_sources + filter_sources)
@@ -4050,7 +4068,7 @@ def _brief_symbol_context(item: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(warnings, list):
         warnings = []
 
-    return {
+    data = {
         "market_status": market_status,
         "context_market_status": context_market_status,
         "auction_market_status": auction_market_status,
@@ -4064,6 +4082,9 @@ def _brief_symbol_context(item: dict[str, Any]) -> dict[str, Any]:
         "raw_open_behavior": raw_open_behavior,
         "initial_open_behavior": initial_open_behavior,
         "current_open_behavior": current_open_behavior,
+        "behavior_transition": behavior_transition,
+        "value_acceptance_state": value_acceptance_state,
+        "value_rejection_confirmed": value_rejection_confirmed,
         "true_otd_allowed": true_otd_allowed,
         "synthetic_open": synthetic_open,
         "synthetic_open_confirmed": synthetic_open_confirmed,
@@ -4081,6 +4102,60 @@ def _brief_symbol_context(item: dict[str, Any]) -> dict[str, Any]:
         "tpo_signal_reason": _first_from_sources(("tpo_signal_reason", "signal_reason", "reason"), filter_sources + context_sources + behavior_sources),
         "status_source_guard": "fresh_context_open_overrides_closed" if fresh_context_open else "normal",
     }
+
+    # Reporting must consume the same canonical Watch Bridge decision as the
+    # signal pipeline. In particular, current OPEN_AUCTION must not be promoted
+    # to WATCH merely because a legacy DOWNGRADE record still contains a
+    # directional first-hour hint. Use the already-resolved session/data fields
+    # as explicit signal overrides so stale top-level fallbacks cannot win over
+    # fresh TPO context here.
+    bridge_signal = {
+        "market_status": market_status,
+        "tpo_signal_permission": permission,
+        "tpo_telegram_modifier": modifier,
+        "open_context": open_context,
+        "open_behavior": open_behavior,
+        "initial_open_behavior": initial_open_behavior,
+        "current_open_behavior": current_open_behavior,
+        "behavior_transition": behavior_transition,
+        "value_acceptance_state": value_acceptance_state,
+        "value_rejection_confirmed": value_rejection_confirmed,
+        "profile_reliability_state": profile_reliability_state,
+        "true_otd_allowed": true_otd_allowed,
+        "synthetic_open": synthetic_open,
+        "synthetic_open_confirmed": synthetic_open_confirmed,
+        "entry_model_hint": entry_hint,
+        "battle_bias_hint": battle_hint,
+    }
+
+    try:
+        bridge = evaluate_tpo_watch_bridge(
+            symbol_payload=item,
+            context=d["context"],
+            filters=d["filters"],
+            signal_payload=bridge_signal,
+        )
+    except Exception as exc:  # pragma: no cover - reporting must remain available
+        bridge = {
+            "version": None,
+            "tpo_watch_state": "NO_WATCH",
+            "tpo_watch_setup": current_open_behavior or open_behavior,
+            "tpo_watch_reason": "Watch Bridge evaluation unavailable in reporting layer.",
+            "tpo_watch_active": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+    data.update(
+        {
+            "tpo_watch_bridge_version": bridge.get("version"),
+            "tpo_watch_state": _upper(bridge.get("tpo_watch_state"), "NO_WATCH"),
+            "tpo_watch_setup": _upper(bridge.get("tpo_watch_setup"), ""),
+            "tpo_watch_reason": bridge.get("tpo_watch_reason"),
+            "tpo_watch_active": bool(bridge.get("tpo_watch_active")),
+            "tpo_watch_bridge_error": bridge.get("error"),
+        }
+    )
+    return data
 
 
 
@@ -4205,7 +4280,18 @@ def _directional_continuation_state(sym: str, data: dict[str, Any]) -> str | Non
     entry_hint = str(data.get("entry_hint") or "").upper()
     reason = str(data.get("trigger_reason") or data.get("tpo_signal_reason") or "").upper()
     open_behavior = str(data.get("open_behavior") or "").upper()
+    current_open_behavior = str(data.get("current_open_behavior") or "").upper()
+    watch_state = str(data.get("tpo_watch_state") or "").upper()
     modifier = str(data.get("modifier") or "").upper()
+
+    # Current OPEN_AUCTION is rotational/observe-only until Watch Bridge proves
+    # an accepted breakout or failed-acceptance branch. A directional first-hour
+    # hint alone must not resurrect a stale continuation candidate.
+    if watch_state in NON_DIRECTIONAL_TPO_WATCH_STATES and (
+        open_behavior == "OPEN_AUCTION"
+        or current_open_behavior.startswith("OPEN_AUCTION")
+    ):
+        return None
 
     directional_hint = any(token in entry_hint or token in reason for token in (
         "RETEST", "PULLBACK", "SWEEP", "RECLAIM", "BOS", "FAILED_ACCEPTANCE",
@@ -4232,11 +4318,20 @@ def _auction_subtype(sym: str, data: dict[str, Any], *, post_news_active: bool =
     activity = data.get("first_hour_activity") if isinstance(data.get("first_hour_activity"), dict) else {}
     entry_timing_status = str(data.get("entry_timing_status") or "").upper()
     trigger_reason = str(data.get("trigger_reason") or data.get("tpo_signal_reason") or "").upper()
+    watch_state = str(data.get("tpo_watch_state") or "").upper()
+    watch_setup = str(data.get("tpo_watch_setup") or "").upper()
 
     if market_status in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"} or permission in {"STALE_DATA", "NO_DATA", "PROVIDER_ERROR"} or data.get("provider_error") or data.get("fallback"):
         return "PROVIDER_STALE"
     if macro_unknown:
         return "MACRO_UNKNOWN"
+    if open_behavior == "OPEN_AUCTION" and watch_state:
+        if watch_state == "LTF_MODEL_PENDING":
+            return watch_setup or "OPEN_AUCTION_DIRECTIONAL_BRANCH"
+        if watch_state == "OBSERVE_ROTATION":
+            return "BALANCE_CHOP"
+        if watch_state in NON_DIRECTIONAL_TPO_WATCH_STATES:
+            return "AUCTION_BRANCH_UNCONFIRMED"
     directional_state = _directional_continuation_state(sym, data)
     if directional_state:
         return directional_state
@@ -4274,6 +4369,10 @@ def _bias_without_trade(sym: str, data: dict[str, Any], *, post_news_active: boo
     activity = data.get("first_hour_activity") if isinstance(data.get("first_hour_activity"), dict) else {}
     direction = _activity_direction_label(activity)
     open_behavior = str(data.get("open_behavior") or "").upper()
+    watch_state = str(data.get("tpo_watch_state") or "").upper()
+
+    if open_behavior == "OPEN_AUCTION" and watch_state in NON_DIRECTIONAL_TPO_WATCH_STATES:
+        return "neutral chop / rotations only"
 
     directional_state = _directional_continuation_state(sym, data)
     if directional_state == "BEARISH_CONTINUATION_WAIT_RETEST":
@@ -4321,6 +4420,8 @@ def _brief_verdict(
     open_behavior = data["open_behavior"]
     entry_hint = data["entry_hint"]
     battle_hint = data["battle_hint"]
+    watch_state = str(data.get("tpo_watch_state") or "NO_WATCH").upper()
+    watch_setup = str(data.get("tpo_watch_setup") or "").upper()
     zone = _compact_zone_text(data.get("primary_zone"))
 
     context_open = _context_says_open(data)
@@ -4407,7 +4508,42 @@ def _brief_verdict(
         detail = f"{subtype_text}{zone_text}{bias_text} | no Battle without external calendar check"
         return "NO_TRADE", f"• {sym} — {detail}"
 
-    if modifier == "DOWNGRADE" or permission in {"BLOCKED_BY_CONTEXT", "BLOCKED_BY_AUCTION"} or battle_hint in {"DOWNGRADE_NO_DIRECTIONAL_BATTLE", "BLOCK"}:
+    # Preserve explicit context/auction blockers. State consistency must never
+    # turn a hard block into an observe-only permission.
+    if permission in {"BLOCKED_BY_CONTEXT", "BLOCKED_BY_AUCTION"} or battle_hint == "BLOCK":
+        reason = open_behavior if open_behavior not in {"UNKNOWN", "-"} else permission
+        blocker = permission if permission in {"BLOCKED_BY_CONTEXT", "BLOCKED_BY_AUCTION"} else battle_hint
+        detail = f"{subtype_text}{zone_text} | explicit blocker={blocker}{bias_text}"
+        return "NO_TRADE", f"• {sym} — {reason} | {detail}"
+
+    # Canonical OPEN_AUCTION routing comes from Watch Bridge and must win over
+    # legacy modifier/subtype wording. This keeps reaction, watch-state and the
+    # final market-state bucket on one source of truth.
+    if open_behavior == "OPEN_AUCTION":
+        bridge_text = f" | watch={watch_state}"
+        if watch_setup:
+            bridge_text += f"/{watch_setup}"
+
+        if watch_state == "LTF_MODEL_PENDING":
+            detail = (
+                f"{subtype_text}{zone_text}{bridge_text} | directional branch підтверджена; "
+                f"чекати fresh retest + LTF model + context-invalidation stop{bias_text}"
+            )
+            if post_news_active:
+                detail += " | post-news: без chase"
+            return "WATCH", f"• {sym} — OPEN_AUCTION_BRANCH | {detail}"
+
+        if watch_state == "BLOCKED":
+            detail = f"{subtype_text}{zone_text}{bridge_text} | no Battle{bias_text}"
+            return "NO_TRADE", f"• {sym} — OPEN_AUCTION | {detail}"
+
+        observe_mode = "тільки ротації" if watch_state == "OBSERVE_ROTATION" else "чекати acceptance/rejection branch"
+        detail = f"{subtype_text}{zone_text}{bridge_text} | {observe_mode}{bias_text}"
+        if post_news_active:
+            detail += " | post-news: перший імпульс не наздоганяти"
+        return "OBSERVE", f"• {sym} — OPEN_AUCTION | {detail}"
+
+    if modifier == "DOWNGRADE" or battle_hint == "DOWNGRADE_NO_DIRECTIONAL_BATTLE":
         reason = open_behavior if open_behavior not in {"UNKNOWN", "-"} else (permission if permission not in {"UNKNOWN", "-"} else "DOWNGRADE")
         detail = f"{subtype_text}"
         if zone != "-":
@@ -4436,14 +4572,6 @@ def _brief_verdict(
         if post_news_active:
             detail = f"{subtype_text}{zone_text} | post-news failed move/rejection context; тільки після reclaim/BOS/retest, без chase{bias_text}"
         return "WATCH", f"• {sym} — OPEN_REJECTION_REVERSE | {detail}"
-
-    # OPEN_AUCTION without DOWNGRADE is not a full no-trade state.
-    # It means observe rotations only; no directional battle.
-    if open_behavior == "OPEN_AUCTION":
-        detail = f"{subtype_text}{zone_text} | тільки ротації{bias_text}"
-        if post_news_active:
-            detail = f"{subtype_text}{zone_text} | post-news auction/rotation; перший імпульс не наздоганяти{bias_text}"
-        return "OBSERVE", f"• {sym} — OPEN_AUCTION | {detail}"
 
     if open_behavior in {"UNCONFIRMED", "UNKNOWN"}:
         if post_news_active:
@@ -4588,6 +4716,8 @@ def _post_news_symbol_line(
     macro_read = _post_news_macro_read(sym, direction, behavior)
     subtype = _auction_subtype(sym, data, post_news_active=not macro_unknown, macro_unknown=macro_unknown)
     bias = _bias_without_trade(sym, data, post_news_active=not macro_unknown, macro_unknown=macro_unknown)
+    watch_state = str(data.get("tpo_watch_state") or "NO_WATCH").upper()
+    watch_setup = str(data.get("tpo_watch_setup") or "").upper()
 
     if holiday_overlay and sym in {"NAS100", "SPX500"}:
         zone_text = f" | зона: {zone}" if zone != "-" else ""
@@ -4601,7 +4731,10 @@ def _post_news_symbol_line(
     elif behavior == "OPEN_TEST_DRIVE":
         mode = "WATCH_AFTER_RETEST_ONLY: LTF model + stop + real target обовʼязкові"
     elif behavior == "OPEN_AUCTION":
-        mode = "rotation/auction: без directional battle"
+        if watch_state == "LTF_MODEL_PENDING":
+            mode = "directional branch підтверджена: тільки fresh retest + LTF model + stop + real target"
+        else:
+            mode = "rotation/auction: без directional battle"
     elif behavior == "OPEN_DRIVE":
         mode = "drive після news: не chase, тільки pullback/acceptance"
     elif behavior in {"UNCONFIRMED", "UNKNOWN"}:
@@ -4614,7 +4747,12 @@ def _post_news_symbol_line(
         mode = "no Battle without external calendar check + LTF confirmation"
 
     zone_text = f" | зона: {zone}" if zone != "-" else ""
-    return f"• {sym} — {behavior} / {context}{zone_text} | subtype={subtype} | bias={bias} | {macro_read} | {activity_text} | {mode}"
+    bridge_text = ""
+    if behavior == "OPEN_AUCTION":
+        bridge_text = f" | watch={watch_state}"
+        if watch_setup:
+            bridge_text += f"/{watch_setup}"
+    return f"• {sym} — {behavior} / {context}{zone_text} | subtype={subtype}{bridge_text} | bias={bias} | {macro_read} | {activity_text} | {mode}"
 
 
 def _build_post_news_reaction_section(
@@ -5217,7 +5355,7 @@ def _build_tpo_audit_snapshot(tpo: Any, report_type: str | None = None) -> dict[
     """
     if not isinstance(tpo, dict):
         return {
-            "version": "tpo-audit-snapshot-v1",
+            "version": "tpo-audit-snapshot-v2-watch-state",
             "report_type": report_type,
             "updated_at_utc": None,
             "symbols": {},
@@ -5288,10 +5426,22 @@ def _build_tpo_audit_snapshot(tpo: Any, report_type: str | None = None) -> dict[
         symbol = str(_tpo_audit_pick(record, "symbol") or key).upper()
         row = {field: _tpo_audit_pick(record, field) for field in fields}
         row["symbol"] = symbol
+        resolved = _brief_symbol_context(record)
+        row.update(
+            {
+                "resolved_open_behavior": resolved.get("open_behavior"),
+                "resolved_current_open_behavior": resolved.get("current_open_behavior"),
+                "tpo_watch_bridge_version": resolved.get("tpo_watch_bridge_version"),
+                "tpo_watch_state": resolved.get("tpo_watch_state"),
+                "tpo_watch_setup": resolved.get("tpo_watch_setup"),
+                "tpo_watch_reason": resolved.get("tpo_watch_reason"),
+                "tpo_watch_bridge_error": resolved.get("tpo_watch_bridge_error"),
+            }
+        )
         symbols[symbol] = row
 
     return {
-        "version": "tpo-audit-snapshot-v1",
+        "version": "tpo-audit-snapshot-v2-watch-state",
         "report_type": report_type,
         "updated_at_utc": tpo.get("updated_at_utc"),
         "symbol_count": len(symbols),
