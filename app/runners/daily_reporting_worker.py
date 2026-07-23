@@ -6,8 +6,8 @@ Scheduled Telegram reporting worker for AI Market Analyst.
 Runs independently from the trading/signal worker.
 
 Production schedule:
-- morning_combined: 11:05 Europe/Kyiv
-- london_close:     16:45 Europe/London
+- morning_combined: 08:05 Europe/Berlin (Frankfurt open)
+- daily_close:      16:15 America/New_York (completed NY close bar)
 
 The legacy NY report remains callable manually and can be re-enabled by the
 new explicit ENABLE_LEGACY_NY_REPORT flag. The old ENABLE_NY_REPORT setting is
@@ -46,9 +46,10 @@ except Exception:  # pragma: no cover
 from app.services.telegram_daily_reporter import send_daily_report
 
 
-WORKER_VERSION = "daily-reporting-worker-v1.2-london-focus"
+WORKER_VERSION = "daily-reporting-worker-v1.3-ny-close"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
-DEFAULT_LONDON_TIMEZONE = "Europe/London"
+DEFAULT_FRANKFURT_TIMEZONE = "Europe/Berlin"
+DEFAULT_NY_TIMEZONE = "America/New_York"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -147,21 +148,24 @@ def _weekday_schedule() -> list[ScheduledReport]:
     reports = [
         ScheduledReport(
             "morning_combined",
-            os.getenv("REPORT_TIME_MORNING_COMBINED", "11:05"),
+            os.getenv("REPORT_TIME_MORNING_COMBINED", "08:05"),
             refresh_tpo=_env_bool("REPORT_REFRESH_TPO_MORNING_COMBINED", False),
-            schedule_timezone=os.getenv("REPORT_TIMEZONE", DEFAULT_TIMEZONE),
+            schedule_timezone=os.getenv(
+                "REPORT_MORNING_TIMEZONE",
+                DEFAULT_FRANKFURT_TIMEZONE,
+            ),
         ),
     ]
 
-    if _env_bool("ENABLE_LONDON_CLOSE_REPORT", True):
+    if _env_bool("ENABLE_DAILY_CLOSE_REPORT", True):
         reports.append(
             ScheduledReport(
-                "london_close",
-                os.getenv("REPORT_TIME_LONDON_CLOSE", "16:45"),
-                refresh_tpo=_env_bool("REPORT_REFRESH_TPO_LONDON_CLOSE", True),
+                "daily_close",
+                os.getenv("REPORT_TIME_DAILY_CLOSE", "16:15"),
+                refresh_tpo=_env_bool("REPORT_REFRESH_TPO_DAILY_CLOSE", True),
                 schedule_timezone=os.getenv(
-                    "REPORT_LONDON_CLOSE_TIMEZONE",
-                    DEFAULT_LONDON_TIMEZONE,
+                    "REPORT_DAILY_CLOSE_TIMEZONE",
+                    DEFAULT_NY_TIMEZONE,
                 ),
             )
         )

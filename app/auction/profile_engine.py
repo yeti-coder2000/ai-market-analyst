@@ -98,6 +98,11 @@ class AuctionContext:
     previous_low: Optional[float]
 
     current_open: Optional[float]
+    current_poc: Optional[float]
+    current_vah: Optional[float]
+    current_val: Optional[float]
+    current_high: Optional[float]
+    current_low: Optional[float]
     open_relation: str
     auction_bias: str
 
@@ -612,6 +617,11 @@ def _empty_context(
         previous_high=None,
         previous_low=None,
         current_open=None,
+        current_poc=None,
+        current_vah=None,
+        current_val=None,
+        current_high=None,
+        current_low=None,
         open_relation=OpenRelation.UNKNOWN.value,
         auction_bias=AuctionBias.UNKNOWN.value,
         nearest_npoc=None,
@@ -787,6 +797,11 @@ def build_auction_context(
         previous_high=previous_profile.high if previous_profile else None,
         previous_low=previous_profile.low if previous_profile else None,
         current_open=current_open,
+        current_poc=current_profile.poc if current_profile else None,
+        current_vah=current_profile.vah if current_profile else None,
+        current_val=current_profile.val if current_profile else None,
+        current_high=current_profile.high if current_profile else None,
+        current_low=current_profile.low if current_profile else None,
         open_relation=open_relation,
         auction_bias=auction_bias,
         nearest_npoc=nearest_npoc.poc if nearest_npoc else None,

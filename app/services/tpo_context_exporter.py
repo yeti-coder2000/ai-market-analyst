@@ -4,6 +4,7 @@ import argparse
 import copy
 import gc
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -13,11 +14,12 @@ import pandas as pd
 from app.auction.profile_engine import build_auction_context, auction_context_to_signal_filters
 from app.core.enums import Instrument, Timeframe
 from app.core.instrument_batches import get_batch_symbols
+from app.core.session_config import SessionConfig, get_session_config
 from app.core.settings import settings
 from app.runners.stateful_batch_runner import _build_loader_for_batch_group, to_jsonable
 from app.services.tpo_open_behavior_classifier import attach_open_behavior_to_tpo_item
 
-EXPORTER_VERSION = "tpo-context-exporter-v1.2-open-behavior"
+EXPORTER_VERSION = "tpo-context-exporter-v1.3-profile-scope"
 DEFAULT_MAX_BARS = 672
 
 TPO_DIR = settings.runtime_dir / "tpo"
@@ -42,6 +44,30 @@ TICK_SIZE_BY_SYMBOL: dict[str, float] = {
 
 def now_iso() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _profile_scope() -> str:
+    return str(os.getenv("TPO_PROFILE_SCOPE") or "INSTRUMENT_NATIVE").strip().upper()
+
+
+def _profile_session_config(symbol: str) -> SessionConfig | None:
+    if _profile_scope() != "LONDON_NY_COMBINED":
+        return None
+
+    base = get_session_config(symbol)
+    return SessionConfig(
+        symbol=symbol,
+        session_anchor="LONDON_NY_COMBINED_OPEN",
+        timezone="Europe/London",
+        open_time="08:00",
+        primary_logic="LONDON_NY_COMBINED_PROFILE",
+        secondary_anchors=("NY_CASH_OPEN", "NY_CASH_CLOSE"),
+        exchange_open_reference=base.exchange_open_reference,
+        asset_class=base.asset_class,
+        trades_weekends=base.trades_weekends,
+        enforce_primary_session_hours=False,
+        stale_bar_threshold_minutes=base.stale_bar_threshold_minutes,
+    )
 
 
 def normalize_symbol(raw: Any) -> Instrument:
@@ -373,6 +399,7 @@ def build_symbol_tpo(loader: Any, symbol: Instrument, max_bars: int) -> dict[str
         tick_size=tick_size,
         value_area_pct=0.70,
         ib_minutes=60,
+        session_config=_profile_session_config(symbol.value),
     )
     filters = auction_context_to_signal_filters(context)
 
@@ -386,6 +413,7 @@ def build_symbol_tpo(loader: Any, symbol: Instrument, max_bars: int) -> dict[str
         context_payload["memory_mode"] = "offline_bounded_recent_history"
         context_payload["provider_error"] = False
         context_payload["fallback_preserved_previous_context"] = False
+        context_payload["profile_scope"] = _profile_scope()
 
     filters_payload = to_jsonable(filters)
     if isinstance(filters_payload, dict):
@@ -443,6 +471,7 @@ def export_tpo_context(groups: list[str], max_bars: int, output_path: Path) -> d
         "exporter_version": EXPORTER_VERSION,
         "updated_at_utc": now_iso(),
         "max_bars": max_bars,
+        "profile_scope": _profile_scope(),
         "previous_store_loaded": bool(previous_store),
         "previous_store_updated_at_utc": previous_store.get("updated_at_utc") if previous_store else None,
         "symbols": {},
@@ -578,7 +607,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export precomputed TPO context for live signal worker.")
     parser.add_argument("--groups", default="core,fx_major,indices")
     parser.add_argument("--max-bars", type=int, default=DEFAULT_MAX_BARS)
-    parser.add_argument("--output", default=str(TPO_LATEST_PATH))
+    parser.add_argument(
+        "--output",
+        default=os.getenv("TPO_EXPORT_OUTPUT", str(TPO_LATEST_PATH)),
+    )
     return parser.parse_args()
 
 

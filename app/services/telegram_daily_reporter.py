@@ -20,7 +20,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -33,7 +33,7 @@ from app.services.daily_market_briefing import (
 from app.services.telegram_notifier import TelegramNotifier
 
 
-REPORTER_VERSION = "telegram-daily-reporter-v1.4-london-operational-positioning"
+REPORTER_VERSION = "telegram-daily-reporter-v1.5-frankfurt-cot-ny-close"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -67,6 +67,26 @@ def _resolve_report_date(report_date: str | None, timezone_name: str | None) -> 
         return datetime.now(ZoneInfo(timezone_value)).date().isoformat()
     except Exception:
         return datetime.now(ZoneInfo("Europe/Kyiv")).date().isoformat()
+
+
+def _previous_trading_date(value: str) -> str:
+    current = date.fromisoformat(value)
+    previous = current - timedelta(days=1)
+    while previous.weekday() >= 5:
+        previous -= timedelta(days=1)
+    return previous.isoformat()
+
+
+def _positioning_reference_date(report_type: str, report_date: str) -> str:
+    normalized = str(report_type or "").strip().lower()
+    if normalized in {"morning", "morning_briefing", "morning_combined"}:
+        return _previous_trading_date(report_date)
+    return report_date
+
+
+def _daily_close_tpo_path(runtime_dir: str | None) -> Path:
+    root = Path(runtime_dir or os.getenv("RUNTIME_DIR") or "runtime")
+    return root / "tpo" / "tpo_london_ny_close_latest.json"
 
 
 def _refresh_positioning_runtime(
@@ -178,7 +198,11 @@ def _run_module(module: str, *, timeout_sec: int) -> dict[str, Any]:
         }
 
 
-def refresh_runtime_artifacts(*, include_tpo: bool | None = None) -> list[dict[str, Any]]:
+def refresh_runtime_artifacts(
+    *,
+    include_tpo: bool | None = None,
+    report_type: str | None = None,
+) -> list[dict[str, Any]]:
     """
     Refresh stats before sending reports.
 
@@ -202,7 +226,24 @@ def refresh_runtime_artifacts(*, include_tpo: bool | None = None) -> list[dict[s
     if _env_bool("REPORT_REFRESH_STATISTICS", True):
         modules.append("app.services.lightweight_statistics_exporter")
 
-    return [_run_module(module, timeout_sec=timeout_sec) for module in modules]
+    previous_scope = os.environ.get("TPO_PROFILE_SCOPE")
+    previous_output = os.environ.get("TPO_EXPORT_OUTPUT")
+    if str(report_type or "").strip().lower() in {"daily_close", "ny_close"}:
+        os.environ["TPO_PROFILE_SCOPE"] = "LONDON_NY_COMBINED"
+        os.environ["TPO_EXPORT_OUTPUT"] = str(
+            _daily_close_tpo_path(os.getenv("RUNTIME_DIR"))
+        )
+    try:
+        return [_run_module(module, timeout_sec=timeout_sec) for module in modules]
+    finally:
+        if previous_scope is None:
+            os.environ.pop("TPO_PROFILE_SCOPE", None)
+        else:
+            os.environ["TPO_PROFILE_SCOPE"] = previous_scope
+        if previous_output is None:
+            os.environ.pop("TPO_EXPORT_OUTPUT", None)
+        else:
+            os.environ["TPO_EXPORT_OUTPUT"] = previous_output
 
 
 
@@ -357,6 +398,8 @@ def _positioning_delivery_enabled(report_type: str, explicit: bool | None = None
     normalized = str(report_type or "").strip().lower()
     if normalized in {"london_close", "london_close_briefing"}:
         return _env_bool("REPORT_SEND_LONDON_CLOSE_POSITIONING", True)
+    if normalized in {"daily_close", "ny_close"}:
+        return _env_bool("REPORT_SEND_DAILY_CLOSE_POSITIONING", False)
 
     allowed = _env_csv_set(
         "REPORT_POSITIONING_TYPES",
@@ -549,7 +592,10 @@ def send_daily_report(
     resolved_report_date = _resolve_report_date(report_date, timezone_name)
 
     if refresh:
-        refresh_results = refresh_runtime_artifacts(include_tpo=include_tpo_refresh)
+        refresh_results = refresh_runtime_artifacts(
+            include_tpo=include_tpo_refresh,
+            report_type=report_type,
+        )
 
         if (
             _env_bool("REPORT_REFRESH_POSITIONING", True)
@@ -558,16 +604,30 @@ def send_daily_report(
             refresh_results.append(
                 _refresh_positioning_runtime(
                     runtime_dir=runtime_dir,
-                    report_date=resolved_report_date,
+                    report_date=_positioning_reference_date(
+                        report_type,
+                        resolved_report_date,
+                    ),
                     report_type=report_type,
                 )
             )
 
-    report = build_briefing_report(
-        report_type=report_type,
-        report_date=resolved_report_date,
-        timezone_name=timezone_name,
-    )
+    previous_tpo_store = os.environ.get("TPO_CONTEXT_STORE_PATH")
+    if str(report_type or "").strip().lower() in {"daily_close", "ny_close"}:
+        os.environ["TPO_CONTEXT_STORE_PATH"] = str(
+            _daily_close_tpo_path(runtime_dir)
+        )
+    try:
+        report = build_briefing_report(
+            report_type=report_type,
+            report_date=resolved_report_date,
+            timezone_name=timezone_name,
+        )
+    finally:
+        if previous_tpo_store is None:
+            os.environ.pop("TPO_CONTEXT_STORE_PATH", None)
+        else:
+            os.environ["TPO_CONTEXT_STORE_PATH"] = previous_tpo_store
 
     # Save full artifacts first. Artifacts may include Positioning/COT sections.
     json_path, txt_path = write_briefing_artifacts(report)
@@ -648,7 +708,7 @@ def main() -> int:
         dry_run=args.dry_run,
         refresh=not args.no_refresh,
         include_tpo_refresh=args.refresh_tpo,
-        send_positioning_report=not args.no_positioning_report,
+        send_positioning_report=False if args.no_positioning_report else None,
         positioning_max_items=args.positioning_max_items,
         positioning_split_limit=args.positioning_split_limit,
     )
