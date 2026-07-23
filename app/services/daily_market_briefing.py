@@ -115,9 +115,12 @@ LONDON_FOCUS_REPORT_TYPES = frozenset(
         "london_1h",
         "london_close",
         "london_close_briefing",
+        "daily_close",
+        "ny_close",
     }
 )
 LONDON_CLOSE_REPORT_TYPES = frozenset({"london_close", "london_close_briefing"})
+DAILY_CLOSE_REPORT_TYPES = frozenset({"daily_close", "ny_close"})
 
 NY_SESSION_SYMBOLS: tuple[str, ...] = (
     "NAS100",
@@ -153,6 +156,8 @@ REPORT_SCOPE_LABELS_UK: dict[str, str] = {
     "london_1h": "London Focus v1: ранній стан London без US indices/oil.",
     "london_close": "London Close: план проти факту для GER40, XAU, FX і crypto; не пошук пізнього входу.",
     "london_close_briefing": "London Close: план проти факту для GER40, XAU, FX і crypto; не пошук пізнього входу.",
+    "daily_close": "Фінал дня: повний London+NY TPO-профіль; матеріал для статистики та наступного Frankfurt open.",
+    "ny_close": "Фінал дня: повний London+NY TPO-профіль; матеріал для статистики та наступного Frankfurt open.",
     "ny": "New York post-open / NY active focus. London-only активи тут не показуються як активний фокус.",
     "ny_1h": "New York post-open / NY active focus. London-only активи тут не показуються як активний фокус.",
     "new_york": "New York post-open / NY active focus. London-only активи тут не показуються як активний фокус.",
@@ -3419,6 +3424,8 @@ def _section_header_for_type(report_type: str, generated_at_local: Any = None) -
         return "🌅 Ранковий брифінг"
     if r in LONDON_CLOSE_REPORT_TYPES:
         return "🇬🇧 Підсумок London Close"
+    if r in DAILY_CLOSE_REPORT_TYPES:
+        return "🌐 Фінальний брифінг London + NY"
     if r in {"london_1h", "london"}:
         return "🇬🇧 Звіт London +1 година"
     if r in {"ny_1h", "ny", "new_york"}:
@@ -3440,7 +3447,7 @@ def _symbol_scope_for_report(report_type: str) -> tuple[str, ...]:
     if r in {"london", "london_1h"}:
         return LONDON_SESSION_SYMBOLS
 
-    if r in LONDON_CLOSE_REPORT_TYPES:
+    if r in LONDON_CLOSE_REPORT_TYPES or r in DAILY_CLOSE_REPORT_TYPES:
         return LONDON_SESSION_SYMBOLS
 
     if r in {"ny", "ny_1h", "new_york"}:
@@ -5360,12 +5367,12 @@ def _build_focus_section(report_type: str, target_date: date | None = None) -> B
                     "До high-impact news не вважати ранню структуру стабільною.",
                 ]
             )
-    elif rt in LONDON_CLOSE_REPORT_TYPES:
+    elif rt in LONDON_CLOSE_REPORT_TYPES or rt in DAILY_CLOSE_REPORT_TYPES:
         section.lines.extend(
             [
-                "London Close — це розбір плану проти факту, а не пошук пізнього входу.",
+                "Фінал London+NY — це розбір плану проти факту, а не пошук пізнього входу.",
                 "Фіксуємо фінальний open behavior, acceptance/rejection, Watch Bridge state і те, що переходить на завтра.",
-                "Новий Battle після закриття London не створюється лише тому, що рух уже став очевидним.",
+                "Новий Battle після закриття NY не створюється лише тому, що рух уже став очевидним.",
             ]
         )
     elif rt in {"london", "london_1h"}:
@@ -5489,6 +5496,12 @@ def _build_tpo_audit_snapshot(tpo: Any, report_type: str | None = None) -> dict[
         "previous_high",
         "previous_low",
         "current_open",
+        "current_poc",
+        "current_vah",
+        "current_val",
+        "current_high",
+        "current_low",
+        "profile_scope",
         "open_relation",
         "open_context",
         "open_location",
@@ -5682,7 +5695,7 @@ def build_briefing_report(
     tpo_audit_snapshot = _build_tpo_audit_snapshot(tpo, normalized_type)
     london_close_section: BriefingSection | None = None
     london_close_comparison: dict[str, Any] | None = None
-    if normalized_type in LONDON_CLOSE_REPORT_TYPES:
+    if normalized_type in LONDON_CLOSE_REPORT_TYPES or normalized_type in DAILY_CLOSE_REPORT_TYPES:
         london_close_section, london_close_comparison = _build_london_close_comparison(
             tpo=tpo,
             target_date=target_date,

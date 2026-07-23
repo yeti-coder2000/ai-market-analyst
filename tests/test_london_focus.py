@@ -30,8 +30,9 @@ def test_london_focus_deactivates_us_indices_and_oil_without_deleting_logic(monk
     assert {"NAS100", "SPX500", "UKOIL"}.isdisjoint(LONDON_FOCUS_SYMBOLS)
 
     schedule = _weekday_schedule()
-    assert [item.report_type for item in schedule] == ["morning_combined", "london_close"]
-    assert schedule[1].schedule_timezone == "Europe/London"
+    assert [item.report_type for item in schedule] == ["morning_combined", "daily_close"]
+    assert schedule[0].schedule_timezone == "Europe/Berlin"
+    assert schedule[1].schedule_timezone == "America/New_York"
     assert schedule[1].refresh_tpo is True
 
 
@@ -42,18 +43,18 @@ def test_legacy_ny_schedule_requires_new_explicit_reactivation_flag(monkeypatch)
 
     assert [item.report_type for item in _weekday_schedule()] == [
         "morning_combined",
-        "london_close",
+        "daily_close",
         "ny_1h",
     ]
 
 
-def test_london_close_schedule_is_dst_anchored_to_london(monkeypatch) -> None:
+def test_daily_close_schedule_is_dst_anchored_to_new_york(monkeypatch) -> None:
     monkeypatch.delenv("ENABLE_LEGACY_NY_REPORT", raising=False)
-    close = next(item for item in _weekday_schedule() if item.report_type == "london_close")
+    close = next(item for item in _weekday_schedule() if item.report_type == "daily_close")
     state = {"sent": {}}
 
-    assert not _should_send(datetime(2026, 7, 22, 15, 44, tzinfo=timezone.utc), close, state)
-    assert _should_send(datetime(2026, 7, 22, 15, 45, tzinfo=timezone.utc), close, state)
+    assert not _should_send(datetime(2026, 7, 22, 20, 14, tzinfo=timezone.utc), close, state)
+    assert _should_send(datetime(2026, 7, 22, 20, 15, tzinfo=timezone.utc), close, state)
 
 
 def test_london_focus_report_scope_keeps_usd_macro_safety_without_us_assets() -> None:
