@@ -8,6 +8,7 @@ from app.core.instrument_batches import get_batch_symbols
 from app.runners.daily_reporting_worker import _should_send, _weekday_schedule
 from app.services.daily_market_briefing import (
     LONDON_FOCUS_SYMBOLS,
+    _build_london_1h_comparison,
     _build_london_close_comparison,
     _filter_london_focus_records,
     _macro_affected_symbols_text,
@@ -30,10 +31,19 @@ def test_london_focus_deactivates_us_indices_and_oil_without_deleting_logic(monk
     assert {"NAS100", "SPX500", "UKOIL"}.isdisjoint(LONDON_FOCUS_SYMBOLS)
 
     schedule = _weekday_schedule()
-    assert [item.report_type for item in schedule] == ["morning_combined", "daily_close"]
-    assert schedule[0].schedule_timezone == "Europe/Berlin"
-    assert schedule[1].schedule_timezone == "America/New_York"
-    assert schedule[1].refresh_tpo is True
+    assert [item.report_type for item in schedule] == [
+        "positioning_japan_open",
+        "morning_combined",
+        "london_1h",
+        "daily_close",
+    ]
+    assert schedule[0].schedule_timezone == "Asia/Tokyo"
+    assert schedule[0].delivery_mode == "positioning_checkpoint"
+    assert schedule[1].schedule_timezone == "Europe/Berlin"
+    assert schedule[2].schedule_timezone == "Europe/London"
+    assert schedule[2].refresh_tpo is True
+    assert schedule[3].schedule_timezone == "America/New_York"
+    assert schedule[3].refresh_tpo is True
 
 
 
@@ -42,7 +52,9 @@ def test_legacy_ny_schedule_requires_new_explicit_reactivation_flag(monkeypatch)
     monkeypatch.setenv("ENABLE_LEGACY_NY_REPORT", "true")
 
     assert [item.report_type for item in _weekday_schedule()] == [
+        "positioning_japan_open",
         "morning_combined",
+        "london_1h",
         "daily_close",
         "ny_1h",
     ]
@@ -55,6 +67,25 @@ def test_daily_close_schedule_is_dst_anchored_to_new_york(monkeypatch) -> None:
 
     assert not _should_send(datetime(2026, 7, 22, 20, 14, tzinfo=timezone.utc), close, state)
     assert _should_send(datetime(2026, 7, 22, 20, 15, tzinfo=timezone.utc), close, state)
+
+
+def test_london_plus_1h_schedule_is_dst_anchored_to_london(monkeypatch) -> None:
+    control = next(item for item in _weekday_schedule() if item.report_type == "london_1h")
+    state = {"sent": {}}
+
+    assert not _should_send(datetime(2026, 7, 22, 7, 59, tzinfo=timezone.utc), control, state)
+    assert _should_send(datetime(2026, 7, 22, 8, 0, tzinfo=timezone.utc), control, state)
+
+
+def test_japan_baseline_expires_instead_of_fabricating_late_open_snapshot() -> None:
+    baseline = next(
+        item for item in _weekday_schedule()
+        if item.report_type == "positioning_japan_open"
+    )
+    state = {"sent": {}}
+
+    assert _should_send(datetime(2026, 7, 22, 0, 5, tzinfo=timezone.utc), baseline, state)
+    assert not _should_send(datetime(2026, 7, 22, 1, 0, tzinfo=timezone.utc), baseline, state)
 
 
 def test_london_focus_report_scope_keeps_usd_macro_safety_without_us_assets() -> None:
@@ -119,6 +150,53 @@ def test_london_close_comparison_reads_persisted_morning_audit(monkeypatch, tmp_
     assert "OPEN_AUCTION_IN_RANGE/OBSERVE_ROTATION → OPEN_DRIVE/LTF_MODEL_PENDING" in "\n".join(section.lines)
 
 
+def test_london_1h_comparison_confirms_or_rejects_frankfurt_scenario(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path))
+    report_dir = tmp_path / "reports" / "briefings"
+    report_dir.mkdir(parents=True)
+    (report_dir / "2026-07-22_morning_combined.json").write_text(
+        json.dumps(
+            {
+                "generated_at_utc": "2026-07-22T06:05:00+00:00",
+                "raw": {
+                    "tpo_audit_snapshot": {
+                        "symbols": {
+                            "XAUUSD": {
+                                "resolved_current_open_behavior": "OPEN_AUCTION",
+                                "tpo_watch_state": "OBSERVE_ROTATION",
+                                "value_acceptance_state": "INSIDE_VALUE",
+                            }
+                        }
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    current = {
+        "symbols": {
+            "XAUUSD": {
+                "resolved_current_open_behavior": "OPEN_TEST_DRIVE",
+                "tpo_watch_state": "LTF_MODEL_PENDING",
+                "value_acceptance_state": "REJECTED_VALUE",
+            }
+        }
+    }
+
+    section, audit = _build_london_1h_comparison(
+        tpo={"symbols": {}},
+        target_date=datetime(2026, 7, 22).date(),
+        current_snapshot=current,
+    )
+
+    assert audit["stage"] == "LONDON_1H"
+    assert audit["symbols"]["XAUUSD"]["changed"] is True
+    assert "London +1h" in section.title
+
+
 def test_london_close_positioning_skips_repeated_weekly_cot_without_operational_delta(tmp_path: Path) -> None:
     positioning_dir = tmp_path / "positioning"
     positioning_dir.mkdir(parents=True)
@@ -159,6 +237,13 @@ def test_london_close_positioning_is_not_disabled_by_legacy_type_list(monkeypatc
     monkeypatch.delenv("REPORT_SEND_LONDON_CLOSE_POSITIONING", raising=False)
 
     assert _positioning_delivery_enabled("london_close") is True
+
+
+def test_london_1h_positioning_is_enabled_by_default(monkeypatch) -> None:
+    monkeypatch.setenv("REPORT_SEND_POSITIONING_TELEGRAM", "true")
+    monkeypatch.delenv("REPORT_SEND_LONDON_1H_POSITIONING", raising=False)
+
+    assert _positioning_delivery_enabled("london_1h") is True
 
 
 def test_london_focus_statistics_start_new_cohort_without_deleting_legacy(monkeypatch) -> None:

@@ -382,6 +382,18 @@ def test_positioning_pipeline_falls_back_to_kraken_and_builds_london_delta(
         },
     )
 
+    japan = positioning_pipeline.refresh_positioning_runtime(
+        runtime_dir=str(tmp_path),
+        report_date="2026-07-22",
+        report_type="positioning_japan_open",
+        collect_live_crypto=True,
+        collect_weekly_cot=False,
+    )
+    assert japan["status"] == "OK"
+    assert japan["operational_positioning_status"] == "JAPAN_BASELINE_CAPTURED"
+    assert any(source["name"] == "kraken_futures_live" and source["status"] == "OK" for source in japan["sources"])
+
+    values.update(price=102.0, oi=210.0)
     morning = positioning_pipeline.refresh_positioning_runtime(
         runtime_dir=str(tmp_path),
         report_date="2026-07-22",
@@ -389,19 +401,17 @@ def test_positioning_pipeline_falls_back_to_kraken_and_builds_london_delta(
         collect_live_crypto=True,
         collect_weekly_cot=False,
     )
-    assert morning["status"] == "OK"
-    assert morning["operational_positioning_status"] == "BASELINE_CAPTURED"
-    assert any(source["name"] == "kraken_futures_live" and source["status"] == "OK" for source in morning["sources"])
+    assert morning["operational_positioning_status"] == "FRANKFURT_DELTA_READY"
 
     values.update(price=105.0, oi=220.0)
     close = positioning_pipeline.refresh_positioning_runtime(
         runtime_dir=str(tmp_path),
         report_date="2026-07-22",
-        report_type="london_close",
+        report_type="london_1h",
         collect_live_crypto=True,
         collect_weekly_cot=False,
     )
-    assert close["operational_positioning_status"] == "DELTA_READY"
+    assert close["operational_positioning_status"] == "LONDON_1H_DELTA_READY"
 
     latest = json.loads(
         (tmp_path / "positioning" / "daily_positioning_latest.json").read_text(encoding="utf-8")
@@ -410,7 +420,7 @@ def test_positioning_pipeline_falls_back_to_kraken_and_builds_london_delta(
     assert btc["daily_market_data"]["price_change_pct"] == 5.0
     assert btc["daily_market_data"]["open_interest_change_pct"] == 10.0
     assert btc["market_proxy"]["source"] == "kraken_futures_public_pf_xbtusd"
-    assert latest["operational_positioning"]["status"] == "DELTA_READY"
+    assert latest["operational_positioning"]["status"] == "LONDON_1H_DELTA_READY"
     assert btc.get("positioning_can_allow_signal") is not True
     assert btc.get("positioning_can_block_signal") is not True
     assert btc["auction_usage"]["battle_gate_impact"] == "none"

@@ -11,7 +11,7 @@ from .positioning_service import get_latest_positioning_context
 from .positioning_store import get_positioning_dir
 
 
-POSITIONING_TELEGRAM_REPORT_VERSION = "positioning-telegram-report-v0.3-london-operational"
+POSITIONING_TELEGRAM_REPORT_VERSION = "positioning-telegram-report-v0.4-three-checkpoint-cycle"
 
 POSITIONING_FOCUS_SYMBOLS: tuple[str, ...] = (
     "GER40",
@@ -455,16 +455,60 @@ def _render_operational_status(operational: dict[str, Any]) -> list[str]:
     symbol_count = len(operational.get("symbols") or {}) if isinstance(operational.get("symbols"), dict) else 0
 
     out = ["<b>Operational positioning</b>", f"Phase: <b>{_h(phase)}</b> | status: <b>{_h(status)}</b>"]
-    if status == "BASELINE_CAPTURED":
-        out.append(f"Morning baseline captured for {symbol_count} assets; London-close delta is pending.")
-    elif status in {"DELTA_READY", "PARTIAL"}:
-        out.append(f"Window: morning baseline → London close | assets with delta: {symbol_count}.")
-    elif status in {"LIVE_SOURCE_UNAVAILABLE", "MORNING_BASELINE_MISSING", "NO_DELTA"}:
+    if status == "JAPAN_BASELINE_CAPTURED":
+        out.append(f"Japan-open baseline captured for {symbol_count} assets; Frankfurt delta is pending.")
+    elif status == "FRANKFURT_DELTA_READY":
+        out.append(f"Window: Japan open → Frankfurt | assets with delta: {symbol_count}.")
+    elif status in {"LONDON_1H_DELTA_READY", "DELTA_READY", "PARTIAL"}:
+        out.append(
+            f"Primary window: Japan open → London +1h; Frankfurt change is shown separately | "
+            f"assets with delta: {symbol_count}."
+        )
+    elif status == "DAILY_CLOSE_SNAPSHOT_CAPTURED":
+        out.append(f"NY-close absolute snapshot captured for the next Frankfurt briefing: {symbol_count} assets.")
+    elif status in {
+        "LIVE_SOURCE_UNAVAILABLE",
+        "JAPAN_BASELINE_MISSING",
+        "BASELINES_MISSING",
+        "NO_DELTA",
+    }:
         out.append("Operational delta unavailable; do not infer intraday participation from weekly COT.")
     else:
         out.append("Operational window was not requested for this report.")
     if baseline or current:
         out.append(f"Baseline: {_h(baseline or 'n/a')} | current: {_h(current or 'n/a')}")
+    if phase == "FRANKFURT_CONTROL":
+        out.extend(_render_previous_trading_day_snapshot(operational))
+    return out
+
+
+def _render_previous_trading_day_snapshot(operational: dict[str, Any]) -> list[str]:
+    previous = operational.get("previous_trading_day")
+    if not isinstance(previous, dict):
+        return []
+
+    expected = str(previous.get("expected_date") or "unknown")
+    status = str(previous.get("status") or "MISSING").upper()
+    captured_at = str(previous.get("captured_at") or "")
+    symbols = previous.get("symbols") if isinstance(previous.get("symbols"), dict) else {}
+    out = [
+        "",
+        "<b>Previous trading-day close snapshot</b>",
+        f"Date: <b>{_h(expected)}</b> | status: <b>{_h(status)}</b>",
+    ]
+    if status != "AVAILABLE":
+        out.append("Final NY-close positioning snapshot is unavailable; no historical state is inferred.")
+        return out
+
+    if captured_at:
+        out.append(f"Captured: {_h(captured_at)}")
+    for symbol, row in symbols.items():
+        if not isinstance(row, dict):
+            continue
+        out.append(
+            f"• {_h(str(symbol))}: price {_fmt_absolute(row.get('price'))} / "
+            f"OI {_fmt_absolute(row.get('open_interest'))}"
+        )
     return out
 
 
@@ -579,11 +623,13 @@ def _render_asset_block(item: dict[str, Any]) -> list[str]:
     out: list[str] = []
     out.append(f"<b>{_h(symbol)}</b>")
     operational_status = str(operational_window.get("status") or "").upper()
-    proxy_label = (
-        "London delta"
-        if operational_status == "DELTA_READY"
-        else ("Morning baseline" if operational_status == "BASELINE_CAPTURED" else "Daily proxy")
-    )
+    proxy_label = {
+        "FRANKFURT_DELTA_READY": "Japan → Frankfurt",
+        "LONDON_1H_DELTA_READY": "Japan → London +1h",
+        "FRANKFURT_ONLY_PARTIAL": "Frankfurt → London +1h (partial)",
+        "DELTA_READY": "Operational delta",
+        "JAPAN_BASELINE_CAPTURED": "Japan-open baseline",
+    }.get(operational_status, "Daily proxy")
     out.append(
         f"{proxy_label}: "
         f"Price {_arrow(price_change)} {_fmt_pct(price_change)} / "
@@ -614,6 +660,15 @@ def _render_asset_block(item: dict[str, Any]) -> list[str]:
             f"{_h(str(operational_window.get('baseline_timestamp') or 'n/a'))} → "
             f"{_h(str(operational_window.get('current_timestamp') or 'n/a'))}"
         )
+        frankfurt_change = operational_window.get("frankfurt_change")
+        if isinstance(frankfurt_change, dict):
+            out.append(
+                "Since Frankfurt: "
+                f"Price {_arrow(frankfurt_change.get('price_change_pct'))} "
+                f"{_fmt_pct(frankfurt_change.get('price_change_pct'))} / "
+                f"OI {_arrow(frankfurt_change.get('open_interest_change_pct'))} "
+                f"{_fmt_pct(frankfurt_change.get('open_interest_change_pct'))}"
+            )
 
     if interpretation:
         out.append(f"Read: {_h(interpretation)}")

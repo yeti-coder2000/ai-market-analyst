@@ -56,15 +56,26 @@ def test_positioning_telegram_report_renders_weekly_cftc_section() -> None:
     assert "Battle Gate: <b>none</b>" in text
 
 
-def test_positioning_telegram_report_renders_operational_baseline_and_filters_inactive_us_assets() -> None:
+def test_positioning_telegram_report_renders_frankfurt_delta_previous_day_and_filters_inactive_us_assets() -> None:
     snapshot = {
         "date": "2026-07-22",
         "status": "OK",
         "operational_positioning": {
-            "phase": "MORNING_BASELINE",
-            "status": "BASELINE_CAPTURED",
-            "baseline_timestamp": "2026-07-22T08:05:00+00:00",
+            "phase": "FRANKFURT_CONTROL",
+            "status": "FRANKFURT_DELTA_READY",
+            "baseline_timestamp": "2026-07-22T00:00:00+00:00",
             "symbols": {"BTCUSD": {}},
+            "previous_trading_day": {
+                "status": "AVAILABLE",
+                "expected_date": "2026-07-21",
+                "captured_at": "2026-07-21T20:15:00+00:00",
+                "symbols": {
+                    "BTCUSD": {
+                        "price": 59500.0,
+                        "open_interest": 148000.0,
+                    }
+                },
+            },
         },
         "weekly_cot": {
             "status": "OK",
@@ -79,14 +90,15 @@ def test_positioning_telegram_report_renders_operational_baseline_and_filters_in
                 "daily_market_data": {
                     "price": 60000.0,
                     "open_interest": 149655.0,
-                    "price_change_pct": 0.0,
-                    "open_interest_change_pct": 0.0,
+                    "price_change_pct": 0.84,
+                    "open_interest_change_pct": 1.12,
                 },
                 "market_proxy": {
                     "source": "kraken_futures_public_pi_xbtusd",
                     "operational_window": {
-                        "status": "BASELINE_CAPTURED",
-                        "baseline_timestamp": "2026-07-22T08:05:00+00:00",
+                        "status": "FRANKFURT_DELTA_READY",
+                        "window": "japan_open_to_frankfurt",
+                        "baseline_timestamp": "2026-07-22T00:00:00+00:00",
                         "current_timestamp": "2026-07-22T08:05:00+00:00",
                     },
                 },
@@ -107,7 +119,10 @@ def test_positioning_telegram_report_renders_operational_baseline_and_filters_in
 
     text = render_positioning_telegram_message(snapshot=snapshot)
 
-    assert "Morning baseline" in text
+    assert "Window: Japan open → Frankfurt" in text
+    assert "Previous trading-day close snapshot" in text
+    assert "Date: <b>2026-07-21</b> | status: <b>AVAILABLE</b>" in text
+    assert "Japan → Frankfurt" in text
     assert "Absolute snapshot: price 60,000.00 / OI 149,655.00" in text
     assert "XAUUSD · weekly COT" in text
     assert "NAS100" not in text

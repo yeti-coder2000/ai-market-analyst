@@ -41,7 +41,7 @@ from .positioning_store import (
 )
 
 
-POSITIONING_PIPELINE_VERSION = "positioning-pipeline-v0.4-operational-london"
+POSITIONING_PIPELINE_VERSION = "positioning-pipeline-v0.5-three-checkpoint-cycle"
 CRYPTO_FEED_FILENAME = "crypto_daily_positioning_feed.json"
 PIPELINE_HEALTH_FILENAME = "positioning_pipeline_health.json"
 
@@ -158,7 +158,7 @@ def refresh_positioning_runtime(
         write_json_atomic(crypto_snapshot_path, operational_source)
     else:
         operational_positioning = {
-            "version": "positioning-operational-v0.1-morning-to-london-close",
+            "version": "positioning-operational-v0.2-japan-frankfurt-london",
             "report_date": target_date,
             "report_type": str(report_type or ""),
             "phase": "UNAVAILABLE",
@@ -869,11 +869,18 @@ def _source_by_name(
 
 def _is_operational_report_type(report_type: str | None) -> bool:
     return str(report_type or "").strip().lower() in {
+        "positioning_japan_open",
+        "japan_open_baseline",
         "morning",
         "morning_briefing",
         "morning_combined",
+        "london",
+        "london_1h",
+        "london_open_1h",
         "london_close",
         "london_close_briefing",
+        "daily_close",
+        "ny_close",
     }
 
 
@@ -888,7 +895,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Refresh Positioning Intelligence runtime artifacts.")
     parser.add_argument("--runtime-dir", default=None, help="Runtime directory.")
     parser.add_argument("--date", default=None, help="Report date YYYY-MM-DD.")
-    parser.add_argument("--report-type", default=None, help="morning_combined or london_close operational phase.")
+    parser.add_argument(
+        "--report-type",
+        default=None,
+        help="positioning_japan_open, morning_combined, london_1h, or daily_close operational phase.",
+    )
     parser.add_argument(
         "--no-live-crypto",
         action="store_true",
