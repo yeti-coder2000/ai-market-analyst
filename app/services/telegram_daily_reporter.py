@@ -10,6 +10,7 @@ Report types:
 - morning
 - holiday_warning
 - london_1h
+- london_close
 - ny_1h
 """
 
@@ -32,7 +33,7 @@ from app.services.daily_market_briefing import (
 from app.services.telegram_notifier import TelegramNotifier
 
 
-REPORTER_VERSION = "telegram-daily-reporter-v1.3-positioning-runtime-refresh"
+REPORTER_VERSION = "telegram-daily-reporter-v1.4-london-operational-positioning"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -72,6 +73,7 @@ def _refresh_positioning_runtime(
     *,
     runtime_dir: str | None,
     report_date: str,
+    report_type: str,
 ) -> dict[str, Any]:
     try:
         from app.services.positioning.positioning_pipeline import (
@@ -82,6 +84,7 @@ def _refresh_positioning_runtime(
         result = refresh_positioning_runtime(
             runtime_dir=runtime_dir,
             report_date=report_date,
+            report_type=report_type,
         )
         return {
             "module": "app.services.positioning.positioning_pipeline",
@@ -351,11 +354,15 @@ def _positioning_delivery_enabled(report_type: str, explicit: bool | None = None
     if not _env_bool("REPORT_SEND_POSITIONING_TELEGRAM", True):
         return False
 
+    normalized = str(report_type or "").strip().lower()
+    if normalized in {"london_close", "london_close_briefing"}:
+        return _env_bool("REPORT_SEND_LONDON_CLOSE_POSITIONING", True)
+
     allowed = _env_csv_set(
         "REPORT_POSITIONING_TYPES",
-        "morning,morning_combined,ny_1h,london_1h,crypto_health",
+        "morning,morning_combined,london_close,crypto_health",
     )
-    return str(report_type or "").strip() in allowed
+    return normalized in allowed
 
 
 def _briefing_report_for_main_telegram(report: Any) -> Any:
@@ -408,6 +415,30 @@ def _dry_positioning_sender(text: str) -> bool:
     return True
 
 
+def _positioning_close_skip_reason(
+    report_type: str,
+    *,
+    runtime_dir: str | None,
+) -> str | None:
+    if str(report_type or "").strip().lower() not in {"london_close", "london_close_briefing"}:
+        return None
+
+    try:
+        from app.services.positioning.positioning_service import get_latest_positioning_context
+
+        snapshot = get_latest_positioning_context(runtime_dir) or {}
+        operational = snapshot.get("operational_positioning")
+        if not isinstance(operational, dict):
+            return "operational_positioning_missing"
+        status = str(operational.get("status") or "UNKNOWN").upper()
+        symbols = operational.get("symbols") if isinstance(operational.get("symbols"), dict) else {}
+        if status in {"DELTA_READY", "PARTIAL"} and symbols:
+            return None
+        return f"no_london_close_delta:{status.lower()}"
+    except Exception as exc:  # noqa: BLE001
+        return f"operational_positioning_read_error:{type(exc).__name__}"
+
+
 def _send_positioning_second_message(
     *,
     notifier: TelegramNotifier | None,
@@ -433,6 +464,24 @@ def _send_positioning_second_message(
             "prepared": 0,
             "sent": 0,
             "errors": [],
+            "battle_gate_impact": "none",
+            "telegram_signal_impact": "none",
+        }
+
+    close_skip_reason = _positioning_close_skip_reason(
+        report_type,
+        runtime_dir=runtime_dir,
+    )
+    if close_skip_reason:
+        return {
+            "ok": True,
+            "enabled": True,
+            "prepared": 0,
+            "sent": 0,
+            "skipped": True,
+            "skipped_reason": close_skip_reason,
+            "dry_run": dry_run,
+            "report_type": report_type,
             "battle_gate_impact": "none",
             "telegram_signal_impact": "none",
         }
@@ -510,6 +559,7 @@ def send_daily_report(
                 _refresh_positioning_runtime(
                     runtime_dir=runtime_dir,
                     report_date=resolved_report_date,
+                    report_type=report_type,
                 )
             )
 

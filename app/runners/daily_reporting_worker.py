@@ -5,9 +5,14 @@ Scheduled Telegram reporting worker for AI Market Analyst.
 
 Runs independently from the trading/signal worker.
 
-Production schedule in Europe/Kyiv:
-- morning_combined: 11:05
-- ny_1h:            17:35
+Production schedule:
+- morning_combined: 11:05 Europe/Kyiv
+- london_close:     16:45 Europe/London
+
+The legacy NY report remains callable manually and can be re-enabled by the
+new explicit ENABLE_LEGACY_NY_REPORT flag. The old ENABLE_NY_REPORT setting is
+intentionally ignored so a stale Render environment cannot silently restore
+the retired production schedule.
 
 Weekend policy:
 - By default, Saturday/Sunday full London/NY reporting is skipped.
@@ -41,8 +46,9 @@ except Exception:  # pragma: no cover
 from app.services.telegram_daily_reporter import send_daily_report
 
 
-WORKER_VERSION = "daily-reporting-worker-v1.1-two-reports-weekend-safe"
+WORKER_VERSION = "daily-reporting-worker-v1.2-london-focus"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
+DEFAULT_LONDON_TIMEZONE = "Europe/London"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -130,6 +136,7 @@ class ScheduledReport:
     hhmm: str
     refresh_tpo: bool = False
     weekend_only: bool = False
+    schedule_timezone: str | None = None
 
 
 def _is_weekend(now_local: datetime) -> bool:
@@ -137,18 +144,41 @@ def _is_weekend(now_local: datetime) -> bool:
 
 
 def _weekday_schedule() -> list[ScheduledReport]:
-    return [
+    reports = [
         ScheduledReport(
             "morning_combined",
             os.getenv("REPORT_TIME_MORNING_COMBINED", "11:05"),
             refresh_tpo=_env_bool("REPORT_REFRESH_TPO_MORNING_COMBINED", False),
-        ),
-        ScheduledReport(
-            "ny_1h",
-            os.getenv("REPORT_TIME_NY_1H", "17:35"),
-            refresh_tpo=_env_bool("REPORT_REFRESH_TPO_NY_1H", False),
+            schedule_timezone=os.getenv("REPORT_TIMEZONE", DEFAULT_TIMEZONE),
         ),
     ]
+
+    if _env_bool("ENABLE_LONDON_CLOSE_REPORT", True):
+        reports.append(
+            ScheduledReport(
+                "london_close",
+                os.getenv("REPORT_TIME_LONDON_CLOSE", "16:45"),
+                refresh_tpo=_env_bool("REPORT_REFRESH_TPO_LONDON_CLOSE", True),
+                schedule_timezone=os.getenv(
+                    "REPORT_LONDON_CLOSE_TIMEZONE",
+                    DEFAULT_LONDON_TIMEZONE,
+                ),
+            )
+        )
+
+    # Reversible compatibility switch. London Focus v1 defaults this to off;
+    # the NY renderer and all US session/macro code remain available.
+    if _env_bool("ENABLE_LEGACY_NY_REPORT", False):
+        reports.append(
+            ScheduledReport(
+                "ny_1h",
+                os.getenv("REPORT_TIME_NY_1H", "17:35"),
+                refresh_tpo=_env_bool("REPORT_REFRESH_TPO_NY_1H", False),
+                schedule_timezone=os.getenv("REPORT_TIMEZONE", DEFAULT_TIMEZONE),
+            )
+        )
+
+    return reports
 
 
 def _weekend_schedule() -> list[ScheduledReport]:
@@ -161,6 +191,7 @@ def _weekend_schedule() -> list[ScheduledReport]:
             os.getenv("REPORT_TIME_WEEKEND_CRYPTO", "11:05"),
             refresh_tpo=_env_bool("REPORT_REFRESH_TPO_WEEKEND_CRYPTO", False),
             weekend_only=True,
+            schedule_timezone=os.getenv("REPORT_TIMEZONE", DEFAULT_TIMEZONE),
         )
     ]
 
@@ -189,11 +220,25 @@ class Shutdown:
 
 
 def _state_key(now_local: datetime, scheduled: ScheduledReport) -> str:
-    day_key = now_local.date().isoformat()
+    scheduled_now = _scheduled_local_time(now_local, scheduled)
+    day_key = scheduled_now.date().isoformat()
     return f"{day_key}:{scheduled.report_type}"
 
 
+def _scheduled_local_time(now_local: datetime, scheduled: ScheduledReport) -> datetime:
+    timezone_name = scheduled.schedule_timezone or os.getenv("REPORT_TIMEZONE", DEFAULT_TIMEZONE)
+    try:
+        zone = ZoneInfo(timezone_name)
+    except Exception:
+        zone = ZoneInfo(DEFAULT_TIMEZONE)
+
+    if now_local.tzinfo is None:
+        return now_local.replace(tzinfo=zone)
+    return now_local.astimezone(zone)
+
+
 def _should_send(now_local: datetime, scheduled: ScheduledReport, state: dict[str, Any]) -> bool:
+    now_local = _scheduled_local_time(now_local, scheduled)
     target = _parse_hhmm(scheduled.hhmm, scheduled.hhmm)
     target_dt = now_local.replace(hour=target.hour, minute=target.minute, second=0, microsecond=0)
 
@@ -213,6 +258,7 @@ def _mark_sent(
     result: dict[str, Any],
     state: dict[str, Any],
 ) -> None:
+    now_local = _scheduled_local_time(now_local, scheduled)
     sent = state.setdefault("sent", {})
     if not isinstance(sent, dict):
         state["sent"] = sent = {}
@@ -220,6 +266,7 @@ def _mark_sent(
     sent[_state_key(now_local, scheduled)] = {
         "report_type": scheduled.report_type,
         "scheduled_time": scheduled.hhmm,
+        "schedule_timezone": scheduled.schedule_timezone,
         "sent_at_local": now_local.isoformat(),
         "weekend_only": scheduled.weekend_only,
         "result": result,
@@ -241,10 +288,13 @@ def run_due_reports_once(
         if not _should_send(now_local, scheduled, state):
             continue
 
+        scheduled_now = _scheduled_local_time(now_local, scheduled)
+        report_date = scheduled_now.date().isoformat()
+
         try:
             result = send_daily_report(
                 report_type=scheduled.report_type,
-                report_date=now_local.date().isoformat(),
+                report_date=report_date,
                 timezone_name=tz_name,
                 dry_run=dry_run,
                 refresh=True,
@@ -255,7 +305,7 @@ def run_due_reports_once(
                 "version": WORKER_VERSION,
                 "status": "error",
                 "report_type": scheduled.report_type,
-                "report_date": now_local.date().isoformat(),
+                "report_date": report_date,
                 "telegram_sent": False,
                 "dry_run": dry_run,
                 "error_message": f"{type(exc).__name__}: {exc}",

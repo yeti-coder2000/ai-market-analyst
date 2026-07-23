@@ -71,8 +71,13 @@ def _to_bool(value: str | None, default: bool = False) -> bool:
 
 
 def _parse_groups() -> list[str]:
-    raw = os.getenv("MULTI_BATCH_GROUPS") or os.getenv("BATCH_GROUPS") or "core,fx_major"
+    raw = os.getenv("MULTI_BATCH_GROUPS") or os.getenv("BATCH_GROUPS") or "core,fx_major,indices"
     groups = [x.strip().lower() for x in raw.split(",") if x.strip()]
+
+    # London Focus keeps GER40 active even if Render still has the old
+    # core,fx_major group list. A deliberate operator opt-out remains possible.
+    if _to_bool(os.getenv("LONDON_FOCUS_GER40_ENABLED"), True) and "indices" not in groups:
+        groups.append("indices")
 
     available = set(list_available_batches())
     unknown = [g for g in groups if g not in available]

@@ -29,12 +29,14 @@ INSTRUMENTS: Dict[str, InstrumentConfig] = {
     "ETH/USD": InstrumentConfig(instrument=Instrument.ETHUSD, enabled=True, priority=2),
 
     # =========================
-    # INDICES / OIL (ВКЛЮЧАЄМО)
+    # LONDON FOCUS
     # =========================
-    "UKOIL": InstrumentConfig(instrument=Instrument.UKOIL, enabled=True, priority=2),
     "GER40": InstrumentConfig(instrument=Instrument.GER40, enabled=True, priority=2),
-    "NAS100": InstrumentConfig(instrument=Instrument.NAS100, enabled=True, priority=2),
-    "SPX500": InstrumentConfig(instrument=Instrument.SPX500, enabled=True, priority=2),
+
+    # American logic is intentionally retained but inactive in London Focus v1.
+    "UKOIL": InstrumentConfig(instrument=Instrument.UKOIL, enabled=False, priority=3),
+    "NAS100": InstrumentConfig(instrument=Instrument.NAS100, enabled=False, priority=3),
+    "SPX500": InstrumentConfig(instrument=Instrument.SPX500, enabled=False, priority=3),
 
     # =========================
     # OPTIONAL

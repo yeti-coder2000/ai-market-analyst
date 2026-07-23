@@ -35,8 +35,10 @@ except Exception:  # pragma: no cover
     settings = None  # type: ignore[assignment]
 
 
-BRIEFING_VERSION = "daily-market-briefing-v1.26-state-consistent-watch-renderer"
+BRIEFING_VERSION = "daily-market-briefing-v1.27-london-focus-close-review"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
+LONDON_FOCUS_VERSION = "LONDON_FOCUS_V1"
+LONDON_FOCUS_EFFECTIVE_DATE_DEFAULT = "2026-07-23"
 
 TPO_LATEST_RELATIVE = Path("tpo") / "tpo_latest.json"
 DAILY_SUMMARY_RELATIVE = Path("stats") / "daily_summary.json"
@@ -88,19 +90,34 @@ NON_DIRECTIONAL_TPO_WATCH_STATES = frozenset(
 # SESSION-SCOPED REPORTING RULES
 # =============================================================================
 
-MORNING_SESSION_SYMBOLS: tuple[str, ...] = (
+LONDON_FOCUS_SYMBOLS: tuple[str, ...] = (
     "GER40",
     "XAUUSD",
     "EURUSD",
     "GBPUSD",
     "USDJPY",
     "USDCHF",
+    "USDCAD",
     "AUDUSD",
     "BTCUSD",
     "ETHUSD",
 )
 
-LONDON_SESSION_SYMBOLS: tuple[str, ...] = MORNING_SESSION_SYMBOLS
+MORNING_SESSION_SYMBOLS: tuple[str, ...] = LONDON_FOCUS_SYMBOLS
+LONDON_SESSION_SYMBOLS: tuple[str, ...] = LONDON_FOCUS_SYMBOLS
+
+LONDON_FOCUS_REPORT_TYPES = frozenset(
+    {
+        "morning",
+        "morning_briefing",
+        "morning_combined",
+        "london",
+        "london_1h",
+        "london_close",
+        "london_close_briefing",
+    }
+)
+LONDON_CLOSE_REPORT_TYPES = frozenset({"london_close", "london_close_briefing"})
 
 NY_SESSION_SYMBOLS: tuple[str, ...] = (
     "NAS100",
@@ -129,11 +146,13 @@ GLOBAL_SYMBOL_ORDER: tuple[str, ...] = (
 )
 
 REPORT_SCOPE_LABELS_UK: dict[str, str] = {
-    "morning": "London / ранкова сесія. NY cash/risk-активи винесені у NY post-open звіт.",
-    "morning_briefing": "London / ранкова сесія. NY cash/risk-активи винесені у NY post-open звіт.",
-    "morning_combined": "London + ранковий брифінг. NY cash/risk-активи винесені у NY post-open звіт.",
-    "london": "London +1h. NY cash/risk-активи тут не показуються як активний фокус.",
-    "london_1h": "London +1h. NY cash/risk-активи тут не показуються як активний фокус.",
+    "morning": "London Focus v1: ранковий план для GER40, XAU, FX і crypto.",
+    "morning_briefing": "London Focus v1: ранковий план для GER40, XAU, FX і crypto.",
+    "morning_combined": "London Focus v1: ранковий план для GER40, XAU, FX і crypto.",
+    "london": "London Focus v1: ранній стан London без US indices/oil.",
+    "london_1h": "London Focus v1: ранній стан London без US indices/oil.",
+    "london_close": "London Close: план проти факту для GER40, XAU, FX і crypto; не пошук пізнього входу.",
+    "london_close_briefing": "London Close: план проти факту для GER40, XAU, FX і crypto; не пошук пізнього входу.",
     "ny": "New York post-open / NY active focus. London-only активи тут не показуються як активний фокус.",
     "ny_1h": "New York post-open / NY active focus. London-only активи тут не показуються як активний фокус.",
     "new_york": "New York post-open / NY active focus. London-only активи тут не показуються як активний фокус.",
@@ -2942,6 +2961,39 @@ def _record_local_date(record: dict[str, Any], timezone_name: str) -> date | Non
     return dt.astimezone(_tz(timezone_name)).date()
 
 
+def _london_focus_effective_date() -> date:
+    raw = str(
+        os.getenv("LONDON_FOCUS_EFFECTIVE_DATE")
+        or LONDON_FOCUS_EFFECTIVE_DATE_DEFAULT
+    ).strip()
+    try:
+        return datetime.strptime(raw[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return datetime.strptime(LONDON_FOCUS_EFFECTIVE_DATE_DEFAULT, "%Y-%m-%d").date()
+
+
+def _filter_london_focus_records(
+    records: list[dict[str, Any]],
+    *,
+    as_of_date: date,
+    timezone_name: str = DEFAULT_TIMEZONE,
+) -> list[dict[str, Any]]:
+    """Start a clean performance cohort without deleting legacy telemetry."""
+
+    effective = _london_focus_effective_date()
+    if as_of_date < effective:
+        return records
+
+    focus = set(LONDON_FOCUS_SYMBOLS)
+    result: list[dict[str, Any]] = []
+    for record in records:
+        symbol = str(record.get("symbol") or record.get("instrument") or "").upper()
+        record_date = _record_local_date(record, timezone_name)
+        if symbol in focus and record_date is not None and record_date >= effective:
+            result.append(record)
+    return result
+
+
 def _production_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     for r in records:
@@ -3133,6 +3185,11 @@ def _yesterday_grouped_metrics(timezone_name: str, target_date: date) -> tuple[d
     outcomes = load_signal_outcomes()
     records = _dedup_signal_outcome_records(_production_records(_signals_from_outcomes(outcomes)))
     records = _positioning_enrich_records_for_reporting(records)
+    records = _filter_london_focus_records(
+        records,
+        as_of_date=target_date,
+        timezone_name=timezone_name,
+    )
 
     yesterday = target_date - timedelta(days=1)
     dated = [r for r in records if _record_local_date(r, timezone_name) == yesterday]
@@ -3147,6 +3204,15 @@ def _yesterday_grouped_metrics(timezone_name: str, target_date: date) -> tuple[d
             "other": _metric_from_records(other),
             "all": _metric_from_records(dated),
         }, "signal_outcomes_by_yesterday_date"
+
+    if target_date >= _london_focus_effective_date():
+        empty = _metric_from_records([])
+        return {
+            "battle": empty,
+            "research": dict(empty),
+            "other": dict(empty),
+            "all": dict(empty),
+        }, "london_focus_v1_no_yesterday_records"
 
     summary = load_daily_summary()
     battle_metrics = summary.get("battle_metrics") if isinstance(summary, dict) else {}
@@ -3189,7 +3255,10 @@ def _yesterday_metric(timezone_name: str, target_date: date) -> tuple[dict[str, 
     grouped, source = _yesterday_grouped_metrics(timezone_name, target_date)
     return grouped.get("all", _metric_from_records([])), source
 
-def _overall_grouped_metrics() -> tuple[dict[str, Any], str]:
+def _overall_grouped_metrics(
+    target_date: date | None = None,
+    timezone_name: str = DEFAULT_TIMEZONE,
+) -> tuple[dict[str, Any], str]:
     """
     Build cumulative production metrics from signal_outcomes.json.
 
@@ -3201,6 +3270,12 @@ def _overall_grouped_metrics() -> tuple[dict[str, Any], str]:
     outcomes = load_signal_outcomes()
     records = _dedup_signal_outcome_records(_production_records(_signals_from_outcomes(outcomes)))
     records = _positioning_enrich_records_for_reporting(records)
+    as_of = target_date or datetime.now(_tz(timezone_name)).date()
+    records = _filter_london_focus_records(
+        records,
+        as_of_date=as_of,
+        timezone_name=timezone_name,
+    )
 
     if not records:
         return {
@@ -3211,7 +3286,11 @@ def _overall_grouped_metrics() -> tuple[dict[str, Any], str]:
             "tpo_otd": _metric_from_records([]),
             "tpo_otd_long": _metric_from_records([]),
             "tpo_otd_short": _metric_from_records([]),
-        }, "signal_outcomes_cumulative_empty"
+        }, (
+            "london_focus_v1_cumulative_empty"
+            if as_of >= _london_focus_effective_date()
+            else "signal_outcomes_cumulative_empty"
+        )
 
     battle = [r for r in records if _record_is_battle_alert(r)]
     research = [r for r in records if _record_is_research_counterfactual(r)]
@@ -3232,7 +3311,11 @@ def _overall_grouped_metrics() -> tuple[dict[str, Any], str]:
         "tpo_otd": _metric_from_records(tpo_otd),
         "tpo_otd_long": _metric_from_records(tpo_otd_long),
         "tpo_otd_short": _metric_from_records(tpo_otd_short),
-    }, "signal_outcomes_cumulative"
+    }, (
+        "signal_outcomes_london_focus_v1_cumulative"
+        if as_of >= _london_focus_effective_date()
+        else "signal_outcomes_cumulative"
+    )
 
 
 def _metric_closed_sample(metric: dict[str, Any]) -> int:
@@ -3259,8 +3342,11 @@ def _format_cumulative_metric_line(label: str, metric: dict[str, Any]) -> str:
     )
 
 
-def _build_overall_stats_section() -> BriefingSection:
-    grouped, source = _overall_grouped_metrics()
+def _build_overall_stats_section(
+    target_date: date | None = None,
+    timezone_name: str = DEFAULT_TIMEZONE,
+) -> BriefingSection:
+    grouped, source = _overall_grouped_metrics(target_date, timezone_name)
     section = BriefingSection("📈 Загальна статистика")
 
     battle = grouped.get("battle", {}) if isinstance(grouped, dict) else {}
@@ -3272,6 +3358,10 @@ def _build_overall_stats_section() -> BriefingSection:
 
     if _metric_total_sample(all_metric) <= 0:
         section.lines.append("Немає cumulative signal_outcomes для загальної статистики.")
+        if target_date is not None and target_date >= _london_focus_effective_date():
+            section.lines.append(
+                f"Статрежим: {LONDON_FOCUS_VERSION}, від {_london_focus_effective_date().isoformat()}; legacy universe не змішується."
+            )
         section.lines.append(f"Джерело: {source}")
         return section
 
@@ -3327,6 +3417,8 @@ def _section_header_for_type(report_type: str, generated_at_local: Any = None) -
     r = _normalize_report_type(report_type)
     if r in {"morning", "morning_briefing", "morning_combined"}:
         return "🌅 Ранковий брифінг"
+    if r in LONDON_CLOSE_REPORT_TYPES:
+        return "🇬🇧 Підсумок London Close"
     if r in {"london_1h", "london"}:
         return "🇬🇧 Звіт London +1 година"
     if r in {"ny_1h", "ny", "new_york"}:
@@ -3346,6 +3438,9 @@ def _symbol_scope_for_report(report_type: str) -> tuple[str, ...]:
         return MORNING_SESSION_SYMBOLS
 
     if r in {"london", "london_1h"}:
+        return LONDON_SESSION_SYMBOLS
+
+    if r in LONDON_CLOSE_REPORT_TYPES:
         return LONDON_SESSION_SYMBOLS
 
     if r in {"ny", "ny_1h", "new_york"}:
@@ -3390,19 +3485,21 @@ def _outside_focus_label_for_report(report_type: str) -> str:
     r = _normalize_report_type(report_type)
     if r in {"ny", "ny_1h", "new_york"}:
         return "поза активним NY-фокусом"
-    if r in {"morning", "morning_briefing", "morning_combined", "london", "london_1h"}:
+    if r in LONDON_FOCUS_REPORT_TYPES:
         return "поза активним London/ранковим фокусом"
     return "поза активним фокусом звіту"
 
 
 def _macro_affected_symbols_text(symbols: list[str], report_type: str) -> str:
     """
-    Risk block must show the full macro-affected universe, not only the
-    session-scoped active focus. Session scope is a reporting/priority filter,
-    not a macro-causality filter. Example: EUR PMI in a NY report may actively
-    affect XAUUSD in focus, while EURUSD/GER40 remain relevant but outside NY focus.
+    Keep full macro causality internally while rendering only the active report
+    universe in London Focus reports. This preserves USD locks for XAU/FX/crypto
+    without reintroducing inactive US indices or oil into the user-facing brief.
     """
     full = _sort_symbols_global(symbols or [])
+    if _normalize_report_type(report_type) in LONDON_FOCUS_REPORT_TYPES:
+        active = set(LONDON_FOCUS_SYMBOLS)
+        full = [symbol for symbol in full if symbol in active]
     if not full:
         return ""
 
@@ -3699,6 +3796,10 @@ def _build_yesterday_section(target_date: date, timezone_name: str) -> BriefingS
     grouped, source = _yesterday_grouped_metrics(timezone_name, target_date)
     yday = (target_date - timedelta(days=1)).isoformat()
     section = BriefingSection(f"📊 Вчора — {yday}")
+    if target_date >= _london_focus_effective_date():
+        section.lines.append(
+            f"Статрежим: {LONDON_FOCUS_VERSION}, від {_london_focus_effective_date().isoformat()}; legacy universe виключено з цієї вибірки."
+        )
 
     battle = grouped.get("battle", {}) if isinstance(grouped, dict) else {}
     research = grouped.get("research", {}) if isinstance(grouped, dict) else {}
@@ -5259,6 +5360,14 @@ def _build_focus_section(report_type: str, target_date: date | None = None) -> B
                     "До high-impact news не вважати ранню структуру стабільною.",
                 ]
             )
+    elif rt in LONDON_CLOSE_REPORT_TYPES:
+        section.lines.extend(
+            [
+                "London Close — це розбір плану проти факту, а не пошук пізнього входу.",
+                "Фіксуємо фінальний open behavior, acceptance/rejection, Watch Bridge state і те, що переходить на завтра.",
+                "Новий Battle після закриття London не створюється лише тому, що рух уже став очевидним.",
+            ]
+        )
     elif rt in {"london", "london_1h"}:
         section.lines.extend(
             [
@@ -5449,6 +5558,113 @@ def _build_tpo_audit_snapshot(tpo: Any, report_type: str | None = None) -> dict[
     }
 
 
+def _load_morning_briefing_artifact(target_date: date) -> tuple[Path | None, dict[str, Any]]:
+    briefing_dir = _runtime_dir() / "reports" / "briefings"
+    for report_type in ("morning_combined", "morning", "morning_briefing"):
+        path = briefing_dir / f"{target_date.isoformat()}_{report_type}.json"
+        payload = _safe_read_json(path, {})
+        if isinstance(payload, dict) and payload:
+            return path, payload
+    return None, {}
+
+
+def _london_close_state(row: Any) -> tuple[str, str, str]:
+    if not isinstance(row, dict):
+        return "NO_DATA", "NO_WATCH", "UNKNOWN"
+
+    behavior = str(
+        row.get("resolved_current_open_behavior")
+        or row.get("resolved_open_behavior")
+        or row.get("current_open_behavior")
+        or row.get("open_behavior")
+        or "UNKNOWN"
+    ).upper()
+    watch_state = str(row.get("tpo_watch_state") or "NO_WATCH").upper()
+    value_state = str(row.get("value_acceptance_state") or "UNKNOWN").upper()
+    return behavior, watch_state, value_state
+
+
+def _build_london_close_comparison(
+    *,
+    tpo: dict[str, Any],
+    target_date: date,
+    close_snapshot: dict[str, Any],
+) -> tuple[BriefingSection, dict[str, Any]]:
+    """Compare the persisted morning hypothesis with the canonical close state."""
+
+    section = BriefingSection("🧾 London: план → факт")
+    morning_path, morning_report = _load_morning_briefing_artifact(target_date)
+    raw = morning_report.get("raw") if isinstance(morning_report.get("raw"), dict) else {}
+    morning_snapshot = raw.get("tpo_audit_snapshot") if isinstance(raw.get("tpo_audit_snapshot"), dict) else {}
+    morning_symbols = morning_snapshot.get("symbols") if isinstance(morning_snapshot.get("symbols"), dict) else {}
+    close_symbols = close_snapshot.get("symbols") if isinstance(close_snapshot.get("symbols"), dict) else {}
+    live_symbols = tpo.get("symbols") if isinstance(tpo.get("symbols"), dict) else {}
+
+    audit: dict[str, Any] = {
+        "version": "london-close-comparison-v1",
+        "report_date": target_date.isoformat(),
+        "morning_artifact": str(morning_path) if morning_path else None,
+        "morning_report_version": morning_report.get("version") if morning_report else None,
+        "morning_generated_at_utc": morning_report.get("generated_at_utc") if morning_report else None,
+        "morning_snapshot_version": morning_snapshot.get("version") if morning_snapshot else None,
+        "close_snapshot_version": close_snapshot.get("version"),
+        "status": "OK" if morning_symbols else "MORNING_BASELINE_MISSING",
+        "symbols": {},
+    }
+
+    if morning_symbols:
+        section.lines.append("Ранкова гіпотеза зіставлена з canonical TPO/Watch Bridge станом на закритті London.")
+    else:
+        section.lines.append("Ранковий audit snapshot не знайдений: показуємо лише close-state без вигаданого переходу.")
+
+    for symbol in LONDON_SESSION_SYMBOLS:
+        before = morning_symbols.get(symbol)
+        after = close_symbols.get(symbol)
+        before_behavior, before_watch, before_value = _london_close_state(before)
+        after_behavior, after_watch, after_value = _london_close_state(after)
+
+        live_item = live_symbols.get(symbol)
+        if isinstance(live_item, dict):
+            close_bucket, _line = _brief_verdict(
+                symbol,
+                _brief_symbol_context(live_item),
+                post_news_active=False,
+                macro_unknown=False,
+            )
+        else:
+            close_bucket = "DATA_MISSING"
+
+        changed = bool(before) and (
+            before_behavior != after_behavior
+            or before_watch != after_watch
+            or before_value != after_value
+        )
+        transition = "перехід" if changed else ("без зміни" if before else "без ранкової бази")
+
+        section.lines.append(
+            f"• {symbol} — {before_behavior}/{before_watch} → "
+            f"{after_behavior}/{after_watch} | {transition} | close={close_bucket}"
+        )
+        audit["symbols"][symbol] = {
+            "morning": {
+                "open_behavior": before_behavior,
+                "watch_state": before_watch,
+                "value_acceptance_state": before_value,
+            },
+            "close": {
+                "open_behavior": after_behavior,
+                "watch_state": after_watch,
+                "value_acceptance_state": after_value,
+                "briefing_bucket": close_bucket,
+            },
+            "changed": changed,
+            "transition": transition,
+        }
+
+    section.lines.append("Close-state є матеріалом для статистики й завтрашнього плану; це не пізній entry trigger.")
+    return section, audit
+
+
 def build_briefing_report(
     *,
     report_type: str = "morning",
@@ -5463,6 +5679,15 @@ def build_briefing_report(
     tpo = load_tpo_store()
     daily_summary = load_daily_summary()
     normalized_type = _normalize_report_type(report_type)
+    tpo_audit_snapshot = _build_tpo_audit_snapshot(tpo, normalized_type)
+    london_close_section: BriefingSection | None = None
+    london_close_comparison: dict[str, Any] | None = None
+    if normalized_type in LONDON_CLOSE_REPORT_TYPES:
+        london_close_section, london_close_comparison = _build_london_close_comparison(
+            tpo=tpo,
+            target_date=target_date,
+            close_snapshot=tpo_audit_snapshot,
+        )
 
     report = BriefingReport(
         report_type=normalized_type,
@@ -5483,7 +5708,15 @@ def build_briefing_report(
             "economic_calendar_enabled": os.getenv("ENABLE_ECONOMIC_CALENDAR", "true"),
             "tpo_updated_at_utc": tpo.get("updated_at_utc") if isinstance(tpo, dict) else None,
             "daily_summary_updated_at_utc": daily_summary.get("updated_at_utc") if isinstance(daily_summary, dict) else None,
-            "tpo_audit_snapshot": _build_tpo_audit_snapshot(tpo, normalized_type),
+            "reporting_scope": {
+                "version": LONDON_FOCUS_VERSION,
+                "effective_date": _london_focus_effective_date().isoformat(),
+                "active_symbols": list(LONDON_FOCUS_SYMBOLS),
+                "inactive_retained_symbols": ["NAS100", "SPX500", "UKOIL"],
+                "usd_macro_safety": "retained",
+            },
+            "tpo_audit_snapshot": tpo_audit_snapshot,
+            "london_close_comparison": london_close_comparison,
         },
     )
 
@@ -5499,13 +5732,15 @@ def build_briefing_report(
         report.sections.append(intermarket_section)
 
     report.sections.append(_build_tpo_snapshot_section(tpo, normalized_type, target_date, tz_name))
+    if london_close_section is not None:
+        report.sections.append(london_close_section)
     report.sections.append(_build_positioning_context_section())
     report.sections.append(_build_suppressed_telegram_section())
     report.sections.append(_build_positioning_diagnostics_section())
 
     if normalized_type in {"morning", "morning_briefing", "morning_combined", "holiday_warning", "pre_market"}:
         report.sections.append(_build_yesterday_section(target_date, tz_name))
-        report.sections.append(_build_overall_stats_section())
+        report.sections.append(_build_overall_stats_section(target_date, tz_name))
 
     # Provider details remain available in JSON artifacts. Telegram stays operational and concise.
     provider_section = _build_provider_section(tpo)

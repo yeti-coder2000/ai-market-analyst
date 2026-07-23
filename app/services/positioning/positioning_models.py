@@ -49,6 +49,7 @@ class PositioningFeedItem:
     source_timestamp: Optional[str] = None
     notes: Optional[str] = None
     flags: list[str] = field(default_factory=list)
+    operational_window: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "PositioningFeedItem":
@@ -64,6 +65,11 @@ class PositioningFeedItem:
             source_timestamp=raw.get("source_timestamp"),
             notes=raw.get("notes"),
             flags=[str(x) for x in raw.get("flags", []) if x],
+            operational_window=(
+                dict(raw.get("operational_window"))
+                if isinstance(raw.get("operational_window"), dict)
+                else {}
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -79,6 +85,7 @@ class PositioningFeedItem:
             "source_timestamp": self.source_timestamp,
             "notes": self.notes,
             "flags": self.flags,
+            "operational_window": self.operational_window,
         }
 
 

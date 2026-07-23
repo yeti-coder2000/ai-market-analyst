@@ -11,7 +11,20 @@ from .positioning_service import get_latest_positioning_context
 from .positioning_store import get_positioning_dir
 
 
-POSITIONING_TELEGRAM_REPORT_VERSION = "positioning-telegram-report-v0.2-weekly-cftc"
+POSITIONING_TELEGRAM_REPORT_VERSION = "positioning-telegram-report-v0.3-london-operational"
+
+POSITIONING_FOCUS_SYMBOLS: tuple[str, ...] = (
+    "GER40",
+    "XAUUSD",
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "USDCHF",
+    "USDCAD",
+    "AUDUSD",
+    "BTCUSD",
+    "ETHUSD",
+)
 
 DEFAULT_POSITIONING_TELEGRAM_REPORT_FILENAME = "positioning_telegram_latest.txt"
 DEFAULT_POSITIONING_TELEGRAM_PART_PREFIX = "positioning_telegram_part"
@@ -46,6 +59,12 @@ def render_positioning_telegram_message(
     items = source_snapshot.get("items") or []
     if not isinstance(items, list):
         items = []
+    focus = set(POSITIONING_FOCUS_SYMBOLS)
+    items = [
+        item
+        for item in items
+        if isinstance(item, dict) and str(item.get("symbol") or "").upper() in focus
+    ]
 
     weekly_cot = source_snapshot.get("weekly_cot") or {}
     if not isinstance(weekly_cot, dict):
@@ -53,6 +72,16 @@ def render_positioning_telegram_message(
     weekly_items = weekly_cot.get("items") or []
     if not isinstance(weekly_items, list):
         weekly_items = []
+    weekly_items = [
+        item
+        for item in weekly_items
+        if isinstance(item, dict) and str(item.get("symbol") or "").upper() in focus
+    ]
+    weekly_cot = dict(weekly_cot)
+    weekly_cot["items"] = weekly_items
+    operational = source_snapshot.get("operational_positioning")
+    if not isinstance(operational, dict):
+        operational = {}
 
     lines: list[str] = []
 
@@ -69,6 +98,9 @@ def render_positioning_telegram_message(
     lines.append("Battle Gate: <b>none</b>")
     lines.append("Telegram signal impact: <b>none</b>")
     lines.append("Delivery: <b>separate Telegram message</b>")
+    lines.append("")
+
+    lines.extend(_render_operational_status(operational))
     lines.append("")
 
     if weekly_items:
@@ -415,6 +447,27 @@ def _render_weekly_cot_section(
     return out
 
 
+def _render_operational_status(operational: dict[str, Any]) -> list[str]:
+    status = str(operational.get("status") or "NOT_AVAILABLE").upper()
+    phase = str(operational.get("phase") or "UNKNOWN").upper()
+    baseline = str(operational.get("baseline_timestamp") or "")
+    current = str(operational.get("current_timestamp") or "")
+    symbol_count = len(operational.get("symbols") or {}) if isinstance(operational.get("symbols"), dict) else 0
+
+    out = ["<b>Operational positioning</b>", f"Phase: <b>{_h(phase)}</b> | status: <b>{_h(status)}</b>"]
+    if status == "BASELINE_CAPTURED":
+        out.append(f"Morning baseline captured for {symbol_count} assets; London-close delta is pending.")
+    elif status in {"DELTA_READY", "PARTIAL"}:
+        out.append(f"Window: morning baseline → London close | assets with delta: {symbol_count}.")
+    elif status in {"LIVE_SOURCE_UNAVAILABLE", "MORNING_BASELINE_MISSING", "NO_DELTA"}:
+        out.append("Operational delta unavailable; do not infer intraday participation from weekly COT.")
+    else:
+        out.append("Operational window was not requested for this report.")
+    if baseline or current:
+        out.append(f"Baseline: {_h(baseline or 'n/a')} | current: {_h(current or 'n/a')}")
+    return out
+
+
 def _render_weekly_cot_item(item: dict[str, Any]) -> list[str]:
     symbol = str(item.get("symbol") or "UNKNOWN")
     report_date = str(item.get("report_date") or "unknown")
@@ -506,6 +559,7 @@ def _render_asset_block(item: dict[str, Any]) -> list[str]:
     auction_usage = item.get("auction_usage") or {}
     raw_source = item.get("raw_source") or {}
     proxy = item.get("market_proxy") or {}
+    operational_window = proxy.get("operational_window") if isinstance(proxy.get("operational_window"), dict) else {}
 
     price_change = market.get("price_change_pct")
     oi_change = market.get("open_interest_change_pct")
@@ -524,12 +578,24 @@ def _render_asset_block(item: dict[str, Any]) -> list[str]:
 
     out: list[str] = []
     out.append(f"<b>{_h(symbol)}</b>")
+    operational_status = str(operational_window.get("status") or "").upper()
+    proxy_label = (
+        "London delta"
+        if operational_status == "DELTA_READY"
+        else ("Morning baseline" if operational_status == "BASELINE_CAPTURED" else "Daily proxy")
+    )
     out.append(
-        "Daily proxy: "
+        f"{proxy_label}: "
         f"Price {_arrow(price_change)} {_fmt_pct(price_change)} / "
         f"OI {_arrow(oi_change)} {_fmt_pct(oi_change)} / "
         f"Volume {_arrow(volume_change)} {_fmt_pct(volume_change)}"
     )
+    if operational_status:
+        out.append(
+            "Absolute snapshot: "
+            f"price {_fmt_absolute(market.get('price'))} / "
+            f"OI {_fmt_absolute(market.get('open_interest'))}"
+        )
     out.append(
         f"Tag: <b>{_h(primary_tag)}</b>"
         f" / conf {_fmt_confidence(confidence)}"
@@ -542,6 +608,12 @@ def _render_asset_block(item: dict[str, Any]) -> list[str]:
     out.append(f"Source: {_h(source)}")
     if source_ts:
         out.append(f"Source time: {_h(source_ts)}")
+    if operational_status:
+        out.append(
+            "Operational window: "
+            f"{_h(str(operational_window.get('baseline_timestamp') or 'n/a'))} → "
+            f"{_h(str(operational_window.get('current_timestamp') or 'n/a'))}"
+        )
 
     if interpretation:
         out.append(f"Read: {_h(interpretation)}")
@@ -586,6 +658,15 @@ def _fmt_confidence(value: Any) -> str:
     if number is None:
         return "n/a"
     return f"{number:.2f}"
+
+
+def _fmt_absolute(value: Any) -> str:
+    number = _to_float(value)
+    if number is None:
+        return "n/a"
+    if abs(number) >= 1000:
+        return f"{number:,.2f}"
+    return f"{number:.6f}".rstrip("0").rstrip(".")
 
 
 def _arrow(value: Any) -> str:

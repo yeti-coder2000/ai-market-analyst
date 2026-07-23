@@ -64,7 +64,7 @@ def interpret_positioning_item(
     Important:
     - This is NOT a signal.
     - This must NOT allow or block Battle Gate.
-    - It only describes participation quality of the previous session.
+    - It only describes participation quality of the supplied research window.
     """
 
     cfg = config or PositioningTaggerConfig()
@@ -80,6 +80,24 @@ def interpret_positioning_item(
             tpo_note="Ignore positioning layer. Continue using TPO/Auction only.",
             data_quality="BAD",
             flags=["MISSING_SYMBOL", *flags],
+        )
+
+    if _contains_any(flags, ("OPERATIONAL_BASELINE_CAPTURED",)):
+        return PositioningInterpretation(
+            primary_tag=POSITIONING_NEUTRAL,
+            secondary_tags=[NO_BATTLE_GATE_IMPACT],
+            confidence=0.35,
+            interpretation=(
+                "Morning absolute price/open-interest baseline captured. "
+                "No London-session participation delta exists yet."
+            ),
+            tpo_note="Baseline only. Do not infer participation direction before the London-close delta.",
+            data_quality=(
+                "MEDIUM"
+                if _contains_any(flags, ("CRYPTO_EXCHANGE_OI_NOISY", "PERP_OI_NOISY"))
+                else "GOOD"
+            ),
+            flags=_dedupe_preserve_order(flags),
         )
 
     if item.price_change_pct is None or item.open_interest_change_pct is None:
@@ -121,13 +139,16 @@ def interpret_positioning_item(
     primary_tag: str
     interpretation: str
     tpo_note: str
+    operational_delta = _contains_any(flags, ("OPERATIONAL_DELTA_SINCE_MORNING",))
 
     if price_up and oi_up:
         primary_tag = FRESH_LONG_PARTICIPATION
         secondary.append(OI_SUPPORTS_PRICE_MOVE)
         interpretation = (
-            "Price rose with rising open interest. Previous move is likely supported "
-            "by fresh participation rather than only short covering."
+            "Since the morning baseline, price rose with rising open interest. "
+            "The London-session move is supported by fresh participation rather than only short covering."
+            if operational_delta
+            else "Price rose with rising open interest. Previous move is likely supported by fresh participation rather than only short covering."
         )
         tpo_note = (
             "Bullish continuation context improves only if today's auction confirms "
@@ -138,8 +159,10 @@ def interpret_positioning_item(
         primary_tag = SHORT_COVERING_RISK
         secondary.append(OI_DIVERGES_FROM_PRICE)
         interpretation = (
-            "Price rose while open interest declined. Move may be exit-driven / short covering "
-            "rather than fresh bullish participation."
+            "Since the morning baseline, price rose while open interest declined. "
+            "The London-session move may be short covering rather than fresh bullish participation."
+            if operational_delta
+            else "Price rose while open interest declined. Move may be exit-driven / short covering rather than fresh bullish participation."
         )
         tpo_note = (
             "Do not overrate bullish continuation. Require retest, value acceptance, "
@@ -150,8 +173,10 @@ def interpret_positioning_item(
         primary_tag = FRESH_SHORT_PARTICIPATION
         secondary.append(OI_SUPPORTS_PRICE_MOVE)
         interpretation = (
-            "Price fell with rising open interest. Previous move is likely supported "
-            "by fresh bearish participation."
+            "Since the morning baseline, price fell with rising open interest. "
+            "The London-session move is supported by fresh bearish participation."
+            if operational_delta
+            else "Price fell with rising open interest. Previous move is likely supported by fresh bearish participation."
         )
         tpo_note = (
             "Bearish continuation context improves only after clean acceptance below value/key references. "
@@ -162,8 +187,10 @@ def interpret_positioning_item(
         primary_tag = LONG_LIQUIDATION_RISK
         secondary.append(OI_DIVERGES_FROM_PRICE)
         interpretation = (
-            "Price fell while open interest declined. Move may be driven by long liquidation "
-            "or position reduction rather than fresh short build."
+            "Since the morning baseline, price and open interest both fell. "
+            "The London-session move may be long liquidation rather than fresh short build."
+            if operational_delta
+            else "Price fell while open interest declined. Move may be driven by long liquidation or position reduction rather than fresh short build."
         )
         tpo_note = (
             "Continuation can fail after liquidation impulses. Require fresh acceptance/retest before action."

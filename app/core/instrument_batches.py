@@ -124,12 +124,12 @@ INSTRUMENT_BATCHES: dict[str, BatchConfig] = {
         "interval_minutes": 15,
     },
 
+    # London Focus v1 keeps the US-index/oil implementation available but
+    # removes those symbols from the active production batch. Re-activation is
+    # a configuration change, not a code recovery exercise.
     "indices": {
         "symbols": [
             "GER40",
-            "NAS100",
-            "SPX500",
-            "UKOIL",
         ],
         "offset_minutes": 10,
         "interval_minutes": 15,

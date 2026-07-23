@@ -54,3 +54,60 @@ def test_positioning_telegram_report_renders_weekly_cftc_section() -> None:
     assert "COT_EXTREME_NET_LONG" in text
     assert "Daily participation data unavailable" in text
     assert "Battle Gate: <b>none</b>" in text
+
+
+def test_positioning_telegram_report_renders_operational_baseline_and_filters_inactive_us_assets() -> None:
+    snapshot = {
+        "date": "2026-07-22",
+        "status": "OK",
+        "operational_positioning": {
+            "phase": "MORNING_BASELINE",
+            "status": "BASELINE_CAPTURED",
+            "baseline_timestamp": "2026-07-22T08:05:00+00:00",
+            "symbols": {"BTCUSD": {}},
+        },
+        "weekly_cot": {
+            "status": "OK",
+            "items": [
+                {"symbol": "NAS100"},
+                {"symbol": "XAUUSD", "positions": {}, "normalization": {}, "interpretation": {}, "data_quality": {}},
+            ],
+        },
+        "items": [
+            {
+                "symbol": "BTCUSD",
+                "daily_market_data": {
+                    "price": 60000.0,
+                    "open_interest": 149655.0,
+                    "price_change_pct": 0.0,
+                    "open_interest_change_pct": 0.0,
+                },
+                "market_proxy": {
+                    "source": "kraken_futures_public_pi_xbtusd",
+                    "operational_window": {
+                        "status": "BASELINE_CAPTURED",
+                        "baseline_timestamp": "2026-07-22T08:05:00+00:00",
+                        "current_timestamp": "2026-07-22T08:05:00+00:00",
+                    },
+                },
+                "positioning_interpretation": {
+                    "primary_tag": "POSITIONING_NEUTRAL",
+                    "confidence": 0.35,
+                    "data_quality": "MEDIUM",
+                },
+                "auction_usage": {
+                    "battle_gate_impact": "none",
+                    "telegram_signal_impact": "none",
+                },
+                "data_quality": {"status": "MEDIUM"},
+            },
+            {"symbol": "NAS100"},
+        ],
+    }
+
+    text = render_positioning_telegram_message(snapshot=snapshot)
+
+    assert "Morning baseline" in text
+    assert "Absolute snapshot: price 60,000.00 / OI 149,655.00" in text
+    assert "XAUUSD · weekly COT" in text
+    assert "NAS100" not in text

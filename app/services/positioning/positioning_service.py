@@ -122,6 +122,7 @@ def build_daily_positioning_context(
                     "proxy_type": "daily_participation_proxy",
                     "source": item.source,
                     "source_timestamp": item.source_timestamp,
+                    "operational_window": item.operational_window,
                 },
                 daily_market_data={
                     "price": item.price,
