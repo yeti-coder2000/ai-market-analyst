@@ -83,15 +83,24 @@ def interpret_positioning_item(
         )
 
     if _contains_any(flags, ("OPERATIONAL_BASELINE_CAPTURED",)):
+        baseline_window = str(
+            (item.operational_window or {}).get("window")
+            or "operational_baseline"
+        )
+        baseline_label = (
+            "Japan-open"
+            if baseline_window == "japan_open_baseline"
+            else "Frankfurt"
+        )
         return PositioningInterpretation(
             primary_tag=POSITIONING_NEUTRAL,
             secondary_tags=[NO_BATTLE_GATE_IMPACT],
             confidence=0.35,
             interpretation=(
-                "Morning absolute price/open-interest baseline captured. "
-                "No London-session participation delta exists yet."
+                f"{baseline_label} absolute price/open-interest baseline captured. "
+                "No directional participation delta is inferred from the baseline alone."
             ),
-            tpo_note="Baseline only. Do not infer participation direction before the London-close delta.",
+            tpo_note="Baseline only. Wait for the scheduled operational delta.",
             data_quality=(
                 "MEDIUM"
                 if _contains_any(flags, ("CRYPTO_EXCHANGE_OI_NOISY", "PERP_OI_NOISY"))
@@ -139,14 +148,29 @@ def interpret_positioning_item(
     primary_tag: str
     interpretation: str
     tpo_note: str
-    operational_delta = _contains_any(flags, ("OPERATIONAL_DELTA_SINCE_MORNING",))
+    operational_delta = _contains_any(
+        flags,
+        (
+            "OPERATIONAL_DELTA_SINCE_MORNING",
+            "OPERATIONAL_DELTA_SINCE_JAPAN_OPEN",
+        ),
+    )
+    operational_window = str(
+        (item.operational_window or {}).get("window")
+        or "operational_window"
+    )
+    operational_label = {
+        "japan_open_to_frankfurt": "From Japan open to Frankfurt",
+        "japan_open_to_london_plus_1h": "From Japan open to London +1h",
+        "morning_baseline_to_london_close": "Since the morning baseline",
+    }.get(operational_window, "Across the operational window")
 
     if price_up and oi_up:
         primary_tag = FRESH_LONG_PARTICIPATION
         secondary.append(OI_SUPPORTS_PRICE_MOVE)
         interpretation = (
-            "Since the morning baseline, price rose with rising open interest. "
-            "The London-session move is supported by fresh participation rather than only short covering."
+            f"{operational_label}, price rose with rising open interest. "
+            "The move is supported by fresh participation rather than only short covering."
             if operational_delta
             else "Price rose with rising open interest. Previous move is likely supported by fresh participation rather than only short covering."
         )
@@ -159,8 +183,8 @@ def interpret_positioning_item(
         primary_tag = SHORT_COVERING_RISK
         secondary.append(OI_DIVERGES_FROM_PRICE)
         interpretation = (
-            "Since the morning baseline, price rose while open interest declined. "
-            "The London-session move may be short covering rather than fresh bullish participation."
+            f"{operational_label}, price rose while open interest declined. "
+            "The move may be short covering rather than fresh bullish participation."
             if operational_delta
             else "Price rose while open interest declined. Move may be exit-driven / short covering rather than fresh bullish participation."
         )
@@ -173,8 +197,8 @@ def interpret_positioning_item(
         primary_tag = FRESH_SHORT_PARTICIPATION
         secondary.append(OI_SUPPORTS_PRICE_MOVE)
         interpretation = (
-            "Since the morning baseline, price fell with rising open interest. "
-            "The London-session move is supported by fresh bearish participation."
+            f"{operational_label}, price fell with rising open interest. "
+            "The move is supported by fresh bearish participation."
             if operational_delta
             else "Price fell with rising open interest. Previous move is likely supported by fresh bearish participation."
         )
@@ -187,8 +211,8 @@ def interpret_positioning_item(
         primary_tag = LONG_LIQUIDATION_RISK
         secondary.append(OI_DIVERGES_FROM_PRICE)
         interpretation = (
-            "Since the morning baseline, price and open interest both fell. "
-            "The London-session move may be long liquidation rather than fresh short build."
+            f"{operational_label}, price and open interest both fell. "
+            "The move may be long liquidation rather than fresh short build."
             if operational_delta
             else "Price fell while open interest declined. Move may be driven by long liquidation or position reduction rather than fresh short build."
         )

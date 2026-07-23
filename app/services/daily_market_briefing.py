@@ -5429,6 +5429,21 @@ def _tpo_audit_pick(record: Any, *keys: str) -> Any:
     return None
 
 
+def _tpo_audit_value_migration(previous_poc: Any, current_poc: Any) -> str:
+    try:
+        previous = float(previous_poc)
+        current = float(current_poc)
+    except (TypeError, ValueError):
+        return "UNKNOWN"
+
+    tolerance = max(abs(previous), abs(current), 1.0) * 1e-9
+    if current > previous + tolerance:
+        return "VALUE_MIGRATION_UP"
+    if current < previous - tolerance:
+        return "VALUE_MIGRATION_DOWN"
+    return "VALUE_MIGRATION_FLAT"
+
+
 def _looks_like_tpo_symbol_record(key: Any, record: Any) -> bool:
     if not isinstance(record, dict):
         return False
@@ -5548,6 +5563,11 @@ def _build_tpo_audit_snapshot(tpo: Any, report_type: str | None = None) -> dict[
         symbol = str(_tpo_audit_pick(record, "symbol") or key).upper()
         row = {field: _tpo_audit_pick(record, field) for field in fields}
         row["symbol"] = symbol
+        row["value_migration"] = _tpo_audit_value_migration(
+            row.get("previous_poc"),
+            row.get("current_poc"),
+        )
+        row["value_migration_basis"] = "current_poc_vs_previous_poc"
         resolved = _brief_symbol_context(record)
         row.update(
             {
@@ -5569,6 +5589,47 @@ def _build_tpo_audit_snapshot(tpo: Any, report_type: str | None = None) -> dict[
         "symbol_count": len(symbols),
         "symbols": symbols,
     }
+
+
+def _build_final_london_ny_profile_section(
+    tpo_audit_snapshot: dict[str, Any],
+) -> BriefingSection:
+    section = BriefingSection("📐 Фінальний TPO-профіль London + NY")
+    symbols = (
+        tpo_audit_snapshot.get("symbols")
+        if isinstance(tpo_audit_snapshot.get("symbols"), dict)
+        else {}
+    )
+    if not symbols:
+        section.lines.append("Фінальний London+NY profile недоступний.")
+        return section
+
+    for symbol in LONDON_SESSION_SYMBOLS:
+        row = symbols.get(symbol)
+        if not isinstance(row, dict):
+            section.lines.append(f"• {symbol} — profile data missing")
+            continue
+
+        behavior = str(
+            row.get("resolved_current_open_behavior")
+            or row.get("current_open_behavior")
+            or row.get("resolved_open_behavior")
+            or "UNKNOWN"
+        )
+        transition = str(row.get("behavior_transition") or "NO_RECORDED_TRANSITION")
+        value_state = str(row.get("value_acceptance_state") or "UNKNOWN")
+        migration = str(row.get("value_migration") or "UNKNOWN")
+        section.lines.append(
+            f"• {symbol} — POC {_fmt_num(row.get('current_poc'))} | "
+            f"VAH/VAL {_fmt_num(row.get('current_vah'))}/{_fmt_num(row.get('current_val'))} | "
+            f"H/L {_fmt_num(row.get('current_high'))}/{_fmt_num(row.get('current_low'))} | "
+            f"{migration} | value={value_state} | behavior={behavior} | transition={transition}"
+        )
+
+    section.lines.append(
+        "Це завершений London+NY profile і база наступного Frankfurt briefing; не entry trigger."
+    )
+    return section
 
 
 def _load_morning_briefing_artifact(target_date: date) -> tuple[Path | None, dict[str, Any]]:
@@ -5597,42 +5658,65 @@ def _london_close_state(row: Any) -> tuple[str, str, str]:
     return behavior, watch_state, value_state
 
 
-def _build_london_close_comparison(
+def _build_morning_state_comparison(
     *,
     tpo: dict[str, Any],
     target_date: date,
-    close_snapshot: dict[str, Any],
+    current_snapshot: dict[str, Any],
+    stage: str,
 ) -> tuple[BriefingSection, dict[str, Any]]:
-    """Compare the persisted morning hypothesis with the canonical close state."""
+    """Compare the persisted Frankfurt hypothesis with a later canonical state."""
 
-    section = BriefingSection("🧾 London: план → факт")
+    if stage == "LONDON_1H":
+        title = "🧭 London +1h: ранковий сценарій → перша година"
+        state_label = "London +1h"
+        final_note = "Це контроль першої години London, а не дозвіл переслідувати вже завершений імпульс."
+    elif stage == "DAILY_CLOSE":
+        title = "🧾 День: ранковий сценарій → фінал London+NY"
+        state_label = "NY close"
+        final_note = "Фінальний state є матеріалом для статистики й наступного Frankfurt open; це не late entry trigger."
+    else:
+        title = "🧾 London: план → факт"
+        state_label = "London close"
+        final_note = "Close-state є матеріалом для статистики й завтрашнього плану; це не пізній entry trigger."
+
+    section = BriefingSection(title)
     morning_path, morning_report = _load_morning_briefing_artifact(target_date)
     raw = morning_report.get("raw") if isinstance(morning_report.get("raw"), dict) else {}
     morning_snapshot = raw.get("tpo_audit_snapshot") if isinstance(raw.get("tpo_audit_snapshot"), dict) else {}
     morning_symbols = morning_snapshot.get("symbols") if isinstance(morning_snapshot.get("symbols"), dict) else {}
-    close_symbols = close_snapshot.get("symbols") if isinstance(close_snapshot.get("symbols"), dict) else {}
+    current_symbols = (
+        current_snapshot.get("symbols")
+        if isinstance(current_snapshot.get("symbols"), dict)
+        else {}
+    )
     live_symbols = tpo.get("symbols") if isinstance(tpo.get("symbols"), dict) else {}
 
     audit: dict[str, Any] = {
-        "version": "london-close-comparison-v1",
+        "version": "morning-state-comparison-v2",
+        "stage": stage,
         "report_date": target_date.isoformat(),
         "morning_artifact": str(morning_path) if morning_path else None,
         "morning_report_version": morning_report.get("version") if morning_report else None,
         "morning_generated_at_utc": morning_report.get("generated_at_utc") if morning_report else None,
         "morning_snapshot_version": morning_snapshot.get("version") if morning_snapshot else None,
-        "close_snapshot_version": close_snapshot.get("version"),
+        "current_snapshot_version": current_snapshot.get("version"),
         "status": "OK" if morning_symbols else "MORNING_BASELINE_MISSING",
         "symbols": {},
     }
 
     if morning_symbols:
-        section.lines.append("Ранкова гіпотеза зіставлена з canonical TPO/Watch Bridge станом на закритті London.")
+        section.lines.append(
+            f"Frankfurt-гіпотеза зіставлена з canonical TPO/Watch Bridge станом на {state_label}."
+        )
     else:
-        section.lines.append("Ранковий audit snapshot не знайдений: показуємо лише close-state без вигаданого переходу.")
+        section.lines.append(
+            f"Frankfurt audit snapshot не знайдений: показуємо лише {state_label} state без вигаданого переходу."
+        )
 
     for symbol in LONDON_SESSION_SYMBOLS:
         before = morning_symbols.get(symbol)
-        after = close_symbols.get(symbol)
+        after = current_symbols.get(symbol)
         before_behavior, before_watch, before_value = _london_close_state(before)
         after_behavior, after_watch, after_value = _london_close_state(after)
 
@@ -5659,12 +5743,12 @@ def _build_london_close_comparison(
             f"{after_behavior}/{after_watch} | {transition} | close={close_bucket}"
         )
         audit["symbols"][symbol] = {
-            "morning": {
+            "frankfurt": {
                 "open_behavior": before_behavior,
                 "watch_state": before_watch,
                 "value_acceptance_state": before_value,
             },
-            "close": {
+            "current": {
                 "open_behavior": after_behavior,
                 "watch_state": after_watch,
                 "value_acceptance_state": after_value,
@@ -5674,8 +5758,50 @@ def _build_london_close_comparison(
             "transition": transition,
         }
 
-    section.lines.append("Close-state є матеріалом для статистики й завтрашнього плану; це не пізній entry trigger.")
+    section.lines.append(final_note)
     return section, audit
+
+
+def _build_london_close_comparison(
+    *,
+    tpo: dict[str, Any],
+    target_date: date,
+    close_snapshot: dict[str, Any],
+) -> tuple[BriefingSection, dict[str, Any]]:
+    return _build_morning_state_comparison(
+        tpo=tpo,
+        target_date=target_date,
+        current_snapshot=close_snapshot,
+        stage="LONDON_CLOSE",
+    )
+
+
+def _build_london_1h_comparison(
+    *,
+    tpo: dict[str, Any],
+    target_date: date,
+    current_snapshot: dict[str, Any],
+) -> tuple[BriefingSection, dict[str, Any]]:
+    return _build_morning_state_comparison(
+        tpo=tpo,
+        target_date=target_date,
+        current_snapshot=current_snapshot,
+        stage="LONDON_1H",
+    )
+
+
+def _build_daily_close_comparison(
+    *,
+    tpo: dict[str, Any],
+    target_date: date,
+    current_snapshot: dict[str, Any],
+) -> tuple[BriefingSection, dict[str, Any]]:
+    return _build_morning_state_comparison(
+        tpo=tpo,
+        target_date=target_date,
+        current_snapshot=current_snapshot,
+        stage="DAILY_CLOSE",
+    )
 
 
 def build_briefing_report(
@@ -5693,10 +5819,22 @@ def build_briefing_report(
     daily_summary = load_daily_summary()
     normalized_type = _normalize_report_type(report_type)
     tpo_audit_snapshot = _build_tpo_audit_snapshot(tpo, normalized_type)
-    london_close_section: BriefingSection | None = None
-    london_close_comparison: dict[str, Any] | None = None
-    if normalized_type in LONDON_CLOSE_REPORT_TYPES or normalized_type in DAILY_CLOSE_REPORT_TYPES:
-        london_close_section, london_close_comparison = _build_london_close_comparison(
+    scenario_section: BriefingSection | None = None
+    scenario_comparison: dict[str, Any] | None = None
+    if normalized_type in {"london", "london_1h"}:
+        scenario_section, scenario_comparison = _build_london_1h_comparison(
+            tpo=tpo,
+            target_date=target_date,
+            current_snapshot=tpo_audit_snapshot,
+        )
+    elif normalized_type in DAILY_CLOSE_REPORT_TYPES:
+        scenario_section, scenario_comparison = _build_daily_close_comparison(
+            tpo=tpo,
+            target_date=target_date,
+            current_snapshot=tpo_audit_snapshot,
+        )
+    elif normalized_type in LONDON_CLOSE_REPORT_TYPES:
+        scenario_section, scenario_comparison = _build_london_close_comparison(
             tpo=tpo,
             target_date=target_date,
             close_snapshot=tpo_audit_snapshot,
@@ -5729,7 +5867,22 @@ def build_briefing_report(
                 "usd_macro_safety": "retained",
             },
             "tpo_audit_snapshot": tpo_audit_snapshot,
-            "london_close_comparison": london_close_comparison,
+            "session_scenario_comparison": scenario_comparison,
+            "london_close_comparison": (
+                scenario_comparison
+                if normalized_type in LONDON_CLOSE_REPORT_TYPES
+                else None
+            ),
+            "london_1h_comparison": (
+                scenario_comparison
+                if normalized_type in {"london", "london_1h"}
+                else None
+            ),
+            "daily_close_comparison": (
+                scenario_comparison
+                if normalized_type in DAILY_CLOSE_REPORT_TYPES
+                else None
+            ),
         },
     )
 
@@ -5745,8 +5898,12 @@ def build_briefing_report(
         report.sections.append(intermarket_section)
 
     report.sections.append(_build_tpo_snapshot_section(tpo, normalized_type, target_date, tz_name))
-    if london_close_section is not None:
-        report.sections.append(london_close_section)
+    if normalized_type in DAILY_CLOSE_REPORT_TYPES:
+        report.sections.append(
+            _build_final_london_ny_profile_section(tpo_audit_snapshot)
+        )
+    if scenario_section is not None:
+        report.sections.append(scenario_section)
     report.sections.append(_build_positioning_context_section())
     report.sections.append(_build_suppressed_telegram_section())
     report.sections.append(_build_positioning_diagnostics_section())

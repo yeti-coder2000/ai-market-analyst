@@ -33,7 +33,7 @@ from app.services.daily_market_briefing import (
 from app.services.telegram_notifier import TelegramNotifier
 
 
-REPORTER_VERSION = "telegram-daily-reporter-v1.5-frankfurt-cot-ny-close"
+REPORTER_VERSION = "telegram-daily-reporter-v1.6-three-checkpoint-cycle"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -78,6 +78,7 @@ def _previous_trading_date(value: str) -> str:
 
 
 def _positioning_reference_date(report_type: str, report_date: str) -> str:
+    """Return the historical snapshot date; never relabel a live refresh with it."""
     normalized = str(report_type or "").strip().lower()
     if normalized in {"morning", "morning_briefing", "morning_combined"}:
         return _previous_trading_date(report_date)
@@ -396,6 +397,8 @@ def _positioning_delivery_enabled(report_type: str, explicit: bool | None = None
         return False
 
     normalized = str(report_type or "").strip().lower()
+    if normalized in {"london_1h", "london_open_1h"}:
+        return _env_bool("REPORT_SEND_LONDON_1H_POSITIONING", True)
     if normalized in {"london_close", "london_close_briefing"}:
         return _env_bool("REPORT_SEND_LONDON_CLOSE_POSITIONING", True)
     if normalized in {"daily_close", "ny_close"}:
@@ -403,7 +406,7 @@ def _positioning_delivery_enabled(report_type: str, explicit: bool | None = None
 
     allowed = _env_csv_set(
         "REPORT_POSITIONING_TYPES",
-        "morning,morning_combined,london_close,crypto_health",
+        "morning,morning_combined,london_1h,crypto_health",
     )
     return normalized in allowed
 
@@ -463,7 +466,13 @@ def _positioning_close_skip_reason(
     *,
     runtime_dir: str | None,
 ) -> str | None:
-    if str(report_type or "").strip().lower() not in {"london_close", "london_close_briefing"}:
+    normalized = str(report_type or "").strip().lower()
+    if normalized not in {
+        "london_1h",
+        "london_open_1h",
+        "london_close",
+        "london_close_briefing",
+    }:
         return None
 
     try:
@@ -475,9 +484,18 @@ def _positioning_close_skip_reason(
             return "operational_positioning_missing"
         status = str(operational.get("status") or "UNKNOWN").upper()
         symbols = operational.get("symbols") if isinstance(operational.get("symbols"), dict) else {}
-        if status in {"DELTA_READY", "PARTIAL"} and symbols:
+        if status in {
+            "LONDON_1H_DELTA_READY",
+            "DELTA_READY",
+            "PARTIAL",
+        } and symbols:
             return None
-        return f"no_london_close_delta:{status.lower()}"
+        checkpoint = (
+            "london_1h"
+            if normalized in {"london_1h", "london_open_1h"}
+            else "london_close"
+        )
+        return f"no_{checkpoint}_delta:{status.lower()}"
     except Exception as exc:  # noqa: BLE001
         return f"operational_positioning_read_error:{type(exc).__name__}"
 
@@ -597,17 +615,19 @@ def send_daily_report(
             report_type=report_type,
         )
 
-        if (
-            _env_bool("REPORT_REFRESH_POSITIONING", True)
-            and _positioning_delivery_enabled(report_type, explicit=send_positioning_report)
-        ):
+        normalized_type = str(report_type or "").strip().lower()
+        refresh_positioning = _env_bool("REPORT_REFRESH_POSITIONING", True) and (
+            _positioning_delivery_enabled(
+                report_type,
+                explicit=send_positioning_report,
+            )
+            or normalized_type in {"daily_close", "ny_close"}
+        )
+        if refresh_positioning:
             refresh_results.append(
                 _refresh_positioning_runtime(
                     runtime_dir=runtime_dir,
-                    report_date=_positioning_reference_date(
-                        report_type,
-                        resolved_report_date,
-                    ),
+                    report_date=resolved_report_date,
                     report_type=report_type,
                 )
             )

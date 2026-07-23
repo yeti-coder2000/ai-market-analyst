@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 from app.services.tpo_context_exporter import _profile_scope, _profile_session_config
+from app.services.daily_market_briefing import (
+    _build_final_london_ny_profile_section,
+    _build_tpo_audit_snapshot,
+)
 from app.services.telegram_daily_reporter import (
     _daily_close_tpo_path,
     _positioning_reference_date,
@@ -37,3 +41,32 @@ def test_daily_close_profile_has_separate_read_only_store(tmp_path) -> None:
     assert _daily_close_tpo_path(str(tmp_path)) == (
         tmp_path / "tpo" / "tpo_london_ny_close_latest.json"
     )
+
+
+def test_daily_close_audit_derives_value_migration_and_renders_final_profile() -> None:
+    snapshot = _build_tpo_audit_snapshot(
+        {
+            "symbols": {
+                "XAUUSD": {
+                    "symbol": "XAUUSD",
+                    "previous_poc": 3300.0,
+                    "current_poc": 3310.0,
+                    "current_vah": 3320.0,
+                    "current_val": 3290.0,
+                    "current_high": 3330.0,
+                    "current_low": 3280.0,
+                    "current_open_behavior": "OPEN_DRIVE",
+                    "behavior_transition": "OPEN_AUCTION_TO_OPEN_DRIVE",
+                    "value_acceptance_state": "ACCEPTED_ABOVE_VALUE",
+                }
+            }
+        },
+        "daily_close",
+    )
+
+    row = snapshot["symbols"]["XAUUSD"]
+    assert row["value_migration"] == "VALUE_MIGRATION_UP"
+    text = "\n".join(_build_final_london_ny_profile_section(snapshot).lines)
+    assert "POC 3310" in text
+    assert "VAH/VAL 3320/3290" in text
+    assert "VALUE_MIGRATION_UP" in text

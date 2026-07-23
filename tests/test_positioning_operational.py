@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from app.services.positioning.positioning_models import PositioningFeedItem
 from app.services.positioning.positioning_operational import (
     apply_operational_positioning_window,
 )
-from app.services.positioning.positioning_models import PositioningFeedItem
 from app.services.positioning.positioning_tagger import interpret_positioning_item
 
 
@@ -29,94 +29,176 @@ def _snapshot(*, price: float, open_interest: float, generated_at: str) -> dict:
     }
 
 
-def test_operational_window_captures_morning_and_calculates_london_delta(tmp_path: Path) -> None:
-    morning, morning_meta = apply_operational_positioning_window(
-        _snapshot(price=100.0, open_interest=200.0, generated_at="2026-07-22T08:05:00+00:00"),
+def test_operational_cycle_builds_japan_frankfurt_and_london_windows(
+    tmp_path: Path,
+) -> None:
+    previous_close, previous_meta = apply_operational_positioning_window(
+        _snapshot(
+            price=98.0,
+            open_interest=190.0,
+            generated_at="2026-07-21T20:15:00+00:00",
+        ),
+        runtime_dir=str(tmp_path),
+        report_date="2026-07-21",
+        report_type="daily_close",
+    )
+    assert previous_close["items"]
+    assert previous_meta["status"] == "DAILY_CLOSE_SNAPSHOT_CAPTURED"
+
+    japan, japan_meta = apply_operational_positioning_window(
+        _snapshot(
+            price=100.0,
+            open_interest=200.0,
+            generated_at="2026-07-22T00:00:00+00:00",
+        ),
+        runtime_dir=str(tmp_path),
+        report_date="2026-07-22",
+        report_type="positioning_japan_open",
+    )
+    assert japan_meta["status"] == "JAPAN_BASELINE_CAPTURED"
+    assert japan["items"][0]["operational_window"]["window"] == "japan_open_baseline"
+
+    frankfurt, frankfurt_meta = apply_operational_positioning_window(
+        _snapshot(
+            price=102.0,
+            open_interest=210.0,
+            generated_at="2026-07-22T06:05:00+00:00",
+        ),
         runtime_dir=str(tmp_path),
         report_date="2026-07-22",
         report_type="morning_combined",
     )
-
-    assert morning_meta["status"] == "BASELINE_CAPTURED"
-    assert morning["items"][0]["price_change_pct"] == 0.0
-    assert morning["items"][0]["open_interest_change_pct"] == 0.0
-    morning_read = interpret_positioning_item(PositioningFeedItem.from_dict(morning["items"][0]))
-    assert morning_read.primary_tag == "POSITIONING_NEUTRAL"
-    assert "No London-session participation delta" in morning_read.interpretation
-    baseline_path = tmp_path / "positioning" / "positioning_operational_morning_baseline.json"
-    assert json.loads(baseline_path.read_text(encoding="utf-8"))["date"] == "2026-07-22"
-
-    close, close_meta = apply_operational_positioning_window(
-        _snapshot(price=105.0, open_interest=220.0, generated_at="2026-07-22T15:45:00+00:00"),
-        runtime_dir=str(tmp_path),
-        report_date="2026-07-22",
-        report_type="london_close",
+    assert frankfurt_meta["status"] == "FRANKFURT_DELTA_READY"
+    assert frankfurt_meta["previous_trading_day"]["status"] == "AVAILABLE"
+    assert frankfurt["items"][0]["price_change_pct"] == 2.0
+    assert frankfurt["items"][0]["open_interest_change_pct"] == 5.0
+    assert (
+        frankfurt["items"][0]["operational_window"]["window"]
+        == "japan_open_to_frankfurt"
     )
 
-    assert close_meta["status"] == "DELTA_READY"
-    item = close["items"][0]
+    london, london_meta = apply_operational_positioning_window(
+        _snapshot(
+            price=105.0,
+            open_interest=220.0,
+            generated_at="2026-07-22T08:00:00+00:00",
+        ),
+        runtime_dir=str(tmp_path),
+        report_date="2026-07-22",
+        report_type="london_1h",
+    )
+    assert london_meta["status"] == "LONDON_1H_DELTA_READY"
+    item = london["items"][0]
     assert item["price_change_pct"] == 5.0
     assert item["open_interest_change_pct"] == 10.0
-    assert item["operational_window"]["status"] == "DELTA_READY"
-    assert "OPERATIONAL_DELTA_SINCE_MORNING" in item["flags"]
-    close_read = interpret_positioning_item(PositioningFeedItem.from_dict(item))
-    assert close_read.primary_tag == "FRESH_LONG_PARTICIPATION"
-    assert "Since the morning baseline" in close_read.interpretation
+    assert item["operational_window"]["frankfurt_change"]["price_change_pct"] == 2.941176
+    assert item["operational_window"]["frankfurt_change"]["open_interest_change_pct"] == 4.761905
+    assert "OPERATIONAL_DELTA_SINCE_JAPAN_OPEN" in item["flags"]
+
+    read = interpret_positioning_item(PositioningFeedItem.from_dict(item))
+    assert read.primary_tag == "FRESH_LONG_PARTICIPATION"
+    assert "From Japan open to London +1h" in read.interpretation
 
 
-def test_operational_close_never_fabricates_delta_without_morning_baseline(tmp_path: Path) -> None:
-    close, meta = apply_operational_positioning_window(
-        _snapshot(price=105.0, open_interest=220.0, generated_at="2026-07-22T15:45:00+00:00"),
-        runtime_dir=str(tmp_path),
-        report_date="2026-07-22",
-        report_type="london_close",
-    )
-
-    assert meta["status"] == "MORNING_BASELINE_MISSING"
-    assert "operational_window" not in close["items"][0]
-
-
-def test_operational_close_is_partial_when_a_morning_symbol_disappears(tmp_path: Path) -> None:
-    morning_source = _snapshot(
-        price=100.0,
-        open_interest=200.0,
-        generated_at="2026-07-22T08:05:00+00:00",
-    )
-    morning_source["items"].append(
-        {
-            "symbol": "ETHUSD",
-            "price": 10.0,
-            "open_interest": 400.0,
-            "volume": 500.0,
-            "source": "kraken_futures_public_pf_ethusd",
-            "source_timestamp": "2026-07-22T08:05:00+00:00",
-            "flags": ["PERP_OI_PROXY"],
-        }
-    )
-    apply_operational_positioning_window(
-        morning_source,
+def test_frankfurt_never_fabricates_japan_delta_but_still_captures_control_baseline(
+    tmp_path: Path,
+) -> None:
+    frankfurt, meta = apply_operational_positioning_window(
+        _snapshot(
+            price=102.0,
+            open_interest=210.0,
+            generated_at="2026-07-22T06:05:00+00:00",
+        ),
         runtime_dir=str(tmp_path),
         report_date="2026-07-22",
         report_type="morning_combined",
     )
 
-    _, meta = apply_operational_positioning_window(
-        _snapshot(price=105.0, open_interest=220.0, generated_at="2026-07-22T15:45:00+00:00"),
+    assert meta["status"] == "JAPAN_BASELINE_MISSING"
+    assert frankfurt["items"][0]["price_change_pct"] is None
+    assert (
+        frankfurt["items"][0]["operational_window"]["status"]
+        == "FRANKFURT_BASELINE_CAPTURED_NO_JAPAN"
+    )
+    baseline_path = (
+        tmp_path
+        / "positioning"
+        / "positioning_operational_frankfurt_baseline.json"
+    )
+    assert json.loads(baseline_path.read_text(encoding="utf-8"))["date"] == "2026-07-22"
+
+
+def test_london_control_is_partial_when_only_frankfurt_baseline_exists(
+    tmp_path: Path,
+) -> None:
+    apply_operational_positioning_window(
+        _snapshot(
+            price=100.0,
+            open_interest=200.0,
+            generated_at="2026-07-22T06:05:00+00:00",
+        ),
         runtime_dir=str(tmp_path),
         report_date="2026-07-22",
-        report_type="london_close",
+        report_type="morning_combined",
+    )
+
+    london, meta = apply_operational_positioning_window(
+        _snapshot(
+            price=105.0,
+            open_interest=220.0,
+            generated_at="2026-07-22T08:00:00+00:00",
+        ),
+        runtime_dir=str(tmp_path),
+        report_date="2026-07-22",
+        report_type="london_1h",
     )
 
     assert meta["status"] == "PARTIAL"
-    assert meta["ready_symbols"] == 1
-    assert meta["missing_symbols"] == ["ETHUSD"]
+    assert "BTCUSD" in meta["symbols"]
+    assert (
+        london["items"][0]["operational_window"]["status"]
+        == "FRANKFURT_ONLY_PARTIAL"
+    )
+    assert (
+        london["items"][0]["operational_window"]["frankfurt_change"]["status"]
+        == "FRANKFURT_TO_LONDON_1H_DELTA_READY"
+    )
+    assert london["items"][0].get("price_change_pct") is None
+
+
+def test_previous_trading_day_snapshot_requires_exact_expected_date(
+    tmp_path: Path,
+) -> None:
+    apply_operational_positioning_window(
+        _snapshot(
+            price=98.0,
+            open_interest=190.0,
+            generated_at="2026-07-20T20:15:00+00:00",
+        ),
+        runtime_dir=str(tmp_path),
+        report_date="2026-07-20",
+        report_type="daily_close",
+    )
+    _, meta = apply_operational_positioning_window(
+        _snapshot(
+            price=100.0,
+            open_interest=200.0,
+            generated_at="2026-07-22T06:05:00+00:00",
+        ),
+        runtime_dir=str(tmp_path),
+        report_date="2026-07-22",
+        report_type="morning_combined",
+    )
+
+    assert meta["previous_trading_day"]["expected_date"] == "2026-07-21"
+    assert meta["previous_trading_day"]["status"] == "MISSING"
 
 
 def test_operational_baseline_rejects_stale_absolute_source(tmp_path: Path) -> None:
     source = _snapshot(
         price=100.0,
         open_interest=200.0,
-        generated_at="2026-07-22T08:05:00+00:00",
+        generated_at="2026-07-22T00:00:00+00:00",
     )
     source["items"][0]["flags"].append("STALE_SOURCE_DATA")
 
@@ -124,8 +206,10 @@ def test_operational_baseline_rejects_stale_absolute_source(tmp_path: Path) -> N
         source,
         runtime_dir=str(tmp_path),
         report_date="2026-07-22",
-        report_type="morning_combined",
+        report_type="positioning_japan_open",
     )
 
     assert meta["status"] == "LIVE_SOURCE_UNAVAILABLE"
-    assert not (tmp_path / "positioning" / "positioning_operational_morning_baseline.json").exists()
+    assert not (
+        tmp_path / "positioning" / "positioning_operational_japan_baseline.json"
+    ).exists()

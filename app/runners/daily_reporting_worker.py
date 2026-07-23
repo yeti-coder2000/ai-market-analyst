@@ -6,7 +6,9 @@ Scheduled Telegram reporting worker for AI Market Analyst.
 Runs independently from the trading/signal worker.
 
 Production schedule:
+- positioning_japan_open: 09:00 Asia/Tokyo (silent operational baseline)
 - morning_combined: 08:05 Europe/Berlin (Frankfurt open)
+- london_1h:       09:00 Europe/London (London open +1h)
 - daily_close:      16:15 America/New_York (completed NY close bar)
 
 The legacy NY report remains callable manually and can be re-enabled by the
@@ -46,9 +48,11 @@ except Exception:  # pragma: no cover
 from app.services.telegram_daily_reporter import send_daily_report
 
 
-WORKER_VERSION = "daily-reporting-worker-v1.3-ny-close"
+WORKER_VERSION = "daily-reporting-worker-v1.4-three-checkpoints"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
+DEFAULT_JAPAN_TIMEZONE = "Asia/Tokyo"
 DEFAULT_FRANKFURT_TIMEZONE = "Europe/Berlin"
+DEFAULT_LONDON_TIMEZONE = "Europe/London"
 DEFAULT_NY_TIMEZONE = "America/New_York"
 
 
@@ -138,6 +142,8 @@ class ScheduledReport:
     refresh_tpo: bool = False
     weekend_only: bool = False
     schedule_timezone: str | None = None
+    delivery_mode: str = "briefing"
+    max_lateness_minutes: int | None = None
 
 
 def _is_weekend(now_local: datetime) -> bool:
@@ -147,12 +153,34 @@ def _is_weekend(now_local: datetime) -> bool:
 def _weekday_schedule() -> list[ScheduledReport]:
     reports = [
         ScheduledReport(
+            "positioning_japan_open",
+            os.getenv("REPORT_TIME_POSITIONING_JAPAN_OPEN", "09:00"),
+            schedule_timezone=os.getenv(
+                "REPORT_POSITIONING_JAPAN_TIMEZONE",
+                DEFAULT_JAPAN_TIMEZONE,
+            ),
+            delivery_mode="positioning_checkpoint",
+            max_lateness_minutes=_env_int(
+                "REPORT_POSITIONING_JAPAN_MAX_LATENESS_MINUTES",
+                30,
+            ),
+        ),
+        ScheduledReport(
             "morning_combined",
             os.getenv("REPORT_TIME_MORNING_COMBINED", "08:05"),
             refresh_tpo=_env_bool("REPORT_REFRESH_TPO_MORNING_COMBINED", False),
             schedule_timezone=os.getenv(
                 "REPORT_MORNING_TIMEZONE",
                 DEFAULT_FRANKFURT_TIMEZONE,
+            ),
+        ),
+        ScheduledReport(
+            "london_1h",
+            os.getenv("REPORT_TIME_LONDON_1H", "09:00"),
+            refresh_tpo=_env_bool("REPORT_REFRESH_TPO_LONDON_1H", True),
+            schedule_timezone=os.getenv(
+                "REPORT_LONDON_1H_TIMEZONE",
+                DEFAULT_LONDON_TIMEZONE,
             ),
         ),
     ]
@@ -248,12 +276,52 @@ def _should_send(now_local: datetime, scheduled: ScheduledReport, state: dict[st
 
     if now_local < target_dt:
         return False
+    if (
+        scheduled.max_lateness_minutes is not None
+        and (now_local - target_dt).total_seconds() > scheduled.max_lateness_minutes * 60
+    ):
+        return False
 
     sent = state.get("sent")
     if not isinstance(sent, dict):
         return True
 
     return _state_key(now_local, scheduled) not in sent
+
+
+def _run_positioning_checkpoint(
+    *,
+    scheduled: ScheduledReport,
+    report_date: str,
+) -> dict[str, Any]:
+    from app.services.telegram_daily_reporter import _refresh_positioning_runtime
+
+    runtime_dir = os.getenv("POSITIONING_RUNTIME_DIR") or os.getenv("RUNTIME_DIR")
+    result = _refresh_positioning_runtime(
+        runtime_dir=runtime_dir,
+        report_date=report_date,
+        report_type=scheduled.report_type,
+    )
+    payload = result.get("result") if isinstance(result.get("result"), dict) else {}
+    operational_status = str(
+        payload.get("operational_positioning_status") or ""
+    ).upper()
+    baseline_captured = operational_status == "JAPAN_BASELINE_CAPTURED"
+    return {
+        "version": WORKER_VERSION,
+        "status": (
+            "ok"
+            if result.get("returncode") == 0 and baseline_captured
+            else "retryable_no_baseline"
+        ),
+        "report_type": scheduled.report_type,
+        "report_date": report_date,
+        "delivery_mode": scheduled.delivery_mode,
+        "telegram_sent": False,
+        "operational_positioning_status": operational_status or None,
+        "positioning_refresh": result,
+        "error_message": result.get("error_message"),
+    }
 
 
 def _mark_sent(
@@ -296,14 +364,20 @@ def run_due_reports_once(
         report_date = scheduled_now.date().isoformat()
 
         try:
-            result = send_daily_report(
-                report_type=scheduled.report_type,
-                report_date=report_date,
-                timezone_name=tz_name,
-                dry_run=dry_run,
-                refresh=True,
-                include_tpo_refresh=scheduled.refresh_tpo,
-            ).to_dict()
+            if scheduled.delivery_mode == "positioning_checkpoint":
+                result = _run_positioning_checkpoint(
+                    scheduled=scheduled,
+                    report_date=report_date,
+                )
+            else:
+                result = send_daily_report(
+                    report_type=scheduled.report_type,
+                    report_date=report_date,
+                    timezone_name=tz_name,
+                    dry_run=dry_run,
+                    refresh=True,
+                    include_tpo_refresh=scheduled.refresh_tpo,
+                ).to_dict()
         except Exception as exc:
             result = {
                 "version": WORKER_VERSION,
