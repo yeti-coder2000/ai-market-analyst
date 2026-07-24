@@ -106,12 +106,14 @@ class BriefingStateConsistencyTests(unittest.TestCase):
         )
         row = snapshot["symbols"]["XAUUSD"]
 
-        self.assertEqual(snapshot["version"], "tpo-audit-snapshot-v2-watch-state")
+        self.assertEqual(snapshot["version"], "tpo-audit-snapshot-v3-direction-scenario")
         self.assertEqual(row["open_behavior"], "OPEN_TEST_DRIVE")
         self.assertEqual(row["resolved_open_behavior"], "OPEN_AUCTION")
         self.assertEqual(row["resolved_current_open_behavior"], "OPEN_AUCTION_IN_RANGE")
         self.assertEqual(row["tpo_watch_state"], "OBSERVE_ROTATION")
         self.assertEqual(row["tpo_watch_setup"], "OPEN_AUCTION_IN_RANGE")
+        self.assertEqual(row["direction"], "DOWN")
+        self.assertEqual(row["scenario_state"], "OPEN_AUCTION_IN_RANGE")
         self.assertIsNone(row["tpo_watch_bridge_error"])
 
 

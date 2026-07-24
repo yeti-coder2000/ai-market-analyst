@@ -5244,6 +5244,9 @@ def _build_suppressed_telegram_section() -> BriefingSection:
         section.lines.append("Suppressed metrics ще недоступні. Потрібен lightweight_statistics_exporter v2.4.")
         return section
 
+    section.lines.append(
+        "Scope: GLOBAL/LEGACY cumulative telemetry; це не локальна когорта поточного briefing/session focus."
+    )
     total = _fmt_count(metrics.get("total"))
     stats_only_total = _fmt_count(metrics.get("statistics_only_total"))
     tracked = metrics.get("tracked_reasons") if isinstance(metrics.get("tracked_reasons"), dict) else {}
@@ -5486,7 +5489,7 @@ def _build_tpo_audit_snapshot(tpo: Any, report_type: str | None = None) -> dict[
     """
     if not isinstance(tpo, dict):
         return {
-            "version": "tpo-audit-snapshot-v2-watch-state",
+            "version": "tpo-audit-snapshot-v3-direction-scenario",
             "report_type": report_type,
             "updated_at_utc": None,
             "symbols": {},
@@ -5550,6 +5553,7 @@ def _build_tpo_audit_snapshot(tpo: Any, report_type: str | None = None) -> dict[
         "entry_model_hint",
         "stop_model_hint",
         "battle_bias_hint",
+        "first_hour_activity",
         "open_behavior_reason",
         "open_behavior_warnings",
         "warnings",
@@ -5569,6 +5573,19 @@ def _build_tpo_audit_snapshot(tpo: Any, report_type: str | None = None) -> dict[
         )
         row["value_migration_basis"] = "current_poc_vs_previous_poc"
         resolved = _brief_symbol_context(record)
+        scenario_state = (
+            _directional_continuation_state(symbol, resolved)
+            or resolved.get("tpo_watch_setup")
+            or resolved.get("entry_hint")
+            or "UNKNOWN"
+        )
+        direction = _post_news_direction_from_activity(
+            resolved.get("first_hour_activity")
+            if isinstance(resolved.get("first_hour_activity"), dict)
+            else {}
+        )
+        if direction not in {"UP", "DOWN"}:
+            direction = _direction_from_scenario_state(scenario_state)
         row.update(
             {
                 "resolved_open_behavior": resolved.get("open_behavior"),
@@ -5578,12 +5595,14 @@ def _build_tpo_audit_snapshot(tpo: Any, report_type: str | None = None) -> dict[
                 "tpo_watch_setup": resolved.get("tpo_watch_setup"),
                 "tpo_watch_reason": resolved.get("tpo_watch_reason"),
                 "tpo_watch_bridge_error": resolved.get("tpo_watch_bridge_error"),
+                "direction": direction,
+                "scenario_state": str(scenario_state).upper(),
             }
         )
         symbols[symbol] = row
 
     return {
-        "version": "tpo-audit-snapshot-v2-watch-state",
+        "version": "tpo-audit-snapshot-v3-direction-scenario",
         "report_type": report_type,
         "updated_at_utc": tpo.get("updated_at_utc"),
         "symbol_count": len(symbols),
@@ -5642,9 +5661,18 @@ def _load_morning_briefing_artifact(target_date: date) -> tuple[Path | None, dic
     return None, {}
 
 
-def _london_close_state(row: Any) -> tuple[str, str, str]:
+def _direction_from_scenario_state(value: Any) -> str:
+    scenario = str(value or "").upper()
+    if "BEARISH" in scenario or "SHORT" in scenario:
+        return "DOWN"
+    if "BULLISH" in scenario or "LONG" in scenario:
+        return "UP"
+    return "UNKNOWN"
+
+
+def _london_close_state(row: Any) -> tuple[str, str, str, str, str]:
     if not isinstance(row, dict):
-        return "NO_DATA", "NO_WATCH", "UNKNOWN"
+        return "NO_DATA", "NO_WATCH", "UNKNOWN", "UNKNOWN", "UNKNOWN"
 
     behavior = str(
         row.get("resolved_current_open_behavior")
@@ -5655,7 +5683,21 @@ def _london_close_state(row: Any) -> tuple[str, str, str]:
     ).upper()
     watch_state = str(row.get("tpo_watch_state") or "NO_WATCH").upper()
     value_state = str(row.get("value_acceptance_state") or "UNKNOWN").upper()
-    return behavior, watch_state, value_state
+    scenario_state = str(
+        row.get("scenario_state")
+        or row.get("tpo_watch_setup")
+        or row.get("entry_model_hint")
+        or "UNKNOWN"
+    ).upper()
+    direction = str(row.get("direction") or "").upper()
+    if direction not in {"UP", "DOWN"}:
+        activity = row.get("first_hour_activity")
+        direction = _post_news_direction_from_activity(
+            activity if isinstance(activity, dict) else {}
+        )
+    if direction not in {"UP", "DOWN"}:
+        direction = _direction_from_scenario_state(scenario_state)
+    return behavior, watch_state, value_state, direction, scenario_state
 
 
 def _build_morning_state_comparison(
@@ -5693,7 +5735,7 @@ def _build_morning_state_comparison(
     live_symbols = tpo.get("symbols") if isinstance(tpo.get("symbols"), dict) else {}
 
     audit: dict[str, Any] = {
-        "version": "morning-state-comparison-v2",
+        "version": "morning-state-comparison-v3-direction-scenario",
         "stage": stage,
         "report_date": target_date.isoformat(),
         "morning_artifact": str(morning_path) if morning_path else None,
@@ -5717,8 +5759,20 @@ def _build_morning_state_comparison(
     for symbol in LONDON_SESSION_SYMBOLS:
         before = morning_symbols.get(symbol)
         after = current_symbols.get(symbol)
-        before_behavior, before_watch, before_value = _london_close_state(before)
-        after_behavior, after_watch, after_value = _london_close_state(after)
+        (
+            before_behavior,
+            before_watch,
+            before_value,
+            before_direction,
+            before_scenario,
+        ) = _london_close_state(before)
+        (
+            after_behavior,
+            after_watch,
+            after_value,
+            after_direction,
+            after_scenario,
+        ) = _london_close_state(after)
 
         live_item = live_symbols.get(symbol)
         if isinstance(live_item, dict):
@@ -5735,25 +5789,50 @@ def _build_morning_state_comparison(
             before_behavior != after_behavior
             or before_watch != after_watch
             or before_value != after_value
+            or before_direction != after_direction
+            or before_scenario != after_scenario
         )
         transition = "перехід" if changed else ("без зміни" if before else "без ранкової бази")
+        value_detail = (
+            f" | value={before_value}→{after_value}"
+            if before_value != after_value
+            else ""
+        )
 
         section.lines.append(
             f"• {symbol} — {before_behavior}/{before_watch} → "
-            f"{after_behavior}/{after_watch} | {transition} | close={close_bucket}"
+            f"{after_behavior}/{after_watch} | "
+            f"dir={before_direction}→{after_direction} | "
+            f"scenario={before_scenario}→{after_scenario}"
+            f"{value_detail} | {transition} | close={close_bucket}"
         )
         audit["symbols"][symbol] = {
             "frankfurt": {
                 "open_behavior": before_behavior,
                 "watch_state": before_watch,
                 "value_acceptance_state": before_value,
+                "direction": before_direction,
+                "scenario_state": before_scenario,
             },
             "current": {
                 "open_behavior": after_behavior,
                 "watch_state": after_watch,
                 "value_acceptance_state": after_value,
+                "direction": after_direction,
+                "scenario_state": after_scenario,
                 "briefing_bucket": close_bucket,
             },
+            "changed_fields": [
+                field
+                for field, before_value_field, after_value_field in (
+                    ("open_behavior", before_behavior, after_behavior),
+                    ("watch_state", before_watch, after_watch),
+                    ("value_acceptance_state", before_value, after_value),
+                    ("direction", before_direction, after_direction),
+                    ("scenario_state", before_scenario, after_scenario),
+                )
+                if before_value_field != after_value_field
+            ],
             "changed": changed,
             "transition": transition,
         }

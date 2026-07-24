@@ -10,6 +10,7 @@ from app.services.daily_market_briefing import (
     LONDON_FOCUS_SYMBOLS,
     _build_london_1h_comparison,
     _build_london_close_comparison,
+    _build_suppressed_telegram_section,
     _filter_london_focus_records,
     _macro_affected_symbols_text,
     _section_header_for_type,
@@ -195,6 +196,138 @@ def test_london_1h_comparison_confirms_or_rejects_frankfurt_scenario(
     assert audit["stage"] == "LONDON_1H"
     assert audit["symbols"]["XAUUSD"]["changed"] is True
     assert "London +1h" in section.title
+
+
+def test_london_1h_comparison_detects_direction_and_scenario_reversal(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path))
+    report_dir = tmp_path / "reports" / "briefings"
+    report_dir.mkdir(parents=True)
+    (report_dir / "2026-07-24_morning_combined.json").write_text(
+        json.dumps(
+            {
+                "raw": {
+                    "tpo_audit_snapshot": {
+                        "symbols": {
+                            "ETHUSD": {
+                                "resolved_current_open_behavior": "OPEN_TEST_DRIVE_CANDIDATE",
+                                "tpo_watch_state": "OBSERVE_ONLY",
+                                "value_acceptance_state": "REJECTED_VALUE",
+                                "direction": "DOWN",
+                                "scenario_state": "BEARISH_CONTINUATION_WAIT_RETEST",
+                            }
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    current = {
+        "symbols": {
+            "ETHUSD": {
+                "resolved_current_open_behavior": "OPEN_TEST_DRIVE_CANDIDATE",
+                "tpo_watch_state": "OBSERVE_ONLY",
+                "value_acceptance_state": "REJECTED_VALUE",
+                "direction": "UP",
+                "scenario_state": "BULLISH_CONTINUATION_WAIT_RETEST",
+            }
+        }
+    }
+
+    section, audit = _build_london_1h_comparison(
+        tpo={"symbols": {}},
+        target_date=datetime(2026, 7, 24).date(),
+        current_snapshot=current,
+    )
+    eth_line = next(line for line in section.lines if line.startswith("• ETHUSD"))
+
+    assert audit["symbols"]["ETHUSD"]["changed"] is True
+    assert audit["symbols"]["ETHUSD"]["changed_fields"] == [
+        "direction",
+        "scenario_state",
+    ]
+    assert "dir=DOWN→UP" in eth_line
+    assert (
+        "scenario=BEARISH_CONTINUATION_WAIT_RETEST"
+        "→BULLISH_CONTINUATION_WAIT_RETEST"
+    ) in eth_line
+    assert "перехід" in eth_line
+    assert "без зміни" not in eth_line
+
+
+def test_london_1h_comparison_shows_value_state_when_it_causes_transition(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("RUNTIME_DIR", str(tmp_path))
+    report_dir = tmp_path / "reports" / "briefings"
+    report_dir.mkdir(parents=True)
+    (report_dir / "2026-07-24_morning_combined.json").write_text(
+        json.dumps(
+            {
+                "raw": {
+                    "tpo_audit_snapshot": {
+                        "symbols": {
+                            "XAUUSD": {
+                                "resolved_current_open_behavior": "OPEN_AUCTION_IN_RANGE",
+                                "tpo_watch_state": "RESEARCH_ONLY",
+                                "value_acceptance_state": "INSIDE_VALUE",
+                                "direction": "UNKNOWN",
+                                "scenario_state": "OPEN_AUCTION_IN_RANGE",
+                            }
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    current = {
+        "symbols": {
+            "XAUUSD": {
+                "resolved_current_open_behavior": "OPEN_AUCTION_IN_RANGE",
+                "tpo_watch_state": "RESEARCH_ONLY",
+                "value_acceptance_state": "REJECTED_VALUE",
+                "direction": "UNKNOWN",
+                "scenario_state": "OPEN_AUCTION_IN_RANGE",
+            }
+        }
+    }
+
+    section, audit = _build_london_1h_comparison(
+        tpo={"symbols": {}},
+        target_date=datetime(2026, 7, 24).date(),
+        current_snapshot=current,
+    )
+    xau_line = next(line for line in section.lines if line.startswith("• XAUUSD"))
+
+    assert audit["symbols"]["XAUUSD"]["changed_fields"] == [
+        "value_acceptance_state"
+    ]
+    assert "value=INSIDE_VALUE→REJECTED_VALUE" in xau_line
+    assert "перехід" in xau_line
+
+
+def test_suppressed_statistics_are_labeled_global_legacy(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.services.daily_market_briefing.load_daily_summary",
+        lambda: {
+            "suppressed_telegram_metrics": {
+                "total": 366,
+                "statistics_only_total": 146,
+                "tracked_reasons": {},
+                "by_reason": {},
+                "by_symbol": {},
+            }
+        },
+    )
+
+    section = _build_suppressed_telegram_section()
+
+    assert section.lines[0].startswith("Scope: GLOBAL/LEGACY cumulative telemetry")
 
 
 def test_london_close_positioning_skips_repeated_weekly_cot_without_operational_delta(tmp_path: Path) -> None:

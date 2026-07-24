@@ -104,6 +104,49 @@ def _truncate(text: str, max_len: int) -> str:
     return text[: max_len - 3] + "..."
 
 
+def _telegram_response_details(
+    body: str,
+    *,
+    http_status: int | None,
+    fallback_error: str | None = None,
+    retry_after_header: Any = None,
+) -> dict[str, Any]:
+    parsed: dict[str, Any] = {}
+    try:
+        candidate = json.loads(body) if body else {}
+        if isinstance(candidate, dict):
+            parsed = candidate
+    except json.JSONDecodeError:
+        parsed = {}
+
+    parameters = parsed.get("parameters")
+    if not isinstance(parameters, dict):
+        parameters = {}
+
+    retry_after = parameters.get("retry_after")
+    if retry_after in (None, ""):
+        retry_after = retry_after_header
+    try:
+        retry_after_value = max(0, int(retry_after)) if retry_after not in (None, "") else None
+    except (TypeError, ValueError):
+        retry_after_value = None
+
+    description = str(parsed.get("description") or fallback_error or "").strip() or None
+    error_code = parsed.get("error_code")
+    try:
+        error_code_value = int(error_code) if error_code not in (None, "") else http_status
+    except (TypeError, ValueError):
+        error_code_value = http_status
+
+    return {
+        "ok": bool(parsed.get("ok")) if "ok" in parsed else False,
+        "http_status": http_status,
+        "error_code": error_code_value,
+        "description": description,
+        "retry_after": retry_after_value,
+    }
+
+
 def _escape_html(text: Any) -> str:
     if text is None:
         return "-"
@@ -948,6 +991,7 @@ class TelegramNotifier:
             max_message_length=_safe_int(os.getenv("TELEGRAM_MAX_MESSAGE_LENGTH", "3900"), 3900),
             use_ukrainian_formatter=_env_bool("ENABLE_UKRAINIAN_TELEGRAM_FORMATTER", True),
         )
+        self.last_send_result: dict[str, Any] | None = None
 
     @property
     def is_enabled(self) -> bool:
@@ -964,6 +1008,15 @@ class TelegramNotifier:
     def send_text(self, text: str) -> bool:
         if not self.is_enabled:
             logger.info("Telegram notifier disabled or not configured.")
+            self.last_send_result = {
+                "ok": False,
+                "http_status": None,
+                "error_code": None,
+                "description": "Telegram notifier disabled or not configured.",
+                "retry_after": None,
+                "attempt": 0,
+                "attempts": self.config.retries,
+            }
             return False
 
         safe_text = _truncate(text, self.config.max_message_length)
@@ -978,6 +1031,7 @@ class TelegramNotifier:
 
         encoded = parse.urlencode(payload).encode("utf-8")
         last_error: Optional[Exception] = None
+        self.last_send_result = None
 
         for attempt in range(1, self.config.retries + 1):
             try:
@@ -986,31 +1040,81 @@ class TelegramNotifier:
                     body = resp.read().decode("utf-8", errors="replace")
 
                     if 200 <= resp.status < 300:
-                        logger.info(
-                            "Telegram message sent successfully. attempt=%s status=%s",
-                            attempt,
-                            resp.status,
+                        details = _telegram_response_details(
+                            body,
+                            http_status=resp.status,
                         )
-                        logger.debug("Telegram response body=%s", body)
-                        return True
+                        if details.get("ok") is False and body:
+                            details["attempt"] = attempt
+                            details["attempts"] = self.config.retries
+                            self.last_send_result = details
+                            logger.error(
+                                "Telegram API returned ok=false. attempt=%s/%s status=%s description=%s",
+                                attempt,
+                                self.config.retries,
+                                resp.status,
+                                details.get("description"),
+                            )
+                            if details.get("retry_after") is not None:
+                                break
+                        else:
+                            self.last_send_result = {
+                                "ok": True,
+                                "http_status": resp.status,
+                                "error_code": None,
+                                "description": None,
+                                "retry_after": None,
+                                "attempt": attempt,
+                                "attempts": self.config.retries,
+                            }
+                            logger.info(
+                                "Telegram message sent successfully. attempt=%s status=%s",
+                                attempt,
+                                resp.status,
+                            )
+                            logger.debug("Telegram response body=%s", body)
+                            return True
 
-                    logger.error(
-                        "Telegram send failed. attempt=%s status=%s body=%s",
-                        attempt,
-                        resp.status,
-                        body,
-                    )
+                    else:
+                        details = _telegram_response_details(
+                            body,
+                            http_status=resp.status,
+                            fallback_error=f"Telegram HTTP status {resp.status}",
+                        )
+                        details["attempt"] = attempt
+                        details["attempts"] = self.config.retries
+                        self.last_send_result = details
+                        logger.info(
+                            "Telegram send failed. attempt=%s/%s status=%s description=%s",
+                            attempt,
+                            self.config.retries,
+                            resp.status,
+                            details.get("description"),
+                        )
 
             except error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+                retry_after_header = exc.headers.get("Retry-After") if exc.headers else None
+                details = _telegram_response_details(
+                    body,
+                    http_status=exc.code,
+                    fallback_error=f"Telegram HTTPError {exc.code}",
+                    retry_after_header=retry_after_header,
+                )
+                details["attempt"] = attempt
+                details["attempts"] = self.config.retries
+                self.last_send_result = details
                 logger.error(
-                    "Telegram HTTPError. attempt=%s/%s code=%s body=%s",
+                    "Telegram HTTPError. attempt=%s/%s code=%s description=%s retry_after=%s",
                     attempt,
                     self.config.retries,
                     exc.code,
-                    body,
+                    details.get("description"),
+                    details.get("retry_after"),
                 )
                 last_error = exc
+                if details.get("retry_after") is not None:
+                    break
 
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
@@ -1019,11 +1123,30 @@ class TelegramNotifier:
                     self.config.retries,
                 )
                 last_error = exc
+                self.last_send_result = {
+                    "ok": False,
+                    "http_status": None,
+                    "error_code": None,
+                    "description": f"{type(exc).__name__}: {exc}",
+                    "retry_after": None,
+                    "attempt": attempt,
+                    "attempts": self.config.retries,
+                }
 
             if attempt < self.config.retries:
                 time.sleep(self.config.retry_delay_seconds)
 
         logger.error("Telegram message failed after retries. last_error=%s", last_error)
+        if self.last_send_result is None:
+            self.last_send_result = {
+                "ok": False,
+                "http_status": None,
+                "error_code": None,
+                "description": str(last_error or "Telegram send failed after retries."),
+                "retry_after": None,
+                "attempt": self.config.retries,
+                "attempts": self.config.retries,
+            }
         return False
 
     def send_admin_message(self, text: str) -> bool:
@@ -1435,4 +1558,3 @@ if __name__ == "__main__":
     notifier = build_telegram_notifier()
     text = notifier.format_alert_payload_legacy_html(sample_payload)
     print(text)
-

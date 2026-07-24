@@ -48,7 +48,7 @@ except Exception:  # pragma: no cover
 from app.services.telegram_daily_reporter import send_daily_report
 
 
-WORKER_VERSION = "daily-reporting-worker-v1.4-three-checkpoints"
+WORKER_VERSION = "daily-reporting-worker-v1.5-idempotent-multipart"
 DEFAULT_TIMEZONE = "Europe/Kyiv"
 DEFAULT_JAPAN_TIMEZONE = "Asia/Tokyo"
 DEFAULT_FRANKFURT_TIMEZONE = "Europe/Berlin"
@@ -106,11 +106,18 @@ def _load_state() -> dict[str, Any]:
                 sent = loaded.get("sent")
                 if not isinstance(sent, dict):
                     loaded["sent"] = {}
+                pending = loaded.get("pending_deliveries")
+                if not isinstance(pending, dict):
+                    loaded["pending_deliveries"] = {}
                 loaded["version"] = WORKER_VERSION
                 return loaded
     except Exception:
         pass
-    return {"version": WORKER_VERSION, "sent": {}}
+    return {
+        "version": WORKER_VERSION,
+        "sent": {},
+        "pending_deliveries": {},
+    }
 
 
 def _save_state(state: dict[str, Any]) -> None:
@@ -283,10 +290,25 @@ def _should_send(now_local: datetime, scheduled: ScheduledReport, state: dict[st
         return False
 
     sent = state.get("sent")
-    if not isinstance(sent, dict):
-        return True
+    state_key = _state_key(now_local, scheduled)
+    if isinstance(sent, dict) and state_key in sent:
+        return False
 
-    return _state_key(now_local, scheduled) not in sent
+    pending = state.get("pending_deliveries")
+    pending_delivery = pending.get(state_key) if isinstance(pending, dict) else None
+    if isinstance(pending_delivery, dict):
+        retry_after_utc = str(pending_delivery.get("retry_after_utc") or "").strip()
+        if retry_after_utc:
+            try:
+                retry_at = datetime.fromisoformat(retry_after_utc.replace("Z", "+00:00"))
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) < retry_at.astimezone(timezone.utc):
+                    return False
+            except ValueError:
+                pass
+
+    return True
 
 
 def _run_positioning_checkpoint(
@@ -343,6 +365,32 @@ def _mark_sent(
         "weekend_only": scheduled.weekend_only,
         "result": result,
     }
+    pending = state.get("pending_deliveries")
+    if isinstance(pending, dict):
+        pending.pop(_state_key(now_local, scheduled), None)
+    _save_state(state)
+
+
+def _persist_delivery_progress(
+    now_local: datetime,
+    scheduled: ScheduledReport,
+    progress: dict[str, Any],
+    state: dict[str, Any],
+) -> None:
+    pending = state.setdefault("pending_deliveries", {})
+    if not isinstance(pending, dict):
+        state["pending_deliveries"] = pending = {}
+
+    payload = dict(progress)
+    payload.update(
+        {
+            "report_type": scheduled.report_type,
+            "scheduled_time": scheduled.hhmm,
+            "schedule_timezone": scheduled.schedule_timezone,
+            "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    pending[_state_key(now_local, scheduled)] = payload
     _save_state(state)
 
 
@@ -370,14 +418,45 @@ def run_due_reports_once(
                     report_date=report_date,
                 )
             else:
-                result = send_daily_report(
+                pending = state.get("pending_deliveries")
+                state_key = _state_key(now_local, scheduled)
+                delivery_resume = (
+                    pending.get(state_key)
+                    if isinstance(pending, dict)
+                    and isinstance(pending.get(state_key), dict)
+                    else None
+                )
+
+                def persist_progress(progress: dict[str, Any]) -> None:
+                    _persist_delivery_progress(
+                        now_local,
+                        scheduled,
+                        progress,
+                        state,
+                    )
+
+                reporter_result = send_daily_report(
                     report_type=scheduled.report_type,
                     report_date=report_date,
                     timezone_name=tz_name,
                     dry_run=dry_run,
                     refresh=True,
                     include_tpo_refresh=scheduled.refresh_tpo,
-                ).to_dict()
+                    delivery_resume=delivery_resume,
+                    delivery_progress_callback=None if dry_run else persist_progress,
+                )
+                result = reporter_result.to_dict()
+                if (
+                    not dry_run
+                    and result.get("status") != "ok"
+                    and isinstance(reporter_result.pending_delivery, dict)
+                ):
+                    _persist_delivery_progress(
+                        now_local,
+                        scheduled,
+                        reporter_result.pending_delivery,
+                        state,
+                    )
         except Exception as exc:
             result = {
                 "version": WORKER_VERSION,
