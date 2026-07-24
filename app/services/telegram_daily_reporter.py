@@ -16,13 +16,14 @@ Report types:
 
 import json
 import copy
+import hashlib
 import os
 import subprocess
 import sys
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from app.services.daily_market_briefing import (
@@ -33,7 +34,7 @@ from app.services.daily_market_briefing import (
 from app.services.telegram_notifier import TelegramNotifier
 
 
-REPORTER_VERSION = "telegram-daily-reporter-v1.6-three-checkpoint-cycle"
+REPORTER_VERSION = "telegram-daily-reporter-v1.7-idempotent-multipart"
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -140,8 +141,10 @@ class ReporterResult:
     refresh_results: list[dict[str, Any]]
     telegram_main_parts: int = 0
     telegram_main_part_lengths: list[int] | None = None
+    telegram_delivery: dict[str, Any] | None = None
     positioning_delivery: dict[str, Any] | None = None
     error_message: str | None = None
+    pending_delivery: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -154,6 +157,7 @@ class ReporterResult:
             "message_length": self.message_length,
             "telegram_main_parts": self.telegram_main_parts,
             "telegram_main_part_lengths": self.telegram_main_part_lengths or [],
+            "telegram_delivery": self.telegram_delivery,
             "artifact_json": self.artifact_json,
             "artifact_text": self.artifact_text,
             "refresh_results": self.refresh_results,
@@ -344,39 +348,145 @@ def _hard_split_text(text: str, limit: int) -> list[str]:
     return out
 
 
+def _main_telegram_parts(
+    message: str,
+    *,
+    split_limit: int | None = None,
+) -> list[str]:
+    chunks = _split_main_telegram_message(message, max_chars=split_limit)
+    total = len(chunks)
+    if total <= 1:
+        return chunks
+    return [
+        f"{chunk}\n\n<i>Main briefing part {idx}/{total}</i>"
+        for idx, chunk in enumerate(chunks, start=1)
+    ]
+
+
+def _delivery_id(parts: list[str]) -> str:
+    payload = "\x00".join(parts).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _retry_after_utc(retry_after_seconds: Any) -> str | None:
+    try:
+        seconds = max(0, int(retry_after_seconds))
+    except (TypeError, ValueError):
+        return None
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+
+
+def _public_delivery_summary(delivery: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in delivery.items()
+        if key not in {"parts", "refresh_results"}
+    }
+
+
 def _send_main_telegram_message(
     notifier: TelegramNotifier,
     message: str,
     *,
     split_limit: int | None = None,
-) -> tuple[bool, list[int]]:
+    resume: dict[str, Any] | None = None,
+    progress_context: dict[str, Any] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     """
-    Send main market briefing in safe chunks.
+    Send or resume the main market briefing in safe chunks.
 
-    Returns:
-    - overall send status
-    - list of sent/attempted chunk lengths
+    Exact prepared part payloads and cumulative completion are exposed to the
+    worker callback before part 1 and after every attempt. This lets the
+    persistent worker state resume at the first unsent part without repeating
+    already delivered parts.
     """
-    chunks = _split_main_telegram_message(message, max_chars=split_limit)
+    resume_parts = resume.get("parts") if isinstance(resume, dict) else None
+    if isinstance(resume_parts, list) and resume_parts and all(
+        isinstance(part, str) and part.strip() for part in resume_parts
+    ):
+        parts = list(resume_parts)
+    else:
+        parts = _main_telegram_parts(message, split_limit=split_limit)
 
-    if not chunks:
-        return False, []
+    total = len(parts)
+    if not parts:
+        return {
+            "version": "telegram-main-delivery-v1",
+            "ok": False,
+            "delivery_id": None,
+            "total_parts": 0,
+            "completed_parts": 0,
+            "sent_parts_this_attempt": 0,
+            "failed_part": None,
+            "api_error": {
+                "description": "empty_telegram_message",
+                "retry_after": None,
+            },
+            "retry_after": None,
+            "retry_after_utc": None,
+            "part_lengths": [],
+            "parts": [],
+        }
 
-    total = len(chunks)
-    lengths: list[int] = []
+    try:
+        completed = int((resume or {}).get("completed_parts") or 0)
+    except (TypeError, ValueError):
+        completed = 0
+    completed = max(0, min(completed, total))
+    delivery_id = _delivery_id(parts)
+    sent_this_attempt = 0
 
-    for idx, chunk in enumerate(chunks, start=1):
-        if total > 1:
-            chunk_text = f"{chunk}\n\n<i>Main briefing part {idx}/{total}</i>"
-        else:
-            chunk_text = chunk
+    def publish(
+        *,
+        ok: bool,
+        failed_part: int | None,
+        api_error: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        retry_after = api_error.get("retry_after") if isinstance(api_error, dict) else None
+        delivery = {
+            "version": "telegram-main-delivery-v1",
+            "ok": ok,
+            "delivery_id": delivery_id,
+            "total_parts": total,
+            "completed_parts": completed,
+            "sent_parts_this_attempt": sent_this_attempt,
+            "failed_part": failed_part,
+            "api_error": api_error,
+            "retry_after": retry_after,
+            "retry_after_utc": _retry_after_utc(retry_after),
+            "part_lengths": [len(part) for part in parts],
+            "parts": parts,
+        }
+        if progress_context:
+            delivery.update(progress_context)
+        if progress_callback is not None:
+            progress_callback(dict(delivery))
+        return delivery
 
-        lengths.append(len(chunk_text))
+    publish(ok=False, failed_part=None, api_error=None)
 
-        if not notifier.send_text(chunk_text):
-            return False, lengths
+    for idx in range(completed, total):
+        part_number = idx + 1
+        if not notifier.send_text(parts[idx]):
+            api_error = getattr(notifier, "last_send_result", None)
+            if not isinstance(api_error, dict):
+                api_error = {
+                    "ok": False,
+                    "description": "telegram_send_failed_without_api_details",
+                    "retry_after": None,
+                }
+            return publish(
+                ok=False,
+                failed_part=part_number,
+                api_error=api_error,
+            )
 
-    return True, lengths
+        completed = part_number
+        sent_this_attempt += 1
+        publish(ok=(completed == total), failed_part=None, api_error=None)
+
+    return publish(ok=True, failed_part=None, api_error=None)
 
 
 
@@ -604,10 +714,91 @@ def send_daily_report(
     send_positioning_report: bool | None = None,
     positioning_max_items: int | None = None,
     positioning_split_limit: int | None = None,
+    delivery_resume: dict[str, Any] | None = None,
+    delivery_progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> ReporterResult:
     refresh_results: list[dict[str, Any]] = []
     runtime_dir = os.getenv("POSITIONING_RUNTIME_DIR") or os.getenv("RUNTIME_DIR")
     resolved_report_date = _resolve_report_date(report_date, timezone_name)
+
+    resume_parts = delivery_resume.get("parts") if isinstance(delivery_resume, dict) else None
+    resume_matches = (
+        not dry_run
+        and isinstance(delivery_resume, dict)
+        and str(delivery_resume.get("stage") or "main") == "main"
+        and str(delivery_resume.get("report_type") or "") == str(report_type)
+        and str(delivery_resume.get("report_date") or "") == resolved_report_date
+        and isinstance(resume_parts, list)
+        and bool(resume_parts)
+    )
+    if resume_matches:
+        notifier = TelegramNotifier()
+        progress_context = {
+            "stage": "main",
+            "report_type": str(report_type),
+            "report_date": resolved_report_date,
+            "message_length": int(delivery_resume.get("message_length") or 0),
+            "artifact_json": delivery_resume.get("artifact_json"),
+            "artifact_text": delivery_resume.get("artifact_text"),
+            "refresh_results": delivery_resume.get("refresh_results") or [],
+        }
+        main_delivery = _send_main_telegram_message(
+            notifier,
+            "",
+            resume=delivery_resume,
+            progress_context=progress_context,
+            progress_callback=delivery_progress_callback,
+        )
+        sent = bool(main_delivery.get("ok"))
+        if sent:
+            positioning_delivery = _send_positioning_second_message(
+                notifier=notifier,
+                report_type=str(report_type),
+                dry_run=False,
+                runtime_dir=runtime_dir,
+                send_positioning_report=send_positioning_report,
+                positioning_max_items=positioning_max_items,
+                positioning_split_limit=positioning_split_limit,
+            )
+        else:
+            positioning_delivery = {
+                "ok": False,
+                "enabled": _positioning_delivery_enabled(
+                    str(report_type),
+                    explicit=send_positioning_report,
+                ),
+                "prepared": 0,
+                "sent": 0,
+                "errors": ["main_telegram_send_failed"],
+                "battle_gate_impact": "none",
+                "telegram_signal_impact": "none",
+            }
+
+        return ReporterResult(
+            status="ok" if sent else "telegram_send_failed",
+            report_type=str(report_type),
+            report_date=resolved_report_date,
+            telegram_sent=sent,
+            dry_run=False,
+            message_length=int(delivery_resume.get("message_length") or 0),
+            telegram_main_parts=int(main_delivery.get("total_parts") or 0),
+            telegram_main_part_lengths=list(main_delivery.get("part_lengths") or []),
+            telegram_delivery=_public_delivery_summary(main_delivery),
+            artifact_json=(
+                str(delivery_resume.get("artifact_json"))
+                if delivery_resume.get("artifact_json")
+                else None
+            ),
+            artifact_text=(
+                str(delivery_resume.get("artifact_text"))
+                if delivery_resume.get("artifact_text")
+                else None
+            ),
+            refresh_results=list(delivery_resume.get("refresh_results") or []),
+            positioning_delivery=positioning_delivery,
+            error_message=None if sent else "telegram_send_failed",
+            pending_delivery=None if sent else main_delivery,
+        )
 
     if refresh:
         refresh_results = refresh_runtime_artifacts(
@@ -659,12 +850,41 @@ def send_daily_report(
     sent = False
     notifier: TelegramNotifier | None = None
     positioning_delivery: dict[str, Any] | None = None
-    main_chunks = _split_main_telegram_message(message)
-    main_part_lengths = [len(chunk) for chunk in main_chunks]
+    main_parts = _main_telegram_parts(message)
+    main_delivery: dict[str, Any] = {
+        "version": "telegram-main-delivery-v1",
+        "ok": True,
+        "dry_run": True,
+        "delivery_id": _delivery_id(main_parts) if main_parts else None,
+        "total_parts": len(main_parts),
+        "completed_parts": len(main_parts),
+        "sent_parts_this_attempt": 0,
+        "failed_part": None,
+        "api_error": None,
+        "retry_after": None,
+        "retry_after_utc": None,
+        "part_lengths": [len(part) for part in main_parts],
+        "parts": main_parts,
+    }
 
     if not dry_run:
         notifier = TelegramNotifier()
-        sent, main_part_lengths = _send_main_telegram_message(notifier, message)
+        progress_context = {
+            "stage": "main",
+            "report_type": report.report_type,
+            "report_date": report.report_date,
+            "message_length": len(message),
+            "artifact_json": str(json_path),
+            "artifact_text": str(txt_path),
+            "refresh_results": refresh_results,
+        }
+        main_delivery = _send_main_telegram_message(
+            notifier,
+            message,
+            progress_context=progress_context,
+            progress_callback=delivery_progress_callback,
+        )
+        sent = bool(main_delivery.get("ok"))
 
     if dry_run or sent:
         positioning_delivery = _send_positioning_second_message(
@@ -694,13 +914,15 @@ def send_daily_report(
         telegram_sent=sent,
         dry_run=dry_run,
         message_length=len(message),
-        telegram_main_parts=len(main_part_lengths),
-        telegram_main_part_lengths=main_part_lengths,
+        telegram_main_parts=int(main_delivery.get("total_parts") or 0),
+        telegram_main_part_lengths=list(main_delivery.get("part_lengths") or []),
+        telegram_delivery=_public_delivery_summary(main_delivery),
         artifact_json=str(json_path),
         artifact_text=str(txt_path),
         refresh_results=refresh_results,
         positioning_delivery=positioning_delivery,
         error_message=None if dry_run or sent else "telegram_send_failed",
+        pending_delivery=None if dry_run or sent else main_delivery,
     )
 
 

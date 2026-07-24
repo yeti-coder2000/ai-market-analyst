@@ -56,6 +56,39 @@ def test_positioning_telegram_report_renders_weekly_cftc_section() -> None:
     assert "Battle Gate: <b>none</b>" in text
 
 
+def test_positioning_report_separates_operational_no_data_from_weekly_cot_ok() -> None:
+    snapshot = {
+        "date": "2026-07-24",
+        "status": "NO_DATA",
+        "items": [],
+        "operational_positioning": {
+            "phase": "UNAVAILABLE",
+            "status": "LIVE_SOURCE_DISABLED",
+            "symbols": {},
+        },
+        "weekly_cot": {
+            "status": "OK",
+            "report_date_latest": "2026-07-21",
+            "items": [
+                {
+                    "symbol": "XAUUSD",
+                    "positions": {},
+                    "normalization": {},
+                    "interpretation": {},
+                    "data_quality": {},
+                }
+            ],
+        },
+    }
+
+    text = render_positioning_telegram_message(snapshot=snapshot)
+
+    assert "Daily/operational status: <b>LIVE_SOURCE_DISABLED</b>" in text
+    assert "Weekly CFTC COT status: <b>OK</b>" in text
+    assert "Operational delta unavailable: live crypto source disabled." in text
+    assert "Operational window was not requested for this report." not in text
+
+
 def test_positioning_telegram_report_renders_frankfurt_delta_previous_day_and_filters_inactive_us_assets() -> None:
     snapshot = {
         "date": "2026-07-22",

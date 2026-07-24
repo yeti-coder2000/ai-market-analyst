@@ -11,7 +11,7 @@ from .positioning_service import get_latest_positioning_context
 from .positioning_store import get_positioning_dir
 
 
-POSITIONING_TELEGRAM_REPORT_VERSION = "positioning-telegram-report-v0.4-three-checkpoint-cycle"
+POSITIONING_TELEGRAM_REPORT_VERSION = "positioning-telegram-report-v0.5-status-separation"
 
 POSITIONING_FOCUS_SYMBOLS: tuple[str, ...] = (
     "GER40",
@@ -82,13 +82,19 @@ def render_positioning_telegram_message(
     operational = source_snapshot.get("operational_positioning")
     if not isinstance(operational, dict):
         operational = {}
+    operational_status = str(
+        operational.get("status")
+        or ("NO_DATA" if not items else status)
+    ).upper()
+    weekly_status = str(weekly_cot.get("status") or "NOT_AVAILABLE").upper()
 
     lines: list[str] = []
 
     lines.append("<b>📊 Positioning Intelligence Briefing</b>")
     lines.append("")
     lines.append(f"Date: <b>{_h(date_value)}</b>")
-    lines.append(f"Status: <b>{_h(status)}</b>")
+    lines.append(f"Daily/operational status: <b>{_h(operational_status)}</b>")
+    lines.append(f"Weekly CFTC COT status: <b>{_h(weekly_status)}</b>")
     if generated_at:
         lines.append(f"Generated: {_h(generated_at)}")
     lines.append(f"Version: {_h(POSITIONING_TELEGRAM_REPORT_VERSION)}")
@@ -473,6 +479,8 @@ def _render_operational_status(operational: dict[str, Any]) -> list[str]:
         "NO_DELTA",
     }:
         out.append("Operational delta unavailable; do not infer intraday participation from weekly COT.")
+    elif status == "LIVE_SOURCE_DISABLED":
+        out.append("Operational delta unavailable: live crypto source disabled.")
     else:
         out.append("Operational window was not requested for this report.")
     if baseline or current:
