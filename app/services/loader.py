@@ -14,6 +14,7 @@ from app.storage.cache_store import ParquetCache
 
 
 STALE_THRESHOLD = {
+    Timeframe.M5: timedelta(minutes=5),
     Timeframe.M15: timedelta(minutes=15),
     Timeframe.M30: timedelta(minutes=30),
     Timeframe.H1: timedelta(hours=1),

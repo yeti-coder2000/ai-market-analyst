@@ -34,7 +34,9 @@ class YFinanceResponseError(YFinanceAdapterError):
     """Raised when yfinance returns no usable OHLC data."""
 
 
-YFINANCE_PROVIDER_ADAPTER_VERSION = "yfinance-provider-adapter-v1.1-intraday-period-symbol-fallback"
+YFINANCE_PROVIDER_ADAPTER_VERSION = (
+    "yfinance-provider-adapter-v1.2-conditional-m5"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,12 +70,14 @@ class YFinanceProviderAdapter:
     # Yahoo intraday history can rate-limit or return empty frames for long
     # periods. Try shorter periods before marking the symbol as stale.
     INTRADAY_PERIOD_FALLBACKS: dict[str, tuple[str, ...]] = {
+        "5m": ("60d", "30d", "10d", "7d", "5d"),
         "15m": ("60d", "30d", "10d", "7d", "5d"),
         "30m": ("60d", "30d", "10d", "7d", "5d"),
     }
 
     # yfinance has no native 4h interval, so H4 is built from 1h bars.
     TIMEFRAME_MAP: dict[Timeframe, tuple[str, str, bool]] = {
+        Timeframe.M5: ("5m", "60d", False),
         Timeframe.M15: ("15m", "60d", False),
         Timeframe.M30: ("30m", "60d", False),
         Timeframe.H1: ("1h", "730d", False),

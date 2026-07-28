@@ -47,6 +47,12 @@ from app.services.ltf_entry_window_detector import (
     LTF_ENTRY_WINDOW_DETECTOR_VERSION,
     detect_ltf_entry_window,
 )
+from app.services.ltf_execution_state_machine import (
+    LTF_EXECUTION_STATE_MACHINE_VERSION,
+    LTFExecutionStateStore,
+    enrich_payload_with_ltf_execution_v2,
+    is_active_tpo_watch,
+)
 from app.services.post_news_continuation_detector import apply_post_news_continuation
 from app.services.signal_tracker import SignalTracker, SignalTrackerResult
 from app.services.telegram_formatter import format_signal_message
@@ -63,7 +69,7 @@ from app.storage.cache_store import ParquetCache
 
 logger = get_logger(__name__, component="stateful_batch_runner")
 
-RUNNER_VERSION = "1.6.2-statistical-shadow-telemetry"
+RUNNER_VERSION = "1.7.0-ltf-execution-state-machine-v2"
 
 # Telegram is a trade-alert channel, not a reconnaissance feed.
 # WATCH / EDGE_FORMING / SCENARIO_FORMING must be persisted to journal/statistics,
@@ -129,6 +135,12 @@ RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
 JOURNAL_FALLBACK_PATH = RUNTIME_DIR / "radar_journal.ndjson"
 SNAPSHOT_FALLBACK_PATH = RUNTIME_DIR / "radar_snapshot_v2.ndjson"
+LTF_EXECUTION_STATE_PATH = Path(
+    os.getenv(
+        "LTF_EXECUTION_STATE_PATH",
+        str(RUNTIME_DIR / "ltf_execution_state_v2.json"),
+    )
+)
 
 # TPO is intentionally NOT calculated inside the live worker.
 # Live worker only reads precomputed auction context from this store.
@@ -1243,6 +1255,9 @@ class StatefulBatchRunner:
             open_signals_path=str(RUNTIME_DIR / "open_signals.json")
         )
         self.telegram = build_telegram_notifier()
+        self.ltf_execution_v2 = LTFExecutionStateStore(
+            path=LTF_EXECUTION_STATE_PATH,
+        )
 
         self.timeframes_by_symbol = timeframes_by_symbol or DEFAULT_TIMEFRAMES_BY_SYMBOL
 
@@ -2046,7 +2061,14 @@ class StatefulBatchRunner:
                 auction_context=analysis.get("auction_context"),
                 auction_filters=analysis.get("auction_filters"),
             )
-            tracker_source_payload = self._enrich_tracker_payload_with_ltf_model_bridge(
+            tracker_source_payload = self._load_m5_for_active_tpo_watch(
+                payload=tracker_source_payload,
+                symbol=symbol,
+                series_by_tf=series_by_tf,
+                load_results=load_results,
+                refreshed_timeframes=refreshed_timeframes,
+            )
+            tracker_source_payload = self._enrich_tracker_payload_with_ltf_execution_v2(
                 payload=tracker_source_payload,
                 series_by_tf=series_by_tf,
             )
@@ -2059,10 +2081,6 @@ class StatefulBatchRunner:
             )
             tracker_source_payload = self._enrich_tracker_payload_with_post_news_otd_bridge(
                 payload=tracker_source_payload,
-            )
-            tracker_source_payload = self._enrich_tracker_payload_with_ltf_entry_window_bridge(
-                payload=tracker_source_payload,
-                series_by_tf=series_by_tf,
             )
 
             tracker_result = self.signal_tracker.process(
@@ -2086,16 +2104,12 @@ class StatefulBatchRunner:
                     auction_context=analysis.get("auction_context"),
                     auction_filters=analysis.get("auction_filters"),
                 )
-                tracker_result.payload = self._enrich_tracker_payload_with_ltf_model_bridge(
+                tracker_result.payload = self._enrich_tracker_payload_with_ltf_execution_v2(
                     payload=tracker_result.payload,
                     series_by_tf=series_by_tf,
                 )
                 tracker_result.payload = self._enrich_tracker_payload_with_post_news_otd_bridge(
                     payload=tracker_result.payload,
-                )
-                tracker_result.payload = self._enrich_tracker_payload_with_ltf_entry_window_bridge(
-                    payload=tracker_result.payload,
-                    series_by_tf=series_by_tf,
                 )
 
             if isinstance(tracker_result.previous_payload, dict):
@@ -2104,16 +2118,8 @@ class StatefulBatchRunner:
                     auction_context=analysis.get("auction_context"),
                     auction_filters=analysis.get("auction_filters"),
                 )
-                tracker_result.previous_payload = self._enrich_tracker_payload_with_ltf_model_bridge(
-                    payload=tracker_result.previous_payload,
-                    series_by_tf=series_by_tf,
-                )
                 tracker_result.previous_payload = self._enrich_tracker_payload_with_post_news_otd_bridge(
                     payload=tracker_result.previous_payload,
-                )
-                tracker_result.previous_payload = self._enrich_tracker_payload_with_ltf_entry_window_bridge(
-                    payload=tracker_result.previous_payload,
-                    series_by_tf=series_by_tf,
                 )
 
             candidate_payload = tracker_result.payload
@@ -2634,6 +2640,183 @@ class StatefulBatchRunner:
             payload["metadata"] = metadata
 
         return payload
+
+
+    def _load_m5_for_active_tpo_watch(
+        self,
+        *,
+        payload: dict[str, Any],
+        symbol: Instrument,
+        series_by_tf: dict[Timeframe, pd.DataFrame],
+        load_results: dict[str, Any],
+        refreshed_timeframes: list[str],
+    ) -> dict[str, Any]:
+        """Load M5 only after the TPO Watch Bridge activates execution watch.
+
+        M5 is intentionally absent from DEFAULT_TIMEFRAMES_BY_SYMBOL.  This
+        second-stage fetch keeps provider usage bounded while ensuring that the
+        authoritative LTF state machine receives causal execution data.
+        """
+        if not isinstance(payload, dict):
+            return {}
+
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+
+        active, reason = is_active_tpo_watch(payload)
+        payload["ltf_m5_requested"] = bool(active)
+        payload["ltf_m5_request_reason"] = reason
+        metadata["ltf_m5_requested"] = bool(active)
+        metadata["ltf_m5_request_reason"] = reason
+
+        if not active:
+            payload["ltf_m5_load_status"] = "NOT_REQUESTED"
+            payload["ltf_candles_available_5m"] = 0
+            metadata["ltf_m5_load_status"] = "NOT_REQUESTED"
+            metadata["ltf_candles_available_5m"] = 0
+            payload["metadata"] = metadata
+            return payload
+
+        existing = series_by_tf.get(Timeframe.M5)
+        if isinstance(existing, pd.DataFrame) and not existing.empty:
+            rows = len(existing)
+            payload["ltf_m5_load_status"] = "ALREADY_LOADED"
+            payload["ltf_candles_available_5m"] = rows
+            metadata["ltf_m5_load_status"] = "ALREADY_LOADED"
+            metadata["ltf_candles_available_5m"] = rows
+            payload["metadata"] = metadata
+            return payload
+
+        try:
+            if not self.simulation_mode:
+                self._ensure_budget_or_wait(credits=1)
+
+            result = self._load_timeframe(symbol, Timeframe.M5)
+            df = getattr(result, "df", None)
+            if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+                raise RuntimeError("M5 loader returned no dataframe")
+
+            series_by_tf[Timeframe.M5] = df
+            source = str(getattr(result, "source", None) or "unknown")
+            rows = int(getattr(result, "rows", len(df)) or len(df))
+
+            if source == "api":
+                self.budget.spend(1)
+                if Timeframe.M5.value not in refreshed_timeframes:
+                    refreshed_timeframes.append(Timeframe.M5.value)
+
+            load_results[Timeframe.M5.value] = {
+                "source": source,
+                "rows": rows,
+                "last_ts": getattr(result, "last_ts", None),
+                "last_close": getattr(result, "last_close", None),
+                "conditional_tpo_watch_load": True,
+            }
+
+            load_status = (
+                "LOADED_FROM_API"
+                if source == "api"
+                else "LOADED_FROM_CACHE"
+            )
+            payload["ltf_m5_load_status"] = load_status
+            payload["ltf_candles_available_5m"] = rows
+            payload["ltf_m5_last_ts"] = getattr(result, "last_ts", None)
+            metadata["ltf_m5_load_status"] = load_status
+            metadata["ltf_candles_available_5m"] = rows
+            metadata["ltf_m5_last_ts"] = getattr(result, "last_ts", None)
+
+        except Exception as error:  # noqa: BLE001
+            logger.exception(
+                "Conditional M5 load failed. symbol=%s error_type=%s",
+                symbol.value,
+                type(error).__name__,
+            )
+            payload["ltf_m5_load_status"] = "FAILED"
+            payload["ltf_m5_load_error_type"] = type(error).__name__
+            payload["ltf_candles_available_5m"] = 0
+            metadata["ltf_m5_load_status"] = "FAILED"
+            metadata["ltf_m5_load_error_type"] = type(error).__name__
+            metadata["ltf_candles_available_5m"] = 0
+
+        metadata["ltf_execution_state_machine_version"] = (
+            LTF_EXECUTION_STATE_MACHINE_VERSION
+        )
+        payload["metadata"] = metadata
+        return payload
+
+
+    def _enrich_tracker_payload_with_ltf_execution_v2(
+        self,
+        *,
+        payload: dict[str, Any],
+        series_by_tf: dict[Timeframe, pd.DataFrame] | None,
+    ) -> dict[str, Any]:
+        """Apply the one authoritative causal LTF state machine.
+
+        The legacy 15m detector and entry-window detector remain importable for
+        historical telemetry/tests, but neither controls PENDING -> READY in the
+        production runner after this bridge.
+        """
+        if not isinstance(payload, dict):
+            return {}
+
+        try:
+            df_5m = self._get_series_by_timeframe_alias(
+                series_by_tf,
+                "M5",
+                "5m",
+                "5min",
+                "5",
+            )
+            df_15m = self._get_series_by_timeframe_alias(
+                series_by_tf,
+                "M15",
+                "15m",
+                "15min",
+                "15",
+            )
+            enriched = enrich_payload_with_ltf_execution_v2(
+                payload,
+                df_5m=df_5m,
+                df_15m=df_15m,
+                store=self.ltf_execution_v2,
+                persist=True,
+            )
+            metadata = enriched.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata["ltf_model_bridge_status"] = enriched.get(
+                "ltf_model_state"
+            )
+            metadata["ltf_model_bridge_reason"] = enriched.get(
+                "trigger_reason"
+            )
+            metadata["ltf_execution_v2_authoritative"] = True
+            metadata["runner_version"] = RUNNER_VERSION
+            enriched["metadata"] = metadata
+            return enriched
+
+        except Exception as error:  # noqa: BLE001
+            logger.exception(
+                "LTF execution state machine v2 enrichment failed. symbol=%s error_type=%s",
+                payload.get("symbol") or payload.get("instrument"),
+                type(error).__name__,
+            )
+            metadata = payload.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata["ltf_execution_v2_error_type"] = type(error).__name__
+            metadata["ltf_execution_v2_authoritative"] = True
+            metadata["runner_version"] = RUNNER_VERSION
+            payload["metadata"] = metadata
+            payload["ltf_model_state"] = "PENDING"
+            payload["ltf_model_state_full"] = "LTF_MODEL_PENDING"
+            payload["ltf_model_outcome"] = "PENDING_LTF_V2_RUNTIME_ERROR"
+            payload["execution_status"] = "NOT_EXECUTABLE"
+            payload["signal_class"] = "WATCH"
+            payload["status"] = "WATCH"
+            return payload
 
 
     def _enrich_tracker_payload_with_ltf_model_bridge(
