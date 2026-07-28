@@ -119,6 +119,9 @@ def _active_symbols() -> list[str]:
             normalized = str(symbol).upper()
             if normalized not in ordered:
                 ordered.append(normalized)
+    for symbol in (*TWELVEDATA_SYMBOLS, *YFINANCE_SYMBOLS):
+        if symbol not in ordered:
+            ordered.append(symbol)
     return ordered
 
 

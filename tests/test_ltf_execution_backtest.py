@@ -121,10 +121,9 @@ class LtfExecutionBacktestTest(unittest.TestCase):
         self.assertEqual(YFINANCE_SYMBOLS["NAS100"], ("^NDX",))
         self.assertEqual(YFINANCE_SYMBOLS["SPX500"], ("^GSPC",))
         self.assertEqual(YFINANCE_SYMBOLS["UKOIL"], ("BZ=F",))
-        self.assertFalse(
-            set(_active_symbols()).difference(TWELVEDATA_SYMBOLS).difference(
-                YFINANCE_SYMBOLS
-            )
+        self.assertEqual(
+            set(_active_symbols()),
+            set(TWELVEDATA_SYMBOLS) | set(YFINANCE_SYMBOLS),
         )
 
     def test_operational_positioning_uses_only_persisted_snapshots(self) -> None:
