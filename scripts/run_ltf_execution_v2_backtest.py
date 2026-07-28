@@ -38,7 +38,9 @@ from app.services.ltf_execution_backtest import (
 )
 
 
-RUNNER_VERSION = "ltf-execution-v2-provider-depth-runner-v1.0"
+RUNNER_VERSION = (
+    "ltf-execution-v2-provider-depth-runner-v1.1-approved-depth-positioning"
+)
 DEFAULT_OUTPUT_ROOT = Path(
     os.getenv(
         "LTF_V2_BACKTEST_OUTPUT_ROOT",
@@ -47,6 +49,14 @@ DEFAULT_OUTPUT_ROOT = Path(
 )
 DEFAULT_TWELVEDATA_OUTPUTSIZE = 5000
 DEFAULT_PROVIDER_PAUSE_SECONDS = 1.6
+DEFAULT_TWELVEDATA_LOOKBACK_DAYS = 730
+DEFAULT_CFTC_LOOKBACK_WEEKS = 156
+DEFAULT_OPERATIONAL_HISTORY_PATH = Path(
+    os.getenv(
+        "POSITIONING_HISTORY_PATH",
+        "/var/data/runtime/positioning/daily_positioning_history.jsonl",
+    )
+)
 MAX_PROVIDER_PAGES_PER_SYMBOL = 5000
 
 TWELVEDATA_SYMBOLS: dict[str, str] = {
@@ -62,6 +72,9 @@ TWELVEDATA_SYMBOLS: dict[str, str] = {
 }
 YFINANCE_SYMBOLS: dict[str, tuple[str, ...]] = {
     "GER40": ("^GDAXI", "EXS1.DE", "DAX"),
+    "NAS100": ("^NDX",),
+    "SPX500": ("^GSPC",),
+    "UKOIL": ("BZ=F",),
 }
 
 SENSITIVE_KEY_FRAGMENTS = (
@@ -293,9 +306,12 @@ def fetch_twelvedata_max_history(
     end_utc: datetime,
     pause_seconds: float,
     outputsize: int = DEFAULT_TWELVEDATA_OUTPUTSIZE,
+    lookback_days: int = DEFAULT_TWELVEDATA_LOOKBACK_DAYS,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     provider_symbol = TWELVEDATA_SYMBOLS[symbol]
     earliest = fetch_twelvedata_earliest(symbol, api_key=api_key)
+    requested_start = end_utc - timedelta(days=max(1, int(lookback_days)))
+    effective_start = max(earliest, requested_start)
     cursor_end = end_utc
     frames: list[pd.DataFrame] = []
     request_count = 1  # earliest_timestamp
@@ -304,8 +320,8 @@ def fetch_twelvedata_max_history(
     pagination_stop_reason: str | None = None
 
     for page in range(1, MAX_PROVIDER_PAGES_PER_SYMBOL + 1):
-        if cursor_end < earliest:
-            pagination_stop_reason = "CURSOR_REACHED_EARLIEST_BOUNDARY"
+        if cursor_end < effective_start:
+            pagination_stop_reason = "CURSOR_REACHED_REQUESTED_BOUNDARY"
             break
         if request_count > 1 and pause_seconds > 0:
             time.sleep(pause_seconds)
@@ -337,7 +353,10 @@ def fetch_twelvedata_max_history(
             symbol=symbol,
         )
         normalized = normalized.loc[
-            (pd.to_datetime(normalized["bar_open_utc"], utc=True) >= pd.Timestamp(earliest))
+            (
+                pd.to_datetime(normalized["bar_open_utc"], utc=True)
+                >= pd.Timestamp(effective_start)
+            )
             & (
                 pd.to_datetime(normalized["bar_open_utc"], utc=True)
                 <= pd.Timestamp(end_utc)
@@ -355,8 +374,12 @@ def fetch_twelvedata_max_history(
                 f"Twelve Data pagination made no backward progress for symbol={symbol}"
             )
         previous_oldest = oldest
-        if oldest <= earliest + timedelta(minutes=5):
-            pagination_stop_reason = "PROVIDER_EARLIEST_REACHED"
+        if oldest <= effective_start + timedelta(minutes=5):
+            pagination_stop_reason = (
+                "PROVIDER_EARLIEST_REACHED"
+                if effective_start == earliest
+                else "REQUESTED_LOOKBACK_REACHED"
+            )
             break
         cursor_end = oldest - timedelta(minutes=5)
     else:
@@ -376,7 +399,9 @@ def fetch_twelvedata_max_history(
         "provider": "twelvedata",
         "provider_symbol": provider_symbol,
         "provider_earliest_5m_utc": earliest.isoformat(),
+        "requested_start_utc": requested_start.isoformat(),
         "requested_end_utc": end_utc.isoformat(),
+        "requested_lookback_days": int(lookback_days),
         "delivered_first_bar_utc": delivered_first.isoformat(),
         "delivered_last_bar_utc": delivered_last.isoformat(),
         "delivered_rows": len(history),
@@ -386,6 +411,9 @@ def fetch_twelvedata_max_history(
         "page_row_max": max(page_rows) if page_rows else 0,
         "reached_provider_earliest": (
             delivered_first <= earliest + timedelta(minutes=5)
+        ),
+        "reached_requested_start": (
+            delivered_first <= effective_start + timedelta(minutes=5)
         ),
         "pagination_stop_reason": pagination_stop_reason,
         "history_sha256": _frame_sha256(history),
@@ -421,8 +449,7 @@ def fetch_yfinance_max_history(
         try:
             raw = yf.download(
                 ticker,
-                start=requested_start,
-                end=end_utc + timedelta(minutes=5),
+                period="60d",
                 interval="5m",
                 progress=False,
                 auto_adjust=False,
@@ -430,6 +457,14 @@ def fetch_yfinance_max_history(
                 timeout=45,
             )
             normalized = _normalize_provider_frame(raw, symbol=symbol)
+            if not normalized.empty:
+                normalized = normalized.loc[
+                    pd.to_datetime(
+                        normalized["bar_open_utc"],
+                        utc=True,
+                    )
+                    <= pd.Timestamp(end_utc)
+                ]
         except Exception as error:  # noqa: BLE001
             attempt["error_type"] = type(error).__name__
             attempts.append(attempt)
@@ -468,6 +503,7 @@ def fetch_symbol_history(
     end_utc: datetime,
     pause_seconds: float,
     yfinance_cache_dir: Path,
+    twelvedata_lookback_days: int = DEFAULT_TWELVEDATA_LOOKBACK_DAYS,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     if symbol in TWELVEDATA_SYMBOLS:
         api_key = os.getenv("TWELVEDATA_API_KEY")
@@ -480,6 +516,7 @@ def fetch_symbol_history(
             api_key=api_key,
             end_utc=end_utc,
             pause_seconds=pause_seconds,
+            lookback_days=twelvedata_lookback_days,
         )
     if symbol in YFINANCE_SYMBOLS:
         return fetch_yfinance_max_history(
@@ -499,6 +536,7 @@ def fetch_all_histories(
     pause_seconds: float,
     allow_network_fetch: bool,
     resume: bool,
+    twelvedata_lookback_days: int = DEFAULT_TWELVEDATA_LOOKBACK_DAYS,
 ) -> dict[str, Any]:
     if not allow_network_fetch:
         raise ProviderDepthBacktestError(
@@ -549,6 +587,7 @@ def fetch_all_histories(
                 end_utc=end_utc,
                 pause_seconds=pause_seconds,
                 yfinance_cache_dir=run_dir / "yfinance-cache",
+                twelvedata_lookback_days=twelvedata_lookback_days,
             )
             _atomic_parquet(history_path, history)
             audit = {
@@ -601,6 +640,220 @@ def fetch_all_histories(
         "version": RUNNER_VERSION,
         "updated_at_utc": datetime.now(UTC).isoformat(),
         "symbols": coverage_by_symbol,
+    }
+
+
+def _has_positioning_field(value: Any, field_names: set[str]) -> bool:
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if str(key) in field_names and nested not in (None, ""):
+                return True
+            if _has_positioning_field(nested, field_names):
+                return True
+    elif isinstance(value, list):
+        return any(
+            _has_positioning_field(nested, field_names)
+            for nested in value
+        )
+    return False
+
+
+def summarize_operational_positioning_history(
+    history_path: Path,
+) -> dict[str, Any]:
+    """Summarize only snapshots that were actually persisted in production."""
+
+    if not history_path.exists():
+        return {
+            "status": "NO_HISTORICAL_SNAPSHOTS",
+            "snapshot_count": 0,
+            "earliest_snapshot_utc": None,
+            "latest_snapshot_utc": None,
+            "symbols": {},
+            "battle_gate_impact": "none",
+            "telegram_signal_impact": "none",
+        }
+
+    oi_fields = {
+        "open_interest",
+        "open_interest_change_pct",
+        "perp_open_interest_change_pct",
+        "cme_open_interest_change_pct",
+    }
+    funding_fields = {"funding_rate", "funding_rate_pct"}
+    timestamps: list[str] = []
+    parsed_snapshots = 0
+    snapshots_with_oi = 0
+    snapshots_with_funding = 0
+    symbol_counts: dict[str, dict[str, int]] = {}
+    invalid_lines = 0
+
+    with history_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            text = line.strip()
+            if not text:
+                continue
+            try:
+                snapshot = json.loads(text)
+            except json.JSONDecodeError:
+                invalid_lines += 1
+                continue
+            if not isinstance(snapshot, Mapping):
+                invalid_lines += 1
+                continue
+
+            parsed_snapshots += 1
+            timestamp = str(
+                snapshot.get("generated_at")
+                or snapshot.get("date")
+                or ""
+            ).strip()
+            if timestamp:
+                timestamps.append(timestamp)
+
+            snapshot_has_oi = False
+            snapshot_has_funding = False
+            items = snapshot.get("items")
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, Mapping):
+                    continue
+                symbol = str(item.get("symbol") or "").strip().upper()
+                if not symbol:
+                    continue
+                counts = symbol_counts.setdefault(
+                    symbol,
+                    {
+                        "snapshot_count": 0,
+                        "oi_snapshot_count": 0,
+                        "funding_snapshot_count": 0,
+                    },
+                )
+                counts["snapshot_count"] += 1
+                has_oi = _has_positioning_field(item, oi_fields)
+                has_funding = _has_positioning_field(item, funding_fields)
+                if has_oi:
+                    counts["oi_snapshot_count"] += 1
+                    snapshot_has_oi = True
+                if has_funding:
+                    counts["funding_snapshot_count"] += 1
+                    snapshot_has_funding = True
+
+            if snapshot_has_oi:
+                snapshots_with_oi += 1
+            if snapshot_has_funding:
+                snapshots_with_funding += 1
+
+    if parsed_snapshots == 0:
+        status = "NO_HISTORICAL_SNAPSHOTS"
+    elif snapshots_with_oi or snapshots_with_funding:
+        status = "AVAILABLE"
+    else:
+        status = "SNAPSHOTS_WITHOUT_OI_FUNDING"
+
+    timestamps.sort()
+    return {
+        "status": status,
+        "snapshot_count": parsed_snapshots,
+        "snapshots_with_open_interest": snapshots_with_oi,
+        "snapshots_with_funding": snapshots_with_funding,
+        "earliest_snapshot_utc": timestamps[0] if timestamps else None,
+        "latest_snapshot_utc": timestamps[-1] if timestamps else None,
+        "invalid_lines": invalid_lines,
+        "symbols": dict(sorted(symbol_counts.items())),
+        "usage": (
+            "coverage_only_where_persisted; no historical values were "
+            "reconstructed"
+        ),
+        "battle_gate_impact": "none",
+        "telegram_signal_impact": "none",
+    }
+
+
+def collect_positioning_coverage(
+    *,
+    target_date: str,
+    cot_lookback_weeks: int,
+    operational_history_path: Path,
+) -> dict[str, Any]:
+    """Collect slow COT coverage and persisted operational snapshot coverage."""
+
+    try:
+        from app.services.positioning.collectors.cftc_cot_collector import (
+            collect_cftc_cot_snapshot,
+        )
+
+        cot = collect_cftc_cot_snapshot(
+            target_date=target_date,
+            lookback_weeks=cot_lookback_weeks,
+        )
+        cot_items = []
+        for item in cot.get("items") or []:
+            if not isinstance(item, Mapping):
+                continue
+            normalization = (
+                item.get("normalization")
+                if isinstance(item.get("normalization"), Mapping)
+                else {}
+            )
+            interpretation = (
+                item.get("interpretation")
+                if isinstance(item.get("interpretation"), Mapping)
+                else {}
+            )
+            quality = (
+                item.get("data_quality")
+                if isinstance(item.get("data_quality"), Mapping)
+                else {}
+            )
+            cot_items.append(
+                {
+                    "symbol": item.get("symbol"),
+                    "report_date": item.get("report_date"),
+                    "history_weeks": item.get("history_weeks"),
+                    "lookback_weeks_requested": normalization.get(
+                        "lookback_weeks_requested"
+                    ),
+                    "primary_tag": interpretation.get("primary_tag"),
+                    "data_quality": quality.get("status"),
+                }
+            )
+        weekly_cot = {
+            "status": cot.get("status"),
+            "requested_lookback_weeks": cot_lookback_weeks,
+            "report_date_latest": cot.get("report_date_latest"),
+            "symbol_count": len(cot_items),
+            "symbols": cot_items,
+            "usage": (
+                "slow_context_coverage_only; excluded from execution winrate "
+                "because COT has no Battle Gate or Telegram signal impact"
+            ),
+            "battle_gate_impact": "none",
+            "telegram_signal_impact": "none",
+        }
+    except Exception as error:  # noqa: BLE001
+        weekly_cot = {
+            "status": "ERROR",
+            "requested_lookback_weeks": cot_lookback_weeks,
+            "report_date_latest": None,
+            "symbol_count": 0,
+            "symbols": [],
+            "error_type": type(error).__name__,
+            "error": str(error)[:240],
+            "battle_gate_impact": "none",
+            "telegram_signal_impact": "none",
+        }
+
+    return {
+        "weekly_cot": weekly_cot,
+        "operational_oi_funding": summarize_operational_positioning_history(
+            operational_history_path
+        ),
+        "winrate_policy": (
+            "positioning is reported as research-only coverage and does not "
+            "alter the core LTF execution winrate"
+        ),
     }
 
 
@@ -761,6 +1014,35 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
             )
         )
 
+    positioning = (
+        report.get("positioning_coverage")
+        if isinstance(report.get("positioning_coverage"), Mapping)
+        else {}
+    )
+    weekly_cot = (
+        positioning.get("weekly_cot")
+        if isinstance(positioning.get("weekly_cot"), Mapping)
+        else {}
+    )
+    operational = (
+        positioning.get("operational_oi_funding")
+        if isinstance(positioning.get("operational_oi_funding"), Mapping)
+        else {}
+    )
+    cot_rows = []
+    for item in weekly_cot.get("symbols") or []:
+        if not isinstance(item, Mapping):
+            continue
+        cot_rows.append(
+            "| {symbol} | {weeks} | {report_date} | {tag} | {quality} |".format(
+                symbol=item.get("symbol"),
+                weeks=item.get("history_weeks"),
+                report_date=item.get("report_date"),
+                tag=item.get("primary_tag"),
+                quality=item.get("data_quality"),
+            )
+        )
+
     limitations = report.get("research_scope") or {}
     return "\n".join(
         [
@@ -794,6 +1076,22 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
             "| Symbol | Candidates | Ready | Filled | Win rate | Avg R |",
             "|---|---:|---:|---:|---:|---:|",
             *by_symbol_rows,
+            "",
+            "## Positioning coverage",
+            "",
+            f"- Weekly COT status: `{weekly_cot.get('status')}`; requested "
+            f"lookback: `{weekly_cot.get('requested_lookback_weeks')}` weeks; "
+            f"latest report: `{weekly_cot.get('report_date_latest')}`.",
+            f"- Operational OI/funding status: `{operational.get('status')}`; "
+            f"persisted snapshots: `{operational.get('snapshot_count')}`; "
+            f"with OI: `{operational.get('snapshots_with_open_interest')}`; "
+            f"with funding: `{operational.get('snapshots_with_funding')}`.",
+            "- Positioning remains research-only and is excluded from the core "
+            "LTF execution winrate.",
+            "",
+            "| Symbol | COT weeks | Latest report | Current tag | Quality |",
+            "|---|---:|---|---|---|",
+            *cot_rows,
             "",
             "## Interpretation limits",
             "",
@@ -877,6 +1175,22 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_PROVIDER_PAUSE_SECONDS,
         type=float,
     )
+    parser.add_argument(
+        "--twelvedata-lookback-days",
+        default=DEFAULT_TWELVEDATA_LOOKBACK_DAYS,
+        type=int,
+        help="Twelve Data M5 research window; approved range is 365-730 days.",
+    )
+    parser.add_argument(
+        "--cot-lookback-weeks",
+        default=DEFAULT_CFTC_LOOKBACK_WEEKS,
+        type=int,
+    )
+    parser.add_argument(
+        "--operational-history-path",
+        default=DEFAULT_OPERATIONAL_HISTORY_PATH,
+        type=Path,
+    )
     parser.add_argument("--holdout-fraction", default=0.30, type=float)
     parser.add_argument("--allow-network-fetch", action="store_true")
     parser.add_argument("--resume", action="store_true")
@@ -893,6 +1207,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.provider_pause_seconds < 0:
         raise ProviderDepthBacktestError(
             "provider pause seconds cannot be negative"
+        )
+    if not 365 <= args.twelvedata_lookback_days <= 730:
+        raise ProviderDepthBacktestError(
+            "Twelve Data lookback must be between 365 and 730 days"
+        )
+    if args.cot_lookback_weeks != DEFAULT_CFTC_LOOKBACK_WEEKS:
+        raise ProviderDepthBacktestError(
+            f"COT lookback must be {DEFAULT_CFTC_LOOKBACK_WEEKS} weeks"
         )
     symbols = [
         item.strip().upper()
@@ -928,6 +1250,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             pause_seconds=args.provider_pause_seconds,
             allow_network_fetch=args.allow_network_fetch,
             resume=args.resume,
+            twelvedata_lookback_days=args.twelvedata_lookback_days,
         )
 
     report = run_streamed_backtest(
@@ -935,6 +1258,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         symbols=symbols,
         provider_manifest=provider_manifest,
         holdout_fraction=args.holdout_fraction,
+    )
+    report["positioning_coverage"] = collect_positioning_coverage(
+        target_date=_closed_m5_now().date().isoformat(),
+        cot_lookback_weeks=args.cot_lookback_weeks,
+        operational_history_path=args.operational_history_path,
     )
     artifacts = write_report_artifacts(run_dir=run_dir, report=report)
     result = {

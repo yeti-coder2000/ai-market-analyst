@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -16,8 +17,12 @@ from app.services.ltf_execution_backtest import (
 )
 from scripts.run_ltf_execution_v2_backtest import (
     ProviderDepthBacktestError,
+    TWELVEDATA_SYMBOLS,
+    YFINANCE_SYMBOLS,
+    _active_symbols,
     fetch_all_histories,
     fetch_twelvedata_max_history,
+    summarize_operational_positioning_history,
 )
 
 
@@ -108,6 +113,86 @@ def _candidate() -> HistoricalWatchCandidate:
 
 
 class LtfExecutionBacktestTest(unittest.TestCase):
+    def test_yfinance_depth_scope_covers_all_approved_symbols(self) -> None:
+        self.assertEqual(
+            set(YFINANCE_SYMBOLS),
+            {"GER40", "NAS100", "SPX500", "UKOIL"},
+        )
+        self.assertEqual(YFINANCE_SYMBOLS["NAS100"], ("^NDX",))
+        self.assertEqual(YFINANCE_SYMBOLS["SPX500"], ("^GSPC",))
+        self.assertEqual(YFINANCE_SYMBOLS["UKOIL"], ("BZ=F",))
+        self.assertFalse(
+            set(_active_symbols()).difference(TWELVEDATA_SYMBOLS).difference(
+                YFINANCE_SYMBOLS
+            )
+        )
+
+    def test_operational_positioning_uses_only_persisted_snapshots(self) -> None:
+        snapshots = [
+            {
+                "generated_at": "2026-07-24T08:00:00+00:00",
+                "items": [
+                    {
+                        "symbol": "BTCUSD",
+                        "raw_source": {
+                            "open_interest": 1000.0,
+                            "funding_rate_pct": 0.01,
+                        },
+                    },
+                    {
+                        "symbol": "ETHUSD",
+                        "raw_source": {"open_interest": 500.0},
+                    },
+                ],
+            },
+            {
+                "generated_at": "2026-07-25T08:00:00+00:00",
+                "items": [
+                    {
+                        "symbol": "BTCUSD",
+                        "daily_market_data": {
+                            "open_interest_change_pct": 2.5,
+                        },
+                    }
+                ],
+            },
+        ]
+        with tempfile.TemporaryDirectory(prefix="positioning-history-") as tmp:
+            path = Path(tmp) / "daily_positioning_history.jsonl"
+            path.write_text(
+                "\n".join(json.dumps(item) for item in snapshots) + "\n",
+                encoding="utf-8",
+            )
+
+            summary = summarize_operational_positioning_history(path)
+
+        self.assertEqual(summary["status"], "AVAILABLE")
+        self.assertEqual(summary["snapshot_count"], 2)
+        self.assertEqual(summary["snapshots_with_open_interest"], 2)
+        self.assertEqual(summary["snapshots_with_funding"], 1)
+        self.assertEqual(
+            summary["symbols"]["BTCUSD"]["oi_snapshot_count"],
+            2,
+        )
+        self.assertEqual(
+            summary["symbols"]["BTCUSD"]["funding_snapshot_count"],
+            1,
+        )
+        self.assertEqual(
+            summary["symbols"]["ETHUSD"]["oi_snapshot_count"],
+            1,
+        )
+
+    def test_operational_positioning_does_not_invent_missing_history(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="positioning-history-") as tmp:
+            missing = Path(tmp) / "missing.jsonl"
+            summary = summarize_operational_positioning_history(missing)
+
+        self.assertEqual(summary["status"], "NO_HISTORICAL_SNAPSHOTS")
+        self.assertEqual(summary["snapshot_count"], 0)
+
     def test_replay_is_causal_and_scores_future_limit_fill(self) -> None:
         candidate = _candidate()
         row = replay_candidate(candidate, _history())
