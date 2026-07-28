@@ -63,6 +63,7 @@ class TwelveDataProviderAdapter:
     }
 
     TIMEFRAME_MAP: dict[Timeframe, str] = {
+        Timeframe.M5: "5min",
         Timeframe.M15: "15min",
         Timeframe.M30: "30min",
         Timeframe.H1: "1h",

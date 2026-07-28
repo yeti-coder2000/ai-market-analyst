@@ -1,0 +1,954 @@
+from __future__ import annotations
+
+"""Fetch maximum available M5 history and replay LTF Execution v2.
+
+The command is research-only.  It writes isolated, versioned artifacts under
+``/var/data/runtime/research`` by default and never mutates production cache,
+signal state, Battle Gate state, or Telegram delivery state.
+
+Twelve Data history is paged backwards from the newest closed bar until the
+provider's ``earliest_timestamp`` boundary.  Yahoo-backed GER40 is requested
+for its documented maximum 60-day intraday window.
+"""
+
+import argparse
+from datetime import UTC, datetime, timedelta
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import sys
+import time
+from typing import Any, Mapping, Sequence
+
+import pandas as pd
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.core.instrument_batches import INSTRUMENT_BATCHES
+from app.services.ltf_execution_backtest import (
+    HistoricalWatchCandidate,
+    compile_backtest_report,
+    normalize_m5_history,
+    reconstruct_tpo_watch_candidates,
+    replay_candidate,
+)
+
+
+RUNNER_VERSION = "ltf-execution-v2-provider-depth-runner-v1.0"
+DEFAULT_OUTPUT_ROOT = Path(
+    os.getenv(
+        "LTF_V2_BACKTEST_OUTPUT_ROOT",
+        "/var/data/runtime/research/ltf_v2_backtest",
+    )
+)
+DEFAULT_TWELVEDATA_OUTPUTSIZE = 5000
+DEFAULT_PROVIDER_PAUSE_SECONDS = 1.6
+MAX_PROVIDER_PAGES_PER_SYMBOL = 5000
+
+TWELVEDATA_SYMBOLS: dict[str, str] = {
+    "XAUUSD": "XAU/USD",
+    "EURUSD": "EUR/USD",
+    "GBPUSD": "GBP/USD",
+    "USDJPY": "USD/JPY",
+    "USDCHF": "USD/CHF",
+    "USDCAD": "USD/CAD",
+    "AUDUSD": "AUD/USD",
+    "BTCUSD": "BTC/USD",
+    "ETHUSD": "ETH/USD",
+}
+YFINANCE_SYMBOLS: dict[str, tuple[str, ...]] = {
+    "GER40": ("^GDAXI", "EXS1.DE", "DAX"),
+}
+
+SENSITIVE_KEY_FRAGMENTS = (
+    "api_key",
+    "apikey",
+    "authorization",
+    "password",
+    "secret",
+    "token",
+)
+
+
+class ProviderDepthBacktestError(RuntimeError):
+    """Fail-closed error for provider-depth research runs."""
+
+
+def _utc(value: Any) -> datetime:
+    stamp = pd.Timestamp(value)
+    if pd.isna(stamp):
+        raise ProviderDepthBacktestError("provider returned an invalid timestamp")
+    if stamp.tzinfo is None:
+        stamp = stamp.tz_localize("UTC")
+    else:
+        stamp = stamp.tz_convert("UTC")
+    return stamp.to_pydatetime()
+
+
+def _iso(value: Any) -> str:
+    return _utc(value).isoformat()
+
+
+def _closed_m5_now() -> datetime:
+    now = datetime.now(UTC).replace(second=0, microsecond=0)
+    minute = now.minute - (now.minute % 5)
+    return now.replace(minute=minute) - timedelta(minutes=5)
+
+
+def _active_symbols() -> list[str]:
+    ordered: list[str] = []
+    for group in ("core", "fx_major", "indices"):
+        for symbol in INSTRUMENT_BATCHES[group]["symbols"]:
+            normalized = str(symbol).upper()
+            if normalized not in ordered:
+                ordered.append(normalized)
+    return ordered
+
+
+def _safe_json_error(payload: Any) -> tuple[Any, Any]:
+    if not isinstance(payload, Mapping):
+        return None, None
+    return payload.get("code"), payload.get("message")
+
+
+def _request_json(
+    endpoint: str,
+    *,
+    params: Mapping[str, Any],
+    timeout_seconds: int = 45,
+    max_attempts: int = 6,
+) -> dict[str, Any]:
+    """Call Twelve Data without ever interpolating a credential into logs."""
+
+    try:
+        import requests
+    except ImportError as error:
+        raise ProviderDepthBacktestError(
+            "requests dependency is unavailable"
+        ) from error
+
+    last_status: int | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.get(
+                f"https://api.twelvedata.com/{endpoint}",
+                params=dict(params),
+                timeout=timeout_seconds,
+            )
+            last_status = int(response.status_code)
+            payload = response.json()
+        except Exception as error:  # noqa: BLE001
+            if attempt >= max_attempts:
+                raise ProviderDepthBacktestError(
+                    f"Twelve Data request failed; endpoint={endpoint}; "
+                    f"error_type={type(error).__name__}"
+                ) from None
+            time.sleep(min(30.0, 2.0 ** (attempt - 1)))
+            continue
+
+        code, message = _safe_json_error(payload)
+        rate_limited = response.status_code == 429 or str(code) == "429"
+        if rate_limited and attempt < max_attempts:
+            header_delay = response.headers.get("Retry-After")
+            try:
+                delay = float(header_delay)
+            except (TypeError, ValueError):
+                delay = min(60.0, 5.0 * attempt)
+            time.sleep(max(1.0, delay))
+            continue
+
+        if response.status_code != 200:
+            raise ProviderDepthBacktestError(
+                f"Twelve Data request failed; endpoint={endpoint}; "
+                f"http_status={response.status_code}; api_code={code}"
+            )
+        if not isinstance(payload, dict):
+            raise ProviderDepthBacktestError(
+                f"Twelve Data returned non-object JSON; endpoint={endpoint}"
+            )
+        if str(payload.get("status") or "").lower() == "error":
+            raise ProviderDepthBacktestError(
+                f"Twelve Data API error; endpoint={endpoint}; "
+                f"api_code={code}; message={str(message or '')[:160]}"
+            )
+        return payload
+
+    raise ProviderDepthBacktestError(
+        f"Twelve Data retries exhausted; endpoint={endpoint}; "
+        f"http_status={last_status}"
+    )
+
+
+def fetch_twelvedata_earliest(
+    symbol: str,
+    *,
+    api_key: str,
+) -> datetime:
+    provider_symbol = TWELVEDATA_SYMBOLS[symbol]
+    payload = _request_json(
+        "earliest_timestamp",
+        params={
+            "symbol": provider_symbol,
+            "interval": "5min",
+            "apikey": api_key,
+        },
+    )
+    value = (
+        payload.get("datetime")
+        or payload.get("earliest_timestamp")
+        or payload.get("timestamp")
+    )
+    if value in (None, ""):
+        raise ProviderDepthBacktestError(
+            f"Twelve Data earliest timestamp is unavailable for symbol={symbol}"
+        )
+    return _utc(value)
+
+
+def _normalize_provider_frame(
+    frame: pd.DataFrame,
+    *,
+    symbol: str,
+) -> pd.DataFrame:
+    data = frame.copy()
+    if isinstance(data.columns, pd.MultiIndex):
+        normalized_columns: list[str] = []
+        for column in data.columns:
+            parts = [str(part) for part in column if str(part or "").strip()]
+            normalized_columns.append(
+                next(
+                    (
+                        part
+                        for part in parts
+                        if part.lower()
+                        in {"open", "high", "low", "close", "volume"}
+                    ),
+                    parts[0] if parts else "",
+                )
+            )
+        data.columns = normalized_columns
+    return normalize_m5_history(data, symbol=symbol)
+
+
+def _frame_sha256(frame: pd.DataFrame) -> str:
+    if frame.empty:
+        return hashlib.sha256(b"").hexdigest()
+    stable = frame[
+        ["bar_open_utc", "open", "high", "low", "close", "volume"]
+    ].copy()
+    stable["bar_open_utc"] = pd.to_datetime(
+        stable["bar_open_utc"],
+        utc=True,
+    ).map(lambda value: value.isoformat())
+    payload = stable.to_csv(index=False, lineterminator="\n").encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _atomic_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(
+            value,
+            indent=2,
+            sort_keys=True,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _assert_no_sensitive_keys(value: Any, path: str = "root") -> None:
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            lowered = str(key).lower()
+            if any(fragment in lowered for fragment in SENSITIVE_KEY_FRAGMENTS):
+                raise ProviderDepthBacktestError(
+                    f"sensitive key blocked from research artifact: {path}.{key}"
+                )
+            _assert_no_sensitive_keys(nested, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            _assert_no_sensitive_keys(nested, f"{path}[{index}]")
+
+
+def _atomic_parquet(path: Path, frame: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    frame.to_parquet(temporary, index=False)
+    temporary.replace(path)
+
+
+def fetch_twelvedata_max_history(
+    symbol: str,
+    *,
+    api_key: str,
+    end_utc: datetime,
+    pause_seconds: float,
+    outputsize: int = DEFAULT_TWELVEDATA_OUTPUTSIZE,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    provider_symbol = TWELVEDATA_SYMBOLS[symbol]
+    earliest = fetch_twelvedata_earliest(symbol, api_key=api_key)
+    cursor_end = end_utc
+    frames: list[pd.DataFrame] = []
+    request_count = 1  # earliest_timestamp
+    page_rows: list[int] = []
+    previous_oldest: datetime | None = None
+    pagination_stop_reason: str | None = None
+
+    for page in range(1, MAX_PROVIDER_PAGES_PER_SYMBOL + 1):
+        if cursor_end < earliest:
+            pagination_stop_reason = "CURSOR_REACHED_EARLIEST_BOUNDARY"
+            break
+        if request_count > 1 and pause_seconds > 0:
+            time.sleep(pause_seconds)
+        payload = _request_json(
+            "time_series",
+            params={
+                "symbol": provider_symbol,
+                "interval": "5min",
+                "end_date": cursor_end.strftime("%Y-%m-%d %H:%M:%S"),
+                "timezone": "UTC",
+                "order": "asc",
+                "format": "JSON",
+                "outputsize": outputsize,
+                "apikey": api_key,
+            },
+        )
+        request_count += 1
+        values = payload.get("values")
+        if not isinstance(values, list) or not values:
+            if frames:
+                pagination_stop_reason = "PROVIDER_RETURNED_NO_OLDER_ROWS"
+                break
+            raise ProviderDepthBacktestError(
+                f"Twelve Data returned no M5 rows for symbol={symbol}"
+            )
+
+        normalized = _normalize_provider_frame(
+            pd.DataFrame(values),
+            symbol=symbol,
+        )
+        normalized = normalized.loc[
+            (pd.to_datetime(normalized["bar_open_utc"], utc=True) >= pd.Timestamp(earliest))
+            & (
+                pd.to_datetime(normalized["bar_open_utc"], utc=True)
+                <= pd.Timestamp(end_utc)
+            )
+        ]
+        if normalized.empty:
+            pagination_stop_reason = "PAGE_EMPTY_AFTER_EARLIEST_FILTER"
+            break
+        frames.append(normalized)
+        page_rows.append(len(normalized))
+        oldest = _utc(normalized["bar_open_utc"].iloc[0])
+
+        if previous_oldest is not None and oldest >= previous_oldest:
+            raise ProviderDepthBacktestError(
+                f"Twelve Data pagination made no backward progress for symbol={symbol}"
+            )
+        previous_oldest = oldest
+        if oldest <= earliest + timedelta(minutes=5):
+            pagination_stop_reason = "PROVIDER_EARLIEST_REACHED"
+            break
+        cursor_end = oldest - timedelta(minutes=5)
+    else:
+        raise ProviderDepthBacktestError(
+            f"Twelve Data pagination safety limit reached for symbol={symbol}"
+        )
+
+    history = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    history = normalize_m5_history(history, symbol=symbol)
+    if history.empty:
+        raise ProviderDepthBacktestError(
+            f"Twelve Data normalized history is empty for symbol={symbol}"
+        )
+    delivered_first = _utc(history["bar_open_utc"].iloc[0])
+    delivered_last = _utc(history["bar_open_utc"].iloc[-1])
+    return history, {
+        "provider": "twelvedata",
+        "provider_symbol": provider_symbol,
+        "provider_earliest_5m_utc": earliest.isoformat(),
+        "requested_end_utc": end_utc.isoformat(),
+        "delivered_first_bar_utc": delivered_first.isoformat(),
+        "delivered_last_bar_utc": delivered_last.isoformat(),
+        "delivered_rows": len(history),
+        "provider_requests": request_count,
+        "page_count": len(page_rows),
+        "page_row_min": min(page_rows) if page_rows else 0,
+        "page_row_max": max(page_rows) if page_rows else 0,
+        "reached_provider_earliest": (
+            delivered_first <= earliest + timedelta(minutes=5)
+        ),
+        "pagination_stop_reason": pagination_stop_reason,
+        "history_sha256": _frame_sha256(history),
+    }
+
+
+def fetch_yfinance_max_history(
+    symbol: str,
+    *,
+    end_utc: datetime,
+    cache_dir: Path,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    try:
+        import yfinance as yf
+    except ImportError as error:
+        raise ProviderDepthBacktestError(
+            "yfinance dependency is unavailable"
+        ) from error
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    yf.set_tz_cache_location(str(cache_dir))
+    attempts: list[dict[str, Any]] = []
+    selected_ticker: str | None = None
+    history = pd.DataFrame()
+    requested_start = end_utc - timedelta(days=60)
+
+    for ticker in YFINANCE_SYMBOLS[symbol]:
+        attempt: dict[str, Any] = {
+            "provider_symbol": ticker,
+            "rows": 0,
+            "error_type": None,
+        }
+        try:
+            raw = yf.download(
+                ticker,
+                start=requested_start,
+                end=end_utc + timedelta(minutes=5),
+                interval="5m",
+                progress=False,
+                auto_adjust=False,
+                threads=False,
+                timeout=45,
+            )
+            normalized = _normalize_provider_frame(raw, symbol=symbol)
+        except Exception as error:  # noqa: BLE001
+            attempt["error_type"] = type(error).__name__
+            attempts.append(attempt)
+            continue
+        attempt["rows"] = len(normalized)
+        attempts.append(attempt)
+        if not normalized.empty:
+            selected_ticker = ticker
+            history = normalized
+            break
+
+    if history.empty or selected_ticker is None:
+        raise ProviderDepthBacktestError(
+            f"yfinance returned no M5 rows for symbol={symbol}"
+        )
+    delivered_first = _utc(history["bar_open_utc"].iloc[0])
+    delivered_last = _utc(history["bar_open_utc"].iloc[-1])
+    return history, {
+        "provider": "yfinance",
+        "provider_symbol": selected_ticker,
+        "provider_intraday_limit": "60d",
+        "requested_start_utc": requested_start.isoformat(),
+        "requested_end_utc": end_utc.isoformat(),
+        "delivered_first_bar_utc": delivered_first.isoformat(),
+        "delivered_last_bar_utc": delivered_last.isoformat(),
+        "delivered_rows": len(history),
+        "provider_requests": len(attempts),
+        "provider_attempts": attempts,
+        "history_sha256": _frame_sha256(history),
+    }
+
+
+def fetch_symbol_history(
+    symbol: str,
+    *,
+    end_utc: datetime,
+    pause_seconds: float,
+    yfinance_cache_dir: Path,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    if symbol in TWELVEDATA_SYMBOLS:
+        api_key = os.getenv("TWELVEDATA_API_KEY")
+        if not api_key:
+            raise ProviderDepthBacktestError(
+                "TWELVEDATA_API_KEY is unavailable"
+            )
+        return fetch_twelvedata_max_history(
+            symbol,
+            api_key=api_key,
+            end_utc=end_utc,
+            pause_seconds=pause_seconds,
+        )
+    if symbol in YFINANCE_SYMBOLS:
+        return fetch_yfinance_max_history(
+            symbol,
+            end_utc=end_utc,
+            cache_dir=yfinance_cache_dir,
+        )
+    raise ProviderDepthBacktestError(
+        f"no provider-depth M5 mapping for symbol={symbol}"
+    )
+
+
+def fetch_all_histories(
+    *,
+    run_dir: Path,
+    symbols: Sequence[str],
+    pause_seconds: float,
+    allow_network_fetch: bool,
+    resume: bool,
+) -> dict[str, Any]:
+    if not allow_network_fetch:
+        raise ProviderDepthBacktestError(
+            "network fetch requires explicit --allow-network-fetch"
+        )
+    history_dir = run_dir / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / "provider_coverage.json"
+    existing: dict[str, Any] = {}
+    if resume and manifest_path.exists():
+        try:
+            loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
+            existing = (
+                dict(loaded.get("symbols") or {})
+                if isinstance(loaded, dict)
+                else {}
+            )
+        except Exception:
+            existing = {}
+
+    end_utc = _closed_m5_now()
+    coverage_by_symbol: dict[str, Any] = dict(existing)
+    for symbol in symbols:
+        history_path = history_dir / f"{symbol}_5m.parquet"
+        if (
+            resume
+            and history_path.exists()
+            and isinstance(coverage_by_symbol.get(symbol), Mapping)
+            and coverage_by_symbol[symbol].get("status") == "OK"
+        ):
+            continue
+
+        print(
+            json.dumps(
+                {
+                    "event": "provider_fetch_started",
+                    "symbol": symbol,
+                    "at_utc": datetime.now(UTC).isoformat(),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        started = time.monotonic()
+        try:
+            history, audit = fetch_symbol_history(
+                symbol,
+                end_utc=end_utc,
+                pause_seconds=pause_seconds,
+                yfinance_cache_dir=run_dir / "yfinance-cache",
+            )
+            _atomic_parquet(history_path, history)
+            audit = {
+                **audit,
+                "status": "OK",
+                "artifact": str(history_path.relative_to(run_dir)),
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+            coverage_by_symbol[symbol] = audit
+            print(
+                json.dumps(
+                    {
+                        "event": "provider_fetch_completed",
+                        "symbol": symbol,
+                        "rows": audit["delivered_rows"],
+                        "first_bar_utc": audit["delivered_first_bar_utc"],
+                        "last_bar_utc": audit["delivered_last_bar_utc"],
+                        "requests": audit["provider_requests"],
+                        "elapsed_seconds": audit["elapsed_seconds"],
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        except Exception as error:  # noqa: BLE001
+            coverage_by_symbol[symbol] = {
+                "status": "FAILED",
+                "error_type": type(error).__name__,
+                "error": str(error)[:240],
+                "elapsed_seconds": round(time.monotonic() - started, 3),
+            }
+            manifest = {
+                "version": RUNNER_VERSION,
+                "updated_at_utc": datetime.now(UTC).isoformat(),
+                "symbols": coverage_by_symbol,
+            }
+            _assert_no_sensitive_keys(manifest)
+            _atomic_json(manifest_path, manifest)
+            raise
+
+        manifest = {
+            "version": RUNNER_VERSION,
+            "updated_at_utc": datetime.now(UTC).isoformat(),
+            "symbols": coverage_by_symbol,
+        }
+        _assert_no_sensitive_keys(manifest)
+        _atomic_json(manifest_path, manifest)
+
+    return {
+        "version": RUNNER_VERSION,
+        "updated_at_utc": datetime.now(UTC).isoformat(),
+        "symbols": coverage_by_symbol,
+    }
+
+
+def run_streamed_backtest(
+    *,
+    run_dir: Path,
+    symbols: Sequence[str],
+    provider_manifest: Mapping[str, Any],
+    holdout_fraction: float,
+) -> dict[str, Any]:
+    candidates: list[HistoricalWatchCandidate] = []
+    records: list[dict[str, Any]] = []
+    coverage: list[dict[str, Any]] = []
+    provider_symbols = provider_manifest.get("symbols")
+    if not isinstance(provider_symbols, Mapping):
+        raise ProviderDepthBacktestError("provider coverage manifest is invalid")
+
+    for symbol in symbols:
+        provider_audit = provider_symbols.get(symbol)
+        if not isinstance(provider_audit, Mapping) or provider_audit.get("status") != "OK":
+            raise ProviderDepthBacktestError(
+                f"provider coverage is incomplete for symbol={symbol}"
+            )
+        history_path = run_dir / str(
+            provider_audit.get("artifact") or f"history/{symbol}_5m.parquet"
+        )
+        if not history_path.exists():
+            raise ProviderDepthBacktestError(
+                f"history artifact is missing for symbol={symbol}"
+            )
+
+        print(
+            json.dumps(
+                {
+                    "event": "symbol_replay_started",
+                    "symbol": symbol,
+                    "at_utc": datetime.now(UTC).isoformat(),
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        started = time.monotonic()
+        history = normalize_m5_history(
+            pd.read_parquet(history_path),
+            symbol=symbol,
+        )
+        symbol_candidates, symbol_coverage = reconstruct_tpo_watch_candidates(
+            history,
+            symbol=symbol,
+        )
+        symbol_rows: list[dict[str, Any]] = []
+        for index, candidate in enumerate(symbol_candidates, start=1):
+            symbol_rows.append(replay_candidate(candidate, history))
+            if index % 100 == 0:
+                print(
+                    json.dumps(
+                        {
+                            "event": "symbol_replay_progress",
+                            "symbol": symbol,
+                            "completed_candidates": index,
+                            "candidate_count": len(symbol_candidates),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+
+        symbol_coverage["provider"] = provider_audit.get("provider")
+        symbol_coverage["provider_earliest_5m_utc"] = provider_audit.get(
+            "provider_earliest_5m_utc"
+        )
+        symbol_coverage["provider_intraday_limit"] = provider_audit.get(
+            "provider_intraday_limit"
+        )
+        symbol_coverage["provider_reached_earliest"] = provider_audit.get(
+            "reached_provider_earliest"
+        )
+        symbol_coverage["replay_elapsed_seconds"] = round(
+            time.monotonic() - started,
+            3,
+        )
+        candidates.extend(symbol_candidates)
+        records.extend(symbol_rows)
+        coverage.append(symbol_coverage)
+        del history
+
+        print(
+            json.dumps(
+                {
+                    "event": "symbol_replay_completed",
+                    "symbol": symbol,
+                    "candidate_count": len(symbol_candidates),
+                    "ready_count": sum(
+                        1 for row in symbol_rows if bool(row.get("ready"))
+                    ),
+                    "elapsed_seconds": symbol_coverage[
+                        "replay_elapsed_seconds"
+                    ],
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+    report = compile_backtest_report(
+        candidates=candidates,
+        rows=records,
+        coverage=coverage,
+        holdout_fraction=holdout_fraction,
+    )
+    report["provider_depth"] = dict(provider_manifest)
+    report["run_dir"] = str(run_dir)
+    return report
+
+
+def _pct(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    return f"{float(value) * 100.0:.2f}%"
+
+
+def _number(value: Any, digits: int = 3) -> str:
+    if value is None:
+        return "n/a"
+    number = float(value)
+    if math.isinf(number):
+        return "∞"
+    return f"{number:.{digits}f}"
+
+
+def render_markdown_report(report: Mapping[str, Any]) -> str:
+    metrics = report["metrics"]
+    all_metrics = metrics["all"]
+    holdout = metrics["holdout"]
+    coverage_rows = []
+    for item in report.get("coverage") or []:
+        coverage_rows.append(
+            "| {symbol} | {first} | {last} | {candidates} | {provider} |".format(
+                symbol=item.get("symbol"),
+                first=item.get("history_first_bar_utc"),
+                last=item.get("history_last_bar_utc"),
+                candidates=item.get("candidate_count"),
+                provider=item.get("provider"),
+            )
+        )
+
+    by_symbol_rows = []
+    for symbol, values in sorted((metrics.get("by_symbol") or {}).items()):
+        by_symbol_rows.append(
+            "| {symbol} | {candidates} | {ready} | {filled} | {winrate} | {avg_r} |".format(
+                symbol=symbol,
+                candidates=values.get("candidate_count"),
+                ready=values.get("ready_count"),
+                filled=values.get("filled_count"),
+                winrate=_pct(values.get("winrate_closed")),
+                avg_r=_number(values.get("average_R_filled")),
+            )
+        )
+
+    limitations = report.get("research_scope") or {}
+    return "\n".join(
+        [
+            "# LTF Execution State Machine v2 — Provider-Depth Backtest",
+            "",
+            f"Generated: `{report.get('generated_at_utc')}`  ",
+            f"Engine: `{report.get('engine_version')}`  ",
+            f"Mode: `{report.get('mode')}`",
+            "",
+            "## Primary results",
+            "",
+            "| Metric | Full history | Chronological 30% holdout |",
+            "|---|---:|---:|",
+            f"| Candidates | {all_metrics.get('candidate_count')} | {holdout.get('candidate_count')} |",
+            f"| ENTRY_READY | {all_metrics.get('ready_count')} | {holdout.get('ready_count')} |",
+            f"| Filled | {all_metrics.get('filled_count')} | {holdout.get('filled_count')} |",
+            f"| Closed-trade win rate | {_pct(all_metrics.get('winrate_closed'))} | {_pct(holdout.get('winrate_closed'))} |",
+            f"| Average R, filled | {_number(all_metrics.get('average_R_filled'))} | {_number(holdout.get('average_R_filled'))} |",
+            f"| Total R | {_number(all_metrics.get('total_R'))} | {_number(holdout.get('total_R'))} |",
+            f"| Profit factor | {_number(all_metrics.get('profit_factor'))} | {_number(holdout.get('profit_factor'))} |",
+            f"| Filled signals/week | {_number(all_metrics.get('filled_signals_per_week'))} | {_number(holdout.get('filled_signals_per_week'))} |",
+            "",
+            "## Provider coverage",
+            "",
+            "| Symbol | First M5 bar | Last M5 bar | Candidates | Provider |",
+            "|---|---|---|---:|---|",
+            *coverage_rows,
+            "",
+            "## By symbol",
+            "",
+            "| Symbol | Candidates | Ready | Filled | Win rate | Avg R |",
+            "|---|---:|---:|---:|---:|---:|",
+            *by_symbol_rows,
+            "",
+            "## Interpretation limits",
+            "",
+            "- This is a no-look-ahead execution-layer replay on reconstructed "
+            "TPO Open Test Drive and Open Rejection Reverse candidates.",
+            "- Historical macro, positioning and Battle Gate states were not "
+            "invented; the result is conditional LTF performance, not yet the "
+            "fully filtered production-system win rate.",
+            "- Same-bar entry+target events are excluded as ambiguous; same-bar "
+            "stop+target events are scored stop-first.",
+            f"- Battle Gate impact: `{limitations.get('battle_gate_impact')}`; "
+            f"Telegram impact: `{limitations.get('telegram_signal_impact')}`.",
+            "",
+        ]
+    )
+
+
+def write_report_artifacts(
+    *,
+    run_dir: Path,
+    report: Mapping[str, Any],
+) -> dict[str, Any]:
+    report_path = run_dir / "backtest_report.json"
+    markdown_path = run_dir / "backtest_report.md"
+    records_path = run_dir / "backtest_records.parquet"
+    _assert_no_sensitive_keys(report)
+    _atomic_json(report_path, report)
+    markdown_temporary = markdown_path.with_suffix(
+        markdown_path.suffix + ".tmp"
+    )
+    markdown_temporary.write_text(
+        render_markdown_report(report),
+        encoding="utf-8",
+    )
+    markdown_temporary.replace(markdown_path)
+    record_frame = pd.DataFrame(report.get("records") or [])
+    if not record_frame.empty:
+        for column in ("blockers", "transition_history"):
+            if column in record_frame.columns:
+                record_frame[column] = record_frame[column].map(
+                    lambda value: json.dumps(
+                        value,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                    )
+                )
+        _atomic_parquet(records_path, record_frame)
+    return {
+        "report_json": str(report_path),
+        "report_markdown": str(markdown_path),
+        "records_parquet": (
+            str(records_path) if records_path.exists() else None
+        ),
+    }
+
+
+def _run_id() -> str:
+    return datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Fetch maximum provider-delivered M5 history and backtest "
+            "LTF Execution State Machine v2."
+        )
+    )
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=DEFAULT_OUTPUT_ROOT,
+    )
+    parser.add_argument("--run-id", default=None)
+    parser.add_argument(
+        "--symbols",
+        default=",".join(_active_symbols()),
+        help="Comma-separated canonical symbols.",
+    )
+    parser.add_argument(
+        "--provider-pause-seconds",
+        default=DEFAULT_PROVIDER_PAUSE_SECONDS,
+        type=float,
+    )
+    parser.add_argument("--holdout-fraction", default=0.30, type=float)
+    parser.add_argument("--allow-network-fetch", action="store_true")
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--replay-only",
+        action="store_true",
+        help="Use already fetched history in the selected run directory.",
+    )
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.provider_pause_seconds < 0:
+        raise ProviderDepthBacktestError(
+            "provider pause seconds cannot be negative"
+        )
+    symbols = [
+        item.strip().upper()
+        for item in str(args.symbols).split(",")
+        if item.strip()
+    ]
+    if not symbols:
+        raise ProviderDepthBacktestError("at least one symbol is required")
+    unsupported = sorted(
+        set(symbols).difference(TWELVEDATA_SYMBOLS).difference(YFINANCE_SYMBOLS)
+    )
+    if unsupported:
+        raise ProviderDepthBacktestError(
+            f"unsupported symbols: {', '.join(unsupported)}"
+        )
+
+    run_id = str(args.run_id or _run_id())
+    run_dir = args.output_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = run_dir / "provider_coverage.json"
+    if args.replay_only:
+        if not manifest_path.exists():
+            raise ProviderDepthBacktestError(
+                f"provider coverage manifest is missing: {manifest_path}"
+            )
+        provider_manifest = json.loads(
+            manifest_path.read_text(encoding="utf-8")
+        )
+    else:
+        provider_manifest = fetch_all_histories(
+            run_dir=run_dir,
+            symbols=symbols,
+            pause_seconds=args.provider_pause_seconds,
+            allow_network_fetch=args.allow_network_fetch,
+            resume=args.resume,
+        )
+
+    report = run_streamed_backtest(
+        run_dir=run_dir,
+        symbols=symbols,
+        provider_manifest=provider_manifest,
+        holdout_fraction=args.holdout_fraction,
+    )
+    artifacts = write_report_artifacts(run_dir=run_dir, report=report)
+    result = {
+        "status": "OK",
+        "version": RUNNER_VERSION,
+        "run_id": run_id,
+        "run_dir": str(run_dir),
+        "symbols": symbols,
+        "artifacts": artifacts,
+        "metrics": report["metrics"],
+    }
+    print(json.dumps(result, indent=2, sort_keys=True), flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
