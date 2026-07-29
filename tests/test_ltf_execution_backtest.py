@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 import tempfile
@@ -10,7 +10,11 @@ from unittest.mock import patch
 import pandas as pd
 
 from app.services.ltf_execution_backtest import (
+    ExecutionCostModel,
+    HistoricalContextPoint,
     HistoricalWatchCandidate,
+    _simulate_limit_outcome,
+    build_dynamic_context_timeline,
     compile_backtest_report,
     reconstruct_tpo_watch_candidates,
     replay_candidate,
@@ -22,6 +26,7 @@ from scripts.run_ltf_execution_v2_backtest import (
     _active_symbols,
     fetch_all_histories,
     fetch_twelvedata_max_history,
+    load_execution_cost_models,
     summarize_operational_positioning_history,
 )
 
@@ -112,6 +117,67 @@ def _candidate() -> HistoricalWatchCandidate:
     )
 
 
+def _outcome_bars(
+    rows: list[tuple[str, float, float, float, float]],
+) -> pd.DataFrame:
+    opens = pd.to_datetime([row[0] for row in rows], utc=True)
+    return pd.DataFrame(
+        {
+            "bar_open_utc": opens - pd.Timedelta(minutes=5),
+            "bar_close_utc": opens,
+            "open": [row[1] for row in rows],
+            "high": [row[2] for row in rows],
+            "low": [row[3] for row in rows],
+            "close": [row[4] for row in rows],
+            "volume": [1000.0] * len(rows),
+        }
+    )
+
+
+def _context_history(*, inside_value: bool) -> pd.DataFrame:
+    prehistory_index = pd.date_range(
+        "2026-07-01T09:00:00Z",
+        periods=12,
+        freq="5min",
+    )
+    context_index = pd.date_range(
+        "2026-07-01T10:00:00Z",
+        periods=12,
+        freq="5min",
+    )
+    prehistory = pd.DataFrame(
+        {
+            "open": [101.0] * len(prehistory_index),
+            "high": [101.1] * len(prehistory_index),
+            "low": [100.9] * len(prehistory_index),
+            "close": [101.0] * len(prehistory_index),
+            "volume": [1000.0] * len(prehistory_index),
+        },
+        index=prehistory_index,
+    )
+    if inside_value:
+        context_open = 100.05
+        context_high = 100.10
+        context_low = 99.90
+        context_close = 100.00
+    else:
+        context_open = 101.00
+        context_high = 101.10
+        context_low = 100.90
+        context_close = 101.00
+    context = pd.DataFrame(
+        {
+            "open": [context_open] * len(context_index),
+            "high": [context_high] * len(context_index),
+            "low": [context_low] * len(context_index),
+            "close": [context_close] * len(context_index),
+            "volume": [1000.0] * len(context_index),
+        },
+        index=context_index,
+    )
+    return pd.concat([prehistory, context])
+
+
 class LtfExecutionBacktestTest(unittest.TestCase):
     def test_yfinance_depth_scope_covers_all_approved_symbols(self) -> None:
         self.assertEqual(
@@ -199,6 +265,18 @@ class LtfExecutionBacktestTest(unittest.TestCase):
         self.assertTrue(row["ready"])
         self.assertEqual(row["ready_at_utc"], "2026-07-01T10:20:00+00:00")
         self.assertEqual(row["filled_at_utc"], "2026-07-01T10:30:00+00:00")
+        self.assertEqual(
+            row["entry_window_expires_at_utc"],
+            "2026-07-01T10:50:00+00:00",
+        )
+        self.assertLessEqual(
+            pd.Timestamp(row["filled_at_utc"]),
+            pd.Timestamp(row["entry_window_expires_at_utc"]),
+        )
+        self.assertGreaterEqual(
+            pd.Timestamp(row["resolved_at_utc"]),
+            pd.Timestamp(row["filled_at_utc"]),
+        )
         self.assertEqual(row["outcome"], "TP_HIT")
         self.assertGreaterEqual(row["realized_R"], 2.0)
         transition_times = [
@@ -206,6 +284,297 @@ class LtfExecutionBacktestTest(unittest.TestCase):
             for item in row["transition_history"]
         ]
         self.assertEqual(transition_times, sorted(transition_times))
+
+    def test_fill_after_30_minute_entry_window_is_not_allowed(self) -> None:
+        ready_at = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
+        outcome = _simulate_limit_outcome(
+            _outcome_bars(
+                [
+                    (
+                        "2026-07-01T10:31:00Z",
+                        100.2,
+                        100.5,
+                        99.5,
+                        100.1,
+                    )
+                ]
+            ),
+            direction="LONG",
+            ready_at=ready_at,
+            entry_window_expires_at=ready_at + timedelta(minutes=30),
+            trade_resolution_expires_at=ready_at + timedelta(hours=8),
+            entry=100.0,
+            stop=99.0,
+            target=102.0,
+        )
+
+        self.assertEqual(outcome["outcome"], "ENTRY_WINDOW_EXPIRED_UNFILLED")
+        self.assertIsNone(outcome["filled_at_utc"])
+        self.assertEqual(
+            outcome["resolved_at_utc"],
+            "2026-07-01T10:30:00+00:00",
+        )
+
+    def test_invalidation_before_limit_fill_cancels_order(self) -> None:
+        ready_at = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
+        outcome = _simulate_limit_outcome(
+            _outcome_bars(
+                [
+                    (
+                        "2026-07-01T10:05:00Z",
+                        99.3,
+                        99.5,
+                        98.5,
+                        99.0,
+                    ),
+                    (
+                        "2026-07-01T10:10:00Z",
+                        99.8,
+                        100.5,
+                        99.5,
+                        100.1,
+                    ),
+                ]
+            ),
+            direction="LONG",
+            ready_at=ready_at,
+            entry_window_expires_at=ready_at + timedelta(minutes=30),
+            trade_resolution_expires_at=ready_at + timedelta(hours=8),
+            entry=100.0,
+            stop=99.0,
+            target=102.0,
+        )
+
+        self.assertEqual(outcome["outcome"], "INVALIDATED_BEFORE_FILL")
+        self.assertIsNone(outcome["filled_at_utc"])
+        self.assertEqual(
+            outcome["cancellation_reason"],
+            "STOP_OR_CONTEXT_INVALIDATION_BEFORE_FILL",
+        )
+
+    def test_context_change_after_ready_cancels_unfilled_limit(self) -> None:
+        ready_at = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
+        outcome = _simulate_limit_outcome(
+            _outcome_bars(
+                [
+                    (
+                        "2026-07-01T10:10:00Z",
+                        99.5,
+                        99.8,
+                        99.3,
+                        99.6,
+                    ),
+                    (
+                        "2026-07-01T10:15:00Z",
+                        99.8,
+                        100.5,
+                        99.5,
+                        100.1,
+                    ),
+                ]
+            ),
+            direction="LONG",
+            ready_at=ready_at,
+            entry_window_expires_at=ready_at + timedelta(minutes=30),
+            trade_resolution_expires_at=ready_at + timedelta(hours=8),
+            entry=100.0,
+            stop=99.0,
+            target=102.0,
+            context_timeline=[
+                HistoricalContextPoint(
+                    as_of_utc=ready_at + timedelta(minutes=10),
+                    payload_updates={
+                        "tpo_watch_active": False,
+                        "current_open_behavior": "OPEN_AUCTION",
+                    },
+                    cancellation_reason="OTD_TRANSITIONED_TO_OPEN_AUCTION",
+                )
+            ],
+        )
+
+        self.assertEqual(outcome["outcome"], "CONTEXT_CANCELLED_BEFORE_FILL")
+        self.assertIsNone(outcome["filled_at_utc"])
+        self.assertEqual(
+            outcome["cancellation_reason"],
+            "OTD_TRANSITIONED_TO_OPEN_AUCTION",
+        )
+
+    def test_filled_trade_can_resolve_after_entry_window(self) -> None:
+        ready_at = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
+        outcome = _simulate_limit_outcome(
+            _outcome_bars(
+                [
+                    (
+                        "2026-07-01T10:25:00Z",
+                        100.2,
+                        100.5,
+                        99.9,
+                        100.3,
+                    ),
+                    (
+                        "2026-07-01T10:35:00Z",
+                        100.3,
+                        101.0,
+                        100.2,
+                        100.8,
+                    ),
+                    (
+                        "2026-07-01T11:00:00Z",
+                        100.8,
+                        102.1,
+                        100.7,
+                        102.0,
+                    ),
+                ]
+            ),
+            direction="LONG",
+            ready_at=ready_at,
+            entry_window_expires_at=ready_at + timedelta(minutes=30),
+            trade_resolution_expires_at=ready_at + timedelta(hours=2),
+            entry=100.0,
+            stop=99.0,
+            target=102.0,
+        )
+
+        self.assertEqual(outcome["outcome"], "TP_HIT")
+        self.assertEqual(
+            outcome["filled_at_utc"],
+            "2026-07-01T10:25:00+00:00",
+        )
+        self.assertEqual(
+            outcome["resolved_at_utc"],
+            "2026-07-01T11:00:00+00:00",
+        )
+
+    def test_otd_acceptance_back_inside_value_cancels_before_ready(
+        self,
+    ) -> None:
+        candidate = _candidate()
+        timeline = build_dynamic_context_timeline(
+            candidate,
+            _context_history(inside_value=True),
+        )
+        first_cancel = next(
+            point for point in timeline if point.cancellation_reason
+        )
+        row = replay_candidate(
+            candidate,
+            _context_history(inside_value=True),
+        )
+
+        self.assertEqual(
+            first_cancel.cancellation_reason,
+            "OTD_ACCEPTED_BACK_INTO_VALUE",
+        )
+        self.assertEqual(
+            first_cancel.payload_updates["current_open_behavior"],
+            "OPEN_REJECTION_REVERSE",
+        )
+        self.assertFalse(row["ready"])
+        self.assertEqual(row["outcome"], "CONTEXT_CANCELLED_BEFORE_READY")
+
+    def test_otd_transition_to_oaor_cancels_before_ready(self) -> None:
+        candidate = _candidate()
+        timeline = build_dynamic_context_timeline(
+            candidate,
+            _context_history(inside_value=False),
+        )
+        first_cancel = next(
+            point for point in timeline if point.cancellation_reason
+        )
+        row = replay_candidate(
+            candidate,
+            _context_history(inside_value=False),
+        )
+
+        self.assertEqual(
+            first_cancel.cancellation_reason,
+            "OTD_TRANSITIONED_TO_OAOR",
+        )
+        self.assertEqual(
+            first_cancel.payload_updates["current_open_behavior"],
+            "OPEN_AUCTION_OUT_OF_RANGE",
+        )
+        self.assertFalse(row["ready"])
+        self.assertEqual(row["outcome"], "CONTEXT_CANCELLED_BEFORE_READY")
+
+    def test_gross_net_cost_arithmetic_is_deterministic(self) -> None:
+        ready_at = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
+        outcome = _simulate_limit_outcome(
+            _outcome_bars(
+                [
+                    (
+                        "2026-07-01T10:05:00Z",
+                        100.2,
+                        100.5,
+                        99.9,
+                        100.3,
+                    ),
+                    (
+                        "2026-07-01T10:10:00Z",
+                        100.5,
+                        102.1,
+                        100.4,
+                        102.0,
+                    ),
+                ]
+            ),
+            direction="LONG",
+            ready_at=ready_at,
+            entry_window_expires_at=ready_at + timedelta(minutes=30),
+            trade_resolution_expires_at=ready_at + timedelta(hours=8),
+            entry=100.0,
+            stop=99.0,
+            target=102.0,
+            cost_model=ExecutionCostModel(
+                spread_price=0.10,
+                commission_r=0.05,
+                adverse_exit_slippage_price=0.20,
+                source="UNIT_TEST",
+            ),
+        )
+
+        self.assertEqual(outcome["outcome"], "TP_HIT")
+        self.assertAlmostEqual(outcome["gross_R"], 2.0)
+        self.assertAlmostEqual(outcome["total_cost_R"], 0.15)
+        self.assertAlmostEqual(outcome["net_R"], 1.85)
+        self.assertAlmostEqual(outcome["adverse_slippage_cost_R"], 0.0)
+
+    def test_cost_model_loader_requires_explicit_per_symbol_values(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="ltf-cost-model-") as tmp:
+            path = Path(tmp) / "costs.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "symbols": {
+                            "EURUSD": {
+                                "spread_price": 0.00008,
+                                "commission_r": 0.02,
+                                "adverse_exit_slippage_price": 0.00003,
+                                "limit_fill_policy": (
+                                    "TRADE_THROUGH_HALF_SPREAD"
+                                ),
+                                "source": "BROKER_CALIBRATION_TEST",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            models = load_execution_cost_models(path)
+
+        self.assertEqual(set(models), {"EURUSD"})
+        self.assertAlmostEqual(models["EURUSD"].spread_price, 0.00008)
+        self.assertEqual(
+            models["EURUSD"].limit_fill_policy,
+            "TRADE_THROUGH_HALF_SPREAD",
+        )
+        self.assertEqual(
+            models["EURUSD"].source,
+            "BROKER_CALIBRATION_TEST",
+        )
 
     def test_report_exposes_chronological_holdout(self) -> None:
         candidate = _candidate()
@@ -231,6 +600,13 @@ class LtfExecutionBacktestTest(unittest.TestCase):
         self.assertEqual(report["metrics"]["development"]["candidate_count"], 1)
         self.assertEqual(report["metrics"]["holdout"]["candidate_count"], 1)
         self.assertFalse(report["research_scope"]["look_ahead_allowed"])
+        self.assertTrue(
+            report["execution_integrity"]["deadlines_are_separate"]
+        )
+        self.assertEqual(
+            report["metrics"]["all"]["metric_basis"],
+            "NET_R",
+        )
 
     def test_monday_uses_last_completed_trading_session_not_sunday(self) -> None:
         friday_index = pd.date_range(
