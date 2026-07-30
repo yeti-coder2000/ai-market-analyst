@@ -14,6 +14,8 @@ from app.services.ltf_execution_backtest import (
     ExecutionCostModel,
     HistoricalContextPoint,
     HistoricalWatchCandidate,
+    ReconstructedProfile,
+    _candidate_interest_zones,
     _simulate_limit_outcome,
     _two_block_acceptance,
     build_dynamic_context_timeline,
@@ -31,6 +33,7 @@ from scripts.run_ltf_execution_v2_backtest import (
     fetch_twelvedata_max_history,
     load_execution_cost_models,
     summarize_operational_positioning_history,
+    write_report_artifacts,
 )
 
 
@@ -328,6 +331,32 @@ class LtfExecutionBacktestTest(unittest.TestCase):
         ]
         self.assertEqual(transition_times, sorted(transition_times))
 
+    def test_entry_deadline_is_capped_by_trade_resolution_horizon(
+        self,
+    ) -> None:
+        candidate = _candidate()
+        expires_at = datetime(2026, 7, 1, 10, 40, tzinfo=UTC)
+        candidate = replace(
+            candidate,
+            expires_at_utc=expires_at,
+            payload={
+                **candidate.payload,
+                "expires_at_utc": expires_at.isoformat(),
+            },
+        )
+
+        row = replay_candidate(candidate, _history())
+
+        self.assertTrue(row["ready"])
+        self.assertEqual(
+            row["entry_window_expires_at_utc"],
+            expires_at.isoformat(),
+        )
+        self.assertEqual(
+            row["trade_resolution_expires_at_utc"],
+            expires_at.isoformat(),
+        )
+
     def test_fill_after_30_minute_entry_window_is_not_allowed(self) -> None:
         ready_at = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
         outcome = _simulate_limit_outcome(
@@ -440,6 +469,33 @@ class LtfExecutionBacktestTest(unittest.TestCase):
         self.assertEqual(
             outcome["cancellation_reason"],
             "OTD_TRANSITIONED_TO_OPEN_AUCTION",
+        )
+
+    def test_context_extreme_requires_close_beyond_tolerance(self) -> None:
+        wick_only = _context_history(inside_value=False)
+        wick_only.loc[
+            pd.Timestamp("2026-07-01T10:00:00Z"),
+            ["open", "high", "low", "close"],
+        ] = [100.0, 100.2, 99.4, 100.0]
+        close_break = wick_only.copy()
+        close_break.loc[
+            pd.Timestamp("2026-07-01T10:00:00Z"),
+            ["open", "high", "low", "close"],
+        ] = [100.0, 100.2, 99.0, 99.0]
+
+        wick_timeline = build_dynamic_context_timeline(
+            _candidate(),
+            wick_only,
+        )
+        close_timeline = build_dynamic_context_timeline(
+            _candidate(),
+            close_break,
+        )
+
+        self.assertIsNone(wick_timeline[0].cancellation_reason)
+        self.assertEqual(
+            close_timeline[0].cancellation_reason,
+            "INVALIDATED_BY_CONTEXT_EXTREME",
         )
 
     def test_filled_trade_can_resolve_after_entry_window(self) -> None:
@@ -822,6 +878,52 @@ class LtfExecutionBacktestTest(unittest.TestCase):
             "BROKER_CALIBRATION_TEST",
         )
 
+    def test_partial_cost_coverage_is_not_reported_as_complete(self) -> None:
+        candidate = _candidate()
+        explicit_row = replay_candidate(
+            candidate,
+            _history(),
+            cost_model=ExecutionCostModel(source="EURUSD_TEST_COSTS"),
+        )
+        report = compile_backtest_report(
+            candidates=[candidate],
+            rows=[explicit_row],
+            coverage=[
+                {
+                    "symbol": "EURUSD",
+                    "history_first_bar_utc": (
+                        "2026-07-01T00:00:00+00:00"
+                    ),
+                    "history_last_bar_utc": (
+                        "2026-07-01T23:55:00+00:00"
+                    ),
+                },
+                {
+                    "symbol": "BTCUSD",
+                    "history_first_bar_utc": (
+                        "2026-07-01T00:00:00+00:00"
+                    ),
+                    "history_last_bar_utc": (
+                        "2026-07-01T23:55:00+00:00"
+                    ),
+                },
+            ],
+        )
+        integrity = report["execution_integrity"]
+
+        self.assertEqual(
+            integrity["cost_model_status"],
+            "PARTIAL_PER_SYMBOL_CONFIG",
+        )
+        self.assertEqual(
+            integrity["cost_model_explicit_symbols"],
+            ["EURUSD"],
+        )
+        self.assertEqual(
+            integrity["cost_model_missing_symbols"],
+            ["BTCUSD"],
+        )
+
     def test_report_exposes_chronological_holdout(self) -> None:
         candidate = _candidate()
         first = replay_candidate(candidate, _history())
@@ -903,6 +1005,41 @@ class LtfExecutionBacktestTest(unittest.TestCase):
         self.assertIn("2026-07-03", monday_candidates[0].reference_profile_id)
         self.assertEqual(audit["diagnostics"].get("otd_candidates"), 1)
 
+    def test_repeated_interest_zone_uses_newest_profile_metadata(
+        self,
+    ) -> None:
+        older = ReconstructedProfile(
+            session_id="EURUSD_2026-07-01_LONDON_SYNTHETIC",
+            session_open_utc=datetime(2026, 7, 1, 7, 0, tzinfo=UTC),
+            session_close_utc=datetime(2026, 7, 2, 7, 0, tzinfo=UTC),
+            high=101.0,
+            low=99.0,
+            vah=100.5,
+            val=99.5,
+            poc=100.0,
+            bin_width=0.1,
+            bars=96,
+        )
+        newest = replace(
+            older,
+            session_id="EURUSD_2026-07-02_LONDON_SYNTHETIC",
+            session_open_utc=datetime(2026, 7, 2, 7, 0, tzinfo=UTC),
+            session_close_utc=datetime(2026, 7, 3, 7, 0, tzinfo=UTC),
+        )
+
+        zones = _candidate_interest_zones([older, newest])
+        repeated_high = next(
+            zone
+            for zone in zones
+            if zone["zone_type"] == "SESSION_HIGH"
+            and zone["price"] == 101.0
+        )
+
+        self.assertEqual(
+            repeated_high["profile_id"],
+            newest.session_id,
+        )
+
     def test_twelvedata_paginates_back_to_reported_earliest(self) -> None:
         pages = [
             {"datetime": "2026-07-01 00:00:00"},
@@ -970,6 +1107,40 @@ class LtfExecutionBacktestTest(unittest.TestCase):
                     allow_network_fetch=False,
                     resume=False,
                 )
+
+    def test_zero_event_rerun_removes_stale_census_artifacts(self) -> None:
+        report = compile_backtest_report(
+            candidates=[],
+            rows=[],
+            event_records=[],
+            coverage=[],
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="ltf-v2-stale-census-"
+        ) as tmp:
+            run_dir = Path(tmp)
+            stale_parquet = run_dir / "otd_orr_event_census.parquet"
+            stale_csv = run_dir / "otd_orr_event_census.csv"
+            stale_parquet_tmp = run_dir / (
+                "otd_orr_event_census.parquet.tmp"
+            )
+            stale_csv_tmp = run_dir / "otd_orr_event_census.csv.tmp"
+            stale_parquet.write_bytes(b"stale")
+            stale_csv.write_text("stale\n", encoding="utf-8")
+            stale_parquet_tmp.write_bytes(b"stale")
+            stale_csv_tmp.write_text("stale\n", encoding="utf-8")
+
+            artifacts = write_report_artifacts(
+                run_dir=run_dir,
+                report=report,
+            )
+
+            self.assertFalse(stale_parquet.exists())
+            self.assertFalse(stale_csv.exists())
+            self.assertFalse(stale_parquet_tmp.exists())
+            self.assertFalse(stale_csv_tmp.exists())
+            self.assertIsNone(artifacts["event_census_parquet"])
+            self.assertIsNone(artifacts["event_census_csv"])
 
 
 if __name__ == "__main__":

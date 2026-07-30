@@ -244,6 +244,43 @@ class OtdOrrEventCensusTest(unittest.TestCase):
             1,
         )
 
+    def test_unconfirmed_synthetic_open_is_excluded_fail_closed(
+        self,
+    ) -> None:
+        candidate = _candidate()
+        candidate = replace(
+            candidate,
+            payload={
+                **candidate.payload,
+                "synthetic_open_confirmed": False,
+                "event_census_execution_eligible": True,
+                "event_census_execution_exclusion_reason": None,
+            },
+        )
+
+        event = measure_event_development(
+            candidate,
+            _history(first_forward_high=101.6),
+        )
+        report = compile_event_census(
+            event_records=[event],
+            execution_rows=[],
+        )
+        metrics = report["metrics"]["all"]
+
+        self.assertFalse(event["event_evaluable"])
+        self.assertFalse(event["execution_universe_eligible"])
+        self.assertEqual(
+            event["event_evaluation_status"],
+            "UNCONFIRMED_SYNTHETIC_OPEN",
+        )
+        self.assertEqual(
+            event["execution_universe_exclusion_reason"],
+            "UNCONFIRMED_SYNTHETIC_OPEN",
+        )
+        self.assertEqual(metrics["development_denominator"], 0)
+        self.assertEqual(metrics["execution"]["eligible_event_count"], 0)
+
     def test_same_bar_development_and_invalidation_is_ambiguous(self) -> None:
         event = measure_event_development(
             _candidate(),
@@ -588,6 +625,31 @@ class OtdOrrEventCensusTest(unittest.TestCase):
                 ],
             )
 
+    def test_event_execution_join_validates_full_identity(self) -> None:
+        event = measure_event_development(
+            _candidate(),
+            _history(first_forward_high=101.6),
+        )
+        mismatches = {
+            "symbol": "BTCUSD",
+            "setup_family": "OPEN_REJECTION_REVERSE",
+            "direction": "SHORT",
+            "activated_at_utc": "2026-07-01T10:05:00+00:00",
+        }
+
+        for field, value in mismatches.items():
+            with self.subTest(field=field):
+                execution = _execution_row()
+                execution[field] = value
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "event/execution identity mismatch",
+                ):
+                    compile_event_census(
+                        event_records=[event],
+                        execution_rows=[execution],
+                    )
+
     def test_counter_trend_event_is_counted_but_not_replayed(
         self,
     ) -> None:
@@ -790,6 +852,43 @@ class OtdOrrEventCensusTest(unittest.TestCase):
                 primary_development_r=1.5000000005,
             )
 
+    def test_unmeasured_threshold_is_not_counted_as_failure(self) -> None:
+        three_r = measure_event_development(
+            _candidate(),
+            _history(first_forward_high=103.1),
+            thresholds_r=(1.0, 1.5, 2.0, 3.0),
+        )
+        two_r_candidate = replace(
+            _candidate(),
+            candidate_id="event-2",
+        )
+        two_r = measure_event_development(
+            two_r_candidate,
+            _history(first_forward_high=101.6),
+            thresholds_r=(1.0, 1.5, 2.0),
+        )
+        report = compile_event_census(
+            event_records=[three_r, two_r],
+            execution_rows=[
+                _execution_row(candidate_id="event-1"),
+                _execution_row(candidate_id="event-2"),
+            ],
+        )
+        three_r_metrics = report["metrics"]["all"]["thresholds"]["3.00"]
+
+        self.assertEqual(three_r_metrics["reached_count"], 1)
+        self.assertEqual(three_r_metrics["eligible_count"], 1)
+        self.assertEqual(three_r_metrics["not_measured_count"], 1)
+        self.assertEqual(three_r_metrics["development_rate"], 1.0)
+        self.assertEqual(
+            report["definition"]["thresholds_R"],
+            [1.0, 1.5, 2.0, 3.0],
+        )
+        self.assertEqual(
+            report["definition"]["threshold_schema_policy"],
+            "UNMEASURED_THRESHOLD_EXCLUDED_FROM_DENOMINATOR",
+        )
+
     def test_counter_trend_reconstruction_is_opt_in_for_event_census(
         self,
     ) -> None:
@@ -831,6 +930,70 @@ class OtdOrrEventCensusTest(unittest.TestCase):
             event_audit["diagnostics"][
                 "included_counter_htf_event_census"
             ],
+            1,
+        )
+
+    def test_missing_exact_session_open_bar_cannot_shift_the_open(
+        self,
+    ) -> None:
+        history = _reconstruction_history().drop(
+            pd.Timestamp("2026-07-06T07:00:00Z")
+        )
+        tail = history.loc[
+            [pd.Timestamp("2026-07-06T08:55:00Z")]
+        ].copy()
+        tail.index = pd.DatetimeIndex(
+            [pd.Timestamp("2026-07-06T09:00:00Z")]
+        )
+        history = pd.concat([history, tail])
+
+        candidates, audit = reconstruct_tpo_watch_candidates(
+            history,
+            symbol="EURUSD",
+        )
+
+        monday_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.session_id.startswith("EURUSD_2026-07-06")
+        ]
+        self.assertEqual(monday_candidates, [])
+        self.assertEqual(
+            audit["diagnostics"].get(
+                "skipped_missing_exact_session_open_bar"
+            ),
+            1,
+        )
+
+    def test_gap_between_open_and_confirmation_rejects_candidate(
+        self,
+    ) -> None:
+        history = _reconstruction_history().drop(
+            pd.Timestamp("2026-07-06T07:10:00Z")
+        )
+        tail = history.loc[
+            [pd.Timestamp("2026-07-06T08:55:00Z")]
+        ].copy()
+        tail.index = pd.DatetimeIndex(
+            [pd.Timestamp("2026-07-06T09:00:00Z")]
+        )
+        history = pd.concat([history, tail])
+
+        candidates, audit = reconstruct_tpo_watch_candidates(
+            history,
+            symbol="EURUSD",
+        )
+
+        monday_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.session_id.startswith("EURUSD_2026-07-06")
+        ]
+        self.assertEqual(monday_candidates, [])
+        self.assertEqual(
+            audit["diagnostics"].get(
+                "skipped_incomplete_open_to_confirmation_m5"
+            ),
             1,
         )
 
@@ -904,7 +1067,19 @@ class OtdOrrEventCensusTest(unittest.TestCase):
         )
         self.assertEqual(
             report["coverage"][0]["execution_candidate_count"],
-            1,
+            0,
+        )
+        self.assertEqual(
+            report["event_census"]["metrics"]["all"][
+                "development_denominator"
+            ],
+            0,
+        )
+        self.assertEqual(
+            report["event_census"]["records"][0][
+                "event_evaluation_status"
+            ],
+            "UNCONFIRMED_SYNTHETIC_OPEN",
         )
 
     def test_event_holdout_is_chronological_across_full_event_universe(

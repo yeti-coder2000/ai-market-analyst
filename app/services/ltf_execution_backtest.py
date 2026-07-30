@@ -27,11 +27,13 @@ from app.services.ltf_execution_state_machine import (
     LTF_EXECUTION_STATE_MACHINE_VERSION,
     LTFExecutionStateStore,
     STATE_ENTRY_READY,
+    _atr as _state_machine_atr,
+    _is_context_invalidated as _state_machine_context_invalidated,
 )
 
 
 LTF_EXECUTION_BACKTEST_VERSION = (
-    "ltf-execution-v2-backtest-integrity-v2.0-otd-orr-event-census"
+    "ltf-execution-v2-backtest-integrity-v2.0.1"
 )
 
 MIN_PRIOR_SESSION_M5_BARS = 96
@@ -310,6 +312,44 @@ def normalize_m5_history(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+def _has_complete_m5_sequence(
+    frame: pd.DataFrame,
+    *,
+    start_utc: datetime,
+    end_close_utc: datetime,
+) -> bool:
+    """Require every unique M5 bar from ``start`` through ``end_close``."""
+
+    if end_close_utc <= start_utc:
+        return False
+    expected_opens = pd.date_range(
+        pd.Timestamp(start_utc),
+        pd.Timestamp(end_close_utc) - pd.Timedelta(minutes=5),
+        freq="5min",
+    )
+    opens = pd.to_datetime(frame["bar_open_utc"], utc=True)
+    closes = pd.to_datetime(frame["bar_close_utc"], utc=True)
+    observed = frame.loc[
+        (opens >= pd.Timestamp(start_utc))
+        & (closes <= pd.Timestamp(end_close_utc))
+    ]
+    observed_opens = pd.DatetimeIndex(
+        pd.to_datetime(
+            observed["bar_open_utc"],
+            utc=True,
+            errors="coerce",
+        )
+    )
+    return (
+        len(observed_opens) == len(expected_opens)
+        and observed_opens.nunique() == len(expected_opens)
+        and observed_opens.sort_values().equals(expected_opens)
+        and not bool(
+            observed["_source_duplicate_bar_open_utc"].astype(bool).any()
+        )
+    )
+
+
 def _session_open(local_day: date, spec: SessionSpec) -> datetime:
     zone = ZoneInfo(spec.timezone)
     local = datetime.combine(local_day, spec.open_time, tzinfo=zone)
@@ -548,14 +588,18 @@ def _candidate_interest_zones(
     profiles: Sequence[ReconstructedProfile],
 ) -> tuple[dict[str, Any], ...]:
     zones: list[dict[str, Any]] = []
-    seen: set[tuple[str, float]] = set()
+    index_by_key: dict[tuple[str, float], int] = {}
     for profile in list(profiles)[-5:]:
         for zone in profile.to_interest_zones():
             key = (str(zone["zone_type"]), round(float(zone["price"]), 8))
-            if key in seen:
-                continue
-            seen.add(key)
-            zones.append(zone)
+            existing_index = index_by_key.get(key)
+            if existing_index is None:
+                index_by_key[key] = len(zones)
+                zones.append(zone)
+            else:
+                # Preserve deterministic zone priority while refreshing the
+                # duplicate level with the latest causal profile metadata.
+                zones[existing_index] = zone
     return tuple(zones)
 
 
@@ -619,6 +663,13 @@ def reconstruct_tpo_watch_candidates(
         first_activity = _slice(current_frame, current_open, first_activity_end)
         if len(first_activity) < 12:
             diagnostics["skipped_first_activity_coverage"] += 1
+            continue
+        if (
+            first_activity.empty
+            or _as_utc(first_activity.iloc[0]["bar_open_utc"])
+            != current_open
+        ):
+            diagnostics["skipped_missing_exact_session_open_bar"] += 1
             continue
         source_duplicates = first_activity[
             "_source_duplicate_bar_open_utc"
@@ -716,6 +767,16 @@ def reconstruct_tpo_watch_candidates(
             diagnostics["skipped_no_confirmed_branch"] += 1
             continue
 
+        if not _has_complete_m5_sequence(
+            first_activity,
+            start_utc=current_open,
+            end_close_utc=activated_at,
+        ):
+            diagnostics[
+                "skipped_incomplete_open_to_confirmation_m5"
+            ] += 1
+            continue
+
         bias = _htf_bias(history, as_of=activated_at)
         if bias in {"LONG", "SHORT"} and bias != direction:
             if not include_counter_htf_events:
@@ -737,19 +798,34 @@ def reconstruct_tpo_watch_candidates(
             f"{session_id}_{setup_family}_{direction}_{activated_at:%H%M}"
         )
         zones = _candidate_interest_zones(prior_profiles)
+        synthetic_open_confirmed = (
+            spec.label
+            not in {
+                "LONDON_SYNTHETIC",
+                "TOKYO_SYNTHETIC",
+                "ASIA_SYNTHETIC",
+                "NY_SYNTHETIC",
+            }
+        )
+        execution_eligible = (
+            signal_alignment != "COUNTER_TREND"
+            and synthetic_open_confirmed
+        )
+        if signal_alignment == "COUNTER_TREND":
+            execution_exclusion_reason = "COUNTER_TREND_HARD_GATE"
+        elif not synthetic_open_confirmed:
+            execution_exclusion_reason = "UNCONFIRMED_SYNTHETIC_OPEN"
+        else:
+            execution_exclusion_reason = None
         payload = {
             "symbol": symbol,
             "direction": direction,
             "expected_direction": direction,
             "htf_bias": bias,
             "signal_alignment": signal_alignment,
-            "event_census_execution_eligible": (
-                signal_alignment != "COUNTER_TREND"
-            ),
+            "event_census_execution_eligible": execution_eligible,
             "event_census_execution_exclusion_reason": (
-                "COUNTER_TREND_HARD_GATE"
-                if signal_alignment == "COUNTER_TREND"
-                else None
+                execution_exclusion_reason
             ),
             "tpo_watch_state": "LTF_MODEL_PENDING",
             "tpo_watch_active": True,
@@ -779,15 +855,7 @@ def reconstruct_tpo_watch_candidates(
             "signal_created_at_utc": activated_at.isoformat(),
             "expires_at_utc": expires_at.isoformat(),
             "profile_reliability": "RECONSTRUCTED_NOT_PARITY_VERIFIED",
-            "synthetic_open_confirmed": (
-                spec.label
-                not in {
-                    "LONDON_SYNTHETIC",
-                    "TOKYO_SYNTHETIC",
-                    "ASIA_SYNTHETIC",
-                    "NY_SYNTHETIC",
-                }
-            ),
+            "synthetic_open_confirmed": synthetic_open_confirmed,
             "historical_context_mode": "RECONSTRUCTED_TPO_NO_LOOKAHEAD",
             "macro_guard_status": "NOT_RECONSTRUCTED",
             "positioning_status": "NOT_RECONSTRUCTED",
@@ -1076,10 +1144,22 @@ def build_dynamic_context_timeline(
             block_index += 1
 
         if cancellation_reason is None:
-            invalidated = (
-                float(row["low"]) <= candidate.test_extreme
-                if candidate.direction == "LONG"
-                else float(row["high"]) >= candidate.test_extreme
+            causal_history = history.loc[
+                pd.to_datetime(
+                    history["bar_close_utc"],
+                    utc=True,
+                )
+                <= pd.Timestamp(bar_close)
+            ]
+            invalidated = _state_machine_context_invalidated(
+                {
+                    "symbol": candidate.symbol,
+                    "direction": candidate.direction,
+                    "context_invalidation_price": candidate.test_extreme,
+                    "bos_level": None,
+                },
+                row,
+                atr_value=_state_machine_atr(causal_history),
             )
             if invalidated:
                 cancellation_reason = "INVALIDATED_BY_CONTEXT_EXTREME"
@@ -1804,10 +1884,16 @@ def replay_candidate(
 
     ready_at = _as_utc(ready_result["ltf_execution_v2_entry_ready_at_utc"])
     entry_expiry_value = ready_result.get("entry_window_expires_at_utc")
-    entry_window_expires_at = (
+    requested_entry_window_expires_at = (
         _as_utc(entry_expiry_value)
         if entry_expiry_value
-        else ready_at + timedelta(minutes=DEFAULT_ENTRY_WINDOW_MINUTES)
+        else ready_at + timedelta(
+            minutes=DEFAULT_ENTRY_WINDOW_MINUTES
+        )
+    )
+    entry_window_expires_at = min(
+        requested_entry_window_expires_at,
+        candidate.expires_at_utc,
     )
     entry = float(ready_result["entry_reference_price"])
     stop = float(ready_result["invalidation_reference_price"])
@@ -2157,7 +2243,11 @@ def run_history_backtest(
         candidates = [
             candidate
             for candidate in event_candidates
-            if candidate.payload.get("signal_alignment") != "COUNTER_TREND"
+            if bool(
+                candidate.payload.get(
+                    "event_census_execution_eligible"
+                )
+            )
         ]
         audit["event_candidate_count"] = len(event_candidates)
         audit["execution_candidate_count"] = len(candidates)
@@ -2200,6 +2290,38 @@ def run_history_backtest(
         holdout_fraction=holdout_fraction,
         primary_development_r=primary_development_r,
     )
+
+
+def _execution_cost_model_integrity(
+    *,
+    expected_symbols: Sequence[str] | set[str],
+    models: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    expected = {
+        str(symbol).upper()
+        for symbol in expected_symbols
+        if str(symbol or "").strip()
+    }
+    explicit = {
+        str(symbol).upper()
+        for symbol, model in models.items()
+        if str(model.get("source") or "UNCONFIGURED_ZERO_COST")
+        != "UNCONFIGURED_ZERO_COST"
+    }
+    explicit_in_scope = explicit.intersection(expected)
+    missing = expected.difference(explicit_in_scope)
+    if not explicit_in_scope:
+        status = "UNCONFIGURED_ZERO_COST"
+    elif missing:
+        status = "PARTIAL_PER_SYMBOL_CONFIG"
+    else:
+        status = "EXPLICIT_PER_SYMBOL_CONFIG"
+    return {
+        "cost_model_status": status,
+        "cost_model_expected_symbols": sorted(expected),
+        "cost_model_explicit_symbols": sorted(explicit_in_scope),
+        "cost_model_missing_symbols": sorted(missing),
+    }
 
 
 def compile_backtest_report(
@@ -2291,6 +2413,20 @@ def compile_backtest_report(
             holdout_fraction=holdout_fraction,
             primary_development_r=primary_development_r,
         )
+    expected_cost_symbols = {
+        str(item.get("symbol") or "").upper()
+        for item in coverage
+        if item.get("symbol")
+    }
+    expected_cost_symbols.update(
+        str(row.get("symbol") or "").upper()
+        for row in ordered_rows
+        if row.get("symbol")
+    )
+    cost_model_integrity = _execution_cost_model_integrity(
+        expected_symbols=expected_cost_symbols,
+        models=execution_cost_models,
+    )
     return {
         "version": LTF_EXECUTION_BACKTEST_VERSION,
         "engine_version": LTF_EXECUTION_STATE_MACHINE_VERSION,
@@ -2305,14 +2441,7 @@ def compile_backtest_report(
             "unfilled_limit_cancelled_on_price_invalidation": True,
             "gross_and_net_results": True,
             "primary_expectancy_basis": "NET_R",
-            "cost_model_status": (
-                "EXPLICIT_PER_SYMBOL_CONFIG"
-                if any(
-                    model.get("source") != "UNCONFIGURED_ZERO_COST"
-                    for model in execution_cost_models.values()
-                )
-                else "UNCONFIGURED_ZERO_COST"
-            ),
+            **cost_model_integrity,
             "mfe_mae_same_fill_bar_policy": "whole_bar_included",
             "otd_orr_event_census": (
                 event_census.get("status") == "OK"

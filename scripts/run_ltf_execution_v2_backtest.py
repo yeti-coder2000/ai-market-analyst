@@ -35,6 +35,7 @@ from app.core.instrument_batches import INSTRUMENT_BATCHES
 from app.services.ltf_execution_backtest import (
     ExecutionCostModel,
     HistoricalWatchCandidate,
+    _execution_cost_model_integrity,
     compile_backtest_report,
     normalize_m5_history,
     reconstruct_tpo_watch_candidates,
@@ -47,7 +48,7 @@ from app.services.otd_orr_event_census import (
 
 
 RUNNER_VERSION = (
-    "ltf-execution-v2-provider-depth-runner-v2.0-otd-orr-event-census"
+    "ltf-execution-v2-provider-depth-runner-v2.0.1"
 )
 DEFAULT_OUTPUT_ROOT = Path(
     os.getenv(
@@ -970,7 +971,11 @@ def run_streamed_backtest(
         symbol_candidates = [
             candidate
             for candidate in event_candidates
-            if candidate.payload.get("signal_alignment") != "COUNTER_TREND"
+            if bool(
+                candidate.payload.get(
+                    "event_census_execution_eligible"
+                )
+            )
         ]
         symbol_coverage["event_candidate_count"] = len(event_candidates)
         symbol_coverage["execution_candidate_count"] = len(
@@ -1083,10 +1088,11 @@ def run_streamed_backtest(
         for symbol in symbols
     }
     report["execution_cost_models"] = dict(sorted(effective_models.items()))
-    report["execution_integrity"]["cost_model_status"] = (
-        "EXPLICIT_PER_SYMBOL_CONFIG"
-        if cost_models
-        else "UNCONFIGURED_ZERO_COST"
+    report["execution_integrity"].update(
+        _execution_cost_model_integrity(
+            expected_symbols=set(symbols),
+            models=effective_models,
+        )
     )
     return report
 
@@ -1285,6 +1291,10 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
             f"- Dynamic context cancellation: "
             f"`{integrity.get('dynamic_context_timeline')}`.",
             f"- Cost model status: `{integrity.get('cost_model_status')}`; "
+            "explicit symbols: "
+            f"`{integrity.get('cost_model_explicit_symbols')}`; "
+            "missing symbols: "
+            f"`{integrity.get('cost_model_missing_symbols')}`; "
             "primary expectancy uses net R.",
             "- Unconfigured costs remain explicit zero; no broker costs are "
             "silently guessed.",
@@ -1388,6 +1398,11 @@ def write_report_artifacts(
                     )
                 )
         _atomic_parquet(records_path, record_frame)
+    else:
+        records_path.unlink(missing_ok=True)
+        records_path.with_suffix(
+            records_path.suffix + ".tmp"
+        ).unlink(missing_ok=True)
     event_census = report.get("event_census")
     census_records = (
         event_census.get("records")
@@ -1414,6 +1429,15 @@ def write_report_artifacts(
         )
         census_frame.to_csv(census_csv_temporary, index=False)
         census_csv_temporary.replace(census_csv_path)
+    else:
+        census_path.unlink(missing_ok=True)
+        census_csv_path.unlink(missing_ok=True)
+        census_path.with_suffix(
+            census_path.suffix + ".tmp"
+        ).unlink(missing_ok=True)
+        census_csv_path.with_suffix(
+            census_csv_path.suffix + ".tmp"
+        ).unlink(missing_ok=True)
     return {
         "report_json": str(report_path),
         "report_markdown": str(markdown_path),

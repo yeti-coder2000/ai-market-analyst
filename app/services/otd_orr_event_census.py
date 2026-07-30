@@ -28,7 +28,7 @@ from app.services.ltf_execution_backtest import (
 
 
 OTD_ORR_EVENT_CENSUS_VERSION = (
-    "backtest-integrity-v2.0-otd-orr-event-census"
+    "backtest-integrity-v2.0.1-otd-orr-event-census"
 )
 DEFAULT_PRIMARY_DEVELOPMENT_R = 1.5
 DEFAULT_DEVELOPMENT_THRESHOLDS_R = (1.0, 1.5, 2.0)
@@ -128,6 +128,31 @@ def _empty_event_record(
     threshold_hits = {
         _threshold_key(value): None for value in thresholds_r
     }
+    htf_alignment_state = str(
+        candidate.payload.get("signal_alignment") or ""
+    ).upper()
+    synthetic_open_confirmed = candidate.payload.get(
+        "synthetic_open_confirmed"
+    )
+    requested_execution_eligibility = bool(
+        candidate.payload.get(
+            "event_census_execution_eligible",
+            htf_alignment_state != "COUNTER_TREND",
+        )
+    )
+    execution_eligible = (
+        requested_execution_eligibility
+        and htf_alignment_state != "COUNTER_TREND"
+        and synthetic_open_confirmed is True
+    )
+    if htf_alignment_state == "COUNTER_TREND":
+        execution_exclusion_reason = "COUNTER_TREND_HARD_GATE"
+    elif synthetic_open_confirmed is not True:
+        execution_exclusion_reason = "UNCONFIRMED_SYNTHETIC_OPEN"
+    else:
+        execution_exclusion_reason = candidate.payload.get(
+            "event_census_execution_exclusion_reason"
+        )
     return {
         "event_census_version": OTD_ORR_EVENT_CENSUS_VERSION,
         "candidate_id": candidate.candidate_id,
@@ -156,18 +181,9 @@ def _empty_event_record(
             "profile_reliability"
         )
         or "RECONSTRUCTED_NOT_PARITY_VERIFIED",
-        "execution_universe_eligible": bool(
-            candidate.payload.get(
-                "event_census_execution_eligible",
-                candidate.payload.get("signal_alignment") != "COUNTER_TREND",
-            )
-        ),
-        "execution_universe_exclusion_reason": candidate.payload.get(
-            "event_census_execution_exclusion_reason"
-        ),
-        "synthetic_open_confirmed": candidate.payload.get(
-            "synthetic_open_confirmed"
-        ),
+        "execution_universe_eligible": execution_eligible,
+        "execution_universe_exclusion_reason": execution_exclusion_reason,
+        "synthetic_open_confirmed": synthetic_open_confirmed,
         "session_open_utc": candidate.session_open_utc.isoformat(),
         "confirmed_at_utc": candidate.activated_at_utc.isoformat(),
         "expires_at_utc": candidate.expires_at_utc.isoformat(),
@@ -237,6 +253,20 @@ def measure_event_development(
             {
                 "event_evaluation_status": "UNSUPPORTED_EVENT_FAMILY",
                 "event_outcome": "NOT_EVALUABLE_UNSUPPORTED_FAMILY",
+            }
+        )
+        return record
+    if candidate.payload.get("synthetic_open_confirmed") is not True:
+        record.update(
+            {
+                "event_evaluation_status": (
+                    "UNCONFIRMED_SYNTHETIC_OPEN"
+                ),
+                "event_outcome": (
+                    "NOT_EVALUABLE_UNCONFIRMED_SYNTHETIC_OPEN"
+                ),
+                "terminal_reason": "UNCONFIRMED_SYNTHETIC_OPEN",
+                "forward_m5_integrity_status": "NOT_EVALUATED",
             }
         )
         return record
@@ -621,6 +651,34 @@ def _execution_fields(
     }
 
 
+def _event_execution_identity_mismatches(
+    event: Mapping[str, Any],
+    execution: Mapping[str, Any],
+) -> list[str]:
+    mismatches: list[str] = []
+    for field in ("symbol", "setup_family", "direction"):
+        event_value = str(event.get(field) or "").upper()
+        execution_value = str(execution.get(field) or "").upper()
+        if not event_value or event_value != execution_value:
+            mismatches.append(field)
+
+    event_confirmed = event.get("confirmed_at_utc")
+    execution_activated = execution.get("activated_at_utc")
+    if not event_confirmed or not execution_activated:
+        mismatches.append("activated_at_utc")
+    else:
+        try:
+            timestamps_match = (
+                _as_utc(event_confirmed)
+                == _as_utc(execution_activated)
+            )
+        except (TypeError, ValueError):
+            timestamps_match = False
+        if not timestamps_match:
+            mismatches.append("activated_at_utc")
+    return mismatches
+
+
 def join_event_and_execution_records(
     event_records: Sequence[Mapping[str, Any]],
     execution_rows: Sequence[Mapping[str, Any]],
@@ -665,12 +723,29 @@ def join_event_and_execution_records(
                 "semantic hard gates override derived eligibility flags"
             )
         execution = execution_by_id.get(candidate_id)
+        if execution is not None:
+            identity_mismatches = _event_execution_identity_mismatches(
+                event,
+                execution,
+            )
+            if identity_mismatches:
+                raise ValueError(
+                    "event/execution identity mismatch; "
+                    f"candidate_id={candidate_id}; "
+                    f"fields={identity_mismatches}"
+                )
         if (
             execution is not None
             and not execution_eligible
         ):
+            hard_gate = str(
+                event.get("execution_universe_exclusion_reason")
+                or htf_alignment_state
+                or "HARD_GATE"
+            )
             raise ValueError(
-                "execution row cannot exist for execution-ineligible event; "
+                f"{hard_gate} execution-ineligible event cannot have "
+                "an execution row; "
                 f"candidate_id={candidate_id}; "
                 "hard-gated events must remain outside execution replay"
             )
@@ -811,9 +886,15 @@ def summarize_event_census(
     )
     threshold_summary: dict[str, dict[str, Any]] = {}
     for key in threshold_keys:
-        threshold_ambiguous = [
+        threshold_measured = [
             row
             for row in records
+            if isinstance(row.get("threshold_hits_utc"), Mapping)
+            and key in row["threshold_hits_utc"]
+        ]
+        threshold_ambiguous = [
+            row
+            for row in threshold_measured
             if any(
                 _threshold_key(float(value)) == key
                 for value in row.get("ambiguous_thresholds_R") or []
@@ -824,18 +905,14 @@ def summarize_event_census(
         }
         threshold_reached = [
             row
-            for row in records
-            if isinstance(row.get("threshold_hits_utc"), Mapping)
-            and row["threshold_hits_utc"].get(key) is not None
+            for row in threshold_measured
+            if row["threshold_hits_utc"].get(key) is not None
         ]
         threshold_known_failures = [
             row
-            for row in records
+            for row in threshold_measured
             if str(row["candidate_id"]) not in threshold_ambiguous_ids
-            and not (
-                isinstance(row.get("threshold_hits_utc"), Mapping)
-                and row["threshold_hits_utc"].get(key) is not None
-            )
+            and row["threshold_hits_utc"].get(key) is None
             and bool(row.get("excursion_observation_complete"))
         ]
         eligible = len(threshold_reached) + len(
@@ -847,6 +924,9 @@ def summarize_event_census(
             "reached_count": reached,
             "ambiguous_count": ambiguous_count,
             "eligible_count": eligible,
+            "not_measured_count": (
+                len(records) - len(threshold_measured)
+            ),
             "development_rate": reached / eligible if eligible else None,
         }
 
@@ -1159,6 +1239,24 @@ def compile_event_census(
         bounded_split = 0
     development = joined[:bounded_split]
     holdout = joined[bounded_split:]
+    measured_thresholds = sorted(
+        {
+            float(key)
+            for row in joined
+            for key in (
+                row.get("threshold_hits_utc", {}).keys()
+                if isinstance(row.get("threshold_hits_utc"), Mapping)
+                else []
+            )
+        }
+    )
+    if not measured_thresholds:
+        measured_thresholds = list(
+            _validated_thresholds(
+                primary_development_r,
+                DEFAULT_DEVELOPMENT_THRESHOLDS_R,
+            )
+        )
     return {
         "version": OTD_ORR_EVENT_CENSUS_VERSION,
         "status": "OK",
@@ -1168,11 +1266,9 @@ def compile_event_census(
                 "ABS(CONFIRMATION_BAR_CLOSE-TEST_EXTREME_AT_CONFIRMATION)"
             ),
             "primary_development_R": float(primary_development_r),
-            "thresholds_R": list(
-                _validated_thresholds(
-                    primary_development_r,
-                    DEFAULT_DEVELOPMENT_THRESHOLDS_R,
-                )
+            "thresholds_R": measured_thresholds,
+            "threshold_schema_policy": (
+                "UNMEASURED_THRESHOLD_EXCLUDED_FROM_DENOMINATOR"
             ),
             "same_bar_development_and_terminal_policy": (
                 "AMBIGUOUS_EXCLUDED_FROM_DEVELOPMENT_DENOMINATOR"
@@ -1189,10 +1285,12 @@ def compile_event_census(
             ),
             "development_rate_is_trade_winrate": False,
             "event_universe": (
-                "ALL_CAUSALLY_VALID_OTD_ORR_INCLUDING_COUNTER_HTF"
+                "ALL_RECONSTRUCTED_OTD_ORR; UNCONFIRMED_SYNTHETIC_"
+                "OPENS_EXCLUDED_FROM_DEVELOPMENT_DENOMINATOR"
             ),
             "execution_universe": (
-                "COUNTER_TREND_HARD_GATE_PRESERVED"
+                "COUNTER_TREND_AND_UNCONFIRMED_SYNTHETIC_OPEN_"
+                "HARD_GATES_PRESERVED"
             ),
         },
         "integrity": {
@@ -1202,6 +1300,7 @@ def compile_event_census(
             "incomplete_context_blocks_are_excluded": True,
             "event_and_execution_denominators_are_separate": True,
             "counter_trend_events_can_receive_execution": False,
+            "unconfirmed_synthetic_open_can_receive_execution": False,
             "weekly_cot_event_join": (
                 "NO_DATA_UNTIL_CAUSAL_PUBLICATION_TIMESTAMPS_EXIST"
             ),
