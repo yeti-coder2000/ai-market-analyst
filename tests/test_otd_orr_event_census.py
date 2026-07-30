@@ -270,6 +270,112 @@ class OtdOrrEventCensusTest(unittest.TestCase):
         self.assertIsNone(
             report["metrics"]["all"]["development_rate"]
         )
+        self.assertEqual(event["event_mfe_R"], 0.0)
+        self.assertEqual(event["event_mae_R"], 0.0)
+        self.assertEqual(
+            report["metrics"]["all"]["median_event_MFE_R"],
+            0.0,
+        )
+        self.assertEqual(
+            report["metrics"]["all"]["median_event_MAE_R"],
+            0.0,
+        )
+
+    def test_gap_before_development_is_not_evaluable(self) -> None:
+        history = _history(first_forward_high=100.4)
+        history = history.drop(
+            index=pd.Timestamp("2026-07-01T10:00:00Z")
+        )
+        history.loc[
+            pd.Timestamp("2026-07-01T10:05:00Z"),
+            "high",
+        ] = 101.6
+
+        event = measure_event_development(_candidate(), history)
+        report = compile_event_census(
+            event_records=[event],
+            execution_rows=[_execution_row()],
+        )
+
+        self.assertFalse(event["event_evaluable"])
+        self.assertFalse(event["primary_development_reached"])
+        self.assertEqual(
+            event["event_evaluation_status"],
+            "INCOMPLETE_FORWARD_M5_SEQUENCE",
+        )
+        self.assertEqual(
+            event["event_outcome"],
+            "NOT_EVALUABLE_INCOMPLETE_FORWARD_M5_SEQUENCE",
+        )
+        self.assertEqual(
+            report["metrics"]["all"]["development_denominator"],
+            0,
+        )
+        self.assertEqual(
+            report["metrics"]["all"]["data_reliability"][
+                "forward_m5_integrity_status_counts"
+            ],
+            {"INCOMPLETE_FORWARD_M5_SEQUENCE": 1},
+        )
+
+    def test_duplicate_forward_bar_cannot_confirm_development(self) -> None:
+        history = _history(first_forward_high=101.6)
+        history = pd.concat(
+            [
+                history,
+                history.loc[
+                    [pd.Timestamp("2026-07-01T10:00:00Z")]
+                ],
+            ]
+        )
+
+        event = measure_event_development(_candidate(), history)
+        report = compile_event_census(
+            event_records=[event],
+            execution_rows=[_execution_row()],
+        )
+
+        self.assertFalse(event["event_evaluable"])
+        self.assertFalse(event["primary_development_reached"])
+        self.assertEqual(
+            event["event_evaluation_status"],
+            "DUPLICATE_FORWARD_M5_BAR",
+        )
+        self.assertEqual(
+            report["metrics"]["all"]["development_denominator"],
+            0,
+        )
+
+    def test_truncated_history_is_right_censored_not_failed(self) -> None:
+        history = _history(first_forward_high=100.4).loc[
+            :"2026-07-01T10:10:00Z"
+        ]
+
+        event = measure_event_development(_candidate(), history)
+        report = compile_event_census(
+            event_records=[event],
+            execution_rows=[_execution_row()],
+        )
+        metrics = report["metrics"]["all"]
+
+        self.assertFalse(event["event_evaluable"])
+        self.assertFalse(event["primary_development_reached"])
+        self.assertEqual(
+            event["event_evaluation_status"],
+            "RIGHT_CENSORED_BEFORE_SESSION_HORIZON",
+        )
+        self.assertEqual(
+            event["event_outcome"],
+            "NOT_EVALUABLE_RIGHT_CENSORED",
+        )
+        self.assertEqual(metrics["development_denominator"], 0)
+        self.assertEqual(metrics["development_failure_count"], 0)
+        self.assertEqual(
+            metrics["data_reliability"][
+                "forward_m5_integrity_status_counts"
+            ],
+            {"RIGHT_CENSORED_BEFORE_SESSION_HORIZON": 1},
+        )
 
     def test_orr_short_development_uses_the_same_causal_event_rules(
         self,
@@ -413,6 +519,56 @@ class OtdOrrEventCensusTest(unittest.TestCase):
                 "counter_trend_events_can_receive_execution"
             ]
         )
+
+    def test_execution_row_for_hard_gated_event_is_rejected(self) -> None:
+        candidate = _candidate()
+        candidate = replace(
+            candidate,
+            payload={
+                **candidate.payload,
+                "signal_alignment": "COUNTER_TREND",
+                "event_census_execution_eligible": False,
+                "event_census_execution_exclusion_reason": (
+                    "COUNTER_TREND_HARD_GATE"
+                ),
+            },
+        )
+        event = measure_event_development(
+            candidate,
+            _history(first_forward_high=101.6),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "execution-ineligible event",
+        ):
+            compile_event_census(
+                event_records=[event],
+                execution_rows=[
+                    _execution_row(
+                        ready=True,
+                        outcome="TP_HIT",
+                        filled_at_utc="2026-07-01T10:15:00+00:00",
+                    )
+                ],
+            )
+
+    def test_compile_rejects_primary_threshold_mismatch(self) -> None:
+        event = measure_event_development(
+            _candidate(),
+            _history(first_forward_high=101.6),
+            primary_development_r=1.5,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "primary development threshold mismatch",
+        ):
+            compile_event_census(
+                event_records=[event],
+                execution_rows=[_execution_row()],
+                primary_development_r=2.0,
+            )
 
     def test_counter_trend_reconstruction_is_opt_in_for_event_census(
         self,

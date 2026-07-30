@@ -13,7 +13,7 @@ trade performance remain separate throughout the report.
 """
 
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 import math
 from statistics import median
 from typing import Any, Mapping, Sequence
@@ -195,6 +195,10 @@ def _empty_event_record(
         "minutes_open_to_primary_development": None,
         "observation_end_utc": None,
         "terminal_reason": None,
+        "forward_m5_integrity_status": "PENDING",
+        "excursion_terminal_bar_policy": (
+            "EXCLUDE_TERMINAL_BAR_WHEN_INTRABAR_ORDER_IS_UNKNOWN"
+        ),
     }
 
 
@@ -324,10 +328,24 @@ def measure_event_development(
     event_mae_r = 0.0
     mae_until_primary: float | None = None
     terminal_reason: str | None = None
-    observation_end = candidate.expires_at_utc
+    forward_m5_integrity_status = "COMPLETE"
+    observation_end = candidate.activated_at_utc
+    expected_bar_close = candidate.activated_at_utc + timedelta(minutes=5)
 
     for _, row in forward.iterrows():
         bar_close = _as_utc(row["bar_close_utc"])
+        if bar_close != expected_bar_close:
+            terminal_reason = "INCOMPLETE_FORWARD_M5_SEQUENCE"
+            forward_m5_integrity_status = (
+                "INCOMPLETE_FORWARD_M5_SEQUENCE"
+            )
+            break
+        if bool(row.get("_source_duplicate_bar_open_utc", False)):
+            terminal_reason = "DUPLICATE_FORWARD_M5_BAR"
+            forward_m5_integrity_status = "DUPLICATE_FORWARD_M5_BAR"
+            break
+        expected_bar_close = bar_close + timedelta(minutes=5)
+
         high = float(row["high"])
         low = float(row["low"])
         favorable_price = (
@@ -340,8 +358,6 @@ def measure_event_development(
             if candidate.direction == "LONG"
             else max(0.0, high - reference_price)
         )
-        event_mfe_r = max(event_mfe_r, favorable_price / structural_r)
-        event_mae_r = max(event_mae_r, adverse_price / structural_r)
 
         invalidated = (
             low <= invalidation_price
@@ -367,6 +383,9 @@ def measure_event_development(
             observation_end = bar_close
             break
 
+        event_mfe_r = max(event_mfe_r, favorable_price / structural_r)
+        event_mae_r = max(event_mae_r, adverse_price / structural_r)
+        observation_end = bar_close
         for threshold in newly_touched:
             threshold_hits[_threshold_key(threshold)] = bar_close.isoformat()
             if (
@@ -382,8 +401,13 @@ def measure_event_development(
                 # determine whether it occurred before or after the threshold.
                 mae_until_primary = event_mae_r
     else:
-        terminal_reason = "SESSION_HORIZON_EXPIRED"
-        observation_end = _as_utc(forward.iloc[-1]["bar_close_utc"])
+        if observation_end < candidate.expires_at_utc:
+            terminal_reason = "RIGHT_CENSORED_BEFORE_SESSION_HORIZON"
+            forward_m5_integrity_status = (
+                "RIGHT_CENSORED_BEFORE_SESSION_HORIZON"
+            )
+        else:
+            terminal_reason = "SESSION_HORIZON_EXPIRED"
 
     primary_key = _threshold_key(float(primary_development_r))
     primary_hit = threshold_hits[primary_key]
@@ -396,28 +420,60 @@ def measure_event_development(
         )
         for threshold in ambiguous_thresholds
     )
-    developed = primary_hit is not None
-    if developed:
+    incomplete_forward_data = forward_m5_integrity_status != "COMPLETE"
+    developed = primary_hit is not None and not incomplete_forward_data
+    if incomplete_forward_data:
+        primary_hit = None
+        primary_ambiguous = False
+        threshold_hits = {
+            _threshold_key(value): None for value in thresholds
+        }
+        ambiguous_thresholds = set()
+        event_mfe_value: float | None = None
+        event_mae_value: float | None = None
+        mae_until_primary = None
+        event_evaluation_status = forward_m5_integrity_status
+        event_outcome = (
+            "NOT_EVALUABLE_RIGHT_CENSORED"
+            if terminal_reason == "RIGHT_CENSORED_BEFORE_SESSION_HORIZON"
+            else f"NOT_EVALUABLE_{terminal_reason}"
+        )
+    elif developed:
+        event_mfe_value = event_mfe_r
+        event_mae_value = event_mae_r
+        event_evaluation_status = "EVALUATED_CAUSALLY"
         event_outcome = "DEVELOPED"
     elif primary_ambiguous:
+        event_mfe_value = event_mfe_r
+        event_mae_value = event_mae_r
+        event_evaluation_status = "EVALUATED_CAUSALLY"
         event_outcome = "AMBIGUOUS_DEVELOPMENT_AND_TERMINAL_SAME_BAR"
     elif terminal_reason == "INVALIDATED_BY_STRUCTURAL_EXTREME":
+        event_mfe_value = event_mfe_r
+        event_mae_value = event_mae_r
+        event_evaluation_status = "EVALUATED_CAUSALLY"
         event_outcome = "INVALIDATED_BEFORE_DEVELOPMENT"
     elif terminal_reason == "SESSION_HORIZON_EXPIRED":
+        event_mfe_value = event_mfe_r
+        event_mae_value = event_mae_r
+        event_evaluation_status = "EVALUATED_CAUSALLY"
         event_outcome = "EXPIRED_NO_DEVELOPMENT"
     else:
+        event_mfe_value = event_mfe_r
+        event_mae_value = event_mae_r
+        event_evaluation_status = "EVALUATED_CAUSALLY"
         event_outcome = "CONTEXT_CANCELLED_BEFORE_DEVELOPMENT"
 
     primary_time = _as_utc(primary_hit) if primary_hit else None
     record.update(
         {
-            "event_evaluable": True,
-            "event_evaluation_status": "EVALUATED_CAUSALLY",
+            "event_evaluable": not incomplete_forward_data,
+            "event_evaluation_status": event_evaluation_status,
             "primary_development_reached": developed,
             "primary_development_ambiguous": primary_ambiguous,
             "event_outcome": event_outcome,
-            "event_mfe_R": event_mfe_r,
-            "event_mae_R": event_mae_r,
+            "event_mfe_R": event_mfe_value,
+            "event_mae_R": event_mae_value,
             "mae_R_until_primary_development": (
                 mae_until_primary if developed else None
             ),
@@ -448,6 +504,7 @@ def measure_event_development(
             ),
             "observation_end_utc": observation_end.isoformat(),
             "terminal_reason": terminal_reason,
+            "forward_m5_integrity_status": forward_m5_integrity_status,
         }
     )
     return record
@@ -598,6 +655,15 @@ def join_event_and_execution_records(
         event_ids.add(candidate_id)
         execution = execution_by_id.get(candidate_id)
         if (
+            execution is not None
+            and not bool(event.get("execution_universe_eligible"))
+        ):
+            raise ValueError(
+                "execution row cannot exist for execution-ineligible event; "
+                f"candidate_id={candidate_id}; "
+                "hard-gated events must remain outside execution replay"
+            )
+        if (
             execution is None
             and bool(event.get("execution_universe_eligible"))
         ):
@@ -640,12 +706,38 @@ def _numeric_values(
     return values
 
 
+def _validate_primary_threshold_alignment(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    primary_development_r: float,
+) -> None:
+    requested = float(primary_development_r)
+    for row in rows:
+        measured = _finite_float(row.get("primary_development_R"))
+        if measured is None or not math.isclose(
+            measured,
+            requested,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        ):
+            raise ValueError(
+                "primary development threshold mismatch; "
+                f"candidate_id={row.get('candidate_id')}; "
+                f"record_primary_R={measured}; "
+                f"report_primary_R={requested}"
+            )
+
+
 def summarize_event_census(
     rows: Sequence[Mapping[str, Any]],
     *,
     primary_development_r: float,
 ) -> dict[str, Any]:
     records = list(rows)
+    _validate_primary_threshold_alignment(
+        records,
+        primary_development_r=primary_development_r,
+    )
     evaluable = [
         row for row in records if bool(row.get("event_evaluable"))
     ]
@@ -736,6 +828,10 @@ def summarize_event_census(
     )
     invalidation_types = Counter(
         str(row.get("structural_invalidation_type") or "UNKNOWN")
+        for row in records
+    )
+    forward_m5_integrity = Counter(
+        str(row.get("forward_m5_integrity_status") or "UNKNOWN")
         for row in records
     )
     weekly_cot_cohorts = Counter(
@@ -907,6 +1003,9 @@ def summarize_event_census(
             "profile_reliability_counts": dict(
                 sorted(profile_reliability.items())
             ),
+            "forward_m5_integrity_status_counts": dict(
+                sorted(forward_m5_integrity.items())
+            ),
             "synthetic_open_confirmed_true_count": sum(
                 1
                 for row in records
@@ -1015,6 +1114,12 @@ def compile_event_census(
             ),
             "same_bar_development_and_terminal_policy": (
                 "AMBIGUOUS_EXCLUDED_FROM_DEVELOPMENT_DENOMINATOR"
+            ),
+            "terminal_bar_excursion_policy": (
+                "EXCLUDE_TERMINAL_BAR_WHEN_INTRABAR_ORDER_IS_UNKNOWN"
+            ),
+            "forward_m5_sequence_policy": (
+                "GAPS_DUPLICATES_AND_RIGHT_CENSORING_NOT_EVALUABLE"
             ),
             "development_rate_is_trade_winrate": False,
             "event_universe": (
