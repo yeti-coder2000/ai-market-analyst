@@ -30,6 +30,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from app.core.instrument_batches import INSTRUMENT_BATCHES
 from app.services.ltf_execution_backtest import (
+    ExecutionCostModel,
     HistoricalWatchCandidate,
     compile_backtest_report,
     normalize_m5_history,
@@ -39,7 +40,7 @@ from app.services.ltf_execution_backtest import (
 
 
 RUNNER_VERSION = (
-    "ltf-execution-v2-provider-depth-runner-v1.1-approved-depth-positioning"
+    "ltf-execution-v2-provider-depth-runner-v1.2-backtest-integrity-v1.1"
 )
 DEFAULT_OUTPUT_ROOT = Path(
     os.getenv(
@@ -860,12 +861,60 @@ def collect_positioning_coverage(
     }
 
 
+def load_execution_cost_models(
+    path: Path | None,
+) -> dict[str, ExecutionCostModel]:
+    """Load explicit per-symbol research costs without inventing defaults."""
+
+    if path is None:
+        return {}
+    if not path.exists() or not path.is_file():
+        raise ProviderDepthBacktestError(
+            f"execution cost model file is missing: {path}"
+        )
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as error:  # noqa: BLE001
+        raise ProviderDepthBacktestError(
+            "execution cost model JSON is invalid; "
+            f"error_type={type(error).__name__}"
+        ) from None
+    if not isinstance(document, Mapping):
+        raise ProviderDepthBacktestError(
+            "execution cost model JSON must be an object"
+        )
+    raw_symbols = (
+        document.get("symbols")
+        if isinstance(document.get("symbols"), Mapping)
+        else document
+    )
+    models: dict[str, ExecutionCostModel] = {}
+    for raw_symbol, raw_model in raw_symbols.items():
+        symbol = str(raw_symbol).upper()
+        if symbol not in TWELVEDATA_SYMBOLS and symbol not in YFINANCE_SYMBOLS:
+            raise ProviderDepthBacktestError(
+                f"execution cost model contains unsupported symbol={symbol}"
+            )
+        if not isinstance(raw_model, Mapping):
+            raise ProviderDepthBacktestError(
+                f"execution cost model must be an object for symbol={symbol}"
+            )
+        try:
+            models[symbol] = ExecutionCostModel.from_mapping(raw_model)
+        except (TypeError, ValueError) as error:
+            raise ProviderDepthBacktestError(
+                f"execution cost model is invalid for symbol={symbol}: {error}"
+            ) from None
+    return models
+
+
 def run_streamed_backtest(
     *,
     run_dir: Path,
     symbols: Sequence[str],
     provider_manifest: Mapping[str, Any],
     holdout_fraction: float,
+    cost_models: Mapping[str, ExecutionCostModel] | None = None,
 ) -> dict[str, Any]:
     candidates: list[HistoricalWatchCandidate] = []
     records: list[dict[str, Any]] = []
@@ -910,7 +959,13 @@ def run_streamed_backtest(
         )
         symbol_rows: list[dict[str, Any]] = []
         for index, candidate in enumerate(symbol_candidates, start=1):
-            symbol_rows.append(replay_candidate(candidate, history))
+            symbol_rows.append(
+                replay_candidate(
+                    candidate,
+                    history,
+                    cost_model=(cost_models or {}).get(symbol),
+                )
+            )
             if index % 100 == 0:
                 print(
                     json.dumps(
@@ -970,6 +1025,18 @@ def run_streamed_backtest(
     )
     report["provider_depth"] = dict(provider_manifest)
     report["run_dir"] = str(run_dir)
+    effective_models = {
+        symbol: (
+            (cost_models or {}).get(symbol) or ExecutionCostModel()
+        ).to_dict()
+        for symbol in symbols
+    }
+    report["execution_cost_models"] = dict(sorted(effective_models.items()))
+    report["execution_integrity"]["cost_model_status"] = (
+        "EXPLICIT_PER_SYMBOL_CONFIG"
+        if cost_models
+        else "UNCONFIGURED_ZERO_COST"
+    )
     return report
 
 
@@ -1007,13 +1074,14 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
     by_symbol_rows = []
     for symbol, values in sorted((metrics.get("by_symbol") or {}).items()):
         by_symbol_rows.append(
-            "| {symbol} | {candidates} | {ready} | {filled} | {winrate} | {avg_r} |".format(
+            "| {symbol} | {candidates} | {ready} | {filled} | {winrate} | {gross_r} | {net_r} |".format(
                 symbol=symbol,
                 candidates=values.get("candidate_count"),
                 ready=values.get("ready_count"),
                 filled=values.get("filled_count"),
                 winrate=_pct(values.get("winrate_closed")),
-                avg_r=_number(values.get("average_R_filled")),
+                gross_r=_number(values.get("average_gross_R_filled")),
+                net_r=_number(values.get("average_net_R_filled")),
             )
         )
 
@@ -1047,9 +1115,10 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
         )
 
     limitations = report.get("research_scope") or {}
+    integrity = report.get("execution_integrity") or {}
     return "\n".join(
         [
-            "# LTF Execution State Machine v2 — Provider-Depth Backtest",
+            "# Backtest Integrity v1.1 — LTF Execution State Machine v2",
             "",
             f"Generated: `{report.get('generated_at_utc')}`  ",
             f"Engine: `{report.get('engine_version')}`  ",
@@ -1063,10 +1132,27 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
             f"| ENTRY_READY | {all_metrics.get('ready_count')} | {holdout.get('ready_count')} |",
             f"| Filled | {all_metrics.get('filled_count')} | {holdout.get('filled_count')} |",
             f"| Closed-trade win rate | {_pct(all_metrics.get('winrate_closed'))} | {_pct(holdout.get('winrate_closed'))} |",
-            f"| Average R, filled | {_number(all_metrics.get('average_R_filled'))} | {_number(holdout.get('average_R_filled'))} |",
-            f"| Total R | {_number(all_metrics.get('total_R'))} | {_number(holdout.get('total_R'))} |",
-            f"| Profit factor | {_number(all_metrics.get('profit_factor'))} | {_number(holdout.get('profit_factor'))} |",
+            f"| Average gross R, filled | {_number(all_metrics.get('average_gross_R_filled'))} | {_number(holdout.get('average_gross_R_filled'))} |",
+            f"| Average net R, filled | {_number(all_metrics.get('average_net_R_filled'))} | {_number(holdout.get('average_net_R_filled'))} |",
+            f"| Gross total R | {_number(all_metrics.get('gross_total_R'))} | {_number(holdout.get('gross_total_R'))} |",
+            f"| Net total R | {_number(all_metrics.get('net_total_R'))} | {_number(holdout.get('net_total_R'))} |",
+            f"| Gross profit factor | {_number(all_metrics.get('gross_profit_factor'))} | {_number(holdout.get('gross_profit_factor'))} |",
+            f"| Net profit factor | {_number(all_metrics.get('net_profit_factor'))} | {_number(holdout.get('net_profit_factor'))} |",
+            f"| Entry-window expired, unfilled | {all_metrics.get('entry_window_expired_unfilled_count')} | {holdout.get('entry_window_expired_unfilled_count')} |",
+            f"| Context cancelled before fill | {all_metrics.get('context_cancelled_before_fill_count')} | {holdout.get('context_cancelled_before_fill_count')} |",
+            f"| Invalidated before fill | {all_metrics.get('invalidated_before_fill_count')} | {holdout.get('invalidated_before_fill_count')} |",
             f"| Filled signals/week | {_number(all_metrics.get('filled_signals_per_week'))} | {_number(holdout.get('filled_signals_per_week'))} |",
+            "",
+            "## Integrity controls",
+            "",
+            f"- Entry and trade deadlines are separate: "
+            f"`{integrity.get('deadlines_are_separate')}`.",
+            f"- Dynamic context cancellation: "
+            f"`{integrity.get('dynamic_context_timeline')}`.",
+            f"- Cost model status: `{integrity.get('cost_model_status')}`; "
+            "primary expectancy uses net R.",
+            "- Unconfigured costs remain explicit zero; no broker costs are "
+            "silently guessed.",
             "",
             "## Provider coverage",
             "",
@@ -1076,8 +1162,8 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
             "",
             "## By symbol",
             "",
-            "| Symbol | Candidates | Ready | Filled | Win rate | Avg R |",
-            "|---|---:|---:|---:|---:|---:|",
+            "| Symbol | Candidates | Ready | Filled | Win rate | Avg gross R | Avg net R |",
+            "|---|---:|---:|---:|---:|---:|---:|",
             *by_symbol_rows,
             "",
             "## Positioning coverage",
@@ -1105,6 +1191,10 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
             "fully filtered production-system win rate.",
             "- Same-bar entry+target events are excluded as ambiguous; same-bar "
             "stop+target events are scored stop-first.",
+            "- A limit can fill only through its production entry window; a "
+            "filled trade can continue through the separate resolution horizon.",
+            "- Session/Profile parity is deliberately deferred to P1 and is not "
+            "claimed by this corrected execution-only result.",
             f"- Battle Gate impact: `{limitations.get('battle_gate_impact')}`; "
             f"Telegram impact: `{limitations.get('telegram_signal_impact')}`.",
             "",
@@ -1132,7 +1222,12 @@ def write_report_artifacts(
     markdown_temporary.replace(markdown_path)
     record_frame = pd.DataFrame(report.get("records") or [])
     if not record_frame.empty:
-        for column in ("blockers", "transition_history"):
+        for column in (
+            "blockers",
+            "transition_history",
+            "context_transition_history",
+            "execution_cost_model",
+        ):
             if column in record_frame.columns:
                 record_frame[column] = record_frame[column].map(
                     lambda value: json.dumps(
@@ -1194,6 +1289,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_OPERATIONAL_HISTORY_PATH,
         type=Path,
     )
+    parser.add_argument(
+        "--cost-model-json",
+        default=None,
+        type=Path,
+        help=(
+            "Optional per-symbol spread/slippage/commission research config. "
+            "When omitted, costs are explicitly reported as unconfigured zero."
+        ),
+    )
     parser.add_argument("--holdout-fraction", default=0.30, type=float)
     parser.add_argument("--allow-network-fetch", action="store_true")
     parser.add_argument("--resume", action="store_true")
@@ -1233,6 +1337,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ProviderDepthBacktestError(
             f"unsupported symbols: {', '.join(unsupported)}"
         )
+    cost_models = load_execution_cost_models(args.cost_model_json)
 
     run_id = str(args.run_id or _run_id())
     run_dir = args.output_root / run_id
@@ -1261,6 +1366,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         symbols=symbols,
         provider_manifest=provider_manifest,
         holdout_fraction=args.holdout_fraction,
+        cost_models=cost_models,
     )
     report["positioning_coverage"] = collect_positioning_coverage(
         target_date=_closed_m5_now().date().isoformat(),
