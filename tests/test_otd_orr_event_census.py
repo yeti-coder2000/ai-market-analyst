@@ -129,6 +129,9 @@ def _execution_row(
     ready: bool = False,
     outcome: str = "NO_ENTRY_READY",
     filled_at_utc: str | None = None,
+    ready_evaluable: bool = True,
+    fill_evaluable: bool = True,
+    trade_outcome_evaluable: bool = True,
 ) -> dict[str, object]:
     return {
         "candidate_id": candidate_id,
@@ -152,6 +155,12 @@ def _execution_row(
         "execution_cost_model": {
             "source": "UNIT_TEST_COSTS",
         },
+        "execution_m5_integrity_status": (
+            "COMPLETE_TO_CAUSAL_OUTCOME"
+        ),
+        "ready_evaluable": ready_evaluable,
+        "fill_evaluable": fill_evaluable,
+        "trade_outcome_evaluable": trade_outcome_evaluable,
     }
 
 
@@ -243,6 +252,57 @@ class OtdOrrEventCensusTest(unittest.TestCase):
             ],
             1,
         )
+
+    def test_execution_censoring_is_excluded_from_rate_denominators(
+        self,
+    ) -> None:
+        event = measure_event_development(
+            _candidate(),
+            _history(first_forward_high=101.6),
+        )
+        pre_ready_censored = _execution_row(
+            outcome="NOT_EVALUABLE_RIGHT_CENSORED_BEFORE_ENTRY_READY",
+            ready_evaluable=False,
+            fill_evaluable=False,
+            trade_outcome_evaluable=False,
+        )
+        pre_ready_censored["execution_m5_integrity_status"] = (
+            "RIGHT_CENSORED_BEFORE_ENTRY_READY"
+        )
+
+        report = compile_event_census(
+            event_records=[event],
+            execution_rows=[pre_ready_censored],
+        )
+        execution = report["metrics"]["all"]["execution"]
+
+        self.assertEqual(execution["eligible_event_count"], 1)
+        self.assertEqual(execution["ready_evaluable_event_count"], 0)
+        self.assertIsNone(execution["ready_rate"])
+        self.assertEqual(
+            execution["m5_integrity_status_counts"],
+            {"RIGHT_CENSORED_BEFORE_ENTRY_READY": 1},
+        )
+
+        ready_censored = _execution_row(
+            ready=True,
+            outcome="NOT_EVALUABLE_RIGHT_CENSORED_BEFORE_ENTRY_WINDOW",
+            ready_evaluable=True,
+            fill_evaluable=False,
+            trade_outcome_evaluable=False,
+        )
+        ready_censored["execution_m5_integrity_status"] = (
+            "RIGHT_CENSORED_BEFORE_ENTRY_WINDOW"
+        )
+        report = compile_event_census(
+            event_records=[event],
+            execution_rows=[ready_censored],
+        )
+        execution = report["metrics"]["all"]["execution"]
+
+        self.assertEqual(execution["ready_rate"], 1.0)
+        self.assertEqual(execution["fill_evaluable_ready_count"], 0)
+        self.assertIsNone(execution["fill_rate_of_ready"])
 
     def test_unconfirmed_synthetic_open_is_excluded_fail_closed(
         self,

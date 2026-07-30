@@ -28,7 +28,7 @@ from app.services.ltf_execution_backtest import (
 
 
 OTD_ORR_EVENT_CENSUS_VERSION = (
-    "backtest-integrity-v2.0.1-otd-orr-event-census"
+    "backtest-integrity-v2.0.2-otd-orr-event-census"
 )
 DEFAULT_PRIMARY_DEVELOPMENT_R = 1.5
 DEFAULT_DEVELOPMENT_THRESHOLDS_R = (1.0, 1.5, 2.0)
@@ -574,6 +574,10 @@ def _execution_fields(
             "minutes_open_to_fill": None,
             "minutes_confirmation_to_fill": None,
             "execution_cost_source": None,
+            "execution_m5_integrity_status": "NOT_APPLICABLE",
+            "ready_evaluable": not execution_eligible,
+            "fill_evaluable": not execution_eligible,
+            "trade_outcome_evaluable": not execution_eligible,
         }
 
     session_open = _as_utc(event["session_open_utc"])
@@ -648,6 +652,15 @@ def _execution_fields(
             else None
         ),
         "execution_cost_source": cost_source,
+        "execution_m5_integrity_status": execution.get(
+            "execution_m5_integrity_status"
+        )
+        or "NOT_REPORTED",
+        "ready_evaluable": execution.get("ready_evaluable") is not False,
+        "fill_evaluable": execution.get("fill_evaluable") is not False,
+        "trade_outcome_evaluable": (
+            execution.get("trade_outcome_evaluable") is not False
+        ),
     }
 
 
@@ -859,19 +872,44 @@ def summarize_event_census(
         for row in records
         if bool(row.get("execution_universe_eligible"))
     ]
-    ready = [row for row in records if bool(row.get("ready"))]
-    filled = [row for row in records if bool(row.get("filled"))]
+    ready_evaluable = [
+        row
+        for row in execution_eligible
+        if row.get("ready_evaluable") is not False
+    ]
+    ready = [
+        row for row in ready_evaluable if bool(row.get("ready"))
+    ]
+    fill_evaluable_ready = [
+        row
+        for row in ready
+        if row.get("fill_evaluable") is not False
+    ]
+    filled = [
+        row for row in fill_evaluable_ready if bool(row.get("filled"))
+    ]
+    outcome_evaluable_filled = [
+        row
+        for row in filled
+        if row.get("trade_outcome_evaluable") is not False
+    ]
     trade_wins = [
-        row for row in filled if row.get("execution_outcome") == "TP_HIT"
+        row
+        for row in outcome_evaluable_filled
+        if row.get("execution_outcome") == "TP_HIT"
     ]
     trade_losses = [
         row
-        for row in filled
+        for row in outcome_evaluable_filled
         if str(row.get("execution_outcome") or "").startswith("SL_HIT")
     ]
     closed = len(trade_wins) + len(trade_losses)
-    gross_values = _numeric_values(filled, "gross_R")
-    net_values = _numeric_values(filled, "net_R")
+    gross_values = _numeric_values(outcome_evaluable_filled, "gross_R")
+    net_values = _numeric_values(outcome_evaluable_filled, "net_R")
+    execution_integrity_statuses = Counter(
+        str(row.get("execution_m5_integrity_status") or "NOT_REPORTED")
+        for row in execution_eligible
+    )
     threshold_keys = sorted(
         {
             str(key)
@@ -1056,15 +1094,28 @@ def summarize_event_census(
                     ).items()
                 )
             ),
+            "ready_evaluable_event_count": len(ready_evaluable),
             "ready_count": len(ready),
             "ready_rate": (
-                len(ready) / len(execution_eligible)
-                if execution_eligible
+                len(ready) / len(ready_evaluable)
+                if ready_evaluable
                 else None
             ),
+            "fill_evaluable_ready_count": len(fill_evaluable_ready),
             "filled_count": len(filled),
             "fill_rate_of_ready": (
-                len(filled) / len(ready) if ready else None
+                len(filled) / len(fill_evaluable_ready)
+                if fill_evaluable_ready
+                else None
+            ),
+            "trade_outcome_evaluable_filled_count": len(
+                outcome_evaluable_filled
+            ),
+            "trade_outcome_unknown_filled_count": (
+                len(filled) - len(outcome_evaluable_filled)
+            ),
+            "m5_integrity_status_counts": dict(
+                sorted(execution_integrity_statuses.items())
             ),
             "closed_trade_count": closed,
             "tp_count": len(trade_wins),

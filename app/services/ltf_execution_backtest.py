@@ -33,7 +33,7 @@ from app.services.ltf_execution_state_machine import (
 
 
 LTF_EXECUTION_BACKTEST_VERSION = (
-    "ltf-execution-v2-backtest-integrity-v2.0.1"
+    "ltf-execution-v2-backtest-integrity-v2.0.2"
 )
 
 MIN_PRIOR_SESSION_M5_BARS = 96
@@ -396,6 +396,47 @@ def _resample_m15(frame: pd.DataFrame, *, origin: datetime) -> pd.DataFrame:
     return result.dropna(subset=["open", "high", "low", "close"])
 
 
+def _prior_profile_m5_integrity_status(
+    frame: pd.DataFrame,
+    *,
+    session_open: datetime,
+) -> str:
+    """Require one causal, unique M5 chain for every bar used by a profile."""
+
+    if len(frame) < MIN_PRIOR_SESSION_M5_BARS:
+        return "INSUFFICIENT_COVERAGE"
+    opens = pd.DatetimeIndex(
+        pd.to_datetime(
+            frame["bar_open_utc"],
+            utc=True,
+            errors="coerce",
+        )
+    )
+    if opens.empty or pd.isna(opens[0]):
+        return "MISSING_EXACT_SESSION_OPEN_BAR"
+    if _as_utc(opens[0]) != session_open:
+        return "MISSING_EXACT_SESSION_OPEN_BAR"
+    duplicate_source = frame.get(
+        "_source_duplicate_bar_open_utc",
+        pd.Series(False, index=frame.index),
+    )
+    if bool(duplicate_source.fillna(False).astype(bool).any()):
+        return "DUPLICATE_M5_BAR"
+    expected_opens = pd.date_range(
+        pd.Timestamp(session_open),
+        opens[-1],
+        freq="5min",
+    )
+    if (
+        opens.hasnans
+        or len(opens) != len(expected_opens)
+        or opens.nunique() != len(expected_opens)
+        or not opens.sort_values().equals(expected_opens)
+    ):
+        return "INCOMPLETE_M5_SEQUENCE"
+    return "COMPLETE"
+
+
 def _profile_from_session(
     frame: pd.DataFrame,
     *,
@@ -404,6 +445,14 @@ def _profile_from_session(
     session_open: datetime,
     session_close: datetime,
 ) -> ReconstructedProfile | None:
+    if (
+        _prior_profile_m5_integrity_status(
+            frame,
+            session_open=session_open,
+        )
+        != "COMPLETE"
+    ):
+        return None
     m15 = _resample_m15(frame, origin=session_open)
     if len(m15) < 16:
         return None
@@ -624,7 +673,29 @@ def reconstruct_tpo_watch_candidates(
         session_open = _session_open(local_day, spec)
         session_close = _session_open(local_day + timedelta(days=1), spec)
         session_frame = _slice(history, session_open, session_close)
-        if len(session_frame) < MIN_PRIOR_SESSION_M5_BARS:
+        profile_integrity_status = _prior_profile_m5_integrity_status(
+            session_frame,
+            session_open=session_open,
+        )
+        if profile_integrity_status != "COMPLETE":
+            diagnostic_key = {
+                "INSUFFICIENT_COVERAGE": (
+                    "skipped_prior_profile_insufficient_coverage"
+                ),
+                "MISSING_EXACT_SESSION_OPEN_BAR": (
+                    "skipped_prior_profile_missing_exact_session_open_bar"
+                ),
+                "DUPLICATE_M5_BAR": (
+                    "skipped_prior_profile_duplicate_m5_bar"
+                ),
+                "INCOMPLETE_M5_SEQUENCE": (
+                    "skipped_prior_profile_incomplete_m5_sequence"
+                ),
+            }.get(
+                profile_integrity_status,
+                "skipped_prior_profile_unknown_m5_integrity",
+            )
+            diagnostics[diagnostic_key] += 1
             continue
         profile = _profile_from_session(
             session_frame,
@@ -855,6 +926,14 @@ def reconstruct_tpo_watch_candidates(
             "signal_created_at_utc": activated_at.isoformat(),
             "expires_at_utc": expires_at.isoformat(),
             "profile_reliability": "RECONSTRUCTED_NOT_PARITY_VERIFIED",
+            "prior_profile_m5_integrity_status": "COMPLETE",
+            "prior_profile_m5_bar_count": len(previous_frame),
+            "prior_profile_first_bar_utc": (
+                _as_utc(previous_frame["bar_open_utc"].iloc[0]).isoformat()
+            ),
+            "prior_profile_last_bar_close_utc": (
+                _as_utc(previous_frame["bar_close_utc"].iloc[-1]).isoformat()
+            ),
             "synthetic_open_confirmed": synthetic_open_confirmed,
             "historical_context_mode": "RECONSTRUCTED_TPO_NO_LOOKAHEAD",
             "macro_guard_status": "NOT_RECONSTRUCTED",
@@ -1434,6 +1513,12 @@ def _finalize_execution_outcome(
     mfe_price: float | None = None,
     mae_price: float | None = None,
     cancellation_reason: str | None = None,
+    execution_m5_integrity_status: str = "COMPLETE_TO_CAUSAL_OUTCOME",
+    execution_observation_complete: bool = True,
+    execution_integrity_issue_at: datetime | None = None,
+    ready_evaluable: bool = True,
+    fill_evaluable: bool = True,
+    trade_outcome_evaluable: bool = True,
 ) -> dict[str, Any]:
     filled = filled_at is not None
     spread_cost_r = (
@@ -1480,8 +1565,52 @@ def _finalize_execution_outcome(
             else None
         ),
         "cancellation_reason": cancellation_reason,
+        "execution_m5_integrity_status": execution_m5_integrity_status,
+        "execution_observation_complete": execution_observation_complete,
+        "execution_integrity_issue_at_utc": (
+            execution_integrity_issue_at.isoformat()
+            if execution_integrity_issue_at
+            else None
+        ),
+        "execution_observation_end_utc": resolved_at.isoformat(),
+        "ready_evaluable": ready_evaluable,
+        "fill_evaluable": fill_evaluable,
+        "trade_outcome_evaluable": trade_outcome_evaluable,
         "execution_cost_model": cost_model.to_dict(),
     }
+
+
+def _execution_integrity_failure_outcome(
+    *,
+    status: str,
+    filled_at: datetime | None,
+    observation_end: datetime,
+    issue_at: datetime,
+    risk: float,
+    cost_model: ExecutionCostModel,
+) -> dict[str, Any]:
+    outcome_by_status = {
+        "INCOMPLETE_POST_CONFIRMATION_M5_SEQUENCE": (
+            "NOT_EVALUABLE_INCOMPLETE_POST_CONFIRMATION_M5_SEQUENCE"
+        ),
+        "DUPLICATE_POST_CONFIRMATION_M5_BAR": (
+            "NOT_EVALUABLE_DUPLICATE_POST_CONFIRMATION_M5_BAR"
+        ),
+    }
+    return _finalize_execution_outcome(
+        outcome=outcome_by_status[status],
+        gross_r=None,
+        filled_at=filled_at,
+        resolved_at=observation_end,
+        risk=risk,
+        cost_model=cost_model,
+        execution_m5_integrity_status=status,
+        execution_observation_complete=False,
+        execution_integrity_issue_at=issue_at,
+        ready_evaluable=True,
+        fill_evaluable=filled_at is not None,
+        trade_outcome_evaluable=False,
+    )
 
 
 def _simulate_limit_outcome(
@@ -1516,26 +1645,75 @@ def _simulate_limit_outcome(
         entry_window_expires_at,
         trade_resolution_expires_at,
     )
-    forward = bars.loc[
+    replay_bars = bars.copy()
+    bar_closes = pd.to_datetime(
+        replay_bars["bar_close_utc"],
+        utc=True,
+        errors="coerce",
+    )
+    if "bar_open_utc" in replay_bars.columns:
+        bar_opens = pd.to_datetime(
+            replay_bars["bar_open_utc"],
+            utc=True,
+            errors="coerce",
+        )
+    else:
+        bar_opens = bar_closes - pd.Timedelta(minutes=5)
+    source_duplicates = pd.Series(
+        bar_opens.duplicated(keep=False),
+        index=replay_bars.index,
+    )
+    if "_source_duplicate_bar_open_utc" in replay_bars.columns:
+        source_duplicates = (
+            source_duplicates
+            | replay_bars["_source_duplicate_bar_open_utc"]
+            .fillna(False)
+            .astype(bool)
+        )
+    replay_bars["_execution_source_duplicate_m5"] = source_duplicates
+    replay_bars["_execution_bar_close_utc"] = bar_closes
+    forward = replay_bars.loc[
         (
-            pd.to_datetime(bars["bar_close_utc"], utc=True)
+            bar_closes
             > pd.Timestamp(ready_at)
         )
         & (
-            pd.to_datetime(bars["bar_close_utc"], utc=True)
+            bar_closes
             <= pd.Timestamp(trade_resolution_expires_at)
         )
-    ]
+    ].sort_values("_execution_bar_close_utc")
     filled_at: datetime | None = None
     last_close = entry
     mfe_price: float | None = None
     mae_price: float | None = None
+    observation_end = ready_at
+    expected_bar_close = ready_at + timedelta(minutes=5)
     points = sorted(context_timeline, key=lambda point: point.as_of_utc)
     context_index = 0
     active_context: HistoricalContextPoint | None = None
 
     for _, row in forward.iterrows():
-        bar_close = _as_utc(row["bar_close_utc"])
+        bar_close = _as_utc(row["_execution_bar_close_utc"])
+        if bar_close != expected_bar_close:
+            return _execution_integrity_failure_outcome(
+                status="INCOMPLETE_POST_CONFIRMATION_M5_SEQUENCE",
+                filled_at=filled_at,
+                observation_end=observation_end,
+                issue_at=expected_bar_close,
+                risk=risk,
+                cost_model=effective_costs,
+            )
+        if bool(row["_execution_source_duplicate_m5"]):
+            return _execution_integrity_failure_outcome(
+                status="DUPLICATE_POST_CONFIRMATION_M5_BAR",
+                filled_at=filled_at,
+                observation_end=observation_end,
+                issue_at=bar_close,
+                risk=risk,
+                cost_model=effective_costs,
+            )
+        observation_end = bar_close
+        expected_bar_close = bar_close + timedelta(minutes=5)
         if filled_at is None and bar_close > entry_expiry:
             return _finalize_execution_outcome(
                 outcome="ENTRY_WINDOW_EXPIRED_UNFILLED",
@@ -1672,7 +1850,7 @@ def _simulate_limit_outcome(
                 mae_price=mae_price,
             )
 
-    if filled_at is None:
+    if filled_at is None and observation_end >= entry_expiry:
         return _finalize_execution_outcome(
             outcome="ENTRY_WINDOW_EXPIRED_UNFILLED",
             gross_r=0.0,
@@ -1681,6 +1859,42 @@ def _simulate_limit_outcome(
             risk=risk,
             cost_model=effective_costs,
             cancellation_reason="ENTRY_WINDOW_EXPIRED",
+        )
+    if filled_at is None:
+        return _finalize_execution_outcome(
+            outcome="NOT_EVALUABLE_RIGHT_CENSORED_BEFORE_ENTRY_WINDOW",
+            gross_r=None,
+            filled_at=None,
+            resolved_at=observation_end,
+            risk=risk,
+            cost_model=effective_costs,
+            execution_m5_integrity_status=(
+                "RIGHT_CENSORED_BEFORE_ENTRY_WINDOW"
+            ),
+            execution_observation_complete=False,
+            execution_integrity_issue_at=expected_bar_close,
+            ready_evaluable=True,
+            fill_evaluable=False,
+            trade_outcome_evaluable=False,
+        )
+    if observation_end < trade_resolution_expires_at:
+        return _finalize_execution_outcome(
+            outcome=(
+                "NOT_EVALUABLE_RIGHT_CENSORED_BEFORE_TRADE_HORIZON"
+            ),
+            gross_r=None,
+            filled_at=filled_at,
+            resolved_at=observation_end,
+            risk=risk,
+            cost_model=effective_costs,
+            execution_m5_integrity_status=(
+                "RIGHT_CENSORED_BEFORE_TRADE_HORIZON"
+            ),
+            execution_observation_complete=False,
+            execution_integrity_issue_at=expected_bar_close,
+            ready_evaluable=True,
+            fill_evaluable=True,
+            trade_outcome_evaluable=False,
         )
     mark_r = (
         (last_close - entry) / risk
@@ -1733,14 +1947,40 @@ def replay_candidate(
     ready_setup_snapshot: dict[str, Any] | None = None
     evaluation_count = 1
 
-    future_closes = sorted(
-        {
-            _as_utc(value)
-            for value in replay["bar_close_utc"]
-            if candidate.activated_at_utc < _as_utc(value) <= candidate.expires_at_utc
-        }
+    replay_closes = pd.to_datetime(
+        replay["bar_close_utc"],
+        utc=True,
+        errors="coerce",
     )
-    for bar_close in future_closes:
+    future_rows = replay.loc[
+        (replay_closes > pd.Timestamp(candidate.activated_at_utc))
+        & (replay_closes <= pd.Timestamp(candidate.expires_at_utc))
+    ].sort_values("bar_close_utc")
+    replay_integrity_status = "COMPLETE"
+    replay_integrity_issue_at: datetime | None = None
+    replay_observation_end = candidate.activated_at_utc
+    expected_bar_close = candidate.activated_at_utc + timedelta(minutes=5)
+    for _, replay_row in future_rows.iterrows():
+        bar_close = _as_utc(replay_row["bar_close_utc"])
+        if bar_close != expected_bar_close:
+            replay_integrity_status = (
+                "INCOMPLETE_POST_CONFIRMATION_M5_SEQUENCE"
+            )
+            replay_integrity_issue_at = expected_bar_close
+            break
+        if bool(
+            replay_row.get(
+                "_source_duplicate_bar_open_utc",
+                False,
+            )
+        ):
+            replay_integrity_status = (
+                "DUPLICATE_POST_CONFIRMATION_M5_BAR"
+            )
+            replay_integrity_issue_at = bar_close
+            break
+        replay_observation_end = bar_close
+        expected_bar_close = bar_close + timedelta(minutes=5)
         point = context_by_close.get(bar_close)
         dynamic_payload = dict(candidate.payload)
         if point is not None:
@@ -1766,6 +2006,7 @@ def replay_candidate(
             point
             for point in context_timeline
             if point.cancellation_reason
+            and point.as_of_utc <= replay_observation_end
         ),
         None,
     )
@@ -1780,13 +2021,45 @@ def replay_candidate(
         no_ready_outcome = "CONTEXT_CANCELLED_BEFORE_READY"
     else:
         no_ready_outcome = "NO_ENTRY_READY"
-    if (
-        context_cancellation_reason
-        and first_cancellation_point is not None
-    ):
+    causal_no_ready_resolution = bool(
+        context_cancellation_reason or terminal_reason
+    )
+    if context_cancellation_reason and first_cancellation_point is not None:
         no_ready_resolved_at = first_cancellation_point.as_of_utc
+    elif terminal_reason:
+        no_ready_resolved_at = replay_observation_end
     else:
         no_ready_resolved_at = candidate.expires_at_utc
+    no_ready_integrity_status = "COMPLETE_TO_CAUSAL_OUTCOME"
+    no_ready_observation_complete = True
+    no_ready_integrity_issue_at: datetime | None = None
+    no_ready_ready_evaluable = True
+    if ready_result is None and not causal_no_ready_resolution:
+        if replay_integrity_status != "COMPLETE":
+            no_ready_integrity_status = replay_integrity_status
+            no_ready_integrity_issue_at = replay_integrity_issue_at
+            no_ready_outcome = {
+                "INCOMPLETE_POST_CONFIRMATION_M5_SEQUENCE": (
+                    "NOT_EVALUABLE_INCOMPLETE_POST_CONFIRMATION_M5_SEQUENCE"
+                ),
+                "DUPLICATE_POST_CONFIRMATION_M5_BAR": (
+                    "NOT_EVALUABLE_DUPLICATE_POST_CONFIRMATION_M5_BAR"
+                ),
+            }[replay_integrity_status]
+            no_ready_resolved_at = replay_observation_end
+            no_ready_observation_complete = False
+            no_ready_ready_evaluable = False
+        elif replay_observation_end < candidate.expires_at_utc:
+            no_ready_integrity_status = (
+                "RIGHT_CENSORED_BEFORE_ENTRY_READY"
+            )
+            no_ready_integrity_issue_at = expected_bar_close
+            no_ready_outcome = (
+                "NOT_EVALUABLE_RIGHT_CENSORED_BEFORE_ENTRY_READY"
+            )
+            no_ready_resolved_at = replay_observation_end
+            no_ready_observation_complete = False
+            no_ready_ready_evaluable = False
     transition_history = (
         final_setup_snapshot.get("transition_history")
         or result.get("ltf_execution_v2_transition_history")
@@ -1859,6 +2132,21 @@ def replay_candidate(
         "resolved_at_utc": no_ready_resolved_at.isoformat(),
         "cancellation_reason": context_cancellation_reason
         or terminal_reason,
+        "execution_m5_integrity_status": no_ready_integrity_status,
+        "execution_observation_complete": (
+            no_ready_observation_complete
+        ),
+        "execution_integrity_issue_at_utc": (
+            no_ready_integrity_issue_at.isoformat()
+            if no_ready_integrity_issue_at
+            else None
+        ),
+        "execution_observation_end_utc": (
+            no_ready_resolved_at.isoformat()
+        ),
+        "ready_evaluable": no_ready_ready_evaluable,
+        "fill_evaluable": no_ready_ready_evaluable,
+        "trade_outcome_evaluable": no_ready_ready_evaluable,
         "context_transition_history": _context_transition_history(
             candidate,
             context_timeline,
@@ -2003,6 +2291,23 @@ def replay_candidate(
             "filled_at_utc": outcome.get("filled_at_utc"),
             "resolved_at_utc": outcome.get("resolved_at_utc"),
             "cancellation_reason": outcome.get("cancellation_reason"),
+            "execution_m5_integrity_status": outcome[
+                "execution_m5_integrity_status"
+            ],
+            "execution_observation_complete": outcome[
+                "execution_observation_complete"
+            ],
+            "execution_integrity_issue_at_utc": outcome[
+                "execution_integrity_issue_at_utc"
+            ],
+            "execution_observation_end_utc": outcome[
+                "execution_observation_end_utc"
+            ],
+            "ready_evaluable": outcome["ready_evaluable"],
+            "fill_evaluable": outcome["fill_evaluable"],
+            "trade_outcome_evaluable": outcome[
+                "trade_outcome_evaluable"
+            ],
             "context_transition_history": context_history,
             "behavior_transition_count_before_ready": transitions_before_ready,
             "behavior_transition_count_before_fill": transitions_before_fill,
@@ -2039,12 +2344,37 @@ def summarize_backtest(
     window_end: datetime | None = None,
 ) -> dict[str, Any]:
     records = list(rows)
-    ready = [row for row in records if bool(row.get("ready"))]
-    filled = [row for row in ready if row.get("filled_at_utc")]
-    wins = sum(1 for row in filled if row.get("outcome") == "TP_HIT")
+    ready_evaluable_records = [
+        row
+        for row in records
+        if row.get("ready_evaluable") is not False
+    ]
+    ready = [
+        row
+        for row in ready_evaluable_records
+        if bool(row.get("ready"))
+    ]
+    fill_evaluable_ready = [
+        row for row in ready if row.get("fill_evaluable") is not False
+    ]
+    filled = [
+        row
+        for row in fill_evaluable_ready
+        if row.get("filled_at_utc")
+    ]
+    outcome_evaluable_filled = [
+        row
+        for row in filled
+        if row.get("trade_outcome_evaluable") is not False
+    ]
+    wins = sum(
+        1
+        for row in outcome_evaluable_filled
+        if row.get("outcome") == "TP_HIT"
+    )
     losses = sum(
         1
-        for row in filled
+        for row in outcome_evaluable_filled
         if str(row.get("outcome") or "").startswith("SL_HIT")
     )
     closed = wins + losses
@@ -2054,7 +2384,7 @@ def summarize_backtest(
             if row.get("gross_R") is not None
             else row["realized_R"]
         )
-        for row in filled
+        for row in outcome_evaluable_filled
         if row.get("gross_R") is not None
         or row.get("realized_R") is not None
     ]
@@ -2068,7 +2398,7 @@ def summarize_backtest(
                 else row["realized_R"]
             )
         )
-        for row in filled
+        for row in outcome_evaluable_filled
         if row.get("net_R") is not None
         or row.get("gross_R") is not None
         or row.get("realized_R") is not None
@@ -2086,23 +2416,31 @@ def summarize_backtest(
     ]
     fill_minutes = [
         float(row["minutes_ready_to_fill"])
-        for row in filled
+        for row in outcome_evaluable_filled
         if row.get("minutes_ready_to_fill") is not None
     ]
     mfe_values = [
         float(row["mfe_R"])
-        for row in filled
+        for row in outcome_evaluable_filled
         if row.get("mfe_R") is not None
     ]
     mae_values = [
         float(row["mae_R"])
-        for row in filled
+        for row in outcome_evaluable_filled
         if row.get("mae_R") is not None
     ]
     total_cost_r = sum(
-        float(row.get("total_cost_R") or 0.0) for row in filled
+        float(row.get("total_cost_R") or 0.0)
+        for row in outcome_evaluable_filled
     )
     outcome_counts = Counter(str(row.get("outcome") or "UNKNOWN") for row in records)
+    execution_integrity_counts = Counter(
+        str(
+            row.get("execution_m5_integrity_status")
+            or "NOT_REPORTED"
+        )
+        for row in records
+    )
     state_counts = Counter(
         str(row.get("final_ltf_state") or "UNKNOWN") for row in records
     )
@@ -2123,10 +2461,28 @@ def summarize_backtest(
 
     return {
         "candidate_count": len(records),
+        "ready_evaluable_candidate_count": len(
+            ready_evaluable_records
+        ),
         "ready_count": len(ready),
-        "ready_rate": (len(ready) / len(records)) if records else None,
+        "ready_rate": (
+            len(ready) / len(ready_evaluable_records)
+            if ready_evaluable_records
+            else None
+        ),
+        "fill_evaluable_ready_count": len(fill_evaluable_ready),
         "filled_count": len(filled),
-        "fill_rate_of_ready": (len(filled) / len(ready)) if ready else None,
+        "fill_rate_of_ready": (
+            len(filled) / len(fill_evaluable_ready)
+            if fill_evaluable_ready
+            else None
+        ),
+        "trade_outcome_evaluable_filled_count": len(
+            outcome_evaluable_filled
+        ),
+        "trade_outcome_unknown_filled_count": (
+            len(filled) - len(outcome_evaluable_filled)
+        ),
         "tp_count": wins,
         "sl_count": losses,
         "closed_trade_count": closed,
@@ -2213,6 +2569,9 @@ def summarize_backtest(
         "window_end_utc": window_end.isoformat() if window_end else None,
         "window_weeks": weeks,
         "outcomes": dict(sorted(outcome_counts.items())),
+        "execution_m5_integrity_status_counts": dict(
+            sorted(execution_integrity_counts.items())
+        ),
         "final_states": dict(sorted(state_counts.items())),
         "top_blockers": blocker_counts.most_common(20),
     }
@@ -2228,6 +2587,14 @@ def run_history_backtest(
         ExecutionCostModel | Mapping[str, Any],
     ] | None = None,
 ) -> dict[str, Any]:
+    normalized_cost_models = {
+        str(symbol).upper(): (
+            model
+            if isinstance(model, ExecutionCostModel)
+            else ExecutionCostModel.from_mapping(model)
+        )
+        for symbol, model in (cost_models or {}).items()
+    }
     all_candidates: list[HistoricalWatchCandidate] = []
     all_event_candidates: list[HistoricalWatchCandidate] = []
     coverage: list[dict[str, Any]] = []
@@ -2270,7 +2637,7 @@ def run_history_backtest(
         replay_candidate(
             candidate,
             history_by_symbol[candidate.symbol],
-            cost_model=(cost_models or {}).get(candidate.symbol),
+            cost_model=normalized_cost_models.get(candidate.symbol),
         )
         for candidate in all_candidates
     ]
@@ -2289,6 +2656,7 @@ def run_history_backtest(
         coverage=coverage,
         holdout_fraction=holdout_fraction,
         primary_development_r=primary_development_r,
+        configured_cost_models=normalized_cost_models,
     )
 
 
@@ -2332,6 +2700,10 @@ def compile_backtest_report(
     event_records: Sequence[Mapping[str, Any]] | None = None,
     holdout_fraction: float = 0.30,
     primary_development_r: float = 1.5,
+    configured_cost_models: Mapping[
+        str,
+        ExecutionCostModel | Mapping[str, Any],
+    ] | None = None,
 ) -> dict[str, Any]:
     """Compile stable aggregate metrics from streamed per-symbol replays."""
 
@@ -2367,7 +2739,14 @@ def compile_backtest_report(
     by_direction: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     by_symbol_family: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     by_rr_bucket: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
-    execution_cost_models: dict[str, dict[str, Any]] = {}
+    execution_cost_models: dict[str, dict[str, Any]] = {
+        str(symbol).upper(): (
+            model.to_dict()
+            if isinstance(model, ExecutionCostModel)
+            else ExecutionCostModel.from_mapping(model).to_dict()
+        )
+        for symbol, model in (configured_cost_models or {}).items()
+    }
     for row in ordered_rows:
         symbol = str(row["symbol"])
         family = str(row["setup_family"])
@@ -2439,6 +2818,15 @@ def compile_backtest_report(
             "dynamic_context_timeline": True,
             "unfilled_limit_cancelled_on_context_change": True,
             "unfilled_limit_cancelled_on_price_invalidation": True,
+            "post_confirmation_m5_sequence_policy": (
+                "FAIL_CLOSED_ON_GAP_OR_SOURCE_DUPLICATE"
+            ),
+            "right_censoring_policy": (
+                "EXCLUDE_UNMEASURED_READY_FILL_AND_OUTCOME_DENOMINATORS"
+            ),
+            "prior_profile_m5_policy": (
+                "EXACT_SESSION_OPEN_AND_COMPLETE_UNIQUE_M5_CHAIN"
+            ),
             "gross_and_net_results": True,
             "primary_expectancy_basis": "NET_R",
             **cost_model_integrity,
