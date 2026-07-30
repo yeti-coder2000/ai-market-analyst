@@ -377,6 +377,118 @@ class OtdOrrEventCensusTest(unittest.TestCase):
             {"RIGHT_CENSORED_BEFORE_SESSION_HORIZON": 1},
         )
 
+    def test_gap_after_development_preserves_proven_outcome(self) -> None:
+        history = _history(first_forward_high=101.6).drop(
+            index=pd.Timestamp("2026-07-01T10:05:00Z")
+        )
+
+        event = measure_event_development(_candidate(), history)
+        report = compile_event_census(
+            event_records=[event],
+            execution_rows=[_execution_row()],
+        )
+        metrics = report["metrics"]["all"]
+
+        self.assertTrue(event["event_evaluable"])
+        self.assertTrue(event["primary_development_reached"])
+        self.assertEqual(event["event_outcome"], "DEVELOPED")
+        self.assertEqual(
+            event["primary_developed_at_utc"],
+            "2026-07-01T10:05:00+00:00",
+        )
+        self.assertEqual(
+            event["forward_m5_integrity_status"],
+            "INCOMPLETE_FORWARD_M5_SEQUENCE",
+        )
+        self.assertFalse(event["excursion_observation_complete"])
+        self.assertEqual(metrics["development_denominator"], 1)
+        self.assertEqual(metrics["developed_count"], 1)
+        self.assertEqual(
+            metrics["thresholds"]["1.50"]["eligible_count"],
+            1,
+        )
+        self.assertEqual(
+            metrics["thresholds"]["1.50"]["reached_count"],
+            1,
+        )
+        self.assertEqual(
+            metrics["thresholds"]["2.00"]["eligible_count"],
+            0,
+        )
+        self.assertIsNone(metrics["median_event_MFE_R"])
+        self.assertIsNone(metrics["median_event_MAE_R"])
+
+    def test_duplicate_after_development_preserves_proven_outcome(
+        self,
+    ) -> None:
+        history = _history(first_forward_high=101.6)
+        history = pd.concat(
+            [
+                history,
+                history.loc[
+                    [pd.Timestamp("2026-07-01T10:05:00Z")]
+                ],
+            ]
+        )
+
+        event = measure_event_development(_candidate(), history)
+
+        self.assertTrue(event["event_evaluable"])
+        self.assertTrue(event["primary_development_reached"])
+        self.assertEqual(event["event_outcome"], "DEVELOPED")
+        self.assertEqual(
+            event["threshold_hits_utc"]["1.50"],
+            "2026-07-01T10:05:00+00:00",
+        )
+        self.assertEqual(
+            event["forward_m5_integrity_status"],
+            "DUPLICATE_FORWARD_M5_BAR",
+        )
+        self.assertFalse(event["excursion_observation_complete"])
+
+    def test_right_censoring_after_development_preserves_proven_outcome(
+        self,
+    ) -> None:
+        history = _history(first_forward_high=101.6).loc[
+            :"2026-07-01T10:05:00Z"
+        ]
+
+        event = measure_event_development(_candidate(), history)
+
+        self.assertTrue(event["event_evaluable"])
+        self.assertTrue(event["primary_development_reached"])
+        self.assertEqual(event["event_outcome"], "DEVELOPED")
+        self.assertEqual(
+            event["primary_developed_at_utc"],
+            "2026-07-01T10:05:00+00:00",
+        )
+        self.assertEqual(
+            event["forward_m5_integrity_status"],
+            "RIGHT_CENSORED_BEFORE_SESSION_HORIZON",
+        )
+        self.assertFalse(event["excursion_observation_complete"])
+
+    def test_primary_threshold_uses_exact_unique_identity(self) -> None:
+        event = measure_event_development(
+            _candidate(),
+            _history(first_forward_high=101.5),
+            primary_development_r=1.504,
+        )
+        report = compile_event_census(
+            event_records=[event],
+            execution_rows=[_execution_row()],
+            primary_development_r=1.504,
+        )
+
+        self.assertFalse(event["primary_development_reached"])
+        self.assertIsNotNone(event["threshold_hits_utc"]["1.50"])
+        self.assertIsNone(event["threshold_hits_utc"]["1.504"])
+        self.assertEqual(
+            report["metrics"]["all"]["primary_development_R"],
+            1.504,
+        )
+        self.assertEqual(report["metrics"]["all"]["developed_count"], 0)
+
     def test_orr_short_development_uses_the_same_causal_event_rules(
         self,
     ) -> None:
@@ -553,6 +665,95 @@ class OtdOrrEventCensusTest(unittest.TestCase):
                 ],
             )
 
+    def test_counter_trend_semantics_override_contradictory_eligible_flag(
+        self,
+    ) -> None:
+        candidate = _candidate()
+        candidate = replace(
+            candidate,
+            payload={
+                **candidate.payload,
+                "signal_alignment": "COUNTER_TREND",
+                "event_census_execution_eligible": True,
+                "event_census_execution_exclusion_reason": None,
+            },
+        )
+        event = measure_event_development(
+            candidate,
+            _history(first_forward_high=101.6),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "COUNTER_TREND.*execution-ineligible",
+        ):
+            compile_event_census(
+                event_records=[event],
+                execution_rows=[
+                    _execution_row(
+                        ready=True,
+                        outcome="TP_HIT",
+                        filled_at_utc="2026-07-01T10:15:00+00:00",
+                    )
+                ],
+            )
+
+    def test_filled_unknown_outcomes_are_not_counted_as_known_failures(
+        self,
+    ) -> None:
+        right_censored = measure_event_development(
+            _candidate(),
+            _history(first_forward_high=100.4).loc[
+                :"2026-07-01T10:10:00Z"
+            ],
+        )
+        ambiguous_candidate = replace(
+            _candidate(),
+            candidate_id="event-2",
+        )
+        ambiguous = measure_event_development(
+            ambiguous_candidate,
+            _history(
+                first_forward_high=101.6,
+                first_forward_low=98.9,
+            ),
+        )
+        report = compile_event_census(
+            event_records=[right_censored, ambiguous],
+            execution_rows=[
+                _execution_row(
+                    candidate_id="event-1",
+                    ready=True,
+                    outcome="SL_HIT",
+                    filled_at_utc="2026-07-01T10:15:00+00:00",
+                ),
+                _execution_row(
+                    candidate_id="event-2",
+                    ready=True,
+                    outcome="SL_HIT",
+                    filled_at_utc="2026-07-01T10:15:00+00:00",
+                ),
+            ],
+        )
+        comparison = report["metrics"]["all"][
+            "development_vs_execution"
+        ]
+
+        self.assertEqual(
+            comparison["filled_without_primary_development_count"],
+            0,
+        )
+        self.assertEqual(
+            comparison[
+                "filled_with_ambiguous_primary_development_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            comparison["filled_with_not_evaluable_event_count"],
+            1,
+        )
+
     def test_compile_rejects_primary_threshold_mismatch(self) -> None:
         event = measure_event_development(
             _candidate(),
@@ -568,6 +769,25 @@ class OtdOrrEventCensusTest(unittest.TestCase):
                 event_records=[event],
                 execution_rows=[_execution_row()],
                 primary_development_r=2.0,
+            )
+
+    def test_compile_does_not_merge_nearby_distinct_thresholds(
+        self,
+    ) -> None:
+        event = measure_event_development(
+            _candidate(),
+            _history(first_forward_high=101.6),
+            primary_development_r=1.5,
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "primary development threshold mismatch",
+        ):
+            compile_event_census(
+                event_records=[event],
+                execution_rows=[_execution_row()],
+                primary_development_r=1.5000000005,
             )
 
     def test_counter_trend_reconstruction_is_opt_in_for_event_census(

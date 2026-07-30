@@ -94,7 +94,11 @@ def _wilson_interval(
 
 
 def _threshold_key(value: float) -> str:
-    return f"{float(value):.2f}"
+    number = float(value)
+    rounded_to_two_places = round(number, 2)
+    if number == rounded_to_two_places:
+        return f"{number:.2f}"
+    return format(number, ".17g")
 
 
 def _validated_thresholds(
@@ -196,6 +200,7 @@ def _empty_event_record(
         "observation_end_utc": None,
         "terminal_reason": None,
         "forward_m5_integrity_status": "PENDING",
+        "excursion_observation_complete": False,
         "excursion_terminal_bar_policy": (
             "EXCLUDE_TERMINAL_BAR_WHEN_INTRABAR_ORDER_IS_UNKNOWN"
         ),
@@ -323,6 +328,7 @@ def measure_event_development(
     threshold_hits: dict[str, str | None] = {
         _threshold_key(value): None for value in thresholds
     }
+    primary_key = _threshold_key(float(primary_development_r))
     ambiguous_thresholds: set[float] = set()
     event_mfe_r = 0.0
     event_mae_r = 0.0
@@ -389,12 +395,7 @@ def measure_event_development(
         for threshold in newly_touched:
             threshold_hits[_threshold_key(threshold)] = bar_close.isoformat()
             if (
-                math.isclose(
-                    threshold,
-                    float(primary_development_r),
-                    rel_tol=0.0,
-                    abs_tol=1e-9,
-                )
+                _threshold_key(threshold) == primary_key
                 and mae_until_primary is None
             ):
                 # Whole-bar adverse excursion is retained.  M5 OHLC cannot
@@ -409,26 +410,16 @@ def measure_event_development(
         else:
             terminal_reason = "SESSION_HORIZON_EXPIRED"
 
-    primary_key = _threshold_key(float(primary_development_r))
     primary_hit = threshold_hits[primary_key]
     primary_ambiguous = any(
-        math.isclose(
-            threshold,
-            float(primary_development_r),
-            rel_tol=0.0,
-            abs_tol=1e-9,
-        )
+        _threshold_key(threshold) == primary_key
         for threshold in ambiguous_thresholds
     )
     incomplete_forward_data = forward_m5_integrity_status != "COMPLETE"
-    developed = primary_hit is not None and not incomplete_forward_data
-    if incomplete_forward_data:
-        primary_hit = None
+    developed = primary_hit is not None
+    event_evaluable = developed or not incomplete_forward_data
+    if incomplete_forward_data and not developed:
         primary_ambiguous = False
-        threshold_hits = {
-            _threshold_key(value): None for value in thresholds
-        }
-        ambiguous_thresholds = set()
         event_mfe_value: float | None = None
         event_mae_value: float | None = None
         mae_until_primary = None
@@ -441,7 +432,14 @@ def measure_event_development(
     elif developed:
         event_mfe_value = event_mfe_r
         event_mae_value = event_mae_r
-        event_evaluation_status = "EVALUATED_CAUSALLY"
+        event_evaluation_status = (
+            "EVALUATED_CAUSALLY"
+            if not incomplete_forward_data
+            else (
+                "EVALUATED_CAUSALLY_WITH_INCOMPLETE_"
+                "POST_DEVELOPMENT_OBSERVATION"
+            )
+        )
         event_outcome = "DEVELOPED"
     elif primary_ambiguous:
         event_mfe_value = event_mfe_r
@@ -467,7 +465,7 @@ def measure_event_development(
     primary_time = _as_utc(primary_hit) if primary_hit else None
     record.update(
         {
-            "event_evaluable": not incomplete_forward_data,
+            "event_evaluable": event_evaluable,
             "event_evaluation_status": event_evaluation_status,
             "primary_development_reached": developed,
             "primary_development_ambiguous": primary_ambiguous,
@@ -505,6 +503,7 @@ def measure_event_development(
             "observation_end_utc": observation_end.isoformat(),
             "terminal_reason": terminal_reason,
             "forward_m5_integrity_status": forward_m5_integrity_status,
+            "excursion_observation_complete": not incomplete_forward_data,
         }
     )
     return record
@@ -653,10 +652,22 @@ def join_event_and_execution_records(
         if candidate_id in event_ids:
             raise ValueError(f"duplicate event candidate_id={candidate_id}")
         event_ids.add(candidate_id)
+        htf_alignment_state = str(
+            event.get("htf_alignment_state") or ""
+        ).upper()
+        execution_eligible = bool(
+            event.get("execution_universe_eligible")
+        )
+        if htf_alignment_state == "COUNTER_TREND" and execution_eligible:
+            raise ValueError(
+                "COUNTER_TREND events must remain execution-ineligible; "
+                f"candidate_id={candidate_id}; "
+                "semantic hard gates override derived eligibility flags"
+            )
         execution = execution_by_id.get(candidate_id)
         if (
             execution is not None
-            and not bool(event.get("execution_universe_eligible"))
+            and not execution_eligible
         ):
             raise ValueError(
                 "execution row cannot exist for execution-ineligible event; "
@@ -665,7 +676,7 @@ def join_event_and_execution_records(
             )
         if (
             execution is None
-            and bool(event.get("execution_universe_eligible"))
+            and execution_eligible
         ):
             missing_eligible_execution.append(candidate_id)
         combined = dict(event)
@@ -714,11 +725,9 @@ def _validate_primary_threshold_alignment(
     requested = float(primary_development_r)
     for row in rows:
         measured = _finite_float(row.get("primary_development_R"))
-        if measured is None or not math.isclose(
-            measured,
-            requested,
-            rel_tol=0.0,
-            abs_tol=1e-9,
+        if (
+            measured is None
+            or _threshold_key(measured) != _threshold_key(requested)
         ):
             raise ValueError(
                 "primary development threshold mismatch; "
@@ -751,7 +760,25 @@ def summarize_event_census(
         for row in unambiguous
         if bool(row.get("primary_development_reached"))
     ]
-    failures = len(unambiguous) - len(developed)
+    known_failures = [
+        row
+        for row in unambiguous
+        if not bool(row.get("primary_development_reached"))
+    ]
+    ambiguous_events = [
+        row
+        for row in evaluable
+        if bool(row.get("primary_development_ambiguous"))
+    ]
+    not_evaluable = [
+        row for row in records if not bool(row.get("event_evaluable"))
+    ]
+    excursion_complete = [
+        row
+        for row in evaluable
+        if bool(row.get("excursion_observation_complete"))
+    ]
+    failures = len(known_failures)
     execution_eligible = [
         row
         for row in records
@@ -784,30 +811,41 @@ def summarize_event_census(
     )
     threshold_summary: dict[str, dict[str, Any]] = {}
     for key in threshold_keys:
-        threshold = float(key)
-        ambiguous = sum(
-            1
-            for row in evaluable
+        threshold_ambiguous = [
+            row
+            for row in records
             if any(
-                math.isclose(
-                    float(value),
-                    threshold,
-                    rel_tol=0.0,
-                    abs_tol=1e-9,
-                )
+                _threshold_key(float(value)) == key
                 for value in row.get("ambiguous_thresholds_R") or []
             )
-        )
-        eligible = len(evaluable) - ambiguous
-        reached = sum(
-            1
-            for row in evaluable
+        ]
+        threshold_ambiguous_ids = {
+            str(row["candidate_id"]) for row in threshold_ambiguous
+        }
+        threshold_reached = [
+            row
+            for row in records
             if isinstance(row.get("threshold_hits_utc"), Mapping)
             and row["threshold_hits_utc"].get(key) is not None
+        ]
+        threshold_known_failures = [
+            row
+            for row in records
+            if str(row["candidate_id"]) not in threshold_ambiguous_ids
+            and not (
+                isinstance(row.get("threshold_hits_utc"), Mapping)
+                and row["threshold_hits_utc"].get(key) is not None
+            )
+            and bool(row.get("excursion_observation_complete"))
+        ]
+        eligible = len(threshold_reached) + len(
+            threshold_known_failures
         )
+        reached = len(threshold_reached)
+        ambiguous_count = len(threshold_ambiguous)
         threshold_summary[key] = {
             "reached_count": reached,
-            "ambiguous_count": ambiguous,
+            "ambiguous_count": ambiguous_count,
             "eligible_count": eligible,
             "development_rate": reached / eligible if eligible else None,
         }
@@ -851,6 +889,15 @@ def summarize_event_census(
     filled_ids = {str(row["candidate_id"]) for row in filled}
     tp_ids = {str(row["candidate_id"]) for row in trade_wins}
     sl_ids = {str(row["candidate_id"]) for row in trade_losses}
+    known_failure_ids = {
+        str(row["candidate_id"]) for row in known_failures
+    }
+    ambiguous_ids = {
+        str(row["candidate_id"]) for row in ambiguous_events
+    }
+    not_evaluable_ids = {
+        str(row["candidate_id"]) for row in not_evaluable
+    }
 
     return {
         "event_count": len(records),
@@ -871,10 +918,10 @@ def summarize_event_census(
         "minimum_sample_warning": len(unambiguous) < 30,
         "thresholds": threshold_summary,
         "median_event_MFE_R": _median(
-            _numeric_values(evaluable, "event_mfe_R")
+            _numeric_values(excursion_complete, "event_mfe_R")
         ),
         "median_event_MAE_R": _median(
-            _numeric_values(evaluable, "event_mae_R")
+            _numeric_values(excursion_complete, "event_mae_R")
         ),
         "median_MAE_R_until_primary_development": _median(
             _numeric_values(
@@ -989,7 +1036,16 @@ def summarize_event_census(
                 developed_ids - filled_ids
             ),
             "filled_without_primary_development_count": len(
-                filled_ids - developed_ids
+                filled_ids & known_failure_ids
+            ),
+            "filled_with_known_primary_development_failure_count": len(
+                filled_ids & known_failure_ids
+            ),
+            "filled_with_ambiguous_primary_development_count": len(
+                filled_ids & ambiguous_ids
+            ),
+            "filled_with_not_evaluable_event_count": len(
+                filled_ids & not_evaluable_ids
             ),
             "developed_and_tp_count": len(developed_ids & tp_ids),
             "developed_and_sl_count": len(developed_ids & sl_ids),
@@ -1005,6 +1061,12 @@ def summarize_event_census(
             ),
             "forward_m5_integrity_status_counts": dict(
                 sorted(forward_m5_integrity.items())
+            ),
+            "excursion_observation_complete_count": len(
+                excursion_complete
+            ),
+            "excursion_observation_incomplete_count": (
+                len(evaluable) - len(excursion_complete)
             ),
             "synthetic_open_confirmed_true_count": sum(
                 1
@@ -1119,7 +1181,11 @@ def compile_event_census(
                 "EXCLUDE_TERMINAL_BAR_WHEN_INTRABAR_ORDER_IS_UNKNOWN"
             ),
             "forward_m5_sequence_policy": (
-                "GAPS_DUPLICATES_AND_RIGHT_CENSORING_NOT_EVALUABLE"
+                "PRESERVE_PROVEN_DEVELOPMENT_FAIL_CLOSED_IF_UNPROVEN"
+            ),
+            "excursion_observation_policy": (
+                "INCOMPLETE_POST_DEVELOPMENT_HORIZONS_EXCLUDED_FROM_"
+                "MFE_MAE_AGGREGATES"
             ),
             "development_rate_is_trade_winrate": False,
             "event_universe": (
