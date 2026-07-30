@@ -33,7 +33,7 @@ from app.services.ltf_execution_state_machine import (
 
 
 LTF_EXECUTION_BACKTEST_VERSION = (
-    "ltf-execution-v2-backtest-integrity-v2.0.2"
+    "ltf-execution-v2-backtest-integrity-v2.0.3"
 )
 
 MIN_PRIOR_SESSION_M5_BARS = 96
@@ -56,6 +56,7 @@ class SessionSpec:
     open_time: time
     label: str
     max_horizon_hours: int = DEFAULT_EXECUTION_HORIZON_HOURS
+    profile_duration_minutes: int = 8 * 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,8 +139,20 @@ DEFAULT_SESSION_SPEC = SessionSpec(
 )
 
 SESSION_SPECS: dict[str, SessionSpec] = {
-    "BTCUSD": SessionSpec("UTC", time(0, 0), "UTC_CRYPTO_DAY", 12),
-    "ETHUSD": SessionSpec("UTC", time(0, 0), "UTC_CRYPTO_DAY", 12),
+    "BTCUSD": SessionSpec(
+        "UTC",
+        time(0, 0),
+        "UTC_CRYPTO_DAY",
+        12,
+        24 * 60,
+    ),
+    "ETHUSD": SessionSpec(
+        "UTC",
+        time(0, 0),
+        "UTC_CRYPTO_DAY",
+        12,
+        24 * 60,
+    ),
     "XAUUSD": SessionSpec("Europe/London", time(8, 0), "LONDON_SYNTHETIC", 8),
     "EURUSD": SessionSpec("Europe/London", time(8, 0), "LONDON_SYNTHETIC", 8),
     "GBPUSD": SessionSpec("Europe/London", time(8, 0), "LONDON_SYNTHETIC", 8),
@@ -147,10 +160,34 @@ SESSION_SPECS: dict[str, SessionSpec] = {
     "USDJPY": SessionSpec("Asia/Tokyo", time(9, 0), "TOKYO_SYNTHETIC", 8),
     "AUDUSD": SessionSpec("Asia/Tokyo", time(9, 0), "ASIA_SYNTHETIC", 8),
     "USDCAD": SessionSpec("America/New_York", time(8, 0), "NY_SYNTHETIC", 8),
-    "GER40": SessionSpec("Europe/Berlin", time(9, 0), "XETRA_CASH", 8),
-    "NAS100": SessionSpec("America/New_York", time(9, 30), "NY_RTH", 7),
-    "SPX500": SessionSpec("America/New_York", time(9, 30), "NY_RTH", 7),
-    "UKOIL": SessionSpec("Europe/London", time(8, 0), "LONDON_SYNTHETIC", 9),
+    "GER40": SessionSpec(
+        "Europe/Berlin",
+        time(9, 0),
+        "XETRA_CASH",
+        8,
+        9 * 60,
+    ),
+    "NAS100": SessionSpec(
+        "America/New_York",
+        time(9, 30),
+        "NY_RTH",
+        7,
+        6 * 60 + 30,
+    ),
+    "SPX500": SessionSpec(
+        "America/New_York",
+        time(9, 30),
+        "NY_RTH",
+        7,
+        6 * 60 + 30,
+    ),
+    "UKOIL": SessionSpec(
+        "Europe/London",
+        time(8, 0),
+        "LONDON_SYNTHETIC",
+        9,
+        9 * 60,
+    ),
 }
 
 TICK_SIZE_BY_SYMBOL: dict[str, float] = {
@@ -356,6 +393,13 @@ def _session_open(local_day: date, spec: SessionSpec) -> datetime:
     return local.astimezone(UTC)
 
 
+def _profile_session_close(
+    session_open: datetime,
+    spec: SessionSpec,
+) -> datetime:
+    return session_open + timedelta(minutes=spec.profile_duration_minutes)
+
+
 def _session_days(frame: pd.DataFrame, spec: SessionSpec) -> list[date]:
     if frame.empty:
         return []
@@ -400,10 +444,22 @@ def _prior_profile_m5_integrity_status(
     frame: pd.DataFrame,
     *,
     session_open: datetime,
+    session_close: datetime,
 ) -> str:
-    """Require one causal, unique M5 chain for every bar used by a profile."""
+    """Require a complete unique M5 chain through the declared session edge."""
 
-    if len(frame) < MIN_PRIOR_SESSION_M5_BARS:
+    if session_close <= session_open:
+        return "INVALID_SESSION_RIGHT_EDGE"
+    expected_opens = pd.date_range(
+        pd.Timestamp(session_open),
+        pd.Timestamp(session_close) - pd.Timedelta(minutes=5),
+        freq="5min",
+    )
+    minimum_coverage = min(
+        MIN_PRIOR_SESSION_M5_BARS,
+        len(expected_opens),
+    )
+    if len(frame) < minimum_coverage:
         return "INSUFFICIENT_COVERAGE"
     opens = pd.DatetimeIndex(
         pd.to_datetime(
@@ -422,11 +478,8 @@ def _prior_profile_m5_integrity_status(
     )
     if bool(duplicate_source.fillna(False).astype(bool).any()):
         return "DUPLICATE_M5_BAR"
-    expected_opens = pd.date_range(
-        pd.Timestamp(session_open),
-        opens[-1],
-        freq="5min",
-    )
+    if opens[-1] != expected_opens[-1]:
+        return "MISSING_CONFIRMED_SESSION_RIGHT_EDGE"
     if (
         opens.hasnans
         or len(opens) != len(expected_opens)
@@ -449,6 +502,7 @@ def _profile_from_session(
         _prior_profile_m5_integrity_status(
             frame,
             session_open=session_open,
+            session_close=session_close,
         )
         != "COMPLETE"
     ):
@@ -671,11 +725,12 @@ def reconstruct_tpo_watch_candidates(
     completed_profiles: list[ReconstructedProfile] = []
     for local_day in days:
         session_open = _session_open(local_day, spec)
-        session_close = _session_open(local_day + timedelta(days=1), spec)
+        session_close = _profile_session_close(session_open, spec)
         session_frame = _slice(history, session_open, session_close)
         profile_integrity_status = _prior_profile_m5_integrity_status(
             session_frame,
             session_open=session_open,
+            session_close=session_close,
         )
         if profile_integrity_status != "COMPLETE":
             diagnostic_key = {
@@ -690,6 +745,12 @@ def reconstruct_tpo_watch_candidates(
                 ),
                 "INCOMPLETE_M5_SEQUENCE": (
                     "skipped_prior_profile_incomplete_m5_sequence"
+                ),
+                "MISSING_CONFIRMED_SESSION_RIGHT_EDGE": (
+                    "skipped_prior_profile_missing_confirmed_right_edge"
+                ),
+                "INVALID_SESSION_RIGHT_EDGE": (
+                    "skipped_prior_profile_invalid_session_right_edge"
                 ),
             }.get(
                 profile_integrity_status,
@@ -934,6 +995,12 @@ def reconstruct_tpo_watch_candidates(
             "prior_profile_last_bar_close_utc": (
                 _as_utc(previous_frame["bar_close_utc"].iloc[-1]).isoformat()
             ),
+            "prior_profile_expected_right_edge_utc": (
+                previous_profile.session_close_utc.isoformat()
+            ),
+            "prior_profile_expected_m5_bar_count": (
+                spec.profile_duration_minutes // 5
+            ),
             "synthetic_open_confirmed": synthetic_open_confirmed,
             "historical_context_mode": "RECONSTRUCTED_TPO_NO_LOOKAHEAD",
             "macro_guard_status": "NOT_RECONSTRUCTED",
@@ -970,6 +1037,10 @@ def reconstruct_tpo_watch_candidates(
             "timezone": spec.timezone,
             "open_time": spec.open_time.isoformat(),
             "label": spec.label,
+            "profile_duration_minutes": spec.profile_duration_minutes,
+            "profile_expected_m5_bars": (
+                spec.profile_duration_minutes // 5
+            ),
         },
         "history_rows": len(history),
         "history_first_bar_utc": (
@@ -1694,6 +1765,18 @@ def _simulate_limit_outcome(
 
     for _, row in forward.iterrows():
         bar_close = _as_utc(row["_execution_bar_close_utc"])
+        # Once every M5 close through the entry deadline has been observed,
+        # a later data defect cannot erase the causally known unfilled expiry.
+        if filled_at is None and observation_end >= entry_expiry:
+            return _finalize_execution_outcome(
+                outcome="ENTRY_WINDOW_EXPIRED_UNFILLED",
+                gross_r=0.0,
+                filled_at=None,
+                resolved_at=entry_expiry,
+                risk=risk,
+                cost_model=effective_costs,
+                cancellation_reason="ENTRY_WINDOW_EXPIRED",
+            )
         if bar_close != expected_bar_close:
             return _execution_integrity_failure_outcome(
                 status="INCOMPLETE_POST_CONFIRMATION_M5_SEQUENCE",
@@ -2721,19 +2804,6 @@ def compile_backtest_report(
             str(row["candidate_id"]),
         ),
     )
-    if ordered_rows:
-        split_index = max(
-            1,
-            min(
-                len(ordered_rows) - 1,
-                int(round(len(ordered_rows) * (1.0 - holdout_fraction))),
-            ),
-        )
-    else:
-        split_index = 0
-    development_rows = ordered_rows[:split_index]
-    holdout_rows = ordered_rows[split_index:]
-
     by_symbol: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     by_family: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     by_direction: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
@@ -2783,8 +2853,30 @@ def compile_backtest_report(
             "version": OTD_ORR_EVENT_CENSUS_VERSION,
             "status": "NOT_PROVIDED",
             "primary_development_R": float(primary_development_r),
+            "holdout_start_utc": None,
             "records": [],
         }
+        if len(ordered_rows) >= 2:
+            legacy_split_index = max(
+                1,
+                min(
+                    len(ordered_rows) - 1,
+                    int(
+                        round(
+                            len(ordered_rows)
+                            * (1.0 - holdout_fraction)
+                        )
+                    ),
+                ),
+            )
+            holdout_start = _as_utc(
+                ordered_rows[legacy_split_index]["activated_at_utc"]
+            )
+        else:
+            holdout_start = None
+        holdout_cutoff_source = (
+            "EXECUTION_UNIVERSE_FALLBACK_EVENT_CENSUS_NOT_PROVIDED"
+        )
     else:
         event_census = compile_event_census(
             event_records=event_records,
@@ -2792,6 +2884,28 @@ def compile_backtest_report(
             holdout_fraction=holdout_fraction,
             primary_development_r=primary_development_r,
         )
+        raw_holdout_start = event_census.get("holdout_start_utc")
+        holdout_start = (
+            _as_utc(raw_holdout_start)
+            if raw_holdout_start
+            else None
+        )
+        holdout_cutoff_source = "FULL_EVENT_UNIVERSE_CONFIRMED_AT_UTC"
+    if holdout_start is None:
+        development_rows = ordered_rows
+        holdout_rows: list[dict[str, Any]] = []
+    else:
+        development_rows = [
+            row
+            for row in ordered_rows
+            if _as_utc(row["activated_at_utc"]) < holdout_start
+        ]
+        holdout_rows = [
+            row
+            for row in ordered_rows
+            if _as_utc(row["activated_at_utc"]) >= holdout_start
+        ]
+    split_index = len(development_rows)
     expected_cost_symbols = {
         str(item.get("symbol") or "").upper()
         for item in coverage
@@ -2825,7 +2939,11 @@ def compile_backtest_report(
                 "EXCLUDE_UNMEASURED_READY_FILL_AND_OUTCOME_DENOMINATORS"
             ),
             "prior_profile_m5_policy": (
-                "EXACT_SESSION_OPEN_AND_COMPLETE_UNIQUE_M5_CHAIN"
+                "EXACT_SESSION_OPEN_RIGHT_EDGE_AND_UNIQUE_M5_CHAIN"
+            ),
+            "chronological_holdout_cutoff_source": holdout_cutoff_source,
+            "event_and_execution_share_holdout_cutoff": (
+                event_records is not None
             ),
             "gross_and_net_results": True,
             "primary_expectancy_basis": "NET_R",
@@ -2867,6 +2985,9 @@ def compile_backtest_report(
             ),
         },
         "holdout_fraction": holdout_fraction,
+        "holdout_start_utc": (
+            holdout_start.isoformat() if holdout_start else None
+        ),
         "split_index": split_index,
         "coverage": [dict(item) for item in coverage],
         "metrics": {

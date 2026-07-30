@@ -467,6 +467,53 @@ class LtfExecutionBacktestTest(unittest.TestCase):
             "2026-07-01T10:30:00+00:00",
         )
 
+    def test_later_gap_preserves_known_entry_window_expiry(self) -> None:
+        ready_at = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
+        outcome = _simulate_limit_outcome(
+            _outcome_bars(
+                [
+                    (
+                        f"2026-07-01T10:{minute:02d}:00Z",
+                        100.4,
+                        100.8,
+                        100.1,
+                        100.4,
+                    )
+                    for minute in range(5, 31, 5)
+                ]
+                + [
+                    (
+                        "2026-07-01T10:40:00Z",
+                        100.4,
+                        100.8,
+                        100.1,
+                        100.4,
+                    )
+                ]
+            ),
+            direction="LONG",
+            ready_at=ready_at,
+            entry_window_expires_at=ready_at + timedelta(minutes=30),
+            trade_resolution_expires_at=ready_at + timedelta(hours=8),
+            entry=100.0,
+            stop=99.0,
+            target=102.0,
+        )
+
+        self.assertEqual(
+            outcome["outcome"],
+            "ENTRY_WINDOW_EXPIRED_UNFILLED",
+        )
+        self.assertEqual(
+            outcome["resolved_at_utc"],
+            "2026-07-01T10:30:00+00:00",
+        )
+        self.assertTrue(outcome["fill_evaluable"])
+        self.assertEqual(
+            outcome["execution_m5_integrity_status"],
+            "COMPLETE_TO_CAUSAL_OUTCOME",
+        )
+
     def test_invalidation_before_limit_fill_cancels_order(self) -> None:
         ready_at = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
         outcome = _simulate_limit_outcome(
@@ -1490,7 +1537,7 @@ class LtfExecutionBacktestTest(unittest.TestCase):
         )
 
     def test_complete_prior_profile_preserves_cash_candidate(self) -> None:
-        candidates, _ = reconstruct_tpo_watch_candidates(
+        candidates, audit = reconstruct_tpo_watch_candidates(
             _cash_reconstruction_history(),
             symbol="GER40",
         )
@@ -1515,6 +1562,57 @@ class LtfExecutionBacktestTest(unittest.TestCase):
         self.assertEqual(
             monday_candidates[0].payload["prior_profile_m5_bar_count"],
             108,
+        )
+        self.assertEqual(
+            monday_candidates[0].payload[
+                "prior_profile_expected_m5_bar_count"
+            ],
+            108,
+        )
+        self.assertEqual(
+            monday_candidates[0].payload[
+                "prior_profile_expected_right_edge_utc"
+            ],
+            "2026-07-03T16:00:00+00:00",
+        )
+        self.assertEqual(
+            monday_candidates[0].payload[
+                "prior_profile_last_bar_close_utc"
+            ],
+            "2026-07-03T16:00:00+00:00",
+        )
+        self.assertEqual(
+            audit["session_spec"]["profile_duration_minutes"],
+            540,
+        )
+
+    def test_right_truncated_prior_profile_rejects_cash_candidate(
+        self,
+    ) -> None:
+        history = _cash_reconstruction_history()
+        truncated_tail = pd.date_range(
+            "2026-07-03T15:00:00Z",
+            periods=12,
+            freq="5min",
+        )
+        history = history.drop(truncated_tail)
+
+        candidates, audit = reconstruct_tpo_watch_candidates(
+            history,
+            symbol="GER40",
+        )
+
+        monday_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.session_id.startswith("GER40_2026-07-06")
+        ]
+        self.assertEqual(monday_candidates, [])
+        self.assertEqual(
+            audit["diagnostics"].get(
+                "skipped_prior_profile_missing_confirmed_right_edge"
+            ),
+            1,
         )
 
     def test_prior_profile_duplicate_rejects_cash_candidate(self) -> None:

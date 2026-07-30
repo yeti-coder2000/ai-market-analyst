@@ -28,7 +28,7 @@ from app.services.ltf_execution_backtest import (
 
 
 OTD_ORR_EVENT_CENSUS_VERSION = (
-    "backtest-integrity-v2.0.2-otd-orr-event-census"
+    "backtest-integrity-v2.0.3-otd-orr-event-census"
 )
 DEFAULT_PRIMARY_DEVELOPMENT_R = 1.5
 DEFAULT_DEVELOPMENT_THRESHOLDS_R = (1.0, 1.5, 2.0)
@@ -1265,6 +1265,49 @@ def _grouped_summaries(
     }
 
 
+def _chronological_holdout_start_utc(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    holdout_fraction: float,
+) -> datetime | None:
+    """Return one time boundary derived from the full event universe."""
+
+    ordered = sorted(
+        records,
+        key=lambda row: (
+            _as_utc(row["confirmed_at_utc"]),
+            str(row["candidate_id"]),
+        ),
+    )
+    if len(ordered) < 2:
+        return None
+    target_split = max(
+        1,
+        min(
+            len(ordered) - 1,
+            int(round(len(ordered) * (1.0 - holdout_fraction))),
+        ),
+    )
+    timestamps = [
+        _as_utc(row["confirmed_at_utc"])
+        for row in ordered
+    ]
+    cutoff = timestamps[target_split]
+    while target_split > 0 and timestamps[target_split - 1] == cutoff:
+        target_split -= 1
+    if target_split == 0:
+        target_split = 1
+        while (
+            target_split < len(timestamps)
+            and timestamps[target_split] == timestamps[0]
+        ):
+            target_split += 1
+        if target_split >= len(timestamps):
+            return None
+        cutoff = timestamps[target_split]
+    return cutoff
+
+
 def compile_event_census(
     *,
     event_records: Sequence[Mapping[str, Any]],
@@ -1278,18 +1321,25 @@ def compile_event_census(
         event_records,
         execution_rows,
     )
-    if joined:
-        bounded_split = max(
-            1,
-            min(
-                len(joined) - 1,
-                int(round(len(joined) * (1.0 - holdout_fraction))),
-            ),
-        )
+    holdout_start = _chronological_holdout_start_utc(
+        joined,
+        holdout_fraction=holdout_fraction,
+    )
+    if holdout_start is None:
+        development = joined
+        holdout: list[dict[str, Any]] = []
     else:
-        bounded_split = 0
-    development = joined[:bounded_split]
-    holdout = joined[bounded_split:]
+        development = [
+            row
+            for row in joined
+            if _as_utc(row["confirmed_at_utc"]) < holdout_start
+        ]
+        holdout = [
+            row
+            for row in joined
+            if _as_utc(row["confirmed_at_utc"]) >= holdout_start
+        ]
+    bounded_split = len(development)
     measured_thresholds = sorted(
         {
             float(key)
@@ -1343,6 +1393,9 @@ def compile_event_census(
                 "COUNTER_TREND_AND_UNCONFIRMED_SYNTHETIC_OPEN_"
                 "HARD_GATES_PRESERVED"
             ),
+            "chronological_holdout_cutoff": (
+                "ONE_CONFIRMED_AT_UTC_BOUNDARY_FROM_FULL_EVENT_UNIVERSE"
+            ),
         },
         "integrity": {
             "look_ahead_allowed": False,
@@ -1350,6 +1403,7 @@ def compile_event_census(
             "future_extreme_does_not_define_risk": True,
             "incomplete_context_blocks_are_excluded": True,
             "event_and_execution_denominators_are_separate": True,
+            "event_and_execution_share_holdout_cutoff": True,
             "counter_trend_events_can_receive_execution": False,
             "unconfirmed_synthetic_open_can_receive_execution": False,
             "weekly_cot_event_join": (
@@ -1364,6 +1418,9 @@ def compile_event_census(
         },
         "split_index": bounded_split,
         "holdout_fraction": holdout_fraction,
+        "holdout_start_utc": (
+            holdout_start.isoformat() if holdout_start else None
+        ),
         "metrics": {
             "all": summarize_event_census(
                 joined,

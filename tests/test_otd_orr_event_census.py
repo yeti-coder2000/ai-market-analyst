@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import unittest
 from unittest.mock import patch
 
@@ -1181,6 +1181,114 @@ class OtdOrrEventCensusTest(unittest.TestCase):
                 "excluded_event_count"
             ],
             1,
+        )
+
+    def test_execution_uses_full_event_universe_holdout_cutoff(
+        self,
+    ) -> None:
+        base_candidate = _candidate()
+        base_event = measure_event_development(
+            base_candidate,
+            _history(first_forward_high=101.6),
+        )
+        events: list[dict[str, object]] = []
+        candidates: list[HistoricalWatchCandidate] = []
+        execution_rows: list[dict[str, object]] = []
+
+        for offset in range(10):
+            confirmed = datetime(
+                2026,
+                7,
+                1,
+                10,
+                0,
+                tzinfo=UTC,
+            ) + timedelta(days=offset)
+            candidate_id = f"event-{offset + 1}"
+            execution_eligible = offset % 2 == 1
+            event = {
+                **base_event,
+                "candidate_id": candidate_id,
+                "session_id": f"EURUSD_2026-07-{offset + 1:02d}_TEST",
+                "session_open_utc": (
+                    confirmed - timedelta(minutes=30)
+                ).isoformat(),
+                "confirmed_at_utc": confirmed.isoformat(),
+                "expires_at_utc": (
+                    confirmed + timedelta(minutes=30)
+                ).isoformat(),
+                "execution_universe_eligible": execution_eligible,
+                "execution_universe_exclusion_reason": (
+                    None
+                    if execution_eligible
+                    else "COUNTER_TREND_HARD_GATE"
+                ),
+                "htf_alignment_state": (
+                    "TREND_ALIGNED"
+                    if execution_eligible
+                    else "COUNTER_TREND"
+                ),
+            }
+            events.append(event)
+            if not execution_eligible:
+                continue
+
+            candidate = replace(
+                base_candidate,
+                candidate_id=candidate_id,
+                session_id=str(event["session_id"]),
+                session_open_utc=confirmed - timedelta(minutes=30),
+                activated_at_utc=confirmed,
+                expires_at_utc=confirmed + timedelta(minutes=30),
+            )
+            candidates.append(candidate)
+            execution = _execution_row(
+                candidate_id=candidate_id,
+                ready=True,
+                outcome="TP_HIT",
+                filled_at_utc=(
+                    confirmed + timedelta(minutes=15)
+                ).isoformat(),
+            )
+            execution["activated_at_utc"] = confirmed.isoformat()
+            execution["expires_at_utc"] = (
+                confirmed + timedelta(minutes=30)
+            ).isoformat()
+            execution_rows.append(execution)
+
+        report = compile_backtest_report(
+            candidates=candidates,
+            rows=execution_rows,
+            event_records=events,
+            coverage=[
+                {
+                    "symbol": "EURUSD",
+                    "history_first_bar_utc": (
+                        "2026-07-01T00:00:00+00:00"
+                    ),
+                    "history_last_bar_utc": (
+                        "2026-07-10T23:55:00+00:00"
+                    ),
+                }
+            ],
+            holdout_fraction=0.30,
+        )
+
+        expected_cutoff = "2026-07-08T10:00:00+00:00"
+        self.assertEqual(report["holdout_start_utc"], expected_cutoff)
+        self.assertEqual(
+            report["event_census"]["holdout_start_utc"],
+            expected_cutoff,
+        )
+        self.assertEqual(report["event_census"]["split_index"], 7)
+        self.assertEqual(report["split_index"], 3)
+        self.assertEqual(
+            report["event_census"]["metrics"]["holdout"]["event_count"],
+            3,
+        )
+        self.assertEqual(
+            report["metrics"]["holdout"]["candidate_count"],
+            2,
         )
 
     def test_cli_exposes_explicit_primary_development_threshold(
