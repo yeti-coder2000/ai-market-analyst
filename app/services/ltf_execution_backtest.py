@@ -31,7 +31,7 @@ from app.services.ltf_execution_state_machine import (
 
 
 LTF_EXECUTION_BACKTEST_VERSION = (
-    "ltf-execution-v2-backtest-integrity-v1.1-causal-entry-context-costs"
+    "ltf-execution-v2-backtest-integrity-v2.0-otd-orr-event-census"
 )
 
 MIN_PRIOR_SESSION_M5_BARS = 96
@@ -282,7 +282,19 @@ def normalize_m5_history(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
         opens = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
     else:
         opens = pd.to_datetime(out.index, utc=True, errors="coerce")
+    duplicate_source = pd.Series(
+        opens.duplicated(keep=False),
+        index=out.index,
+    )
+    if "_source_duplicate_bar_open_utc" in out.columns:
+        duplicate_source = (
+            duplicate_source
+            | out["_source_duplicate_bar_open_utc"]
+            .fillna(False)
+            .astype(bool)
+        )
     out["bar_open_utc"] = opens
+    out["_source_duplicate_bar_open_utc"] = duplicate_source
     out["bar_close_utc"] = opens + pd.Timedelta(minutes=5)
     for column in required:
         out[column] = pd.to_numeric(out[column], errors="coerce")
@@ -469,23 +481,65 @@ def _two_block_acceptance(
     if post_touch.empty:
         return False, None
     indexed = post_touch.set_index("bar_open_utc")
-    blocks = indexed.resample(
+    block_groups = indexed.resample(
         "30min",
         origin=pd.Timestamp(origin),
         label="left",
         closed="left",
-    ).agg({"close": "last"})
-    blocks = blocks.dropna(subset=["close"])
-    if len(blocks) < 2:
-        return False, None
-    inside = (
-        blocks["close"] < edge
-        if opened_above
-        else blocks["close"] > edge
     )
-    for index in range(1, len(blocks)):
-        if bool(inside.iloc[index - 1]) and bool(inside.iloc[index]):
-            activated = _as_utc(blocks.index[index] + pd.Timedelta(minutes=30))
+    expected_offsets = range(0, CONTEXT_TPO_BLOCK_MINUTES, 5)
+    complete_blocks: list[tuple[pd.Timestamp, float]] = []
+    for block_open, block in block_groups:
+        block_open = pd.Timestamp(block_open)
+        observed_opens = pd.DatetimeIndex(
+            pd.to_datetime(block.index, utc=True, errors="coerce")
+        )
+        expected_opens = pd.DatetimeIndex(
+            [
+                block_open + pd.Timedelta(minutes=offset)
+                for offset in expected_offsets
+            ]
+        )
+        if (
+            len(observed_opens) != len(expected_opens)
+            or observed_opens.nunique() != len(expected_opens)
+            or not observed_opens.sort_values().equals(expected_opens)
+            or block["close"].isna().any()
+            or bool(
+                block.get(
+                    "_source_duplicate_bar_open_utc",
+                    pd.Series(False, index=block.index),
+                ).any()
+            )
+        ):
+            continue
+        complete_blocks.append(
+            (block_open, float(block["close"].iloc[-1]))
+        )
+    if len(complete_blocks) < 2:
+        return False, None
+    for index in range(1, len(complete_blocks)):
+        previous_open, previous_close = complete_blocks[index - 1]
+        current_open, current_close = complete_blocks[index]
+        consecutive = (
+            current_open - previous_open
+            == pd.Timedelta(minutes=CONTEXT_TPO_BLOCK_MINUTES)
+        )
+        previous_inside = (
+            previous_close < edge
+            if opened_above
+            else previous_close > edge
+        )
+        current_inside = (
+            current_close < edge
+            if opened_above
+            else current_close > edge
+        )
+        if consecutive and previous_inside and current_inside:
+            activated = _as_utc(
+                current_open
+                + pd.Timedelta(minutes=CONTEXT_TPO_BLOCK_MINUTES)
+            )
             return True, activated
     return False, None
 
@@ -509,6 +563,7 @@ def reconstruct_tpo_watch_candidates(
     frame: pd.DataFrame,
     *,
     symbol: str,
+    include_counter_htf_events: bool = False,
 ) -> tuple[list[HistoricalWatchCandidate], dict[str, Any]]:
     symbol = symbol.upper()
     history = normalize_m5_history(frame, symbol=symbol)
@@ -565,6 +620,12 @@ def reconstruct_tpo_watch_candidates(
         if len(first_activity) < 12:
             diagnostics["skipped_first_activity_coverage"] += 1
             continue
+        source_duplicates = first_activity[
+            "_source_duplicate_bar_open_utc"
+        ].astype(bool)
+        if bool(source_duplicates.iloc[0]):
+            diagnostics["skipped_duplicate_session_open_bar"] += 1
+            continue
 
         open_price = float(first_activity.iloc[0]["open"])
         ranges = (previous_frame["high"] - previous_frame["low"]).abs()
@@ -583,6 +644,7 @@ def reconstruct_tpo_watch_candidates(
             if opened_above
             else first_activity["high"] >= edge - tolerance
         )
+        touches = touches & ~source_duplicates
         if not bool(touches.any()):
             diagnostics["skipped_no_value_test"] += 1
             continue
@@ -605,6 +667,9 @@ def reconstruct_tpo_watch_candidates(
             else (post_touch["close"] <= edge - tolerance)
             & (post_touch["close"] < post_touch["open"])
         )
+        rejection_mask = rejection_mask & ~post_touch[
+            "_source_duplicate_bar_open_utc"
+        ].astype(bool)
         rejection_rows = post_touch.loc[rejection_mask]
         rejection_at = (
             _as_utc(rejection_rows.iloc[0]["bar_close_utc"])
@@ -653,8 +718,15 @@ def reconstruct_tpo_watch_candidates(
 
         bias = _htf_bias(history, as_of=activated_at)
         if bias in {"LONG", "SHORT"} and bias != direction:
-            diagnostics["skipped_counter_htf"] += 1
-            continue
+            if not include_counter_htf_events:
+                diagnostics["skipped_counter_htf"] += 1
+                continue
+            diagnostics["included_counter_htf_event_census"] += 1
+            signal_alignment = "COUNTER_TREND"
+        else:
+            signal_alignment = (
+                "TREND_ALIGNED" if bias == direction else "NEUTRAL_HTF_OTD"
+            )
 
         expires_at = min(
             next_open,
@@ -670,8 +742,14 @@ def reconstruct_tpo_watch_candidates(
             "direction": direction,
             "expected_direction": direction,
             "htf_bias": bias,
-            "signal_alignment": (
-                "TREND_ALIGNED" if bias == direction else "NEUTRAL_HTF_OTD"
+            "signal_alignment": signal_alignment,
+            "event_census_execution_eligible": (
+                signal_alignment != "COUNTER_TREND"
+            ),
+            "event_census_execution_exclusion_reason": (
+                "COUNTER_TREND_HARD_GATE"
+                if signal_alignment == "COUNTER_TREND"
+                else None
             ),
             "tpo_watch_state": "LTF_MODEL_PENDING",
             "tpo_watch_active": True,
@@ -758,6 +836,7 @@ def reconstruct_tpo_watch_candidates(
             else None
         ),
         "candidate_count": len(candidates),
+        "include_counter_htf_events": include_counter_htf_events,
         "diagnostics": dict(sorted(diagnostics.items())),
     }
 
@@ -803,12 +882,19 @@ def _context_blocks(
             len(observed_opens) != len(expected_opens)
             or observed_opens.nunique() != len(expected_opens)
             or not observed_opens.sort_values().equals(expected_opens)
+            or bool(
+                block.get(
+                    "_source_duplicate_bar_open_utc",
+                    pd.Series(False, index=block.index),
+                ).any()
+            )
         ):
             continue
         if block[["open", "high", "low", "close"]].isna().any().any():
             continue
         result.append(
             {
+                "block_open_utc": _as_utc(block_open),
                 "block_end_utc": block_end,
                 "open": float(block["open"].iloc[0]),
                 "high": float(block["high"].max()),
@@ -851,6 +937,11 @@ def _balance_transition(
     if len(blocks) < 2:
         return None
     first, second = blocks[-2:]
+    if (
+        second["block_open_utc"] - first["block_open_utc"]
+        != timedelta(minutes=CONTEXT_TPO_BLOCK_MINUTES)
+    ):
+        return None
     first_range = max(float(first["high"]) - float(first["low"]), tolerance)
     second_range = max(float(second["high"]) - float(second["low"]), tolerance)
     overlap = max(
@@ -957,6 +1048,15 @@ def build_dynamic_context_timeline(
             and blocks[block_index]["block_end_utc"] <= bar_close
         ):
             block = blocks[block_index]
+            if (
+                completed_blocks
+                and block["block_open_utc"]
+                - completed_blocks[-1]["block_open_utc"]
+                != timedelta(minutes=CONTEXT_TPO_BLOCK_MINUTES)
+            ):
+                completed_blocks.clear()
+                acceptance_count = 0
+                rejection_count = 0
             completed_blocks.append(block)
             relation = _context_relation(
                 block,
@@ -2036,27 +2136,46 @@ def run_history_backtest(
     histories: Mapping[str, pd.DataFrame],
     *,
     holdout_fraction: float = 0.30,
+    primary_development_r: float = 1.5,
     cost_models: Mapping[
         str,
         ExecutionCostModel | Mapping[str, Any],
     ] | None = None,
 ) -> dict[str, Any]:
     all_candidates: list[HistoricalWatchCandidate] = []
+    all_event_candidates: list[HistoricalWatchCandidate] = []
     coverage: list[dict[str, Any]] = []
     history_by_symbol: dict[str, pd.DataFrame] = {}
     for symbol, raw in sorted(histories.items()):
         normalized = normalize_m5_history(raw, symbol=symbol)
         history_by_symbol[symbol.upper()] = normalized
-        candidates, audit = reconstruct_tpo_watch_candidates(
+        event_candidates, audit = reconstruct_tpo_watch_candidates(
             normalized,
             symbol=symbol,
+            include_counter_htf_events=True,
         )
+        candidates = [
+            candidate
+            for candidate in event_candidates
+            if candidate.payload.get("signal_alignment") != "COUNTER_TREND"
+        ]
+        audit["event_candidate_count"] = len(event_candidates)
+        audit["execution_candidate_count"] = len(candidates)
+        audit["candidate_count"] = len(candidates)
+        all_event_candidates.extend(event_candidates)
         all_candidates.extend(candidates)
         coverage.append(audit)
 
     all_candidates.sort(
         key=lambda item: (item.activated_at_utc, item.candidate_id)
     )
+    all_event_candidates.sort(
+        key=lambda item: (item.activated_at_utc, item.candidate_id)
+    )
+    from app.services.otd_orr_event_census import (
+        measure_event_development,
+    )
+
     rows = [
         replay_candidate(
             candidate,
@@ -2065,11 +2184,21 @@ def run_history_backtest(
         )
         for candidate in all_candidates
     ]
+    event_records = [
+        measure_event_development(
+            candidate,
+            history_by_symbol[candidate.symbol],
+            primary_development_r=primary_development_r,
+        )
+        for candidate in all_event_candidates
+    ]
     return compile_backtest_report(
         candidates=all_candidates,
         rows=rows,
+        event_records=event_records,
         coverage=coverage,
         holdout_fraction=holdout_fraction,
+        primary_development_r=primary_development_r,
     )
 
 
@@ -2078,7 +2207,9 @@ def compile_backtest_report(
     candidates: Sequence[HistoricalWatchCandidate],
     rows: Sequence[Mapping[str, Any]],
     coverage: Sequence[Mapping[str, Any]],
+    event_records: Sequence[Mapping[str, Any]] | None = None,
     holdout_fraction: float = 0.30,
+    primary_development_r: float = 1.5,
 ) -> dict[str, Any]:
     """Compile stable aggregate metrics from streamed per-symbol replays."""
 
@@ -2141,6 +2272,25 @@ def compile_backtest_report(
     ]
     window_start = min(starts) if starts else None
     window_end = max(ends) if ends else None
+    from app.services.otd_orr_event_census import (
+        OTD_ORR_EVENT_CENSUS_VERSION,
+        compile_event_census,
+    )
+
+    if event_records is None:
+        event_census = {
+            "version": OTD_ORR_EVENT_CENSUS_VERSION,
+            "status": "NOT_PROVIDED",
+            "primary_development_R": float(primary_development_r),
+            "records": [],
+        }
+    else:
+        event_census = compile_event_census(
+            event_records=event_records,
+            execution_rows=ordered_rows,
+            holdout_fraction=holdout_fraction,
+            primary_development_r=primary_development_r,
+        )
     return {
         "version": LTF_EXECUTION_BACKTEST_VERSION,
         "engine_version": LTF_EXECUTION_STATE_MACHINE_VERSION,
@@ -2164,6 +2314,10 @@ def compile_backtest_report(
                 else "UNCONFIGURED_ZERO_COST"
             ),
             "mfe_mae_same_fill_bar_policy": "whole_bar_included",
+            "otd_orr_event_census": (
+                event_census.get("status") == "OK"
+            ),
+            "development_and_trade_metrics_are_separate": True,
         },
         "execution_cost_models": dict(sorted(execution_cost_models.items())),
         "research_scope": {
@@ -2188,6 +2342,12 @@ def compile_backtest_report(
                 "context_cancel_before_fill_conservative"
             ),
             "session_profile_parity": "DEFERRED_TO_P1",
+            "event_development_primary_threshold_R": (
+                float(primary_development_r)
+            ),
+            "event_census_scope": (
+                "RESEARCH_ONLY_APPEND_ONLY_NO_EXECUTION_PERMISSION_IMPACT"
+            ),
         },
         "holdout_fraction": holdout_fraction,
         "split_index": split_index,
@@ -2221,6 +2381,7 @@ def compile_backtest_report(
                 for key, value in sorted(by_rr_bucket.items())
             },
         },
+        "event_census": event_census,
         "candidates": [candidate.to_dict() for candidate in all_candidates],
         "records": ordered_rows,
     }

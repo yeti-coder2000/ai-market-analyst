@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
@@ -14,8 +15,10 @@ from app.services.ltf_execution_backtest import (
     HistoricalContextPoint,
     HistoricalWatchCandidate,
     _simulate_limit_outcome,
+    _two_block_acceptance,
     build_dynamic_context_timeline,
     compile_backtest_report,
+    normalize_m5_history,
     reconstruct_tpo_watch_candidates,
     replay_candidate,
 )
@@ -181,6 +184,41 @@ def _context_history(*, inside_value: bool) -> pd.DataFrame:
 def _gapped_context_history(*, inside_value: bool) -> pd.DataFrame:
     history = _context_history(inside_value=inside_value)
     return history.drop(pd.Timestamp("2026-07-01T10:55:00Z"))
+
+
+def _gapped_three_block_context_history(
+    *,
+    inside_value: bool,
+) -> pd.DataFrame:
+    history = _context_history(inside_value=inside_value)
+    if inside_value:
+        context_open = 100.05
+        context_high = 100.10
+        context_low = 99.90
+        context_close = 100.00
+    else:
+        context_open = 101.00
+        context_high = 101.10
+        context_low = 100.90
+        context_close = 101.00
+    third_index = pd.date_range(
+        "2026-07-01T11:00:00Z",
+        periods=6,
+        freq="5min",
+    )
+    third = pd.DataFrame(
+        {
+            "open": [context_open] * len(third_index),
+            "high": [context_high] * len(third_index),
+            "low": [context_low] * len(third_index),
+            "close": [context_close] * len(third_index),
+            "volume": [1000.0] * len(third_index),
+        },
+        index=third_index,
+    )
+    return pd.concat([history, third]).drop(
+        pd.Timestamp("2026-07-01T10:55:00Z")
+    )
 
 
 class LtfExecutionBacktestTest(unittest.TestCase):
@@ -556,6 +594,155 @@ class LtfExecutionBacktestTest(unittest.TestCase):
                 for point in timeline
             )
         )
+
+    def test_gapped_block_breaks_later_acceptance_and_balance_streaks(
+        self,
+    ) -> None:
+        candidate = _candidate()
+        candidate = replace(
+            candidate,
+            expires_at_utc=datetime(
+                2026,
+                7,
+                1,
+                11,
+                30,
+                tzinfo=UTC,
+            ),
+            payload={
+                **candidate.payload,
+                "expires_at_utc": (
+                    "2026-07-01T11:30:00+00:00"
+                ),
+            },
+        )
+        inside_timeline = build_dynamic_context_timeline(
+            candidate,
+            _gapped_three_block_context_history(inside_value=True),
+        )
+        outside_timeline = build_dynamic_context_timeline(
+            candidate,
+            _gapped_three_block_context_history(inside_value=False),
+        )
+
+        self.assertFalse(
+            any(point.cancellation_reason for point in inside_timeline)
+        )
+        self.assertFalse(
+            any(point.cancellation_reason for point in outside_timeline)
+        )
+        self.assertLessEqual(
+            max(
+                point.payload_updates["value_acceptance_tpo_count"]
+                for point in inside_timeline
+            ),
+            1,
+        )
+        self.assertLessEqual(
+            max(
+                point.payload_updates["value_rejection_tpo_count"]
+                for point in outside_timeline
+            ),
+            1,
+        )
+
+    def test_primary_orr_acceptance_requires_consecutive_complete_blocks(
+        self,
+    ) -> None:
+        opens = pd.date_range(
+            "2026-07-01T10:00:00Z",
+            periods=18,
+            freq="5min",
+        )
+        post_touch = pd.DataFrame(
+            {
+                "bar_open_utc": opens,
+                "close": [99.0] * len(opens),
+            }
+        )
+        gapped = post_touch.loc[
+            post_touch["bar_open_utc"]
+            != pd.Timestamp("2026-07-01T10:55:00Z")
+        ]
+        complete_two_blocks = post_touch.iloc[:12]
+
+        accepted_gapped, activated_gapped = _two_block_acceptance(
+            gapped,
+            edge=100.0,
+            opened_above=True,
+            origin=datetime(2026, 7, 1, 10, 0, tzinfo=UTC),
+        )
+        accepted_complete, activated_complete = _two_block_acceptance(
+            complete_two_blocks,
+            edge=100.0,
+            opened_above=True,
+            origin=datetime(2026, 7, 1, 10, 0, tzinfo=UTC),
+        )
+
+        self.assertFalse(accepted_gapped)
+        self.assertIsNone(activated_gapped)
+        self.assertTrue(accepted_complete)
+        self.assertEqual(
+            activated_complete,
+            datetime(2026, 7, 1, 11, 0, tzinfo=UTC),
+        )
+
+    def test_source_duplicate_rejects_context_and_primary_acceptance_block(
+        self,
+    ) -> None:
+        outside = _context_history(inside_value=False)
+        duplicated_context = pd.concat(
+            [
+                outside,
+                outside.loc[
+                    [pd.Timestamp("2026-07-01T10:05:00Z")]
+                ],
+            ]
+        )
+        timeline = build_dynamic_context_timeline(
+            _candidate(),
+            duplicated_context,
+        )
+
+        opens = pd.date_range(
+            "2026-07-01T10:00:00Z",
+            periods=12,
+            freq="5min",
+        )
+        raw_acceptance = pd.DataFrame(
+            {
+                "bar_open_utc": opens,
+                "open": [99.0] * len(opens),
+                "high": [99.1] * len(opens),
+                "low": [98.9] * len(opens),
+                "close": [99.0] * len(opens),
+            }
+        )
+        raw_acceptance = pd.concat(
+            [raw_acceptance, raw_acceptance.iloc[[1]]],
+            ignore_index=True,
+        )
+        normalized = normalize_m5_history(
+            raw_acceptance,
+            symbol="EURUSD",
+        )
+        accepted, activated = _two_block_acceptance(
+            normalized,
+            edge=100.0,
+            opened_above=True,
+            origin=datetime(2026, 7, 1, 10, 0, tzinfo=UTC),
+        )
+
+        self.assertFalse(any(point.cancellation_reason for point in timeline))
+        self.assertLessEqual(
+            max(
+                point.payload_updates["value_rejection_tpo_count"]
+                for point in timeline
+            ),
+            1,
+        )
+        self.assertFalse(accepted)
+        self.assertIsNone(activated)
 
     def test_gross_net_cost_arithmetic_is_deterministic(self) -> None:
         ready_at = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
