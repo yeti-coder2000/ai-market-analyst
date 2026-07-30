@@ -775,34 +775,45 @@ def _context_blocks(
     if session.empty:
         return []
     indexed = session.set_index("bar_open_utc")
-    blocks = indexed.resample(
+    block_groups = indexed.resample(
         f"{CONTEXT_TPO_BLOCK_MINUTES}min",
         origin=pd.Timestamp(candidate.session_open_utc),
         label="left",
         closed="left",
-    ).agg(
-        {
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-        }
     )
-    blocks = blocks.dropna(subset=["open", "high", "low", "close"])
     result: list[dict[str, Any]] = []
-    for block_open, row in blocks.iterrows():
+    expected_offsets = range(0, CONTEXT_TPO_BLOCK_MINUTES, 5)
+    for block_open, block in block_groups:
+        block_open = pd.Timestamp(block_open)
         block_end = _as_utc(
             block_open + pd.Timedelta(minutes=CONTEXT_TPO_BLOCK_MINUTES)
         )
         if not candidate.activated_at_utc < block_end <= candidate.expires_at_utc:
             continue
+        observed_opens = pd.DatetimeIndex(
+            pd.to_datetime(block.index, utc=True, errors="coerce")
+        )
+        expected_opens = pd.DatetimeIndex(
+            [
+                block_open + pd.Timedelta(minutes=offset)
+                for offset in expected_offsets
+            ]
+        )
+        if (
+            len(observed_opens) != len(expected_opens)
+            or observed_opens.nunique() != len(expected_opens)
+            or not observed_opens.sort_values().equals(expected_opens)
+        ):
+            continue
+        if block[["open", "high", "low", "close"]].isna().any().any():
+            continue
         result.append(
             {
                 "block_end_utc": block_end,
-                "open": float(row["open"]),
-                "high": float(row["high"]),
-                "low": float(row["low"]),
-                "close": float(row["close"]),
+                "open": float(block["open"].iloc[0]),
+                "high": float(block["high"].max()),
+                "low": float(block["low"].min()),
+                "close": float(block["close"].iloc[-1]),
             }
         )
     return result

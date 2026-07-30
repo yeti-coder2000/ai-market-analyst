@@ -178,6 +178,11 @@ def _context_history(*, inside_value: bool) -> pd.DataFrame:
     return pd.concat([prehistory, context])
 
 
+def _gapped_context_history(*, inside_value: bool) -> pd.DataFrame:
+    history = _context_history(inside_value=inside_value)
+    return history.drop(pd.Timestamp("2026-07-01T10:55:00Z"))
+
+
 class LtfExecutionBacktestTest(unittest.TestCase):
     def test_yfinance_depth_scope_covers_all_approved_symbols(self) -> None:
         self.assertEqual(
@@ -497,6 +502,60 @@ class LtfExecutionBacktestTest(unittest.TestCase):
         )
         self.assertFalse(row["ready"])
         self.assertEqual(row["outcome"], "CONTEXT_CANCELLED_BEFORE_READY")
+
+    def test_incomplete_inside_value_block_does_not_confirm_acceptance(
+        self,
+    ) -> None:
+        candidate = _candidate()
+        timeline = build_dynamic_context_timeline(
+            candidate,
+            _gapped_context_history(inside_value=True),
+        )
+
+        self.assertFalse(
+            any(point.cancellation_reason for point in timeline)
+        )
+        self.assertLessEqual(
+            max(
+                point.payload_updates["value_acceptance_tpo_count"]
+                for point in timeline
+            ),
+            1,
+        )
+        self.assertTrue(
+            all(
+                point.payload_updates["current_open_behavior"]
+                == "OPEN_TEST_DRIVE_CONFIRMED"
+                for point in timeline
+            )
+        )
+
+    def test_incomplete_outside_value_block_does_not_trigger_oaor(
+        self,
+    ) -> None:
+        candidate = _candidate()
+        timeline = build_dynamic_context_timeline(
+            candidate,
+            _gapped_context_history(inside_value=False),
+        )
+
+        self.assertFalse(
+            any(point.cancellation_reason for point in timeline)
+        )
+        self.assertLessEqual(
+            max(
+                point.payload_updates["value_rejection_tpo_count"]
+                for point in timeline
+            ),
+            1,
+        )
+        self.assertTrue(
+            all(
+                point.payload_updates["current_open_behavior"]
+                == "OPEN_TEST_DRIVE_CONFIRMED"
+                for point in timeline
+            )
+        )
 
     def test_gross_net_cost_arithmetic_is_deterministic(self) -> None:
         ready_at = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
