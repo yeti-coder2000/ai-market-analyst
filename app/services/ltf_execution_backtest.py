@@ -33,7 +33,7 @@ from app.services.ltf_execution_state_machine import (
 
 
 LTF_EXECUTION_BACKTEST_VERSION = (
-    "ltf-execution-v2-backtest-integrity-v2.0.3"
+    "ltf-execution-v2-backtest-integrity-v2.0.4"
 )
 
 MIN_PRIOR_SESSION_M5_BARS = 96
@@ -409,6 +409,18 @@ def _session_days(frame: pd.DataFrame, spec: SessionSpec) -> list[date]:
     return list(pd.date_range(first, last, freq="D").date)
 
 
+def _is_confirmed_non_trading_day(
+    local_day: date,
+    spec: SessionSpec,
+) -> bool:
+    """Confirm calendar closures without inferring holidays from missing data."""
+
+    return (
+        local_day.weekday() >= 5
+        and spec.label != "UTC_CRYPTO_DAY"
+    )
+
+
 def _slice(
     frame: pd.DataFrame,
     start: datetime,
@@ -719,19 +731,37 @@ def reconstruct_tpo_watch_candidates(
     candidates: list[HistoricalWatchCandidate] = []
     diagnostics: Counter[str] = Counter()
 
-    # Build profiles once, then resolve the latest completed *trading* session
-    # for each day.  This makes Monday use Friday for weekday instruments and
-    # also handles exchange holidays without peeking into the current session.
+    # Build profiles once, retaining the integrity state of every calendar
+    # session.  A later event may skip only calendar-confirmed non-trading days;
+    # missing weekday data and corrupt sessions fail closed instead of silently
+    # falling back to an older VAH/VAL/POC.
     completed_profiles: list[ReconstructedProfile] = []
+    session_states: dict[date, dict[str, Any]] = {}
     for local_day in days:
         session_open = _session_open(local_day, spec)
         session_close = _profile_session_close(session_open, spec)
         session_frame = _slice(history, session_open, session_close)
+        if (
+            session_frame.empty
+            and _is_confirmed_non_trading_day(local_day, spec)
+        ):
+            session_states[local_day] = {
+                "status": "CONFIRMED_NON_TRADING_DAY",
+                "has_data": False,
+                "profile": None,
+            }
+            diagnostics["confirmed_non_trading_days"] += 1
+            continue
         profile_integrity_status = _prior_profile_m5_integrity_status(
             session_frame,
             session_open=session_open,
             session_close=session_close,
         )
+        session_states[local_day] = {
+            "status": profile_integrity_status,
+            "has_data": not session_frame.empty,
+            "profile": None,
+        }
         if profile_integrity_status != "COMPLETE":
             diagnostic_key = {
                 "INSUFFICIENT_COVERAGE": (
@@ -767,11 +797,63 @@ def reconstruct_tpo_watch_candidates(
         )
         if profile is not None:
             completed_profiles.append(profile)
+            session_states[local_day] = {
+                "status": "COMPLETE",
+                "has_data": True,
+                "profile": profile,
+            }
+        else:
+            session_states[local_day]["status"] = (
+                "PROFILE_RECONSTRUCTION_FAILED"
+            )
+            diagnostics[
+                "skipped_prior_profile_reconstruction_failed"
+            ] += 1
 
     for local_day in days:
+        current_session_state = session_states.get(local_day) or {}
+        if (
+            current_session_state.get("status")
+            == "CONFIRMED_NON_TRADING_DAY"
+        ):
+            diagnostics["skipped_confirmed_non_trading_current_day"] += 1
+            continue
         current_open = _session_open(local_day, spec)
         next_open = _session_open(local_day + timedelta(days=1), spec)
         current_frame = _slice(history, current_open, next_open)
+        previous_profile: ReconstructedProfile | None = None
+        prior_session_block: Mapping[str, Any] | None = None
+        for prior_day in reversed(days):
+            if prior_day >= local_day:
+                continue
+            prior_state = session_states.get(prior_day) or {}
+            prior_status = str(prior_state.get("status") or "UNKNOWN")
+            if prior_status == "CONFIRMED_NON_TRADING_DAY":
+                diagnostics[
+                    "confirmed_non_trading_prior_days_skipped"
+                ] += 1
+                continue
+            if prior_status == "COMPLETE":
+                candidate_profile = prior_state.get("profile")
+                if isinstance(candidate_profile, ReconstructedProfile):
+                    previous_profile = candidate_profile
+                    break
+            prior_session_block = prior_state
+            break
+
+        if previous_profile is None:
+            if prior_session_block is None:
+                diagnostics["skipped_prior_coverage"] += 1
+            elif bool(prior_session_block.get("has_data")):
+                diagnostics[
+                    "skipped_prior_session_integrity_block"
+                ] += 1
+            else:
+                diagnostics[
+                    "skipped_prior_session_unconfirmed_no_data"
+                ] += 1
+            continue
+
         prior_profiles = [
             profile
             for profile in completed_profiles
@@ -784,7 +866,6 @@ def reconstruct_tpo_watch_candidates(
             diagnostics["skipped_current_coverage"] += 1
             continue
 
-        previous_profile = prior_profiles[-1]
         previous_frame = _slice(
             history,
             previous_profile.session_open_utc,
@@ -1055,6 +1136,10 @@ def reconstruct_tpo_watch_candidates(
         ),
         "candidate_count": len(candidates),
         "include_counter_htf_events": include_counter_htf_events,
+        "prior_profile_fallback_policy": (
+            "ONLY_ACROSS_CONFIRMED_NON_TRADING_WEEKEND_DAYS; "
+            "MISSING_WEEKDAY_OR_FAILED_M5_INTEGRITY_BLOCKS"
+        ),
         "diagnostics": dict(sorted(diagnostics.items())),
     }
 
@@ -2939,11 +3024,17 @@ def compile_backtest_report(
                 "EXCLUDE_UNMEASURED_READY_FILL_AND_OUTCOME_DENOMINATORS"
             ),
             "prior_profile_m5_policy": (
-                "EXACT_SESSION_OPEN_RIGHT_EDGE_AND_UNIQUE_M5_CHAIN"
+                "NEAREST_PRIOR_SESSION_FAIL_CLOSED; FALLBACK_ONLY_ACROSS_"
+                "CONFIRMED_NON_TRADING_DAYS; EXACT_SESSION_OPEN_RIGHT_"
+                "EDGE_AND_UNIQUE_M5_CHAIN"
             ),
             "chronological_holdout_cutoff_source": holdout_cutoff_source,
             "event_and_execution_share_holdout_cutoff": (
                 event_records is not None
+            ),
+            "development_holdout_frequency_window_policy": (
+                "COVERAGE_START_TO_SHARED_CUTOFF_AND_SHARED_CUTOFF_TO_"
+                "COVERAGE_END"
             ),
             "gross_and_net_results": True,
             "primary_expectancy_basis": "NET_R",
@@ -2996,8 +3087,20 @@ def compile_backtest_report(
                 window_start=window_start,
                 window_end=window_end,
             ),
-            "development": summarize_backtest(development_rows),
-            "holdout": summarize_backtest(holdout_rows),
+            "development": summarize_backtest(
+                development_rows,
+                window_start=window_start,
+                window_end=(
+                    holdout_start
+                    if holdout_start is not None
+                    else window_end
+                ),
+            ),
+            "holdout": summarize_backtest(
+                holdout_rows,
+                window_start=holdout_start,
+                window_end=window_end,
+            ),
             "by_symbol": {
                 key: summarize_backtest(value)
                 for key, value in sorted(by_symbol.items())

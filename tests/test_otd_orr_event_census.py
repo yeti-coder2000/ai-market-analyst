@@ -1290,6 +1290,91 @@ class OtdOrrEventCensusTest(unittest.TestCase):
             report["metrics"]["holdout"]["candidate_count"],
             2,
         )
+        development = report["metrics"]["development"]
+        holdout = report["metrics"]["holdout"]
+        self.assertEqual(
+            development["window_start_utc"],
+            "2026-07-01T00:00:00+00:00",
+        )
+        self.assertEqual(development["window_end_utc"], expected_cutoff)
+        self.assertEqual(holdout["window_start_utc"], expected_cutoff)
+        self.assertEqual(
+            holdout["window_end_utc"],
+            "2026-07-10T23:55:00+00:00",
+        )
+        development_weeks = (
+            datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+            - datetime(2026, 7, 1, 0, 0, tzinfo=UTC)
+        ).total_seconds() / 604800.0
+        holdout_weeks = (
+            datetime(2026, 7, 10, 23, 55, tzinfo=UTC)
+            - datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
+        ).total_seconds() / 604800.0
+        self.assertAlmostEqual(
+            development["ready_signals_per_week"],
+            development["ready_count"] / development_weeks,
+        )
+        self.assertAlmostEqual(
+            development["filled_signals_per_week"],
+            development["filled_count"] / development_weeks,
+        )
+        self.assertAlmostEqual(
+            holdout["ready_signals_per_week"],
+            holdout["ready_count"] / holdout_weeks,
+        )
+        self.assertAlmostEqual(
+            holdout["filled_signals_per_week"],
+            holdout["filled_count"] / holdout_weeks,
+        )
+
+    def test_markdown_renders_actual_holdout_fraction_and_cutoff(
+        self,
+    ) -> None:
+        first = {
+            **measure_event_development(
+                _candidate(),
+                _history(first_forward_high=101.6),
+            ),
+            "execution_universe_eligible": False,
+            "execution_universe_exclusion_reason": (
+                "COUNTER_TREND_HARD_GATE"
+            ),
+            "htf_alignment_state": "COUNTER_TREND",
+        }
+        second = {
+            **first,
+            "candidate_id": "event-2",
+            "session_id": "EURUSD_2026-07-08_TEST",
+            "session_open_utc": "2026-07-08T09:30:00+00:00",
+            "confirmed_at_utc": "2026-07-08T10:00:00+00:00",
+            "expires_at_utc": "2026-07-08T10:30:00+00:00",
+        }
+        report = compile_backtest_report(
+            candidates=[],
+            rows=[],
+            event_records=[first, second],
+            coverage=[
+                {
+                    "symbol": "EURUSD",
+                    "history_first_bar_utc": (
+                        "2026-07-01T00:00:00+00:00"
+                    ),
+                    "history_last_bar_utc": (
+                        "2026-07-08T23:55:00+00:00"
+                    ),
+                }
+            ],
+            holdout_fraction=0.50,
+        )
+
+        markdown = render_markdown_report(report)
+
+        self.assertIn("Chronological 50% holdout", markdown)
+        self.assertIn(
+            "Holdout cutoff UTC: `2026-07-08T10:00:00+00:00`",
+            markdown,
+        )
+        self.assertNotIn("Chronological 30% holdout", markdown)
 
     def test_cli_exposes_explicit_primary_development_threshold(
         self,

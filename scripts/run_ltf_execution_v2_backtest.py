@@ -1116,6 +1116,15 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
     metrics = report["metrics"]
     all_metrics = metrics["all"]
     holdout = metrics["holdout"]
+    raw_holdout_fraction = report.get("holdout_fraction")
+    try:
+        holdout_percent_number = float(raw_holdout_fraction) * 100.0
+        holdout_percent = (
+            f"{holdout_percent_number:.2f}".rstrip("0").rstrip(".") + "%"
+        )
+    except (TypeError, ValueError):
+        holdout_percent = "n/a"
+    holdout_start_utc = report.get("holdout_start_utc") or "n/a"
     event_census = (
         report.get("event_census")
         if isinstance(report.get("event_census"), Mapping)
@@ -1240,11 +1249,13 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
             "",
             f"Generated: `{report.get('generated_at_utc')}`  ",
             f"Engine: `{report.get('engine_version')}`  ",
-            f"Mode: `{report.get('mode')}`",
+            f"Mode: `{report.get('mode')}`  ",
+            f"Holdout fraction: `{holdout_percent}`  ",
+            f"Holdout cutoff UTC: `{holdout_start_utc}`",
             "",
             "## Primary results",
             "",
-            "| Metric | Full history | Chronological 30% holdout |",
+            f"| Metric | Full history | Chronological {holdout_percent} holdout |",
             "|---|---:|---:|",
             f"| Candidates | {all_metrics.get('candidate_count')} | {holdout.get('candidate_count')} |",
             f"| ENTRY_READY | {all_metrics.get('ready_count')} | {holdout.get('ready_count')} |",
@@ -1266,7 +1277,7 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
             f"Primary development threshold: `{_number(primary_development_r, 2)}R`. "
             "Development rate and trade win rate use separate denominators.",
             "",
-            "| Metric | Full history | Chronological holdout |",
+            f"| Metric | Full history | Chronological {holdout_percent} holdout |",
             "|---|---:|---:|",
             f"| Events | {census_all.get('event_count')} | {census_holdout.get('event_count')} |",
             f"| Causally evaluable | {census_all.get('event_evaluable_count')} | {census_holdout.get('event_evaluable_count')} |",

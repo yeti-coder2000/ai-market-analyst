@@ -1511,6 +1511,95 @@ class LtfExecutionBacktestTest(unittest.TestCase):
             1,
         )
 
+    def test_corrupt_nearest_prior_session_blocks_older_profile_fallback(
+        self,
+    ) -> None:
+        base_history = _cash_reconstruction_history()
+        friday = base_history.loc[
+            "2026-07-03T07:00:00Z":"2026-07-03T15:55:00Z"
+        ].copy()
+        thursday = friday.copy()
+        thursday.index = thursday.index - pd.Timedelta(days=1)
+        with_older_profile = pd.concat([thursday, base_history])
+        corruptions = {
+            "gap": with_older_profile.drop(
+                pd.Timestamp("2026-07-03T10:00:00Z")
+            ),
+            "right_truncated": with_older_profile.drop(
+                pd.date_range(
+                    "2026-07-03T15:00:00Z",
+                    periods=12,
+                    freq="5min",
+                )
+            ),
+            "duplicate": pd.concat(
+                [
+                    with_older_profile,
+                    with_older_profile.loc[
+                        [pd.Timestamp("2026-07-03T10:00:00Z")]
+                    ],
+                ]
+            ),
+        }
+
+        for corruption, history in corruptions.items():
+            with self.subTest(corruption=corruption):
+                candidates, audit = reconstruct_tpo_watch_candidates(
+                    history,
+                    symbol="GER40",
+                )
+
+                monday_candidates = [
+                    candidate
+                    for candidate in candidates
+                    if candidate.session_id.startswith(
+                        "GER40_2026-07-06"
+                    )
+                ]
+                self.assertEqual(monday_candidates, [])
+                self.assertEqual(
+                    audit["diagnostics"].get(
+                        "skipped_prior_session_integrity_block"
+                    ),
+                    1,
+                )
+
+    def test_unconfirmed_empty_weekday_blocks_profile_fallback(
+        self,
+    ) -> None:
+        history = _cash_reconstruction_history()
+        monday = history.loc[
+            "2026-07-06T07:00:00Z":"2026-07-06T08:55:00Z"
+        ].copy()
+        tuesday = monday.copy()
+        tuesday.index = tuesday.index + pd.Timedelta(days=1)
+        history = pd.concat(
+            [
+                history.loc[
+                    "2026-07-03T07:00:00Z":"2026-07-03T15:55:00Z"
+                ],
+                tuesday,
+            ]
+        )
+
+        candidates, audit = reconstruct_tpo_watch_candidates(
+            history,
+            symbol="GER40",
+        )
+
+        tuesday_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.session_id.startswith("GER40_2026-07-07")
+        ]
+        self.assertEqual(tuesday_candidates, [])
+        self.assertEqual(
+            audit["diagnostics"].get(
+                "skipped_prior_session_unconfirmed_no_data"
+            ),
+            1,
+        )
+
     def test_missing_prior_profile_open_rejects_cash_candidate(
         self,
     ) -> None:
