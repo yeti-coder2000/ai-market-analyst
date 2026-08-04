@@ -1563,6 +1563,17 @@ class LtfExecutionBacktestTest(unittest.TestCase):
                         coverage=coverage,
                     )
 
+        noncanonical_row = {**row, "symbol": " eurusd "}
+        with self.assertRaisesRegex(
+            ValueError,
+            "execution universe symbol is not canonical",
+        ):
+            compile_backtest_report(
+                candidates=[],
+                rows=[noncanonical_row],
+                coverage=[valid_coverage],
+            )
+
     def test_monday_uses_last_completed_trading_session_not_sunday(self) -> None:
         friday_index = pd.date_range(
             "2026-07-03T07:00:00Z",

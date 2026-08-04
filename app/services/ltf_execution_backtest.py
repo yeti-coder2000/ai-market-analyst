@@ -2954,9 +2954,15 @@ def _validate_universe_symbols_have_coverage(
 ) -> None:
     universe_symbols: set[str] = set()
     for row in rows:
-        symbol = str(row.get("symbol") or "").strip().upper()
+        raw_symbol = str(row.get("symbol") or "")
+        symbol = raw_symbol.strip().upper()
         if not symbol:
             raise ValueError(f"{universe_name} universe row is missing symbol")
+        if raw_symbol != symbol:
+            raise ValueError(
+                f"{universe_name} universe symbol is not canonical; "
+                f"symbol={raw_symbol!r}; expected={symbol}"
+            )
         universe_symbols.add(symbol)
     missing = sorted(universe_symbols - declared_symbols)
     if missing:
