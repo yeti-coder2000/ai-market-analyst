@@ -1502,6 +1502,67 @@ class LtfExecutionBacktestTest(unittest.TestCase):
                 self.assertIsNone(summary["ready_signals_per_week"])
                 self.assertIsNone(summary["filled_signals_per_week"])
 
+    def test_coverage_aware_frequency_never_infers_candidate_window(
+        self,
+    ) -> None:
+        row = replay_candidate(_candidate(), _history())
+
+        summary = summarize_backtest(
+            [row],
+            frequency_coverage_scope="ASSET_PROVIDER_COVERAGE:EURUSD",
+        )
+
+        self.assertEqual(
+            summary["frequency_status"],
+            "UNAVAILABLE_MISSING_WINDOW_BOUNDARY",
+        )
+        self.assertEqual(
+            summary["frequency_coverage_scope"],
+            "ASSET_PROVIDER_COVERAGE:EURUSD",
+        )
+        self.assertIsNone(summary["window_weeks"])
+        self.assertIsNone(summary["ready_signals_per_week"])
+        self.assertIsNone(summary["filled_signals_per_week"])
+
+    def test_execution_universe_requires_unique_declared_coverage(
+        self,
+    ) -> None:
+        row = replay_candidate(_candidate(), _history())
+        valid_coverage = {
+            "symbol": "EURUSD",
+            "history_first_bar_utc": "2026-07-01T00:00:00+00:00",
+            "history_last_bar_close_utc": "2026-07-02T00:00:00+00:00",
+        }
+
+        cases = {
+            "missing": (
+                [
+                    {
+                        **valid_coverage,
+                        "symbol": "GBPUSD",
+                    }
+                ],
+                "execution universe symbols missing declared coverage",
+            ),
+            "duplicate": (
+                [valid_coverage, {**valid_coverage, "symbol": " eurusd "}],
+                "duplicate declared coverage symbol=EURUSD",
+            ),
+            "blank": (
+                [{**valid_coverage, "symbol": ""}],
+                "coverage row is missing symbol",
+            ),
+        }
+
+        for name, (coverage, error) in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, error):
+                    compile_backtest_report(
+                        candidates=[],
+                        rows=[row],
+                        coverage=coverage,
+                    )
+
     def test_monday_uses_last_completed_trading_session_not_sunday(self) -> None:
         friday_index = pd.date_range(
             "2026-07-03T07:00:00Z",

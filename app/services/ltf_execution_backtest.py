@@ -33,7 +33,7 @@ from app.services.ltf_execution_state_machine import (
 
 
 LTF_EXECUTION_BACKTEST_VERSION = (
-    "ltf-execution-v2-backtest-integrity-v2.0.5"
+    "ltf-execution-v2-backtest-integrity-v2.0.6"
 )
 
 M5_BAR_MINUTES = 5
@@ -2624,7 +2624,11 @@ def summarize_backtest(
         for blocker in row.get("blockers") or []:
             blocker_counts[str(blocker)] += 1
 
-    explicit_window = window_start is not None or window_end is not None
+    explicit_window = (
+        window_start is not None
+        or window_end is not None
+        or frequency_coverage_scope is not None
+    )
     if window_start is None and not explicit_window and records:
         window_start = min(_as_utc(row["activated_at_utc"]) for row in records)
     if window_end is None and not explicit_window and records:
@@ -2900,9 +2904,17 @@ def _normalized_coverage_rows(
     coverage: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
+    declared_symbols: set[str] = set()
     for raw in coverage:
         item = dict(raw)
-        symbol = str(item.get("symbol") or "").upper()
+        symbol = str(item.get("symbol") or "").strip().upper()
+        if not symbol:
+            raise ValueError("coverage row is missing symbol")
+        if symbol in declared_symbols:
+            raise ValueError(
+                f"duplicate declared coverage symbol={symbol}"
+            )
+        declared_symbols.add(symbol)
         start = _optional_utc(item.get("history_first_bar_utc"))
         exact_end = _optional_utc(
             item.get("history_last_bar_close_utc")
@@ -2932,6 +2944,26 @@ def _normalized_coverage_rows(
         item["frequency_coverage_status"] = status
         normalized.append(item)
     return normalized
+
+
+def _validate_universe_symbols_have_coverage(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    declared_symbols: set[str],
+    universe_name: str,
+) -> None:
+    universe_symbols: set[str] = set()
+    for row in rows:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not symbol:
+            raise ValueError(f"{universe_name} universe row is missing symbol")
+        universe_symbols.add(symbol)
+    missing = sorted(universe_symbols - declared_symbols)
+    if missing:
+        raise ValueError(
+            f"{universe_name} universe symbols missing declared coverage; "
+            f"symbols={missing}"
+        )
 
 
 def _coverage_window(
@@ -3068,6 +3100,21 @@ def compile_backtest_report(
             str(row["candidate_id"]),
         ),
     )
+    normalized_coverage = _normalized_coverage_rows(coverage)
+    declared_coverage_symbols = {
+        str(item["symbol"]).upper() for item in normalized_coverage
+    }
+    _validate_universe_symbols_have_coverage(
+        ordered_rows,
+        declared_symbols=declared_coverage_symbols,
+        universe_name="execution",
+    )
+    if event_records is not None:
+        _validate_universe_symbols_have_coverage(
+            event_records,
+            declared_symbols=declared_coverage_symbols,
+            universe_name="event",
+        )
     by_symbol: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     by_symbol_family: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     execution_cost_models: dict[str, dict[str, Any]] = {
@@ -3087,7 +3134,6 @@ def compile_backtest_report(
         if symbol not in execution_cost_models and isinstance(model, Mapping):
             execution_cost_models[symbol] = dict(model)
 
-    normalized_coverage = _normalized_coverage_rows(coverage)
     coverage_by_symbol = {
         str(item.get("symbol") or "").upper(): item
         for item in normalized_coverage
@@ -3137,6 +3183,10 @@ def compile_backtest_report(
             "version": OTD_ORR_EVENT_CENSUS_VERSION,
             "status": "NOT_PROVIDED",
             "primary_development_R": float(primary_development_r),
+            "holdout_fraction": holdout_fraction,
+            "target_holdout_fraction": holdout_fraction,
+            "realized_event_holdout_fraction": None,
+            "realized_execution_holdout_fraction": None,
             "holdout_start_utc": None,
             "holdout_status": (
                 "UNAVAILABLE_NO_DISTINCT_TEMPORAL_CUTOFF"
@@ -3210,11 +3260,17 @@ def compile_backtest_report(
         holdout_status = str(
             event_census.get("holdout_status") or holdout_status
         )
-    expected_cost_symbols = {
-        str(item.get("symbol") or "").upper()
-        for item in coverage
-        if item.get("symbol")
-    }
+    realized_event_holdout_fraction = (
+        event_census.get("realized_event_holdout_fraction")
+        if event_records is not None
+        else None
+    )
+    realized_execution_holdout_fraction = (
+        len(holdout_rows) / len(headline_rows)
+        if holdout_status == "AVAILABLE" and headline_rows
+        else None
+    )
+    expected_cost_symbols = set(declared_coverage_symbols)
     expected_cost_symbols.update(
         str(row.get("symbol") or "").upper()
         for row in ordered_rows
@@ -3284,6 +3340,11 @@ def compile_backtest_report(
                 "PER_ASSET_COHORTS_USE_ASSET_PROVIDER_COVERAGE; "
                 "PORTFOLIO_COHORTS_USE_COMMON_ASSET_OVERLAP"
             ),
+            "coverage_universe_policy": (
+                "EXECUTION_AND_EVENT_SYMBOLS_REQUIRE_UNIQUE_DECLARED_"
+                "COVERAGE; COVERAGE_AWARE_FREQUENCIES_NEVER_INFER_"
+                "CANDIDATE_WINDOWS"
+            ),
             "gross_and_net_results": True,
             "primary_expectancy_basis": "NET_R",
             **cost_model_integrity,
@@ -3324,6 +3385,13 @@ def compile_backtest_report(
             ),
         },
         "holdout_fraction": holdout_fraction,
+        "target_holdout_fraction": holdout_fraction,
+        "realized_event_holdout_fraction": (
+            realized_event_holdout_fraction
+        ),
+        "realized_execution_holdout_fraction": (
+            realized_execution_holdout_fraction
+        ),
         "holdout_start_utc": (
             holdout_start.isoformat() if holdout_start else None
         ),

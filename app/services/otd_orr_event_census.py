@@ -28,7 +28,7 @@ from app.services.ltf_execution_backtest import (
 
 
 OTD_ORR_EVENT_CENSUS_VERSION = (
-    "backtest-integrity-v2.0.4-otd-orr-event-census"
+    "backtest-integrity-v2.0.5-otd-orr-event-census"
 )
 DEFAULT_PRIMARY_DEVELOPMENT_R = 1.5
 DEFAULT_DEVELOPMENT_THRESHOLDS_R = (1.0, 1.5, 2.0)
@@ -1393,6 +1393,26 @@ def compile_event_census(
         holdout_status = "UNAVAILABLE_INVERTED_COVERAGE_WINDOW"
     else:
         holdout_status = "UNAVAILABLE_NO_COMMON_ASSET_COVERAGE"
+    realized_event_holdout_fraction = (
+        len(holdout) / len(headline_joined)
+        if holdout_status == "AVAILABLE" and headline_joined
+        else None
+    )
+    headline_execution = [
+        row
+        for row in headline_joined
+        if bool(row.get("execution_record_available"))
+    ]
+    holdout_execution = [
+        row
+        for row in holdout
+        if bool(row.get("execution_record_available"))
+    ]
+    realized_execution_holdout_fraction = (
+        len(holdout_execution) / len(headline_execution)
+        if holdout_status == "AVAILABLE" and headline_execution
+        else None
+    )
     bounded_split = len(development)
     measured_thresholds = sorted(
         {
@@ -1476,6 +1496,13 @@ def compile_event_census(
         },
         "split_index": bounded_split,
         "holdout_fraction": holdout_fraction,
+        "target_holdout_fraction": holdout_fraction,
+        "realized_event_holdout_fraction": (
+            realized_event_holdout_fraction
+        ),
+        "realized_execution_holdout_fraction": (
+            realized_execution_holdout_fraction
+        ),
         "holdout_start_utc": (
             holdout_start.isoformat() if holdout_start else None
         ),

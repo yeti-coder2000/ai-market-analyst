@@ -1501,6 +1501,141 @@ class OtdOrrEventCensusTest(unittest.TestCase):
                 "2026-07-10T00:00:00+00:00",
             )
 
+    def test_event_only_universe_requires_declared_symbol_coverage(
+        self,
+    ) -> None:
+        event = {
+            **measure_event_development(
+                _candidate(),
+                _history(first_forward_high=101.6),
+            ),
+            "execution_universe_eligible": False,
+            "execution_universe_exclusion_reason": (
+                "COUNTER_TREND_HARD_GATE"
+            ),
+            "htf_alignment_state": "COUNTER_TREND",
+        }
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "event universe symbols missing declared coverage",
+        ):
+            compile_backtest_report(
+                candidates=[],
+                rows=[],
+                event_records=[event],
+                coverage=[
+                    {
+                        "symbol": "GBPUSD",
+                        "history_first_bar_utc": (
+                            "2026-07-01T00:00:00+00:00"
+                        ),
+                        "history_last_bar_close_utc": (
+                            "2026-07-02T00:00:00+00:00"
+                        ),
+                    }
+                ],
+            )
+
+    def test_reports_target_and_realized_holdout_fractions_separately(
+        self,
+    ) -> None:
+        base_event = measure_event_development(
+            _candidate(),
+            _history(first_forward_high=101.6),
+        )
+        events = []
+        execution_rows = []
+        for index in range(10):
+            confirmed = (
+                datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
+                if index < 8
+                else datetime(2026, 7, index, 10, 0, tzinfo=UTC)
+            )
+            candidate_id = f"tied-event-{index}"
+            events.append(
+                {
+                    **base_event,
+                    "candidate_id": candidate_id,
+                    "session_id": f"EURUSD_{index}_TEST",
+                    "session_open_utc": (
+                        confirmed - timedelta(minutes=30)
+                    ).isoformat(),
+                    "confirmed_at_utc": confirmed.isoformat(),
+                    "expires_at_utc": (
+                        confirmed + timedelta(minutes=30)
+                    ).isoformat(),
+                }
+            )
+            execution = _execution_row(candidate_id=candidate_id)
+            execution.update(
+                {
+                    "activated_at_utc": confirmed.isoformat(),
+                    "expires_at_utc": (
+                        confirmed + timedelta(minutes=30)
+                    ).isoformat(),
+                }
+            )
+            execution_rows.append(execution)
+
+        report = compile_backtest_report(
+            candidates=[],
+            rows=execution_rows,
+            event_records=events,
+            coverage=[
+                {
+                    "symbol": "EURUSD",
+                    "history_first_bar_utc": (
+                        "2026-07-01T00:00:00+00:00"
+                    ),
+                    "history_last_bar_close_utc": (
+                        "2026-07-10T00:00:00+00:00"
+                    ),
+                }
+            ],
+            holdout_fraction=0.30,
+        )
+
+        self.assertEqual(report["target_holdout_fraction"], 0.30)
+        self.assertEqual(report["realized_event_holdout_fraction"], 0.20)
+        self.assertEqual(
+            report["realized_execution_holdout_fraction"],
+            0.20,
+        )
+        self.assertEqual(
+            report["event_census"]["target_holdout_fraction"],
+            0.30,
+        )
+        self.assertEqual(
+            report["event_census"]["realized_event_holdout_fraction"],
+            0.20,
+        )
+        self.assertEqual(
+            report["event_census"][
+                "realized_execution_holdout_fraction"
+            ],
+            0.20,
+        )
+        self.assertEqual(
+            report["event_census"]["metrics"]["holdout"]["event_count"],
+            2,
+        )
+        self.assertEqual(
+            report["metrics"]["holdout"]["candidate_count"],
+            2,
+        )
+
+        markdown = render_markdown_report(report)
+        self.assertIn("Target holdout fraction: `30%`", markdown)
+        self.assertIn(
+            "Realized event holdout fraction: `20%`",
+            markdown,
+        )
+        self.assertIn(
+            "Realized execution holdout fraction: `20%`",
+            markdown,
+        )
+
     def test_unavailable_holdout_is_explicit_in_json_and_markdown(
         self,
     ) -> None:
@@ -1545,6 +1680,14 @@ class OtdOrrEventCensusTest(unittest.TestCase):
         self.assertIsNone(
             report["metrics"]["holdout"]["filled_signals_per_week"]
         )
+        self.assertIsNone(report["realized_event_holdout_fraction"])
+        self.assertIsNone(report["realized_execution_holdout_fraction"])
+        self.assertIsNone(
+            report["event_census"]["realized_event_holdout_fraction"]
+        )
+        self.assertIsNone(
+            report["event_census"]["realized_execution_holdout_fraction"]
+        )
 
         markdown = render_markdown_report(report)
         self.assertIn(
@@ -1557,6 +1700,14 @@ class OtdOrrEventCensusTest(unittest.TestCase):
         )
         self.assertIn("| READY signals/week |", markdown)
         self.assertIn("| Filled signals/week |", markdown)
+        self.assertIn(
+            "Realized event holdout fraction: `n/a`",
+            markdown,
+        )
+        self.assertIn(
+            "Realized execution holdout fraction: `n/a`",
+            markdown,
+        )
 
     def test_cutoff_at_coverage_end_does_not_invent_holdout_frequency(
         self,
@@ -1664,7 +1815,7 @@ class OtdOrrEventCensusTest(unittest.TestCase):
 
         markdown = render_markdown_report(report)
 
-        self.assertIn("Chronological 50% holdout", markdown)
+        self.assertIn("Chronological target 50% holdout", markdown)
         self.assertIn(
             "Holdout cutoff UTC: `2026-07-08T10:00:00+00:00`",
             markdown,

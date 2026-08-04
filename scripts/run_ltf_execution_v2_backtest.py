@@ -1122,14 +1122,27 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
         or "UNAVAILABLE_STATUS_NOT_REPORTED"
     )
     holdout_available = holdout_status == "AVAILABLE"
-    raw_holdout_fraction = report.get("holdout_fraction")
-    try:
-        holdout_percent_number = float(raw_holdout_fraction) * 100.0
-        holdout_percent = (
-            f"{holdout_percent_number:.2f}".rstrip("0").rstrip(".") + "%"
+    def holdout_percent(value: Any) -> str:
+        try:
+            percent_number = float(value) * 100.0
+            return (
+                f"{percent_number:.2f}".rstrip("0").rstrip(".") + "%"
+            )
+        except (TypeError, ValueError):
+            return "n/a"
+
+    target_holdout_percent = holdout_percent(
+        report.get(
+            "target_holdout_fraction",
+            report.get("holdout_fraction"),
         )
-    except (TypeError, ValueError):
-        holdout_percent = "n/a"
+    )
+    realized_event_holdout_percent = holdout_percent(
+        report.get("realized_event_holdout_fraction")
+    )
+    realized_execution_holdout_percent = holdout_percent(
+        report.get("realized_execution_holdout_fraction")
+    )
     holdout_start_utc = report.get("holdout_start_utc") or "n/a"
     headline_coverage = (
         report.get("headline_coverage")
@@ -1336,15 +1349,22 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
     )
     return "\n".join(
         [
-            "# Backtest Integrity v2.0.5 — OTD/ORR Event Census",
+            "# Backtest Integrity v2.0.6 — OTD/ORR Event Census",
             "",
             f"Generated: `{report.get('generated_at_utc')}`  ",
             f"Engine: `{report.get('engine_version')}`  ",
             f"Mode: `{report.get('mode')}`  ",
-            f"Holdout fraction: `{holdout_percent}`  ",
+            f"Target holdout fraction: `{target_holdout_percent}`  ",
+            "Realized event holdout fraction: "
+            f"`{realized_event_holdout_percent}`  ",
+            "Realized execution holdout fraction: "
+            f"`{realized_execution_holdout_percent}`  ",
             f"Holdout cutoff UTC: `{holdout_start_utc}`  ",
             f"Holdout status: `{holdout_status}`  ",
-            f"Holdout scheme: Chronological {holdout_percent} holdout  ",
+            "Holdout scheme: Chronological target "
+            f"{target_holdout_percent} holdout; realized events "
+            f"{realized_event_holdout_percent}; realized executions "
+            f"{realized_execution_holdout_percent}  ",
             "Headline coverage: "
             f"`{headline_coverage.get('status')}` "
             f"from `{headline_coverage.get('window_start_utc')}` "
