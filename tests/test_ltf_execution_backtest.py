@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
@@ -13,11 +14,17 @@ from app.services.ltf_execution_backtest import (
     ExecutionCostModel,
     HistoricalContextPoint,
     HistoricalWatchCandidate,
+    ReconstructedProfile,
+    _candidate_interest_zones,
     _simulate_limit_outcome,
+    _two_block_acceptance,
     build_dynamic_context_timeline,
     compile_backtest_report,
+    normalize_m5_history,
     reconstruct_tpo_watch_candidates,
     replay_candidate,
+    run_history_backtest,
+    summarize_backtest,
 )
 from scripts.run_ltf_execution_v2_backtest import (
     ProviderDepthBacktestError,
@@ -28,6 +35,7 @@ from scripts.run_ltf_execution_v2_backtest import (
     fetch_twelvedata_max_history,
     load_execution_cost_models,
     summarize_operational_positioning_history,
+    write_report_artifacts,
 )
 
 
@@ -183,6 +191,77 @@ def _gapped_context_history(*, inside_value: bool) -> pd.DataFrame:
     return history.drop(pd.Timestamp("2026-07-01T10:55:00Z"))
 
 
+def _gapped_three_block_context_history(
+    *,
+    inside_value: bool,
+) -> pd.DataFrame:
+    history = _context_history(inside_value=inside_value)
+    if inside_value:
+        context_open = 100.05
+        context_high = 100.10
+        context_low = 99.90
+        context_close = 100.00
+    else:
+        context_open = 101.00
+        context_high = 101.10
+        context_low = 100.90
+        context_close = 101.00
+    third_index = pd.date_range(
+        "2026-07-01T11:00:00Z",
+        periods=6,
+        freq="5min",
+    )
+    third = pd.DataFrame(
+        {
+            "open": [context_open] * len(third_index),
+            "high": [context_high] * len(third_index),
+            "low": [context_low] * len(third_index),
+            "close": [context_close] * len(third_index),
+            "volume": [1000.0] * len(third_index),
+        },
+        index=third_index,
+    )
+    return pd.concat([history, third]).drop(
+        pd.Timestamp("2026-07-01T10:55:00Z")
+    )
+
+
+def _cash_reconstruction_history() -> pd.DataFrame:
+    prior_index = pd.date_range(
+        "2026-07-03T07:00:00Z",
+        periods=108,
+        freq="5min",
+    )
+    prior = pd.DataFrame(
+        {
+            "open": [100.0] * len(prior_index),
+            "high": [100.10] * len(prior_index),
+            "low": [99.90] * len(prior_index),
+            "close": [100.0] * len(prior_index),
+            "volume": [1000.0] * len(prior_index),
+        },
+        index=prior_index,
+    )
+    current_index = pd.date_range(
+        "2026-07-06T07:00:00Z",
+        periods=24,
+        freq="5min",
+    )
+    current = pd.DataFrame(
+        {
+            "open": [115.0] * len(current_index),
+            "high": [115.10] * len(current_index),
+            "low": [114.80] * len(current_index),
+            "close": [115.0] * len(current_index),
+            "volume": [1000.0] * len(current_index),
+        },
+        index=current_index,
+    )
+    current.iloc[4] = [114.8, 114.9, 99.95, 114.2, 1000.0]
+    current.iloc[5] = [114.2, 114.9, 114.1, 114.8, 1000.0]
+    return pd.concat([prior, current])
+
+
 class LtfExecutionBacktestTest(unittest.TestCase):
     def test_yfinance_depth_scope_covers_all_approved_symbols(self) -> None:
         self.assertEqual(
@@ -290,18 +369,86 @@ class LtfExecutionBacktestTest(unittest.TestCase):
         ]
         self.assertEqual(transition_times, sorted(transition_times))
 
+    def test_entry_deadline_is_capped_by_trade_resolution_horizon(
+        self,
+    ) -> None:
+        candidate = _candidate()
+        expires_at = datetime(2026, 7, 1, 10, 40, tzinfo=UTC)
+        candidate = replace(
+            candidate,
+            expires_at_utc=expires_at,
+            payload={
+                **candidate.payload,
+                "expires_at_utc": expires_at.isoformat(),
+            },
+        )
+
+        row = replay_candidate(candidate, _history())
+
+        self.assertTrue(row["ready"])
+        self.assertEqual(
+            row["entry_window_expires_at_utc"],
+            expires_at.isoformat(),
+        )
+        self.assertEqual(
+            row["trade_resolution_expires_at_utc"],
+            expires_at.isoformat(),
+        )
+
     def test_fill_after_30_minute_entry_window_is_not_allowed(self) -> None:
         ready_at = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
         outcome = _simulate_limit_outcome(
             _outcome_bars(
                 [
                     (
-                        "2026-07-01T10:31:00Z",
+                        "2026-07-01T10:05:00Z",
                         100.2,
+                        100.8,
+                        100.1,
+                        100.4,
+                    ),
+                    (
+                        "2026-07-01T10:10:00Z",
+                        100.4,
+                        100.8,
+                        100.1,
+                        100.4,
+                    ),
+                    (
+                        "2026-07-01T10:15:00Z",
+                        100.4,
+                        100.8,
+                        100.1,
+                        100.4,
+                    ),
+                    (
+                        "2026-07-01T10:20:00Z",
+                        100.4,
+                        100.8,
+                        100.1,
+                        100.4,
+                    ),
+                    (
+                        "2026-07-01T10:25:00Z",
+                        100.4,
+                        100.8,
+                        100.1,
+                        100.4,
+                    ),
+                    (
+                        "2026-07-01T10:30:00Z",
+                        100.4,
+                        100.8,
+                        100.1,
+                        100.4,
+                    ),
+                    (
+                        "2026-07-01T10:35:00Z",
+                        100.4,
                         100.5,
                         99.5,
                         100.1,
-                    )
+                    ),
                 ]
             ),
             direction="LONG",
@@ -318,6 +465,53 @@ class LtfExecutionBacktestTest(unittest.TestCase):
         self.assertEqual(
             outcome["resolved_at_utc"],
             "2026-07-01T10:30:00+00:00",
+        )
+
+    def test_later_gap_preserves_known_entry_window_expiry(self) -> None:
+        ready_at = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
+        outcome = _simulate_limit_outcome(
+            _outcome_bars(
+                [
+                    (
+                        f"2026-07-01T10:{minute:02d}:00Z",
+                        100.4,
+                        100.8,
+                        100.1,
+                        100.4,
+                    )
+                    for minute in range(5, 31, 5)
+                ]
+                + [
+                    (
+                        "2026-07-01T10:40:00Z",
+                        100.4,
+                        100.8,
+                        100.1,
+                        100.4,
+                    )
+                ]
+            ),
+            direction="LONG",
+            ready_at=ready_at,
+            entry_window_expires_at=ready_at + timedelta(minutes=30),
+            trade_resolution_expires_at=ready_at + timedelta(hours=8),
+            entry=100.0,
+            stop=99.0,
+            target=102.0,
+        )
+
+        self.assertEqual(
+            outcome["outcome"],
+            "ENTRY_WINDOW_EXPIRED_UNFILLED",
+        )
+        self.assertEqual(
+            outcome["resolved_at_utc"],
+            "2026-07-01T10:30:00+00:00",
+        )
+        self.assertTrue(outcome["fill_evaluable"])
+        self.assertEqual(
+            outcome["execution_m5_integrity_status"],
+            "COMPLETE_TO_CAUSAL_OUTCOME",
         )
 
     def test_invalidation_before_limit_fill_cancels_order(self) -> None:
@@ -363,6 +557,13 @@ class LtfExecutionBacktestTest(unittest.TestCase):
             _outcome_bars(
                 [
                     (
+                        "2026-07-01T10:05:00Z",
+                        100.4,
+                        100.6,
+                        100.2,
+                        100.4,
+                    ),
+                    (
                         "2026-07-01T10:10:00Z",
                         99.5,
                         99.8,
@@ -404,11 +605,66 @@ class LtfExecutionBacktestTest(unittest.TestCase):
             "OTD_TRANSITIONED_TO_OPEN_AUCTION",
         )
 
+    def test_context_extreme_requires_close_beyond_tolerance(self) -> None:
+        wick_only = _context_history(inside_value=False)
+        wick_only.loc[
+            pd.Timestamp("2026-07-01T10:00:00Z"),
+            ["open", "high", "low", "close"],
+        ] = [100.0, 100.2, 99.4, 100.0]
+        close_break = wick_only.copy()
+        close_break.loc[
+            pd.Timestamp("2026-07-01T10:00:00Z"),
+            ["open", "high", "low", "close"],
+        ] = [100.0, 100.2, 99.0, 99.0]
+
+        wick_timeline = build_dynamic_context_timeline(
+            _candidate(),
+            wick_only,
+        )
+        close_timeline = build_dynamic_context_timeline(
+            _candidate(),
+            close_break,
+        )
+
+        self.assertIsNone(wick_timeline[0].cancellation_reason)
+        self.assertEqual(
+            close_timeline[0].cancellation_reason,
+            "INVALIDATED_BY_CONTEXT_EXTREME",
+        )
+
     def test_filled_trade_can_resolve_after_entry_window(self) -> None:
         ready_at = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
         outcome = _simulate_limit_outcome(
             _outcome_bars(
                 [
+                    (
+                        "2026-07-01T10:05:00Z",
+                        100.3,
+                        100.6,
+                        100.2,
+                        100.4,
+                    ),
+                    (
+                        "2026-07-01T10:10:00Z",
+                        100.4,
+                        100.6,
+                        100.2,
+                        100.4,
+                    ),
+                    (
+                        "2026-07-01T10:15:00Z",
+                        100.4,
+                        100.6,
+                        100.2,
+                        100.4,
+                    ),
+                    (
+                        "2026-07-01T10:20:00Z",
+                        100.4,
+                        100.6,
+                        100.2,
+                        100.4,
+                    ),
                     (
                         "2026-07-01T10:25:00Z",
                         100.2,
@@ -417,17 +673,52 @@ class LtfExecutionBacktestTest(unittest.TestCase):
                         100.3,
                     ),
                     (
-                        "2026-07-01T10:35:00Z",
+                        "2026-07-01T10:30:00Z",
                         100.3,
-                        101.0,
+                        100.8,
                         100.2,
+                        100.6,
+                    ),
+                    (
+                        "2026-07-01T10:35:00Z",
+                        100.6,
+                        101.0,
+                        100.5,
                         100.8,
                     ),
                     (
-                        "2026-07-01T11:00:00Z",
+                        "2026-07-01T10:40:00Z",
                         100.8,
-                        102.1,
+                        101.1,
                         100.7,
+                        100.9,
+                    ),
+                    (
+                        "2026-07-01T10:45:00Z",
+                        100.9,
+                        101.2,
+                        100.8,
+                        101.0,
+                    ),
+                    (
+                        "2026-07-01T10:50:00Z",
+                        101.0,
+                        101.3,
+                        100.9,
+                        101.1,
+                    ),
+                    (
+                        "2026-07-01T10:55:00Z",
+                        101.1,
+                        101.4,
+                        101.0,
+                        101.2,
+                    ),
+                    (
+                        "2026-07-01T11:00:00Z",
+                        101.2,
+                        102.1,
+                        101.1,
                         102.0,
                     ),
                 ]
@@ -450,6 +741,258 @@ class LtfExecutionBacktestTest(unittest.TestCase):
             outcome["resolved_at_utc"],
             "2026-07-01T11:00:00+00:00",
         )
+
+    def test_post_confirmation_gap_cannot_be_skipped_before_ready(
+        self,
+    ) -> None:
+        history = _history().drop(
+            pd.Timestamp("2026-07-01T10:05:00Z")
+        )
+
+        row = replay_candidate(_candidate(), history)
+
+        self.assertFalse(row["ready"])
+        self.assertEqual(
+            row["outcome"],
+            "NOT_EVALUABLE_INCOMPLETE_POST_CONFIRMATION_M5_SEQUENCE",
+        )
+        self.assertEqual(
+            row["execution_m5_integrity_status"],
+            "INCOMPLETE_POST_CONFIRMATION_M5_SEQUENCE",
+        )
+        self.assertFalse(row["ready_evaluable"])
+        self.assertEqual(
+            row["resolved_at_utc"],
+            "2026-07-01T10:05:00+00:00",
+        )
+
+    def test_post_confirmation_duplicate_cannot_be_skipped_before_ready(
+        self,
+    ) -> None:
+        history = _history()
+        duplicated = pd.concat(
+            [
+                history,
+                history.loc[
+                    [pd.Timestamp("2026-07-01T10:05:00Z")]
+                ],
+            ]
+        )
+
+        row = replay_candidate(_candidate(), duplicated)
+
+        self.assertFalse(row["ready"])
+        self.assertEqual(
+            row["outcome"],
+            "NOT_EVALUABLE_DUPLICATE_POST_CONFIRMATION_M5_BAR",
+        )
+        self.assertEqual(
+            row["execution_m5_integrity_status"],
+            "DUPLICATE_POST_CONFIRMATION_M5_BAR",
+        )
+        self.assertFalse(row["ready_evaluable"])
+
+    def test_gap_after_fill_cannot_credit_later_target(self) -> None:
+        ready_at = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
+        outcome = _simulate_limit_outcome(
+            _outcome_bars(
+                [
+                    (
+                        "2026-07-01T10:05:00Z",
+                        100.2,
+                        100.5,
+                        99.9,
+                        100.3,
+                    ),
+                    (
+                        "2026-07-01T10:15:00Z",
+                        100.5,
+                        102.1,
+                        100.4,
+                        102.0,
+                    ),
+                ]
+            ),
+            direction="LONG",
+            ready_at=ready_at,
+            entry_window_expires_at=ready_at + timedelta(minutes=30),
+            trade_resolution_expires_at=ready_at + timedelta(hours=2),
+            entry=100.0,
+            stop=99.0,
+            target=102.0,
+        )
+
+        self.assertEqual(
+            outcome["outcome"],
+            "NOT_EVALUABLE_INCOMPLETE_POST_CONFIRMATION_M5_SEQUENCE",
+        )
+        self.assertEqual(
+            outcome["execution_m5_integrity_status"],
+            "INCOMPLETE_POST_CONFIRMATION_M5_SEQUENCE",
+        )
+        self.assertEqual(
+            outcome["filled_at_utc"],
+            "2026-07-01T10:05:00+00:00",
+        )
+        self.assertIsNone(outcome["gross_R"])
+        self.assertIsNone(outcome["net_R"])
+        self.assertEqual(
+            outcome["resolved_at_utc"],
+            "2026-07-01T10:05:00+00:00",
+        )
+
+    def test_duplicate_after_fill_cannot_credit_later_target(
+        self,
+    ) -> None:
+        ready_at = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
+        duplicated = _outcome_bars(
+            [
+                (
+                    "2026-07-01T10:05:00Z",
+                    100.2,
+                    100.5,
+                    99.9,
+                    100.3,
+                ),
+                (
+                    "2026-07-01T10:10:00Z",
+                    100.5,
+                    102.1,
+                    100.4,
+                    102.0,
+                ),
+                (
+                    "2026-07-01T10:10:00Z",
+                    100.5,
+                    102.1,
+                    100.4,
+                    102.0,
+                ),
+            ]
+        )
+
+        outcome = _simulate_limit_outcome(
+            duplicated,
+            direction="LONG",
+            ready_at=ready_at,
+            entry_window_expires_at=ready_at + timedelta(minutes=30),
+            trade_resolution_expires_at=ready_at + timedelta(hours=2),
+            entry=100.0,
+            stop=99.0,
+            target=102.0,
+        )
+
+        self.assertEqual(
+            outcome["outcome"],
+            "NOT_EVALUABLE_DUPLICATE_POST_CONFIRMATION_M5_BAR",
+        )
+        self.assertEqual(
+            outcome["execution_m5_integrity_status"],
+            "DUPLICATE_POST_CONFIRMATION_M5_BAR",
+        )
+        self.assertEqual(
+            outcome["filled_at_utc"],
+            "2026-07-01T10:05:00+00:00",
+        )
+        self.assertIsNone(outcome["gross_R"])
+        self.assertEqual(
+            outcome["resolved_at_utc"],
+            "2026-07-01T10:05:00+00:00",
+        )
+
+    def test_right_censoring_cannot_invent_entry_window_expiry(
+        self,
+    ) -> None:
+        truncated = _history().loc[
+            : pd.Timestamp("2026-07-01T10:15:00Z")
+        ]
+
+        row = replay_candidate(_candidate(), truncated)
+
+        self.assertTrue(row["ready"])
+        self.assertEqual(
+            row["outcome"],
+            "NOT_EVALUABLE_RIGHT_CENSORED_BEFORE_ENTRY_WINDOW",
+        )
+        self.assertEqual(
+            row["execution_m5_integrity_status"],
+            "RIGHT_CENSORED_BEFORE_ENTRY_WINDOW",
+        )
+        self.assertFalse(row["fill_evaluable"])
+        self.assertFalse(row["trade_outcome_evaluable"])
+        self.assertEqual(
+            row["resolved_at_utc"],
+            "2026-07-01T10:20:00+00:00",
+        )
+        summary = summarize_backtest([row])
+        self.assertEqual(summary["ready_evaluable_candidate_count"], 1)
+        self.assertEqual(summary["fill_evaluable_ready_count"], 0)
+        self.assertIsNone(summary["fill_rate_of_ready"])
+
+    def test_right_censoring_after_fill_cannot_invent_trade_expiry(
+        self,
+    ) -> None:
+        truncated = _history().loc[
+            : pd.Timestamp("2026-07-01T10:25:00Z")
+        ]
+
+        row = replay_candidate(_candidate(), truncated)
+
+        self.assertTrue(row["ready"])
+        self.assertEqual(
+            row["outcome"],
+            "NOT_EVALUABLE_RIGHT_CENSORED_BEFORE_TRADE_HORIZON",
+        )
+        self.assertEqual(
+            row["execution_m5_integrity_status"],
+            "RIGHT_CENSORED_BEFORE_TRADE_HORIZON",
+        )
+        self.assertTrue(row["fill_evaluable"])
+        self.assertFalse(row["trade_outcome_evaluable"])
+        self.assertEqual(
+            row["filled_at_utc"],
+            "2026-07-01T10:30:00+00:00",
+        )
+        self.assertEqual(
+            row["resolved_at_utc"],
+            "2026-07-01T10:30:00+00:00",
+        )
+        summary = summarize_backtest([row])
+        self.assertEqual(summary["filled_count"], 1)
+        self.assertEqual(
+            summary["trade_outcome_evaluable_filled_count"],
+            0,
+        )
+        self.assertEqual(summary["trade_outcome_unknown_filled_count"], 1)
+        self.assertIsNone(summary["average_net_R_filled"])
+
+    def test_right_censoring_before_ready_is_not_a_ready_failure(
+        self,
+    ) -> None:
+        truncated = _history().loc[
+            : pd.Timestamp("2026-07-01T10:10:00Z")
+        ]
+
+        row = replay_candidate(_candidate(), truncated)
+
+        self.assertFalse(row["ready"])
+        self.assertEqual(
+            row["outcome"],
+            "NOT_EVALUABLE_RIGHT_CENSORED_BEFORE_ENTRY_READY",
+        )
+        self.assertEqual(
+            row["execution_m5_integrity_status"],
+            "RIGHT_CENSORED_BEFORE_ENTRY_READY",
+        )
+        self.assertFalse(row["ready_evaluable"])
+        self.assertEqual(
+            row["resolved_at_utc"],
+            "2026-07-01T10:15:00+00:00",
+        )
+        summary = summarize_backtest([row])
+        self.assertEqual(summary["candidate_count"], 1)
+        self.assertEqual(summary["ready_evaluable_candidate_count"], 0)
+        self.assertIsNone(summary["ready_rate"])
 
     def test_otd_acceptance_back_inside_value_cancels_before_ready(
         self,
@@ -557,6 +1100,155 @@ class LtfExecutionBacktestTest(unittest.TestCase):
             )
         )
 
+    def test_gapped_block_breaks_later_acceptance_and_balance_streaks(
+        self,
+    ) -> None:
+        candidate = _candidate()
+        candidate = replace(
+            candidate,
+            expires_at_utc=datetime(
+                2026,
+                7,
+                1,
+                11,
+                30,
+                tzinfo=UTC,
+            ),
+            payload={
+                **candidate.payload,
+                "expires_at_utc": (
+                    "2026-07-01T11:30:00+00:00"
+                ),
+            },
+        )
+        inside_timeline = build_dynamic_context_timeline(
+            candidate,
+            _gapped_three_block_context_history(inside_value=True),
+        )
+        outside_timeline = build_dynamic_context_timeline(
+            candidate,
+            _gapped_three_block_context_history(inside_value=False),
+        )
+
+        self.assertFalse(
+            any(point.cancellation_reason for point in inside_timeline)
+        )
+        self.assertFalse(
+            any(point.cancellation_reason for point in outside_timeline)
+        )
+        self.assertLessEqual(
+            max(
+                point.payload_updates["value_acceptance_tpo_count"]
+                for point in inside_timeline
+            ),
+            1,
+        )
+        self.assertLessEqual(
+            max(
+                point.payload_updates["value_rejection_tpo_count"]
+                for point in outside_timeline
+            ),
+            1,
+        )
+
+    def test_primary_orr_acceptance_requires_consecutive_complete_blocks(
+        self,
+    ) -> None:
+        opens = pd.date_range(
+            "2026-07-01T10:00:00Z",
+            periods=18,
+            freq="5min",
+        )
+        post_touch = pd.DataFrame(
+            {
+                "bar_open_utc": opens,
+                "close": [99.0] * len(opens),
+            }
+        )
+        gapped = post_touch.loc[
+            post_touch["bar_open_utc"]
+            != pd.Timestamp("2026-07-01T10:55:00Z")
+        ]
+        complete_two_blocks = post_touch.iloc[:12]
+
+        accepted_gapped, activated_gapped = _two_block_acceptance(
+            gapped,
+            edge=100.0,
+            opened_above=True,
+            origin=datetime(2026, 7, 1, 10, 0, tzinfo=UTC),
+        )
+        accepted_complete, activated_complete = _two_block_acceptance(
+            complete_two_blocks,
+            edge=100.0,
+            opened_above=True,
+            origin=datetime(2026, 7, 1, 10, 0, tzinfo=UTC),
+        )
+
+        self.assertFalse(accepted_gapped)
+        self.assertIsNone(activated_gapped)
+        self.assertTrue(accepted_complete)
+        self.assertEqual(
+            activated_complete,
+            datetime(2026, 7, 1, 11, 0, tzinfo=UTC),
+        )
+
+    def test_source_duplicate_rejects_context_and_primary_acceptance_block(
+        self,
+    ) -> None:
+        outside = _context_history(inside_value=False)
+        duplicated_context = pd.concat(
+            [
+                outside,
+                outside.loc[
+                    [pd.Timestamp("2026-07-01T10:05:00Z")]
+                ],
+            ]
+        )
+        timeline = build_dynamic_context_timeline(
+            _candidate(),
+            duplicated_context,
+        )
+
+        opens = pd.date_range(
+            "2026-07-01T10:00:00Z",
+            periods=12,
+            freq="5min",
+        )
+        raw_acceptance = pd.DataFrame(
+            {
+                "bar_open_utc": opens,
+                "open": [99.0] * len(opens),
+                "high": [99.1] * len(opens),
+                "low": [98.9] * len(opens),
+                "close": [99.0] * len(opens),
+            }
+        )
+        raw_acceptance = pd.concat(
+            [raw_acceptance, raw_acceptance.iloc[[1]]],
+            ignore_index=True,
+        )
+        normalized = normalize_m5_history(
+            raw_acceptance,
+            symbol="EURUSD",
+        )
+        accepted, activated = _two_block_acceptance(
+            normalized,
+            edge=100.0,
+            opened_above=True,
+            origin=datetime(2026, 7, 1, 10, 0, tzinfo=UTC),
+        )
+
+        self.assertFalse(any(point.cancellation_reason for point in timeline))
+        self.assertLessEqual(
+            max(
+                point.payload_updates["value_rejection_tpo_count"]
+                for point in timeline
+            ),
+            1,
+        )
+        self.assertFalse(accepted)
+        self.assertIsNone(activated)
+
     def test_gross_net_cost_arithmetic_is_deterministic(self) -> None:
         ready_at = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
         outcome = _simulate_limit_outcome(
@@ -635,6 +1327,102 @@ class LtfExecutionBacktestTest(unittest.TestCase):
             "BROKER_CALIBRATION_TEST",
         )
 
+    def test_partial_cost_coverage_is_not_reported_as_complete(self) -> None:
+        candidate = _candidate()
+        explicit_row = replay_candidate(
+            candidate,
+            _history(),
+            cost_model=ExecutionCostModel(source="EURUSD_TEST_COSTS"),
+        )
+        report = compile_backtest_report(
+            candidates=[candidate],
+            rows=[explicit_row],
+            coverage=[
+                {
+                    "symbol": "EURUSD",
+                    "history_first_bar_utc": (
+                        "2026-07-01T00:00:00+00:00"
+                    ),
+                    "history_last_bar_utc": (
+                        "2026-07-01T23:55:00+00:00"
+                    ),
+                },
+                {
+                    "symbol": "BTCUSD",
+                    "history_first_bar_utc": (
+                        "2026-07-01T00:00:00+00:00"
+                    ),
+                    "history_last_bar_utc": (
+                        "2026-07-01T23:55:00+00:00"
+                    ),
+                },
+            ],
+        )
+        integrity = report["execution_integrity"]
+
+        self.assertEqual(
+            integrity["cost_model_status"],
+            "PARTIAL_PER_SYMBOL_CONFIG",
+        )
+        self.assertEqual(
+            integrity["cost_model_explicit_symbols"],
+            ["EURUSD"],
+        )
+        self.assertEqual(
+            integrity["cost_model_missing_symbols"],
+            ["BTCUSD"],
+        )
+
+    def test_zero_candidate_symbol_preserves_explicit_cost_coverage(
+        self,
+    ) -> None:
+        report = run_history_backtest(
+            {"BTCUSD": _history().iloc[:12]},
+            cost_models={
+                "BTCUSD": ExecutionCostModel(
+                    spread_price=1.0,
+                    commission_r=0.02,
+                    source="BTC_EXPLICIT_TEST_COSTS",
+                )
+            },
+        )
+
+        self.assertEqual(report["metrics"]["all"]["candidate_count"], 0)
+        self.assertEqual(
+            report["execution_integrity"]["cost_model_status"],
+            "EXPLICIT_PER_SYMBOL_CONFIG",
+        )
+        self.assertEqual(
+            report["execution_integrity"][
+                "cost_model_explicit_symbols"
+            ],
+            ["BTCUSD"],
+        )
+        self.assertEqual(
+            report["execution_integrity"]["cost_model_missing_symbols"],
+            [],
+        )
+        self.assertEqual(
+            report["execution_cost_models"]["BTCUSD"]["source"],
+            "BTC_EXPLICIT_TEST_COSTS",
+        )
+        self.assertEqual(
+            report["metrics"]["by_symbol"]["BTCUSD"]["candidate_count"],
+            0,
+        )
+        self.assertEqual(
+            report["metrics"]["by_symbol"]["BTCUSD"][
+                "ready_signals_per_week"
+            ],
+            0.0,
+        )
+        self.assertEqual(
+            report["metrics"]["by_symbol"]["BTCUSD"][
+                "frequency_coverage_scope"
+            ],
+            "ASSET_PROVIDER_COVERAGE:BTCUSD",
+        )
+
     def test_report_exposes_chronological_holdout(self) -> None:
         candidate = _candidate()
         first = replay_candidate(candidate, _history())
@@ -666,6 +1454,125 @@ class LtfExecutionBacktestTest(unittest.TestCase):
             report["metrics"]["all"]["metric_basis"],
             "NET_R",
         )
+
+    def test_reconstruction_coverage_ends_at_exact_last_m5_close(self) -> None:
+        _, audit = reconstruct_tpo_watch_candidates(
+            _history(),
+            symbol="EURUSD",
+        )
+
+        self.assertEqual(
+            audit["history_last_bar_utc"],
+            "2026-07-01T10:30:00+00:00",
+        )
+        self.assertEqual(
+            audit["history_last_bar_close_utc"],
+            "2026-07-01T10:35:00+00:00",
+        )
+
+    def test_zero_or_inverted_frequency_window_is_unavailable(self) -> None:
+        row = replay_candidate(_candidate(), _history())
+        boundary = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
+        cases = {
+            "zero": (
+                boundary,
+                boundary,
+                "UNAVAILABLE_ZERO_LENGTH_WINDOW",
+            ),
+            "inverted": (
+                boundary,
+                boundary - timedelta(minutes=5),
+                "UNAVAILABLE_INVERTED_WINDOW",
+            ),
+        }
+
+        for name, (window_start, window_end, expected_status) in cases.items():
+            with self.subTest(name=name):
+                summary = summarize_backtest(
+                    [row],
+                    window_start=window_start,
+                    window_end=window_end,
+                )
+
+                self.assertEqual(
+                    summary["frequency_status"],
+                    expected_status,
+                )
+                self.assertIsNone(summary["window_weeks"])
+                self.assertIsNone(summary["ready_signals_per_week"])
+                self.assertIsNone(summary["filled_signals_per_week"])
+
+    def test_coverage_aware_frequency_never_infers_candidate_window(
+        self,
+    ) -> None:
+        row = replay_candidate(_candidate(), _history())
+
+        summary = summarize_backtest(
+            [row],
+            frequency_coverage_scope="ASSET_PROVIDER_COVERAGE:EURUSD",
+        )
+
+        self.assertEqual(
+            summary["frequency_status"],
+            "UNAVAILABLE_MISSING_WINDOW_BOUNDARY",
+        )
+        self.assertEqual(
+            summary["frequency_coverage_scope"],
+            "ASSET_PROVIDER_COVERAGE:EURUSD",
+        )
+        self.assertIsNone(summary["window_weeks"])
+        self.assertIsNone(summary["ready_signals_per_week"])
+        self.assertIsNone(summary["filled_signals_per_week"])
+
+    def test_execution_universe_requires_unique_declared_coverage(
+        self,
+    ) -> None:
+        row = replay_candidate(_candidate(), _history())
+        valid_coverage = {
+            "symbol": "EURUSD",
+            "history_first_bar_utc": "2026-07-01T00:00:00+00:00",
+            "history_last_bar_close_utc": "2026-07-02T00:00:00+00:00",
+        }
+
+        cases = {
+            "missing": (
+                [
+                    {
+                        **valid_coverage,
+                        "symbol": "GBPUSD",
+                    }
+                ],
+                "execution universe symbols missing declared coverage",
+            ),
+            "duplicate": (
+                [valid_coverage, {**valid_coverage, "symbol": " eurusd "}],
+                "duplicate declared coverage symbol=EURUSD",
+            ),
+            "blank": (
+                [{**valid_coverage, "symbol": ""}],
+                "coverage row is missing symbol",
+            ),
+        }
+
+        for name, (coverage, error) in cases.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, error):
+                    compile_backtest_report(
+                        candidates=[],
+                        rows=[row],
+                        coverage=coverage,
+                    )
+
+        noncanonical_row = {**row, "symbol": " eurusd "}
+        with self.assertRaisesRegex(
+            ValueError,
+            "execution universe symbol is not canonical",
+        ):
+            compile_backtest_report(
+                candidates=[],
+                rows=[noncanonical_row],
+                coverage=[valid_coverage],
+            )
 
     def test_monday_uses_last_completed_trading_session_not_sunday(self) -> None:
         friday_index = pd.date_range(
@@ -715,6 +1622,341 @@ class LtfExecutionBacktestTest(unittest.TestCase):
         self.assertEqual(len(monday_candidates), 1)
         self.assertIn("2026-07-03", monday_candidates[0].reference_profile_id)
         self.assertEqual(audit["diagnostics"].get("otd_candidates"), 1)
+
+    def test_prior_profile_gap_rejects_cash_candidate(self) -> None:
+        history = _cash_reconstruction_history().drop(
+            pd.Timestamp("2026-07-03T10:00:00Z")
+        )
+
+        candidates, audit = reconstruct_tpo_watch_candidates(
+            history,
+            symbol="GER40",
+        )
+
+        monday_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.session_id.startswith("GER40_2026-07-06")
+        ]
+        self.assertEqual(monday_candidates, [])
+        self.assertEqual(
+            audit["diagnostics"].get(
+                "skipped_prior_profile_incomplete_m5_sequence"
+            ),
+            1,
+        )
+
+    def test_corrupt_nearest_prior_session_blocks_older_profile_fallback(
+        self,
+    ) -> None:
+        base_history = _cash_reconstruction_history()
+        friday = base_history.loc[
+            "2026-07-03T07:00:00Z":"2026-07-03T15:55:00Z"
+        ].copy()
+        thursday = friday.copy()
+        thursday.index = thursday.index - pd.Timedelta(days=1)
+        with_older_profile = pd.concat([thursday, base_history])
+        corruptions = {
+            "gap": with_older_profile.drop(
+                pd.Timestamp("2026-07-03T10:00:00Z")
+            ),
+            "right_truncated": with_older_profile.drop(
+                pd.date_range(
+                    "2026-07-03T15:00:00Z",
+                    periods=12,
+                    freq="5min",
+                )
+            ),
+            "duplicate": pd.concat(
+                [
+                    with_older_profile,
+                    with_older_profile.loc[
+                        [pd.Timestamp("2026-07-03T10:00:00Z")]
+                    ],
+                ]
+            ),
+        }
+
+        for corruption, history in corruptions.items():
+            with self.subTest(corruption=corruption):
+                candidates, audit = reconstruct_tpo_watch_candidates(
+                    history,
+                    symbol="GER40",
+                )
+
+                monday_candidates = [
+                    candidate
+                    for candidate in candidates
+                    if candidate.session_id.startswith(
+                        "GER40_2026-07-06"
+                    )
+                ]
+                self.assertEqual(monday_candidates, [])
+                self.assertEqual(
+                    audit["diagnostics"].get(
+                        "skipped_prior_session_integrity_block"
+                    ),
+                    1,
+                )
+
+    def test_unconfirmed_empty_weekday_blocks_profile_fallback(
+        self,
+    ) -> None:
+        history = _cash_reconstruction_history()
+        monday = history.loc[
+            "2026-07-06T07:00:00Z":"2026-07-06T08:55:00Z"
+        ].copy()
+        tuesday = monday.copy()
+        tuesday.index = tuesday.index + pd.Timedelta(days=1)
+        history = pd.concat(
+            [
+                history.loc[
+                    "2026-07-03T07:00:00Z":"2026-07-03T15:55:00Z"
+                ],
+                tuesday,
+            ]
+        )
+
+        candidates, audit = reconstruct_tpo_watch_candidates(
+            history,
+            symbol="GER40",
+        )
+
+        tuesday_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.session_id.startswith("GER40_2026-07-07")
+        ]
+        self.assertEqual(tuesday_candidates, [])
+        self.assertEqual(
+            audit["diagnostics"].get(
+                "skipped_prior_session_unconfirmed_no_data"
+            ),
+            1,
+        )
+
+    def test_crypto_weekend_is_not_skipped_as_non_trading_day(self) -> None:
+        friday_index = pd.date_range(
+            "2026-07-03T00:00:00Z",
+            periods=288,
+            freq="5min",
+        )
+        friday = pd.DataFrame(
+            {
+                "open": [100.0] * len(friday_index),
+                "high": [100.1] * len(friday_index),
+                "low": [99.9] * len(friday_index),
+                "close": [100.0] * len(friday_index),
+                "volume": [1000.0] * len(friday_index),
+            },
+            index=friday_index,
+        )
+        sunday_index = pd.date_range(
+            "2026-07-05T00:00:00Z",
+            periods=24,
+            freq="5min",
+        )
+        sunday = pd.DataFrame(
+            {
+                "open": [101.0] * len(sunday_index),
+                "high": [101.1] * len(sunday_index),
+                "low": [100.8] * len(sunday_index),
+                "close": [101.0] * len(sunday_index),
+                "volume": [1000.0] * len(sunday_index),
+            },
+            index=sunday_index,
+        )
+
+        candidates, audit = reconstruct_tpo_watch_candidates(
+            pd.concat([friday, sunday]),
+            symbol="BTCUSD",
+        )
+
+        sunday_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.session_id.startswith("BTCUSD_2026-07-05")
+        ]
+        self.assertEqual(sunday_candidates, [])
+        self.assertEqual(
+            audit["diagnostics"].get(
+                "skipped_prior_session_unconfirmed_no_data"
+            ),
+            1,
+        )
+        self.assertIsNone(
+            audit["diagnostics"].get(
+                "confirmed_non_trading_prior_days_skipped"
+            )
+        )
+
+    def test_missing_prior_profile_open_rejects_cash_candidate(
+        self,
+    ) -> None:
+        history = _cash_reconstruction_history().drop(
+            pd.Timestamp("2026-07-03T07:00:00Z")
+        )
+
+        candidates, audit = reconstruct_tpo_watch_candidates(
+            history,
+            symbol="GER40",
+        )
+
+        monday_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.session_id.startswith("GER40_2026-07-06")
+        ]
+        self.assertEqual(monday_candidates, [])
+        self.assertEqual(
+            audit["diagnostics"].get(
+                "skipped_prior_profile_missing_exact_session_open_bar"
+            ),
+            1,
+        )
+
+    def test_complete_prior_profile_preserves_cash_candidate(self) -> None:
+        candidates, audit = reconstruct_tpo_watch_candidates(
+            _cash_reconstruction_history(),
+            symbol="GER40",
+        )
+
+        monday_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.session_id.startswith("GER40_2026-07-06")
+        ]
+        self.assertEqual(len(monday_candidates), 1)
+        self.assertTrue(
+            monday_candidates[0].payload[
+                "event_census_execution_eligible"
+            ]
+        )
+        self.assertEqual(
+            monday_candidates[0].payload[
+                "prior_profile_m5_integrity_status"
+            ],
+            "COMPLETE",
+        )
+        self.assertEqual(
+            monday_candidates[0].payload["prior_profile_m5_bar_count"],
+            108,
+        )
+        self.assertEqual(
+            monday_candidates[0].payload[
+                "prior_profile_expected_m5_bar_count"
+            ],
+            108,
+        )
+        self.assertEqual(
+            monday_candidates[0].payload[
+                "prior_profile_expected_right_edge_utc"
+            ],
+            "2026-07-03T16:00:00+00:00",
+        )
+        self.assertEqual(
+            monday_candidates[0].payload[
+                "prior_profile_last_bar_close_utc"
+            ],
+            "2026-07-03T16:00:00+00:00",
+        )
+        self.assertEqual(
+            audit["session_spec"]["profile_duration_minutes"],
+            540,
+        )
+
+    def test_right_truncated_prior_profile_rejects_cash_candidate(
+        self,
+    ) -> None:
+        history = _cash_reconstruction_history()
+        truncated_tail = pd.date_range(
+            "2026-07-03T15:00:00Z",
+            periods=12,
+            freq="5min",
+        )
+        history = history.drop(truncated_tail)
+
+        candidates, audit = reconstruct_tpo_watch_candidates(
+            history,
+            symbol="GER40",
+        )
+
+        monday_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.session_id.startswith("GER40_2026-07-06")
+        ]
+        self.assertEqual(monday_candidates, [])
+        self.assertEqual(
+            audit["diagnostics"].get(
+                "skipped_prior_profile_missing_confirmed_right_edge"
+            ),
+            1,
+        )
+
+    def test_prior_profile_duplicate_rejects_cash_candidate(self) -> None:
+        history = _cash_reconstruction_history()
+        duplicated = pd.concat(
+            [
+                history,
+                history.loc[
+                    [pd.Timestamp("2026-07-03T10:00:00Z")]
+                ],
+            ]
+        )
+
+        candidates, audit = reconstruct_tpo_watch_candidates(
+            duplicated,
+            symbol="GER40",
+        )
+
+        monday_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.session_id.startswith("GER40_2026-07-06")
+        ]
+        self.assertEqual(monday_candidates, [])
+        self.assertEqual(
+            audit["diagnostics"].get(
+                "skipped_prior_profile_duplicate_m5_bar"
+            ),
+            1,
+        )
+
+    def test_repeated_interest_zone_uses_newest_profile_metadata(
+        self,
+    ) -> None:
+        older = ReconstructedProfile(
+            session_id="EURUSD_2026-07-01_LONDON_SYNTHETIC",
+            session_open_utc=datetime(2026, 7, 1, 7, 0, tzinfo=UTC),
+            session_close_utc=datetime(2026, 7, 2, 7, 0, tzinfo=UTC),
+            high=101.0,
+            low=99.0,
+            vah=100.5,
+            val=99.5,
+            poc=100.0,
+            bin_width=0.1,
+            bars=96,
+        )
+        newest = replace(
+            older,
+            session_id="EURUSD_2026-07-02_LONDON_SYNTHETIC",
+            session_open_utc=datetime(2026, 7, 2, 7, 0, tzinfo=UTC),
+            session_close_utc=datetime(2026, 7, 3, 7, 0, tzinfo=UTC),
+        )
+
+        zones = _candidate_interest_zones([older, newest])
+        repeated_high = next(
+            zone
+            for zone in zones
+            if zone["zone_type"] == "SESSION_HIGH"
+            and zone["price"] == 101.0
+        )
+
+        self.assertEqual(
+            repeated_high["profile_id"],
+            newest.session_id,
+        )
 
     def test_twelvedata_paginates_back_to_reported_earliest(self) -> None:
         pages = [
@@ -783,6 +2025,40 @@ class LtfExecutionBacktestTest(unittest.TestCase):
                     allow_network_fetch=False,
                     resume=False,
                 )
+
+    def test_zero_event_rerun_removes_stale_census_artifacts(self) -> None:
+        report = compile_backtest_report(
+            candidates=[],
+            rows=[],
+            event_records=[],
+            coverage=[],
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="ltf-v2-stale-census-"
+        ) as tmp:
+            run_dir = Path(tmp)
+            stale_parquet = run_dir / "otd_orr_event_census.parquet"
+            stale_csv = run_dir / "otd_orr_event_census.csv"
+            stale_parquet_tmp = run_dir / (
+                "otd_orr_event_census.parquet.tmp"
+            )
+            stale_csv_tmp = run_dir / "otd_orr_event_census.csv.tmp"
+            stale_parquet.write_bytes(b"stale")
+            stale_csv.write_text("stale\n", encoding="utf-8")
+            stale_parquet_tmp.write_bytes(b"stale")
+            stale_csv_tmp.write_text("stale\n", encoding="utf-8")
+
+            artifacts = write_report_artifacts(
+                run_dir=run_dir,
+                report=report,
+            )
+
+            self.assertFalse(stale_parquet.exists())
+            self.assertFalse(stale_csv.exists())
+            self.assertFalse(stale_parquet_tmp.exists())
+            self.assertFalse(stale_csv_tmp.exists())
+            self.assertIsNone(artifacts["event_census_parquet"])
+            self.assertIsNone(artifacts["event_census_csv"])
 
 
 if __name__ == "__main__":

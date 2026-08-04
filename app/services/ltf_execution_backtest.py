@@ -27,13 +27,16 @@ from app.services.ltf_execution_state_machine import (
     LTF_EXECUTION_STATE_MACHINE_VERSION,
     LTFExecutionStateStore,
     STATE_ENTRY_READY,
+    _atr as _state_machine_atr,
+    _is_context_invalidated as _state_machine_context_invalidated,
 )
 
 
 LTF_EXECUTION_BACKTEST_VERSION = (
-    "ltf-execution-v2-backtest-integrity-v1.1-causal-entry-context-costs"
+    "ltf-execution-v2-backtest-integrity-v2.0.6"
 )
 
+M5_BAR_MINUTES = 5
 MIN_PRIOR_SESSION_M5_BARS = 96
 MIN_CURRENT_SESSION_M5_BARS = 24
 FIRST_ACTIVITY_MINUTES = 90
@@ -54,6 +57,7 @@ class SessionSpec:
     open_time: time
     label: str
     max_horizon_hours: int = DEFAULT_EXECUTION_HORIZON_HOURS
+    profile_duration_minutes: int = 8 * 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,8 +140,20 @@ DEFAULT_SESSION_SPEC = SessionSpec(
 )
 
 SESSION_SPECS: dict[str, SessionSpec] = {
-    "BTCUSD": SessionSpec("UTC", time(0, 0), "UTC_CRYPTO_DAY", 12),
-    "ETHUSD": SessionSpec("UTC", time(0, 0), "UTC_CRYPTO_DAY", 12),
+    "BTCUSD": SessionSpec(
+        "UTC",
+        time(0, 0),
+        "UTC_CRYPTO_DAY",
+        12,
+        24 * 60,
+    ),
+    "ETHUSD": SessionSpec(
+        "UTC",
+        time(0, 0),
+        "UTC_CRYPTO_DAY",
+        12,
+        24 * 60,
+    ),
     "XAUUSD": SessionSpec("Europe/London", time(8, 0), "LONDON_SYNTHETIC", 8),
     "EURUSD": SessionSpec("Europe/London", time(8, 0), "LONDON_SYNTHETIC", 8),
     "GBPUSD": SessionSpec("Europe/London", time(8, 0), "LONDON_SYNTHETIC", 8),
@@ -145,10 +161,34 @@ SESSION_SPECS: dict[str, SessionSpec] = {
     "USDJPY": SessionSpec("Asia/Tokyo", time(9, 0), "TOKYO_SYNTHETIC", 8),
     "AUDUSD": SessionSpec("Asia/Tokyo", time(9, 0), "ASIA_SYNTHETIC", 8),
     "USDCAD": SessionSpec("America/New_York", time(8, 0), "NY_SYNTHETIC", 8),
-    "GER40": SessionSpec("Europe/Berlin", time(9, 0), "XETRA_CASH", 8),
-    "NAS100": SessionSpec("America/New_York", time(9, 30), "NY_RTH", 7),
-    "SPX500": SessionSpec("America/New_York", time(9, 30), "NY_RTH", 7),
-    "UKOIL": SessionSpec("Europe/London", time(8, 0), "LONDON_SYNTHETIC", 9),
+    "GER40": SessionSpec(
+        "Europe/Berlin",
+        time(9, 0),
+        "XETRA_CASH",
+        8,
+        9 * 60,
+    ),
+    "NAS100": SessionSpec(
+        "America/New_York",
+        time(9, 30),
+        "NY_RTH",
+        7,
+        6 * 60 + 30,
+    ),
+    "SPX500": SessionSpec(
+        "America/New_York",
+        time(9, 30),
+        "NY_RTH",
+        7,
+        6 * 60 + 30,
+    ),
+    "UKOIL": SessionSpec(
+        "Europe/London",
+        time(8, 0),
+        "LONDON_SYNTHETIC",
+        9,
+        9 * 60,
+    ),
 }
 
 TICK_SIZE_BY_SYMBOL: dict[str, float] = {
@@ -282,7 +322,19 @@ def normalize_m5_history(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
         opens = pd.to_datetime(out["timestamp"], utc=True, errors="coerce")
     else:
         opens = pd.to_datetime(out.index, utc=True, errors="coerce")
+    duplicate_source = pd.Series(
+        opens.duplicated(keep=False),
+        index=out.index,
+    )
+    if "_source_duplicate_bar_open_utc" in out.columns:
+        duplicate_source = (
+            duplicate_source
+            | out["_source_duplicate_bar_open_utc"]
+            .fillna(False)
+            .astype(bool)
+        )
     out["bar_open_utc"] = opens
+    out["_source_duplicate_bar_open_utc"] = duplicate_source
     out["bar_close_utc"] = opens + pd.Timedelta(minutes=5)
     for column in required:
         out[column] = pd.to_numeric(out[column], errors="coerce")
@@ -298,10 +350,55 @@ def normalize_m5_history(frame: pd.DataFrame, *, symbol: str) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+def _has_complete_m5_sequence(
+    frame: pd.DataFrame,
+    *,
+    start_utc: datetime,
+    end_close_utc: datetime,
+) -> bool:
+    """Require every unique M5 bar from ``start`` through ``end_close``."""
+
+    if end_close_utc <= start_utc:
+        return False
+    expected_opens = pd.date_range(
+        pd.Timestamp(start_utc),
+        pd.Timestamp(end_close_utc) - pd.Timedelta(minutes=5),
+        freq="5min",
+    )
+    opens = pd.to_datetime(frame["bar_open_utc"], utc=True)
+    closes = pd.to_datetime(frame["bar_close_utc"], utc=True)
+    observed = frame.loc[
+        (opens >= pd.Timestamp(start_utc))
+        & (closes <= pd.Timestamp(end_close_utc))
+    ]
+    observed_opens = pd.DatetimeIndex(
+        pd.to_datetime(
+            observed["bar_open_utc"],
+            utc=True,
+            errors="coerce",
+        )
+    )
+    return (
+        len(observed_opens) == len(expected_opens)
+        and observed_opens.nunique() == len(expected_opens)
+        and observed_opens.sort_values().equals(expected_opens)
+        and not bool(
+            observed["_source_duplicate_bar_open_utc"].astype(bool).any()
+        )
+    )
+
+
 def _session_open(local_day: date, spec: SessionSpec) -> datetime:
     zone = ZoneInfo(spec.timezone)
     local = datetime.combine(local_day, spec.open_time, tzinfo=zone)
     return local.astimezone(UTC)
+
+
+def _profile_session_close(
+    session_open: datetime,
+    spec: SessionSpec,
+) -> datetime:
+    return session_open + timedelta(minutes=spec.profile_duration_minutes)
 
 
 def _session_days(frame: pd.DataFrame, spec: SessionSpec) -> list[date]:
@@ -311,6 +408,18 @@ def _session_days(frame: pd.DataFrame, spec: SessionSpec) -> list[date]:
     first = _as_utc(frame["bar_open_utc"].iloc[0]).astimezone(zone).date()
     last = _as_utc(frame["bar_open_utc"].iloc[-1]).astimezone(zone).date()
     return list(pd.date_range(first, last, freq="D").date)
+
+
+def _is_confirmed_non_trading_day(
+    local_day: date,
+    spec: SessionSpec,
+) -> bool:
+    """Confirm calendar closures without inferring holidays from missing data."""
+
+    return (
+        local_day.weekday() >= 5
+        and spec.label != "UTC_CRYPTO_DAY"
+    )
 
 
 def _slice(
@@ -344,6 +453,56 @@ def _resample_m15(frame: pd.DataFrame, *, origin: datetime) -> pd.DataFrame:
     return result.dropna(subset=["open", "high", "low", "close"])
 
 
+def _prior_profile_m5_integrity_status(
+    frame: pd.DataFrame,
+    *,
+    session_open: datetime,
+    session_close: datetime,
+) -> str:
+    """Require a complete unique M5 chain through the declared session edge."""
+
+    if session_close <= session_open:
+        return "INVALID_SESSION_RIGHT_EDGE"
+    expected_opens = pd.date_range(
+        pd.Timestamp(session_open),
+        pd.Timestamp(session_close) - pd.Timedelta(minutes=5),
+        freq="5min",
+    )
+    minimum_coverage = min(
+        MIN_PRIOR_SESSION_M5_BARS,
+        len(expected_opens),
+    )
+    if len(frame) < minimum_coverage:
+        return "INSUFFICIENT_COVERAGE"
+    opens = pd.DatetimeIndex(
+        pd.to_datetime(
+            frame["bar_open_utc"],
+            utc=True,
+            errors="coerce",
+        )
+    )
+    if opens.empty or pd.isna(opens[0]):
+        return "MISSING_EXACT_SESSION_OPEN_BAR"
+    if _as_utc(opens[0]) != session_open:
+        return "MISSING_EXACT_SESSION_OPEN_BAR"
+    duplicate_source = frame.get(
+        "_source_duplicate_bar_open_utc",
+        pd.Series(False, index=frame.index),
+    )
+    if bool(duplicate_source.fillna(False).astype(bool).any()):
+        return "DUPLICATE_M5_BAR"
+    if opens[-1] != expected_opens[-1]:
+        return "MISSING_CONFIRMED_SESSION_RIGHT_EDGE"
+    if (
+        opens.hasnans
+        or len(opens) != len(expected_opens)
+        or opens.nunique() != len(expected_opens)
+        or not opens.sort_values().equals(expected_opens)
+    ):
+        return "INCOMPLETE_M5_SEQUENCE"
+    return "COMPLETE"
+
+
 def _profile_from_session(
     frame: pd.DataFrame,
     *,
@@ -352,6 +511,15 @@ def _profile_from_session(
     session_open: datetime,
     session_close: datetime,
 ) -> ReconstructedProfile | None:
+    if (
+        _prior_profile_m5_integrity_status(
+            frame,
+            session_open=session_open,
+            session_close=session_close,
+        )
+        != "COMPLETE"
+    ):
+        return None
     m15 = _resample_m15(frame, origin=session_open)
     if len(m15) < 16:
         return None
@@ -469,23 +637,65 @@ def _two_block_acceptance(
     if post_touch.empty:
         return False, None
     indexed = post_touch.set_index("bar_open_utc")
-    blocks = indexed.resample(
+    block_groups = indexed.resample(
         "30min",
         origin=pd.Timestamp(origin),
         label="left",
         closed="left",
-    ).agg({"close": "last"})
-    blocks = blocks.dropna(subset=["close"])
-    if len(blocks) < 2:
-        return False, None
-    inside = (
-        blocks["close"] < edge
-        if opened_above
-        else blocks["close"] > edge
     )
-    for index in range(1, len(blocks)):
-        if bool(inside.iloc[index - 1]) and bool(inside.iloc[index]):
-            activated = _as_utc(blocks.index[index] + pd.Timedelta(minutes=30))
+    expected_offsets = range(0, CONTEXT_TPO_BLOCK_MINUTES, 5)
+    complete_blocks: list[tuple[pd.Timestamp, float]] = []
+    for block_open, block in block_groups:
+        block_open = pd.Timestamp(block_open)
+        observed_opens = pd.DatetimeIndex(
+            pd.to_datetime(block.index, utc=True, errors="coerce")
+        )
+        expected_opens = pd.DatetimeIndex(
+            [
+                block_open + pd.Timedelta(minutes=offset)
+                for offset in expected_offsets
+            ]
+        )
+        if (
+            len(observed_opens) != len(expected_opens)
+            or observed_opens.nunique() != len(expected_opens)
+            or not observed_opens.sort_values().equals(expected_opens)
+            or block["close"].isna().any()
+            or bool(
+                block.get(
+                    "_source_duplicate_bar_open_utc",
+                    pd.Series(False, index=block.index),
+                ).any()
+            )
+        ):
+            continue
+        complete_blocks.append(
+            (block_open, float(block["close"].iloc[-1]))
+        )
+    if len(complete_blocks) < 2:
+        return False, None
+    for index in range(1, len(complete_blocks)):
+        previous_open, previous_close = complete_blocks[index - 1]
+        current_open, current_close = complete_blocks[index]
+        consecutive = (
+            current_open - previous_open
+            == pd.Timedelta(minutes=CONTEXT_TPO_BLOCK_MINUTES)
+        )
+        previous_inside = (
+            previous_close < edge
+            if opened_above
+            else previous_close > edge
+        )
+        current_inside = (
+            current_close < edge
+            if opened_above
+            else current_close > edge
+        )
+        if consecutive and previous_inside and current_inside:
+            activated = _as_utc(
+                current_open
+                + pd.Timedelta(minutes=CONTEXT_TPO_BLOCK_MINUTES)
+            )
             return True, activated
     return False, None
 
@@ -494,14 +704,18 @@ def _candidate_interest_zones(
     profiles: Sequence[ReconstructedProfile],
 ) -> tuple[dict[str, Any], ...]:
     zones: list[dict[str, Any]] = []
-    seen: set[tuple[str, float]] = set()
+    index_by_key: dict[tuple[str, float], int] = {}
     for profile in list(profiles)[-5:]:
         for zone in profile.to_interest_zones():
             key = (str(zone["zone_type"]), round(float(zone["price"]), 8))
-            if key in seen:
-                continue
-            seen.add(key)
-            zones.append(zone)
+            existing_index = index_by_key.get(key)
+            if existing_index is None:
+                index_by_key[key] = len(zones)
+                zones.append(zone)
+            else:
+                # Preserve deterministic zone priority while refreshing the
+                # duplicate level with the latest causal profile metadata.
+                zones[existing_index] = zone
     return tuple(zones)
 
 
@@ -509,6 +723,7 @@ def reconstruct_tpo_watch_candidates(
     frame: pd.DataFrame,
     *,
     symbol: str,
+    include_counter_htf_events: bool = False,
 ) -> tuple[list[HistoricalWatchCandidate], dict[str, Any]]:
     symbol = symbol.upper()
     history = normalize_m5_history(frame, symbol=symbol)
@@ -517,15 +732,62 @@ def reconstruct_tpo_watch_candidates(
     candidates: list[HistoricalWatchCandidate] = []
     diagnostics: Counter[str] = Counter()
 
-    # Build profiles once, then resolve the latest completed *trading* session
-    # for each day.  This makes Monday use Friday for weekday instruments and
-    # also handles exchange holidays without peeking into the current session.
+    # Build profiles once, retaining the integrity state of every calendar
+    # session.  A later event may skip only calendar-confirmed non-trading days;
+    # missing weekday data and corrupt sessions fail closed instead of silently
+    # falling back to an older VAH/VAL/POC.
     completed_profiles: list[ReconstructedProfile] = []
+    session_states: dict[date, dict[str, Any]] = {}
     for local_day in days:
         session_open = _session_open(local_day, spec)
-        session_close = _session_open(local_day + timedelta(days=1), spec)
+        session_close = _profile_session_close(session_open, spec)
         session_frame = _slice(history, session_open, session_close)
-        if len(session_frame) < MIN_PRIOR_SESSION_M5_BARS:
+        if (
+            session_frame.empty
+            and _is_confirmed_non_trading_day(local_day, spec)
+        ):
+            session_states[local_day] = {
+                "status": "CONFIRMED_NON_TRADING_DAY",
+                "has_data": False,
+                "profile": None,
+            }
+            diagnostics["confirmed_non_trading_days"] += 1
+            continue
+        profile_integrity_status = _prior_profile_m5_integrity_status(
+            session_frame,
+            session_open=session_open,
+            session_close=session_close,
+        )
+        session_states[local_day] = {
+            "status": profile_integrity_status,
+            "has_data": not session_frame.empty,
+            "profile": None,
+        }
+        if profile_integrity_status != "COMPLETE":
+            diagnostic_key = {
+                "INSUFFICIENT_COVERAGE": (
+                    "skipped_prior_profile_insufficient_coverage"
+                ),
+                "MISSING_EXACT_SESSION_OPEN_BAR": (
+                    "skipped_prior_profile_missing_exact_session_open_bar"
+                ),
+                "DUPLICATE_M5_BAR": (
+                    "skipped_prior_profile_duplicate_m5_bar"
+                ),
+                "INCOMPLETE_M5_SEQUENCE": (
+                    "skipped_prior_profile_incomplete_m5_sequence"
+                ),
+                "MISSING_CONFIRMED_SESSION_RIGHT_EDGE": (
+                    "skipped_prior_profile_missing_confirmed_right_edge"
+                ),
+                "INVALID_SESSION_RIGHT_EDGE": (
+                    "skipped_prior_profile_invalid_session_right_edge"
+                ),
+            }.get(
+                profile_integrity_status,
+                "skipped_prior_profile_unknown_m5_integrity",
+            )
+            diagnostics[diagnostic_key] += 1
             continue
         profile = _profile_from_session(
             session_frame,
@@ -536,11 +798,63 @@ def reconstruct_tpo_watch_candidates(
         )
         if profile is not None:
             completed_profiles.append(profile)
+            session_states[local_day] = {
+                "status": "COMPLETE",
+                "has_data": True,
+                "profile": profile,
+            }
+        else:
+            session_states[local_day]["status"] = (
+                "PROFILE_RECONSTRUCTION_FAILED"
+            )
+            diagnostics[
+                "skipped_prior_profile_reconstruction_failed"
+            ] += 1
 
     for local_day in days:
+        current_session_state = session_states.get(local_day) or {}
+        if (
+            current_session_state.get("status")
+            == "CONFIRMED_NON_TRADING_DAY"
+        ):
+            diagnostics["skipped_confirmed_non_trading_current_day"] += 1
+            continue
         current_open = _session_open(local_day, spec)
         next_open = _session_open(local_day + timedelta(days=1), spec)
         current_frame = _slice(history, current_open, next_open)
+        previous_profile: ReconstructedProfile | None = None
+        prior_session_block: Mapping[str, Any] | None = None
+        for prior_day in reversed(days):
+            if prior_day >= local_day:
+                continue
+            prior_state = session_states.get(prior_day) or {}
+            prior_status = str(prior_state.get("status") or "UNKNOWN")
+            if prior_status == "CONFIRMED_NON_TRADING_DAY":
+                diagnostics[
+                    "confirmed_non_trading_prior_days_skipped"
+                ] += 1
+                continue
+            if prior_status == "COMPLETE":
+                candidate_profile = prior_state.get("profile")
+                if isinstance(candidate_profile, ReconstructedProfile):
+                    previous_profile = candidate_profile
+                    break
+            prior_session_block = prior_state
+            break
+
+        if previous_profile is None:
+            if prior_session_block is None:
+                diagnostics["skipped_prior_coverage"] += 1
+            elif bool(prior_session_block.get("has_data")):
+                diagnostics[
+                    "skipped_prior_session_integrity_block"
+                ] += 1
+            else:
+                diagnostics[
+                    "skipped_prior_session_unconfirmed_no_data"
+                ] += 1
+            continue
+
         prior_profiles = [
             profile
             for profile in completed_profiles
@@ -553,7 +867,6 @@ def reconstruct_tpo_watch_candidates(
             diagnostics["skipped_current_coverage"] += 1
             continue
 
-        previous_profile = prior_profiles[-1]
         previous_frame = _slice(
             history,
             previous_profile.session_open_utc,
@@ -564,6 +877,19 @@ def reconstruct_tpo_watch_candidates(
         first_activity = _slice(current_frame, current_open, first_activity_end)
         if len(first_activity) < 12:
             diagnostics["skipped_first_activity_coverage"] += 1
+            continue
+        if (
+            first_activity.empty
+            or _as_utc(first_activity.iloc[0]["bar_open_utc"])
+            != current_open
+        ):
+            diagnostics["skipped_missing_exact_session_open_bar"] += 1
+            continue
+        source_duplicates = first_activity[
+            "_source_duplicate_bar_open_utc"
+        ].astype(bool)
+        if bool(source_duplicates.iloc[0]):
+            diagnostics["skipped_duplicate_session_open_bar"] += 1
             continue
 
         open_price = float(first_activity.iloc[0]["open"])
@@ -583,6 +909,7 @@ def reconstruct_tpo_watch_candidates(
             if opened_above
             else first_activity["high"] >= edge - tolerance
         )
+        touches = touches & ~source_duplicates
         if not bool(touches.any()):
             diagnostics["skipped_no_value_test"] += 1
             continue
@@ -605,6 +932,9 @@ def reconstruct_tpo_watch_candidates(
             else (post_touch["close"] <= edge - tolerance)
             & (post_touch["close"] < post_touch["open"])
         )
+        rejection_mask = rejection_mask & ~post_touch[
+            "_source_duplicate_bar_open_utc"
+        ].astype(bool)
         rejection_rows = post_touch.loc[rejection_mask]
         rejection_at = (
             _as_utc(rejection_rows.iloc[0]["bar_close_utc"])
@@ -651,10 +981,27 @@ def reconstruct_tpo_watch_candidates(
             diagnostics["skipped_no_confirmed_branch"] += 1
             continue
 
+        if not _has_complete_m5_sequence(
+            first_activity,
+            start_utc=current_open,
+            end_close_utc=activated_at,
+        ):
+            diagnostics[
+                "skipped_incomplete_open_to_confirmation_m5"
+            ] += 1
+            continue
+
         bias = _htf_bias(history, as_of=activated_at)
         if bias in {"LONG", "SHORT"} and bias != direction:
-            diagnostics["skipped_counter_htf"] += 1
-            continue
+            if not include_counter_htf_events:
+                diagnostics["skipped_counter_htf"] += 1
+                continue
+            diagnostics["included_counter_htf_event_census"] += 1
+            signal_alignment = "COUNTER_TREND"
+        else:
+            signal_alignment = (
+                "TREND_ALIGNED" if bias == direction else "NEUTRAL_HTF_OTD"
+            )
 
         expires_at = min(
             next_open,
@@ -665,13 +1012,34 @@ def reconstruct_tpo_watch_candidates(
             f"{session_id}_{setup_family}_{direction}_{activated_at:%H%M}"
         )
         zones = _candidate_interest_zones(prior_profiles)
+        synthetic_open_confirmed = (
+            spec.label
+            not in {
+                "LONDON_SYNTHETIC",
+                "TOKYO_SYNTHETIC",
+                "ASIA_SYNTHETIC",
+                "NY_SYNTHETIC",
+            }
+        )
+        execution_eligible = (
+            signal_alignment != "COUNTER_TREND"
+            and synthetic_open_confirmed
+        )
+        if signal_alignment == "COUNTER_TREND":
+            execution_exclusion_reason = "COUNTER_TREND_HARD_GATE"
+        elif not synthetic_open_confirmed:
+            execution_exclusion_reason = "UNCONFIRMED_SYNTHETIC_OPEN"
+        else:
+            execution_exclusion_reason = None
         payload = {
             "symbol": symbol,
             "direction": direction,
             "expected_direction": direction,
             "htf_bias": bias,
-            "signal_alignment": (
-                "TREND_ALIGNED" if bias == direction else "NEUTRAL_HTF_OTD"
+            "signal_alignment": signal_alignment,
+            "event_census_execution_eligible": execution_eligible,
+            "event_census_execution_exclusion_reason": (
+                execution_exclusion_reason
             ),
             "tpo_watch_state": "LTF_MODEL_PENDING",
             "tpo_watch_active": True,
@@ -701,15 +1069,21 @@ def reconstruct_tpo_watch_candidates(
             "signal_created_at_utc": activated_at.isoformat(),
             "expires_at_utc": expires_at.isoformat(),
             "profile_reliability": "RECONSTRUCTED_NOT_PARITY_VERIFIED",
-            "synthetic_open_confirmed": (
-                spec.label
-                not in {
-                    "LONDON_SYNTHETIC",
-                    "TOKYO_SYNTHETIC",
-                    "ASIA_SYNTHETIC",
-                    "NY_SYNTHETIC",
-                }
+            "prior_profile_m5_integrity_status": "COMPLETE",
+            "prior_profile_m5_bar_count": len(previous_frame),
+            "prior_profile_first_bar_utc": (
+                _as_utc(previous_frame["bar_open_utc"].iloc[0]).isoformat()
             ),
+            "prior_profile_last_bar_close_utc": (
+                _as_utc(previous_frame["bar_close_utc"].iloc[-1]).isoformat()
+            ),
+            "prior_profile_expected_right_edge_utc": (
+                previous_profile.session_close_utc.isoformat()
+            ),
+            "prior_profile_expected_m5_bar_count": (
+                spec.profile_duration_minutes // 5
+            ),
+            "synthetic_open_confirmed": synthetic_open_confirmed,
             "historical_context_mode": "RECONSTRUCTED_TPO_NO_LOOKAHEAD",
             "macro_guard_status": "NOT_RECONSTRUCTED",
             "positioning_status": "NOT_RECONSTRUCTED",
@@ -745,6 +1119,10 @@ def reconstruct_tpo_watch_candidates(
             "timezone": spec.timezone,
             "open_time": spec.open_time.isoformat(),
             "label": spec.label,
+            "profile_duration_minutes": spec.profile_duration_minutes,
+            "profile_expected_m5_bars": (
+                spec.profile_duration_minutes // 5
+            ),
         },
         "history_rows": len(history),
         "history_first_bar_utc": (
@@ -757,7 +1135,17 @@ def reconstruct_tpo_watch_candidates(
             if not history.empty
             else None
         ),
+        "history_last_bar_close_utc": (
+            _as_utc(history["bar_close_utc"].iloc[-1]).isoformat()
+            if not history.empty
+            else None
+        ),
         "candidate_count": len(candidates),
+        "include_counter_htf_events": include_counter_htf_events,
+        "prior_profile_fallback_policy": (
+            "ONLY_ACROSS_CONFIRMED_NON_TRADING_WEEKEND_DAYS; "
+            "MISSING_WEEKDAY_OR_FAILED_M5_INTEGRITY_BLOCKS"
+        ),
         "diagnostics": dict(sorted(diagnostics.items())),
     }
 
@@ -803,12 +1191,19 @@ def _context_blocks(
             len(observed_opens) != len(expected_opens)
             or observed_opens.nunique() != len(expected_opens)
             or not observed_opens.sort_values().equals(expected_opens)
+            or bool(
+                block.get(
+                    "_source_duplicate_bar_open_utc",
+                    pd.Series(False, index=block.index),
+                ).any()
+            )
         ):
             continue
         if block[["open", "high", "low", "close"]].isna().any().any():
             continue
         result.append(
             {
+                "block_open_utc": _as_utc(block_open),
                 "block_end_utc": block_end,
                 "open": float(block["open"].iloc[0]),
                 "high": float(block["high"].max()),
@@ -851,6 +1246,11 @@ def _balance_transition(
     if len(blocks) < 2:
         return None
     first, second = blocks[-2:]
+    if (
+        second["block_open_utc"] - first["block_open_utc"]
+        != timedelta(minutes=CONTEXT_TPO_BLOCK_MINUTES)
+    ):
+        return None
     first_range = max(float(first["high"]) - float(first["low"]), tolerance)
     second_range = max(float(second["high"]) - float(second["low"]), tolerance)
     overlap = max(
@@ -957,6 +1357,15 @@ def build_dynamic_context_timeline(
             and blocks[block_index]["block_end_utc"] <= bar_close
         ):
             block = blocks[block_index]
+            if (
+                completed_blocks
+                and block["block_open_utc"]
+                - completed_blocks[-1]["block_open_utc"]
+                != timedelta(minutes=CONTEXT_TPO_BLOCK_MINUTES)
+            ):
+                completed_blocks.clear()
+                acceptance_count = 0
+                rejection_count = 0
             completed_blocks.append(block)
             relation = _context_relation(
                 block,
@@ -976,10 +1385,22 @@ def build_dynamic_context_timeline(
             block_index += 1
 
         if cancellation_reason is None:
-            invalidated = (
-                float(row["low"]) <= candidate.test_extreme
-                if candidate.direction == "LONG"
-                else float(row["high"]) >= candidate.test_extreme
+            causal_history = history.loc[
+                pd.to_datetime(
+                    history["bar_close_utc"],
+                    utc=True,
+                )
+                <= pd.Timestamp(bar_close)
+            ]
+            invalidated = _state_machine_context_invalidated(
+                {
+                    "symbol": candidate.symbol,
+                    "direction": candidate.direction,
+                    "context_invalidation_price": candidate.test_extreme,
+                    "bos_level": None,
+                },
+                row,
+                atr_value=_state_machine_atr(causal_history),
             )
             if invalidated:
                 cancellation_reason = "INVALIDATED_BY_CONTEXT_EXTREME"
@@ -1254,6 +1675,12 @@ def _finalize_execution_outcome(
     mfe_price: float | None = None,
     mae_price: float | None = None,
     cancellation_reason: str | None = None,
+    execution_m5_integrity_status: str = "COMPLETE_TO_CAUSAL_OUTCOME",
+    execution_observation_complete: bool = True,
+    execution_integrity_issue_at: datetime | None = None,
+    ready_evaluable: bool = True,
+    fill_evaluable: bool = True,
+    trade_outcome_evaluable: bool = True,
 ) -> dict[str, Any]:
     filled = filled_at is not None
     spread_cost_r = (
@@ -1300,8 +1727,52 @@ def _finalize_execution_outcome(
             else None
         ),
         "cancellation_reason": cancellation_reason,
+        "execution_m5_integrity_status": execution_m5_integrity_status,
+        "execution_observation_complete": execution_observation_complete,
+        "execution_integrity_issue_at_utc": (
+            execution_integrity_issue_at.isoformat()
+            if execution_integrity_issue_at
+            else None
+        ),
+        "execution_observation_end_utc": resolved_at.isoformat(),
+        "ready_evaluable": ready_evaluable,
+        "fill_evaluable": fill_evaluable,
+        "trade_outcome_evaluable": trade_outcome_evaluable,
         "execution_cost_model": cost_model.to_dict(),
     }
+
+
+def _execution_integrity_failure_outcome(
+    *,
+    status: str,
+    filled_at: datetime | None,
+    observation_end: datetime,
+    issue_at: datetime,
+    risk: float,
+    cost_model: ExecutionCostModel,
+) -> dict[str, Any]:
+    outcome_by_status = {
+        "INCOMPLETE_POST_CONFIRMATION_M5_SEQUENCE": (
+            "NOT_EVALUABLE_INCOMPLETE_POST_CONFIRMATION_M5_SEQUENCE"
+        ),
+        "DUPLICATE_POST_CONFIRMATION_M5_BAR": (
+            "NOT_EVALUABLE_DUPLICATE_POST_CONFIRMATION_M5_BAR"
+        ),
+    }
+    return _finalize_execution_outcome(
+        outcome=outcome_by_status[status],
+        gross_r=None,
+        filled_at=filled_at,
+        resolved_at=observation_end,
+        risk=risk,
+        cost_model=cost_model,
+        execution_m5_integrity_status=status,
+        execution_observation_complete=False,
+        execution_integrity_issue_at=issue_at,
+        ready_evaluable=True,
+        fill_evaluable=filled_at is not None,
+        trade_outcome_evaluable=False,
+    )
 
 
 def _simulate_limit_outcome(
@@ -1336,26 +1807,87 @@ def _simulate_limit_outcome(
         entry_window_expires_at,
         trade_resolution_expires_at,
     )
-    forward = bars.loc[
+    replay_bars = bars.copy()
+    bar_closes = pd.to_datetime(
+        replay_bars["bar_close_utc"],
+        utc=True,
+        errors="coerce",
+    )
+    if "bar_open_utc" in replay_bars.columns:
+        bar_opens = pd.to_datetime(
+            replay_bars["bar_open_utc"],
+            utc=True,
+            errors="coerce",
+        )
+    else:
+        bar_opens = bar_closes - pd.Timedelta(minutes=5)
+    source_duplicates = pd.Series(
+        bar_opens.duplicated(keep=False),
+        index=replay_bars.index,
+    )
+    if "_source_duplicate_bar_open_utc" in replay_bars.columns:
+        source_duplicates = (
+            source_duplicates
+            | replay_bars["_source_duplicate_bar_open_utc"]
+            .fillna(False)
+            .astype(bool)
+        )
+    replay_bars["_execution_source_duplicate_m5"] = source_duplicates
+    replay_bars["_execution_bar_close_utc"] = bar_closes
+    forward = replay_bars.loc[
         (
-            pd.to_datetime(bars["bar_close_utc"], utc=True)
+            bar_closes
             > pd.Timestamp(ready_at)
         )
         & (
-            pd.to_datetime(bars["bar_close_utc"], utc=True)
+            bar_closes
             <= pd.Timestamp(trade_resolution_expires_at)
         )
-    ]
+    ].sort_values("_execution_bar_close_utc")
     filled_at: datetime | None = None
     last_close = entry
     mfe_price: float | None = None
     mae_price: float | None = None
+    observation_end = ready_at
+    expected_bar_close = ready_at + timedelta(minutes=5)
     points = sorted(context_timeline, key=lambda point: point.as_of_utc)
     context_index = 0
     active_context: HistoricalContextPoint | None = None
 
     for _, row in forward.iterrows():
-        bar_close = _as_utc(row["bar_close_utc"])
+        bar_close = _as_utc(row["_execution_bar_close_utc"])
+        # Once every M5 close through the entry deadline has been observed,
+        # a later data defect cannot erase the causally known unfilled expiry.
+        if filled_at is None and observation_end >= entry_expiry:
+            return _finalize_execution_outcome(
+                outcome="ENTRY_WINDOW_EXPIRED_UNFILLED",
+                gross_r=0.0,
+                filled_at=None,
+                resolved_at=entry_expiry,
+                risk=risk,
+                cost_model=effective_costs,
+                cancellation_reason="ENTRY_WINDOW_EXPIRED",
+            )
+        if bar_close != expected_bar_close:
+            return _execution_integrity_failure_outcome(
+                status="INCOMPLETE_POST_CONFIRMATION_M5_SEQUENCE",
+                filled_at=filled_at,
+                observation_end=observation_end,
+                issue_at=expected_bar_close,
+                risk=risk,
+                cost_model=effective_costs,
+            )
+        if bool(row["_execution_source_duplicate_m5"]):
+            return _execution_integrity_failure_outcome(
+                status="DUPLICATE_POST_CONFIRMATION_M5_BAR",
+                filled_at=filled_at,
+                observation_end=observation_end,
+                issue_at=bar_close,
+                risk=risk,
+                cost_model=effective_costs,
+            )
+        observation_end = bar_close
+        expected_bar_close = bar_close + timedelta(minutes=5)
         if filled_at is None and bar_close > entry_expiry:
             return _finalize_execution_outcome(
                 outcome="ENTRY_WINDOW_EXPIRED_UNFILLED",
@@ -1492,7 +2024,7 @@ def _simulate_limit_outcome(
                 mae_price=mae_price,
             )
 
-    if filled_at is None:
+    if filled_at is None and observation_end >= entry_expiry:
         return _finalize_execution_outcome(
             outcome="ENTRY_WINDOW_EXPIRED_UNFILLED",
             gross_r=0.0,
@@ -1501,6 +2033,42 @@ def _simulate_limit_outcome(
             risk=risk,
             cost_model=effective_costs,
             cancellation_reason="ENTRY_WINDOW_EXPIRED",
+        )
+    if filled_at is None:
+        return _finalize_execution_outcome(
+            outcome="NOT_EVALUABLE_RIGHT_CENSORED_BEFORE_ENTRY_WINDOW",
+            gross_r=None,
+            filled_at=None,
+            resolved_at=observation_end,
+            risk=risk,
+            cost_model=effective_costs,
+            execution_m5_integrity_status=(
+                "RIGHT_CENSORED_BEFORE_ENTRY_WINDOW"
+            ),
+            execution_observation_complete=False,
+            execution_integrity_issue_at=expected_bar_close,
+            ready_evaluable=True,
+            fill_evaluable=False,
+            trade_outcome_evaluable=False,
+        )
+    if observation_end < trade_resolution_expires_at:
+        return _finalize_execution_outcome(
+            outcome=(
+                "NOT_EVALUABLE_RIGHT_CENSORED_BEFORE_TRADE_HORIZON"
+            ),
+            gross_r=None,
+            filled_at=filled_at,
+            resolved_at=observation_end,
+            risk=risk,
+            cost_model=effective_costs,
+            execution_m5_integrity_status=(
+                "RIGHT_CENSORED_BEFORE_TRADE_HORIZON"
+            ),
+            execution_observation_complete=False,
+            execution_integrity_issue_at=expected_bar_close,
+            ready_evaluable=True,
+            fill_evaluable=True,
+            trade_outcome_evaluable=False,
         )
     mark_r = (
         (last_close - entry) / risk
@@ -1553,14 +2121,40 @@ def replay_candidate(
     ready_setup_snapshot: dict[str, Any] | None = None
     evaluation_count = 1
 
-    future_closes = sorted(
-        {
-            _as_utc(value)
-            for value in replay["bar_close_utc"]
-            if candidate.activated_at_utc < _as_utc(value) <= candidate.expires_at_utc
-        }
+    replay_closes = pd.to_datetime(
+        replay["bar_close_utc"],
+        utc=True,
+        errors="coerce",
     )
-    for bar_close in future_closes:
+    future_rows = replay.loc[
+        (replay_closes > pd.Timestamp(candidate.activated_at_utc))
+        & (replay_closes <= pd.Timestamp(candidate.expires_at_utc))
+    ].sort_values("bar_close_utc")
+    replay_integrity_status = "COMPLETE"
+    replay_integrity_issue_at: datetime | None = None
+    replay_observation_end = candidate.activated_at_utc
+    expected_bar_close = candidate.activated_at_utc + timedelta(minutes=5)
+    for _, replay_row in future_rows.iterrows():
+        bar_close = _as_utc(replay_row["bar_close_utc"])
+        if bar_close != expected_bar_close:
+            replay_integrity_status = (
+                "INCOMPLETE_POST_CONFIRMATION_M5_SEQUENCE"
+            )
+            replay_integrity_issue_at = expected_bar_close
+            break
+        if bool(
+            replay_row.get(
+                "_source_duplicate_bar_open_utc",
+                False,
+            )
+        ):
+            replay_integrity_status = (
+                "DUPLICATE_POST_CONFIRMATION_M5_BAR"
+            )
+            replay_integrity_issue_at = bar_close
+            break
+        replay_observation_end = bar_close
+        expected_bar_close = bar_close + timedelta(minutes=5)
         point = context_by_close.get(bar_close)
         dynamic_payload = dict(candidate.payload)
         if point is not None:
@@ -1586,6 +2180,7 @@ def replay_candidate(
             point
             for point in context_timeline
             if point.cancellation_reason
+            and point.as_of_utc <= replay_observation_end
         ),
         None,
     )
@@ -1600,13 +2195,45 @@ def replay_candidate(
         no_ready_outcome = "CONTEXT_CANCELLED_BEFORE_READY"
     else:
         no_ready_outcome = "NO_ENTRY_READY"
-    if (
-        context_cancellation_reason
-        and first_cancellation_point is not None
-    ):
+    causal_no_ready_resolution = bool(
+        context_cancellation_reason or terminal_reason
+    )
+    if context_cancellation_reason and first_cancellation_point is not None:
         no_ready_resolved_at = first_cancellation_point.as_of_utc
+    elif terminal_reason:
+        no_ready_resolved_at = replay_observation_end
     else:
         no_ready_resolved_at = candidate.expires_at_utc
+    no_ready_integrity_status = "COMPLETE_TO_CAUSAL_OUTCOME"
+    no_ready_observation_complete = True
+    no_ready_integrity_issue_at: datetime | None = None
+    no_ready_ready_evaluable = True
+    if ready_result is None and not causal_no_ready_resolution:
+        if replay_integrity_status != "COMPLETE":
+            no_ready_integrity_status = replay_integrity_status
+            no_ready_integrity_issue_at = replay_integrity_issue_at
+            no_ready_outcome = {
+                "INCOMPLETE_POST_CONFIRMATION_M5_SEQUENCE": (
+                    "NOT_EVALUABLE_INCOMPLETE_POST_CONFIRMATION_M5_SEQUENCE"
+                ),
+                "DUPLICATE_POST_CONFIRMATION_M5_BAR": (
+                    "NOT_EVALUABLE_DUPLICATE_POST_CONFIRMATION_M5_BAR"
+                ),
+            }[replay_integrity_status]
+            no_ready_resolved_at = replay_observation_end
+            no_ready_observation_complete = False
+            no_ready_ready_evaluable = False
+        elif replay_observation_end < candidate.expires_at_utc:
+            no_ready_integrity_status = (
+                "RIGHT_CENSORED_BEFORE_ENTRY_READY"
+            )
+            no_ready_integrity_issue_at = expected_bar_close
+            no_ready_outcome = (
+                "NOT_EVALUABLE_RIGHT_CENSORED_BEFORE_ENTRY_READY"
+            )
+            no_ready_resolved_at = replay_observation_end
+            no_ready_observation_complete = False
+            no_ready_ready_evaluable = False
     transition_history = (
         final_setup_snapshot.get("transition_history")
         or result.get("ltf_execution_v2_transition_history")
@@ -1679,6 +2306,21 @@ def replay_candidate(
         "resolved_at_utc": no_ready_resolved_at.isoformat(),
         "cancellation_reason": context_cancellation_reason
         or terminal_reason,
+        "execution_m5_integrity_status": no_ready_integrity_status,
+        "execution_observation_complete": (
+            no_ready_observation_complete
+        ),
+        "execution_integrity_issue_at_utc": (
+            no_ready_integrity_issue_at.isoformat()
+            if no_ready_integrity_issue_at
+            else None
+        ),
+        "execution_observation_end_utc": (
+            no_ready_resolved_at.isoformat()
+        ),
+        "ready_evaluable": no_ready_ready_evaluable,
+        "fill_evaluable": no_ready_ready_evaluable,
+        "trade_outcome_evaluable": no_ready_ready_evaluable,
         "context_transition_history": _context_transition_history(
             candidate,
             context_timeline,
@@ -1704,10 +2346,16 @@ def replay_candidate(
 
     ready_at = _as_utc(ready_result["ltf_execution_v2_entry_ready_at_utc"])
     entry_expiry_value = ready_result.get("entry_window_expires_at_utc")
-    entry_window_expires_at = (
+    requested_entry_window_expires_at = (
         _as_utc(entry_expiry_value)
         if entry_expiry_value
-        else ready_at + timedelta(minutes=DEFAULT_ENTRY_WINDOW_MINUTES)
+        else ready_at + timedelta(
+            minutes=DEFAULT_ENTRY_WINDOW_MINUTES
+        )
+    )
+    entry_window_expires_at = min(
+        requested_entry_window_expires_at,
+        candidate.expires_at_utc,
     )
     entry = float(ready_result["entry_reference_price"])
     stop = float(ready_result["invalidation_reference_price"])
@@ -1817,6 +2465,23 @@ def replay_candidate(
             "filled_at_utc": outcome.get("filled_at_utc"),
             "resolved_at_utc": outcome.get("resolved_at_utc"),
             "cancellation_reason": outcome.get("cancellation_reason"),
+            "execution_m5_integrity_status": outcome[
+                "execution_m5_integrity_status"
+            ],
+            "execution_observation_complete": outcome[
+                "execution_observation_complete"
+            ],
+            "execution_integrity_issue_at_utc": outcome[
+                "execution_integrity_issue_at_utc"
+            ],
+            "execution_observation_end_utc": outcome[
+                "execution_observation_end_utc"
+            ],
+            "ready_evaluable": outcome["ready_evaluable"],
+            "fill_evaluable": outcome["fill_evaluable"],
+            "trade_outcome_evaluable": outcome[
+                "trade_outcome_evaluable"
+            ],
             "context_transition_history": context_history,
             "behavior_transition_count_before_ready": transitions_before_ready,
             "behavior_transition_count_before_fill": transitions_before_fill,
@@ -1851,14 +2516,40 @@ def summarize_backtest(
     *,
     window_start: datetime | None = None,
     window_end: datetime | None = None,
+    frequency_coverage_scope: str | None = None,
 ) -> dict[str, Any]:
     records = list(rows)
-    ready = [row for row in records if bool(row.get("ready"))]
-    filled = [row for row in ready if row.get("filled_at_utc")]
-    wins = sum(1 for row in filled if row.get("outcome") == "TP_HIT")
+    ready_evaluable_records = [
+        row
+        for row in records
+        if row.get("ready_evaluable") is not False
+    ]
+    ready = [
+        row
+        for row in ready_evaluable_records
+        if bool(row.get("ready"))
+    ]
+    fill_evaluable_ready = [
+        row for row in ready if row.get("fill_evaluable") is not False
+    ]
+    filled = [
+        row
+        for row in fill_evaluable_ready
+        if row.get("filled_at_utc")
+    ]
+    outcome_evaluable_filled = [
+        row
+        for row in filled
+        if row.get("trade_outcome_evaluable") is not False
+    ]
+    wins = sum(
+        1
+        for row in outcome_evaluable_filled
+        if row.get("outcome") == "TP_HIT"
+    )
     losses = sum(
         1
-        for row in filled
+        for row in outcome_evaluable_filled
         if str(row.get("outcome") or "").startswith("SL_HIT")
     )
     closed = wins + losses
@@ -1868,7 +2559,7 @@ def summarize_backtest(
             if row.get("gross_R") is not None
             else row["realized_R"]
         )
-        for row in filled
+        for row in outcome_evaluable_filled
         if row.get("gross_R") is not None
         or row.get("realized_R") is not None
     ]
@@ -1882,7 +2573,7 @@ def summarize_backtest(
                 else row["realized_R"]
             )
         )
-        for row in filled
+        for row in outcome_evaluable_filled
         if row.get("net_R") is not None
         or row.get("gross_R") is not None
         or row.get("realized_R") is not None
@@ -1900,23 +2591,31 @@ def summarize_backtest(
     ]
     fill_minutes = [
         float(row["minutes_ready_to_fill"])
-        for row in filled
+        for row in outcome_evaluable_filled
         if row.get("minutes_ready_to_fill") is not None
     ]
     mfe_values = [
         float(row["mfe_R"])
-        for row in filled
+        for row in outcome_evaluable_filled
         if row.get("mfe_R") is not None
     ]
     mae_values = [
         float(row["mae_R"])
-        for row in filled
+        for row in outcome_evaluable_filled
         if row.get("mae_R") is not None
     ]
     total_cost_r = sum(
-        float(row.get("total_cost_R") or 0.0) for row in filled
+        float(row.get("total_cost_R") or 0.0)
+        for row in outcome_evaluable_filled
     )
     outcome_counts = Counter(str(row.get("outcome") or "UNKNOWN") for row in records)
+    execution_integrity_counts = Counter(
+        str(
+            row.get("execution_m5_integrity_status")
+            or "NOT_REPORTED"
+        )
+        for row in records
+    )
     state_counts = Counter(
         str(row.get("final_ltf_state") or "UNKNOWN") for row in records
     )
@@ -1925,22 +2624,62 @@ def summarize_backtest(
         for blocker in row.get("blockers") or []:
             blocker_counts[str(blocker)] += 1
 
-    if window_start is None and records:
-        window_start = min(_as_utc(row["activated_at_utc"]) for row in records)
-    if window_end is None and records:
-        window_end = max(_as_utc(row["expires_at_utc"]) for row in records)
-    weeks = (
-        max((window_end - window_start).total_seconds() / 604800.0, 1 / 7)
-        if window_start is not None and window_end is not None
-        else None
+    explicit_window = (
+        window_start is not None
+        or window_end is not None
+        or frequency_coverage_scope is not None
     )
+    if window_start is None and not explicit_window and records:
+        window_start = min(_as_utc(row["activated_at_utc"]) for row in records)
+    if window_end is None and not explicit_window and records:
+        window_end = max(_as_utc(row["expires_at_utc"]) for row in records)
+    if window_start is None or window_end is None:
+        weeks = None
+        frequency_status = "UNAVAILABLE_MISSING_WINDOW_BOUNDARY"
+    else:
+        window_start = _as_utc(window_start)
+        window_end = _as_utc(window_end)
+        window_seconds = (window_end - window_start).total_seconds()
+        if window_seconds < 0:
+            weeks = None
+            frequency_status = "UNAVAILABLE_INVERTED_WINDOW"
+        elif window_seconds == 0:
+            weeks = None
+            frequency_status = "UNAVAILABLE_ZERO_LENGTH_WINDOW"
+        else:
+            weeks = window_seconds / 604800.0
+            frequency_status = "AVAILABLE"
+    if frequency_coverage_scope is None:
+        frequency_coverage_scope = (
+            "EXPLICIT_WINDOW"
+            if explicit_window
+            else "INFERRED_CANDIDATE_WINDOW"
+        )
 
     return {
         "candidate_count": len(records),
+        "ready_evaluable_candidate_count": len(
+            ready_evaluable_records
+        ),
         "ready_count": len(ready),
-        "ready_rate": (len(ready) / len(records)) if records else None,
+        "ready_rate": (
+            len(ready) / len(ready_evaluable_records)
+            if ready_evaluable_records
+            else None
+        ),
+        "fill_evaluable_ready_count": len(fill_evaluable_ready),
         "filled_count": len(filled),
-        "fill_rate_of_ready": (len(filled) / len(ready)) if ready else None,
+        "fill_rate_of_ready": (
+            len(filled) / len(fill_evaluable_ready)
+            if fill_evaluable_ready
+            else None
+        ),
+        "trade_outcome_evaluable_filled_count": len(
+            outcome_evaluable_filled
+        ),
+        "trade_outcome_unknown_filled_count": (
+            len(filled) - len(outcome_evaluable_filled)
+        ),
         "tp_count": wins,
         "sl_count": losses,
         "closed_trade_count": closed,
@@ -2023,10 +2762,15 @@ def summarize_backtest(
         "filled_signals_per_week": (
             len(filled) / weeks if weeks and weeks > 0 else None
         ),
+        "frequency_status": frequency_status,
+        "frequency_coverage_scope": frequency_coverage_scope,
         "window_start_utc": window_start.isoformat() if window_start else None,
         "window_end_utc": window_end.isoformat() if window_end else None,
         "window_weeks": weeks,
         "outcomes": dict(sorted(outcome_counts.items())),
+        "execution_m5_integrity_status_counts": dict(
+            sorted(execution_integrity_counts.items())
+        ),
         "final_states": dict(sorted(state_counts.items())),
         "top_blockers": blocker_counts.most_common(20),
     }
@@ -2036,41 +2780,301 @@ def run_history_backtest(
     histories: Mapping[str, pd.DataFrame],
     *,
     holdout_fraction: float = 0.30,
+    primary_development_r: float = 1.5,
     cost_models: Mapping[
         str,
         ExecutionCostModel | Mapping[str, Any],
     ] | None = None,
 ) -> dict[str, Any]:
+    normalized_cost_models = {
+        str(symbol).upper(): (
+            model
+            if isinstance(model, ExecutionCostModel)
+            else ExecutionCostModel.from_mapping(model)
+        )
+        for symbol, model in (cost_models or {}).items()
+    }
     all_candidates: list[HistoricalWatchCandidate] = []
+    all_event_candidates: list[HistoricalWatchCandidate] = []
     coverage: list[dict[str, Any]] = []
     history_by_symbol: dict[str, pd.DataFrame] = {}
     for symbol, raw in sorted(histories.items()):
         normalized = normalize_m5_history(raw, symbol=symbol)
         history_by_symbol[symbol.upper()] = normalized
-        candidates, audit = reconstruct_tpo_watch_candidates(
+        event_candidates, audit = reconstruct_tpo_watch_candidates(
             normalized,
             symbol=symbol,
+            include_counter_htf_events=True,
         )
+        candidates = [
+            candidate
+            for candidate in event_candidates
+            if bool(
+                candidate.payload.get(
+                    "event_census_execution_eligible"
+                )
+            )
+        ]
+        audit["event_candidate_count"] = len(event_candidates)
+        audit["execution_candidate_count"] = len(candidates)
+        audit["candidate_count"] = len(candidates)
+        all_event_candidates.extend(event_candidates)
         all_candidates.extend(candidates)
         coverage.append(audit)
 
     all_candidates.sort(
         key=lambda item: (item.activated_at_utc, item.candidate_id)
     )
+    all_event_candidates.sort(
+        key=lambda item: (item.activated_at_utc, item.candidate_id)
+    )
+    from app.services.otd_orr_event_census import (
+        measure_event_development,
+    )
+
     rows = [
         replay_candidate(
             candidate,
             history_by_symbol[candidate.symbol],
-            cost_model=(cost_models or {}).get(candidate.symbol),
+            cost_model=normalized_cost_models.get(candidate.symbol),
         )
         for candidate in all_candidates
+    ]
+    event_records = [
+        measure_event_development(
+            candidate,
+            history_by_symbol[candidate.symbol],
+            primary_development_r=primary_development_r,
+        )
+        for candidate in all_event_candidates
     ]
     return compile_backtest_report(
         candidates=all_candidates,
         rows=rows,
+        event_records=event_records,
         coverage=coverage,
         holdout_fraction=holdout_fraction,
+        primary_development_r=primary_development_r,
+        configured_cost_models=normalized_cost_models,
     )
+
+
+def _execution_cost_model_integrity(
+    *,
+    expected_symbols: Sequence[str] | set[str],
+    models: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    expected = {
+        str(symbol).upper()
+        for symbol in expected_symbols
+        if str(symbol or "").strip()
+    }
+    explicit = {
+        str(symbol).upper()
+        for symbol, model in models.items()
+        if str(model.get("source") or "UNCONFIGURED_ZERO_COST")
+        != "UNCONFIGURED_ZERO_COST"
+    }
+    explicit_in_scope = explicit.intersection(expected)
+    missing = expected.difference(explicit_in_scope)
+    if not explicit_in_scope:
+        status = "UNCONFIGURED_ZERO_COST"
+    elif missing:
+        status = "PARTIAL_PER_SYMBOL_CONFIG"
+    else:
+        status = "EXPLICIT_PER_SYMBOL_CONFIG"
+    return {
+        "cost_model_status": status,
+        "cost_model_expected_symbols": sorted(expected),
+        "cost_model_explicit_symbols": sorted(explicit_in_scope),
+        "cost_model_missing_symbols": sorted(missing),
+    }
+
+
+def _optional_utc(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        return _as_utc(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalized_coverage_rows(
+    coverage: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    declared_symbols: set[str] = set()
+    for raw in coverage:
+        item = dict(raw)
+        symbol = str(item.get("symbol") or "").strip().upper()
+        if not symbol:
+            raise ValueError("coverage row is missing symbol")
+        if symbol in declared_symbols:
+            raise ValueError(
+                f"duplicate declared coverage symbol={symbol}"
+            )
+        declared_symbols.add(symbol)
+        start = _optional_utc(item.get("history_first_bar_utc"))
+        exact_end = _optional_utc(
+            item.get("history_last_bar_close_utc")
+        )
+        legacy_last_open = _optional_utc(item.get("history_last_bar_utc"))
+        if exact_end is not None:
+            end = exact_end
+            end_source = "EXACT_M5_BAR_CLOSE"
+        elif legacy_last_open is not None:
+            end = legacy_last_open + timedelta(minutes=M5_BAR_MINUTES)
+            end_source = "LEGACY_M5_OPEN_PLUS_5_MINUTES"
+            item["history_last_bar_close_utc"] = end.isoformat()
+        else:
+            end = None
+            end_source = "UNAVAILABLE"
+
+        if start is None or end is None:
+            status = "UNAVAILABLE_MISSING_BOUNDARY"
+        elif end < start:
+            status = "UNAVAILABLE_INVERTED_WINDOW"
+        elif end == start:
+            status = "UNAVAILABLE_ZERO_LENGTH_WINDOW"
+        else:
+            status = "AVAILABLE"
+        item["symbol"] = symbol
+        item["history_last_bar_close_source"] = end_source
+        item["frequency_coverage_status"] = status
+        normalized.append(item)
+    return normalized
+
+
+def _validate_universe_symbols_have_coverage(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    declared_symbols: set[str],
+    universe_name: str,
+) -> None:
+    universe_symbols: set[str] = set()
+    for row in rows:
+        raw_symbol = str(row.get("symbol") or "")
+        symbol = raw_symbol.strip().upper()
+        if not symbol:
+            raise ValueError(f"{universe_name} universe row is missing symbol")
+        if raw_symbol != symbol:
+            raise ValueError(
+                f"{universe_name} universe symbol is not canonical; "
+                f"symbol={raw_symbol!r}; expected={symbol}"
+            )
+        universe_symbols.add(symbol)
+    missing = sorted(universe_symbols - declared_symbols)
+    if missing:
+        raise ValueError(
+            f"{universe_name} universe symbols missing declared coverage; "
+            f"symbols={missing}"
+        )
+
+
+def _coverage_window(
+    item: Mapping[str, Any],
+) -> tuple[datetime | None, datetime | None]:
+    return (
+        _optional_utc(item.get("history_first_bar_utc")),
+        _optional_utc(item.get("history_last_bar_close_utc")),
+    )
+
+
+def _common_asset_coverage(
+    coverage: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    symbols = sorted(
+        {
+            str(item.get("symbol") or "").upper()
+            for item in coverage
+            if str(item.get("symbol") or "").strip()
+        }
+    )
+    if not coverage:
+        return {
+            "status": "UNAVAILABLE_NO_ASSET_COVERAGE",
+            "policy": "INTERSECTION_OF_ALL_DECLARED_ASSET_COVERAGE",
+            "symbols": symbols,
+            "window_start_utc": None,
+            "window_end_utc": None,
+        }
+    windows = [_coverage_window(item) for item in coverage]
+    if any(start is None or end is None for start, end in windows):
+        return {
+            "status": "UNAVAILABLE_INCOMPLETE_ASSET_COVERAGE",
+            "policy": "INTERSECTION_OF_ALL_DECLARED_ASSET_COVERAGE",
+            "symbols": symbols,
+            "window_start_utc": None,
+            "window_end_utc": None,
+        }
+    starts = [start for start, _ in windows if start is not None]
+    ends = [end for _, end in windows if end is not None]
+    window_start = max(starts)
+    window_end = min(ends)
+    if window_end < window_start:
+        status = "UNAVAILABLE_INVERTED_COMMON_ASSET_OVERLAP"
+    elif window_end == window_start:
+        status = "UNAVAILABLE_ZERO_LENGTH_COMMON_ASSET_OVERLAP"
+    else:
+        status = "AVAILABLE_COMMON_ASSET_OVERLAP"
+    return {
+        "status": status,
+        "policy": "INTERSECTION_OF_ALL_DECLARED_ASSET_COVERAGE",
+        "symbols": symbols,
+        "window_start_utc": window_start.isoformat(),
+        "window_end_utc": window_end.isoformat(),
+    }
+
+
+def _records_in_window(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    timestamp_field: str,
+    window_start: datetime | None,
+    window_end: datetime | None,
+) -> list[dict[str, Any]]:
+    if window_start is None or window_end is None:
+        return []
+    return [
+        dict(row)
+        for row in rows
+        if window_start
+        <= _as_utc(row[timestamp_field])
+        <= window_end
+    ]
+
+
+def _holdout_availability_status(
+    *,
+    holdout_start: datetime | None,
+    window_start: datetime | None,
+    window_end: datetime | None,
+    headline_coverage_status: str,
+) -> str:
+    if headline_coverage_status != "AVAILABLE_COMMON_ASSET_OVERLAP":
+        if (
+            headline_coverage_status
+            == "UNAVAILABLE_ZERO_LENGTH_COMMON_ASSET_OVERLAP"
+        ):
+            return "UNAVAILABLE_ZERO_LENGTH_COVERAGE_WINDOW"
+        if (
+            headline_coverage_status
+            == "UNAVAILABLE_INVERTED_COMMON_ASSET_OVERLAP"
+        ):
+            return "UNAVAILABLE_INVERTED_COVERAGE_WINDOW"
+        return "UNAVAILABLE_NO_COMMON_ASSET_COVERAGE"
+    if holdout_start is None:
+        return "UNAVAILABLE_NO_DISTINCT_TEMPORAL_CUTOFF"
+    if window_start is None or window_end is None:
+        return "UNAVAILABLE_NO_COMMON_ASSET_COVERAGE"
+    if holdout_start > window_end:
+        return "UNAVAILABLE_INVERTED_COVERAGE_WINDOW"
+    if holdout_start == window_end:
+        return "UNAVAILABLE_ZERO_LENGTH_COVERAGE_WINDOW"
+    if holdout_start <= window_start:
+        return "UNAVAILABLE_ZERO_OR_INVERTED_DEVELOPMENT_WINDOW"
+    return "AVAILABLE"
 
 
 def compile_backtest_report(
@@ -2078,7 +3082,13 @@ def compile_backtest_report(
     candidates: Sequence[HistoricalWatchCandidate],
     rows: Sequence[Mapping[str, Any]],
     coverage: Sequence[Mapping[str, Any]],
+    event_records: Sequence[Mapping[str, Any]] | None = None,
     holdout_fraction: float = 0.30,
+    primary_development_r: float = 1.5,
+    configured_cost_models: Mapping[
+        str,
+        ExecutionCostModel | Mapping[str, Any],
+    ] | None = None,
 ) -> dict[str, Any]:
     """Compile stable aggregate metrics from streamed per-symbol replays."""
 
@@ -2096,51 +3106,211 @@ def compile_backtest_report(
             str(row["candidate_id"]),
         ),
     )
-    if ordered_rows:
-        split_index = max(
-            1,
-            min(
-                len(ordered_rows) - 1,
-                int(round(len(ordered_rows) * (1.0 - holdout_fraction))),
-            ),
+    normalized_coverage = _normalized_coverage_rows(coverage)
+    declared_coverage_symbols = {
+        str(item["symbol"]).upper() for item in normalized_coverage
+    }
+    _validate_universe_symbols_have_coverage(
+        ordered_rows,
+        declared_symbols=declared_coverage_symbols,
+        universe_name="execution",
+    )
+    if event_records is not None:
+        _validate_universe_symbols_have_coverage(
+            event_records,
+            declared_symbols=declared_coverage_symbols,
+            universe_name="event",
         )
-    else:
-        split_index = 0
-    development_rows = ordered_rows[:split_index]
-    holdout_rows = ordered_rows[split_index:]
-
     by_symbol: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
-    by_family: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
-    by_direction: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     by_symbol_family: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
-    by_rr_bucket: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
-    execution_cost_models: dict[str, dict[str, Any]] = {}
+    execution_cost_models: dict[str, dict[str, Any]] = {
+        str(symbol).upper(): (
+            model.to_dict()
+            if isinstance(model, ExecutionCostModel)
+            else ExecutionCostModel.from_mapping(model).to_dict()
+        )
+        for symbol, model in (configured_cost_models or {}).items()
+    }
     for row in ordered_rows:
         symbol = str(row["symbol"])
         family = str(row["setup_family"])
         by_symbol[symbol].append(row)
-        by_family[family].append(row)
-        by_direction[str(row["direction"])].append(row)
         by_symbol_family[f"{symbol}|{family}"].append(row)
-        by_rr_bucket[
-            str(row.get("practical_rr_bucket") or "NOT_READY")
-        ].append(row)
         model = row.get("execution_cost_model")
         if symbol not in execution_cost_models and isinstance(model, Mapping):
             execution_cost_models[symbol] = dict(model)
 
-    starts = [
-        _as_utc(item["history_first_bar_utc"])
-        for item in coverage
-        if item.get("history_first_bar_utc")
-    ]
-    ends = [
-        _as_utc(item["history_last_bar_utc"])
-        for item in coverage
-        if item.get("history_last_bar_utc")
-    ]
-    window_start = min(starts) if starts else None
-    window_end = max(ends) if ends else None
+    coverage_by_symbol = {
+        str(item.get("symbol") or "").upper(): item
+        for item in normalized_coverage
+        if item.get("symbol")
+    }
+    for covered_symbol in coverage_by_symbol:
+        by_symbol.setdefault(covered_symbol, [])
+    headline_coverage = _common_asset_coverage(normalized_coverage)
+    window_start = _optional_utc(
+        headline_coverage.get("window_start_utc")
+    )
+    window_end = _optional_utc(headline_coverage.get("window_end_utc"))
+    headline_rows = _records_in_window(
+        ordered_rows,
+        timestamp_field="activated_at_utc",
+        window_start=window_start,
+        window_end=window_end,
+    )
+    headline_coverage.update(
+        {
+            "full_provider_coverage_execution_candidate_count": len(
+                ordered_rows
+            ),
+            "headline_execution_candidate_count": len(headline_rows),
+            "excluded_execution_candidate_count_outside_overlap": (
+                len(ordered_rows) - len(headline_rows)
+            ),
+        }
+    )
+    by_family: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    by_direction: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    by_rr_bucket: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in headline_rows:
+        by_family[str(row["setup_family"])].append(row)
+        by_direction[str(row["direction"])].append(row)
+        by_rr_bucket[
+            str(row.get("practical_rr_bucket") or "NOT_READY")
+        ].append(row)
+
+    from app.services.otd_orr_event_census import (
+        OTD_ORR_EVENT_CENSUS_VERSION,
+        compile_event_census,
+    )
+
+    if event_records is None:
+        event_census = {
+            "version": OTD_ORR_EVENT_CENSUS_VERSION,
+            "status": "NOT_PROVIDED",
+            "primary_development_R": float(primary_development_r),
+            "holdout_fraction": holdout_fraction,
+            "target_holdout_fraction": holdout_fraction,
+            "realized_event_holdout_fraction": None,
+            "realized_execution_holdout_fraction": None,
+            "holdout_start_utc": None,
+            "holdout_status": (
+                "UNAVAILABLE_NO_DISTINCT_TEMPORAL_CUTOFF"
+            ),
+            "records": [],
+        }
+        if len(headline_rows) >= 2:
+            legacy_split_index = max(
+                1,
+                min(
+                    len(headline_rows) - 1,
+                    int(
+                        round(
+                            len(headline_rows)
+                            * (1.0 - holdout_fraction)
+                        )
+                    ),
+                ),
+            )
+            holdout_start = _as_utc(
+                headline_rows[legacy_split_index]["activated_at_utc"]
+            )
+        else:
+            holdout_start = None
+        holdout_cutoff_source = (
+            "EXECUTION_UNIVERSE_FALLBACK_EVENT_CENSUS_NOT_PROVIDED"
+        )
+    else:
+        event_census = compile_event_census(
+            event_records=event_records,
+            execution_rows=ordered_rows,
+            holdout_fraction=holdout_fraction,
+            primary_development_r=primary_development_r,
+            headline_window_start=window_start,
+            headline_window_end=window_end,
+            headline_coverage_status=str(
+                headline_coverage["status"]
+            ),
+        )
+        raw_holdout_start = event_census.get("holdout_start_utc")
+        holdout_start = (
+            _as_utc(raw_holdout_start)
+            if raw_holdout_start
+            else None
+        )
+        holdout_cutoff_source = (
+            "COMMON_ASSET_COVERAGE_EVENT_UNIVERSE_CONFIRMED_AT_UTC"
+        )
+    if holdout_start is None:
+        development_rows = headline_rows
+        holdout_rows: list[dict[str, Any]] = []
+    else:
+        development_rows = [
+            row
+            for row in headline_rows
+            if _as_utc(row["activated_at_utc"]) < holdout_start
+        ]
+        holdout_rows = [
+            row
+            for row in headline_rows
+            if _as_utc(row["activated_at_utc"]) >= holdout_start
+        ]
+    split_index = len(development_rows)
+    holdout_status = _holdout_availability_status(
+        holdout_start=holdout_start,
+        window_start=window_start,
+        window_end=window_end,
+        headline_coverage_status=str(headline_coverage["status"]),
+    )
+    if event_records is not None:
+        holdout_status = str(
+            event_census.get("holdout_status") or holdout_status
+        )
+    realized_event_holdout_fraction = (
+        event_census.get("realized_event_holdout_fraction")
+        if event_records is not None
+        else None
+    )
+    realized_execution_holdout_fraction = (
+        len(holdout_rows) / len(headline_rows)
+        if holdout_status == "AVAILABLE" and headline_rows
+        else None
+    )
+    expected_cost_symbols = set(declared_coverage_symbols)
+    expected_cost_symbols.update(
+        str(row.get("symbol") or "").upper()
+        for row in ordered_rows
+        if row.get("symbol")
+    )
+    cost_model_integrity = _execution_cost_model_integrity(
+        expected_symbols=expected_cost_symbols,
+        models=execution_cost_models,
+    )
+
+    def summarize_symbol_cohort(
+        key: str,
+        values: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        symbol = str(key).split("|", 1)[0].upper()
+        symbol_coverage = coverage_by_symbol.get(symbol) or {}
+        symbol_start, symbol_end = _coverage_window(symbol_coverage)
+        scoped_values = (
+            _records_in_window(
+                values,
+                timestamp_field="activated_at_utc",
+                window_start=symbol_start,
+                window_end=symbol_end,
+            )
+            if symbol_start is not None and symbol_end is not None
+            else [dict(row) for row in values]
+        )
+        return summarize_backtest(
+            scoped_values,
+            window_start=symbol_start,
+            window_end=symbol_end,
+            frequency_coverage_scope=f"ASSET_PROVIDER_COVERAGE:{symbol}",
+        )
+
     return {
         "version": LTF_EXECUTION_BACKTEST_VERSION,
         "engine_version": LTF_EXECUTION_STATE_MACHINE_VERSION,
@@ -2153,17 +3323,42 @@ def compile_backtest_report(
             "dynamic_context_timeline": True,
             "unfilled_limit_cancelled_on_context_change": True,
             "unfilled_limit_cancelled_on_price_invalidation": True,
+            "post_confirmation_m5_sequence_policy": (
+                "FAIL_CLOSED_ON_GAP_OR_SOURCE_DUPLICATE"
+            ),
+            "right_censoring_policy": (
+                "EXCLUDE_UNMEASURED_READY_FILL_AND_OUTCOME_DENOMINATORS"
+            ),
+            "prior_profile_m5_policy": (
+                "NEAREST_PRIOR_SESSION_FAIL_CLOSED; FALLBACK_ONLY_ACROSS_"
+                "CONFIRMED_NON_TRADING_DAYS; EXACT_SESSION_OPEN_RIGHT_"
+                "EDGE_AND_UNIQUE_M5_CHAIN"
+            ),
+            "chronological_holdout_cutoff_source": holdout_cutoff_source,
+            "event_and_execution_share_holdout_cutoff": (
+                event_records is not None
+            ),
+            "development_holdout_frequency_window_policy": (
+                "COMMON_ASSET_COVERAGE_START_TO_SHARED_CUTOFF_AND_SHARED_"
+                "CUTOFF_TO_EXACT_M5_BAR_CLOSE"
+            ),
+            "cohort_frequency_window_policy": (
+                "PER_ASSET_COHORTS_USE_ASSET_PROVIDER_COVERAGE; "
+                "PORTFOLIO_COHORTS_USE_COMMON_ASSET_OVERLAP"
+            ),
+            "coverage_universe_policy": (
+                "EXECUTION_AND_EVENT_SYMBOLS_REQUIRE_UNIQUE_DECLARED_"
+                "COVERAGE; COVERAGE_AWARE_FREQUENCIES_NEVER_INFER_"
+                "CANDIDATE_WINDOWS"
+            ),
             "gross_and_net_results": True,
             "primary_expectancy_basis": "NET_R",
-            "cost_model_status": (
-                "EXPLICIT_PER_SYMBOL_CONFIG"
-                if any(
-                    model.get("source") != "UNCONFIGURED_ZERO_COST"
-                    for model in execution_cost_models.values()
-                )
-                else "UNCONFIGURED_ZERO_COST"
-            ),
+            **cost_model_integrity,
             "mfe_mae_same_fill_bar_policy": "whole_bar_included",
+            "otd_orr_event_census": (
+                event_census.get("status") == "OK"
+            ),
+            "development_and_trade_metrics_are_separate": True,
         },
         "execution_cost_models": dict(sorted(execution_cost_models.items())),
         "research_scope": {
@@ -2188,39 +3383,88 @@ def compile_backtest_report(
                 "context_cancel_before_fill_conservative"
             ),
             "session_profile_parity": "DEFERRED_TO_P1",
+            "event_development_primary_threshold_R": (
+                float(primary_development_r)
+            ),
+            "event_census_scope": (
+                "RESEARCH_ONLY_APPEND_ONLY_NO_EXECUTION_PERMISSION_IMPACT"
+            ),
         },
         "holdout_fraction": holdout_fraction,
+        "target_holdout_fraction": holdout_fraction,
+        "realized_event_holdout_fraction": (
+            realized_event_holdout_fraction
+        ),
+        "realized_execution_holdout_fraction": (
+            realized_execution_holdout_fraction
+        ),
+        "holdout_start_utc": (
+            holdout_start.isoformat() if holdout_start else None
+        ),
+        "holdout_status": holdout_status,
         "split_index": split_index,
-        "coverage": [dict(item) for item in coverage],
+        "headline_coverage": headline_coverage,
+        "coverage": normalized_coverage,
         "metrics": {
             "all": summarize_backtest(
-                ordered_rows,
+                headline_rows,
                 window_start=window_start,
                 window_end=window_end,
+                frequency_coverage_scope="COMMON_ASSET_OVERLAP",
             ),
-            "development": summarize_backtest(development_rows),
-            "holdout": summarize_backtest(holdout_rows),
+            "development": summarize_backtest(
+                development_rows,
+                window_start=window_start,
+                window_end=(
+                    holdout_start
+                    if holdout_start is not None
+                    else window_end
+                ),
+                frequency_coverage_scope="COMMON_ASSET_OVERLAP",
+            ),
+            "holdout": summarize_backtest(
+                holdout_rows,
+                window_start=holdout_start,
+                window_end=window_end,
+                frequency_coverage_scope="COMMON_ASSET_OVERLAP",
+            ),
             "by_symbol": {
-                key: summarize_backtest(value)
+                key: summarize_symbol_cohort(key, value)
                 for key, value in sorted(by_symbol.items())
             },
             "by_family": {
-                key: summarize_backtest(value)
+                key: summarize_backtest(
+                    value,
+                    window_start=window_start,
+                    window_end=window_end,
+                    frequency_coverage_scope="COMMON_ASSET_OVERLAP",
+                )
                 for key, value in sorted(by_family.items())
             },
             "by_direction": {
-                key: summarize_backtest(value)
+                key: summarize_backtest(
+                    value,
+                    window_start=window_start,
+                    window_end=window_end,
+                    frequency_coverage_scope="COMMON_ASSET_OVERLAP",
+                )
                 for key, value in sorted(by_direction.items())
             },
             "by_symbol_family": {
-                key: summarize_backtest(value)
+                key: summarize_symbol_cohort(key, value)
                 for key, value in sorted(by_symbol_family.items())
             },
             "by_practical_rr_bucket": {
-                key: summarize_backtest(value)
+                key: summarize_backtest(
+                    value,
+                    window_start=window_start,
+                    window_end=window_end,
+                    frequency_coverage_scope="COMMON_ASSET_OVERLAP",
+                )
                 for key, value in sorted(by_rr_bucket.items())
             },
         },
+        "event_census": event_census,
         "candidates": [candidate.to_dict() for candidate in all_candidates],
         "records": ordered_rows,
     }
