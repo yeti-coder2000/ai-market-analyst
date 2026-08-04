@@ -33,9 +33,10 @@ from app.services.ltf_execution_state_machine import (
 
 
 LTF_EXECUTION_BACKTEST_VERSION = (
-    "ltf-execution-v2-backtest-integrity-v2.0.4"
+    "ltf-execution-v2-backtest-integrity-v2.0.5"
 )
 
+M5_BAR_MINUTES = 5
 MIN_PRIOR_SESSION_M5_BARS = 96
 MIN_CURRENT_SESSION_M5_BARS = 24
 FIRST_ACTIVITY_MINUTES = 90
@@ -1131,6 +1132,11 @@ def reconstruct_tpo_watch_candidates(
         ),
         "history_last_bar_utc": (
             _as_utc(history["bar_open_utc"].iloc[-1]).isoformat()
+            if not history.empty
+            else None
+        ),
+        "history_last_bar_close_utc": (
+            _as_utc(history["bar_close_utc"].iloc[-1]).isoformat()
             if not history.empty
             else None
         ),
@@ -2510,6 +2516,7 @@ def summarize_backtest(
     *,
     window_start: datetime | None = None,
     window_end: datetime | None = None,
+    frequency_coverage_scope: str | None = None,
 ) -> dict[str, Any]:
     records = list(rows)
     ready_evaluable_records = [
@@ -2617,15 +2624,33 @@ def summarize_backtest(
         for blocker in row.get("blockers") or []:
             blocker_counts[str(blocker)] += 1
 
-    if window_start is None and records:
+    explicit_window = window_start is not None or window_end is not None
+    if window_start is None and not explicit_window and records:
         window_start = min(_as_utc(row["activated_at_utc"]) for row in records)
-    if window_end is None and records:
+    if window_end is None and not explicit_window and records:
         window_end = max(_as_utc(row["expires_at_utc"]) for row in records)
-    weeks = (
-        max((window_end - window_start).total_seconds() / 604800.0, 1 / 7)
-        if window_start is not None and window_end is not None
-        else None
-    )
+    if window_start is None or window_end is None:
+        weeks = None
+        frequency_status = "UNAVAILABLE_MISSING_WINDOW_BOUNDARY"
+    else:
+        window_start = _as_utc(window_start)
+        window_end = _as_utc(window_end)
+        window_seconds = (window_end - window_start).total_seconds()
+        if window_seconds < 0:
+            weeks = None
+            frequency_status = "UNAVAILABLE_INVERTED_WINDOW"
+        elif window_seconds == 0:
+            weeks = None
+            frequency_status = "UNAVAILABLE_ZERO_LENGTH_WINDOW"
+        else:
+            weeks = window_seconds / 604800.0
+            frequency_status = "AVAILABLE"
+    if frequency_coverage_scope is None:
+        frequency_coverage_scope = (
+            "EXPLICIT_WINDOW"
+            if explicit_window
+            else "INFERRED_CANDIDATE_WINDOW"
+        )
 
     return {
         "candidate_count": len(records),
@@ -2733,6 +2758,8 @@ def summarize_backtest(
         "filled_signals_per_week": (
             len(filled) / weeks if weeks and weeks > 0 else None
         ),
+        "frequency_status": frequency_status,
+        "frequency_coverage_scope": frequency_coverage_scope,
         "window_start_utc": window_start.isoformat() if window_start else None,
         "window_end_utc": window_end.isoformat() if window_end else None,
         "window_weeks": weeks,
@@ -2860,6 +2887,158 @@ def _execution_cost_model_integrity(
     }
 
 
+def _optional_utc(value: Any) -> datetime | None:
+    if value in (None, ""):
+        return None
+    try:
+        return _as_utc(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalized_coverage_rows(
+    coverage: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    for raw in coverage:
+        item = dict(raw)
+        symbol = str(item.get("symbol") or "").upper()
+        start = _optional_utc(item.get("history_first_bar_utc"))
+        exact_end = _optional_utc(
+            item.get("history_last_bar_close_utc")
+        )
+        legacy_last_open = _optional_utc(item.get("history_last_bar_utc"))
+        if exact_end is not None:
+            end = exact_end
+            end_source = "EXACT_M5_BAR_CLOSE"
+        elif legacy_last_open is not None:
+            end = legacy_last_open + timedelta(minutes=M5_BAR_MINUTES)
+            end_source = "LEGACY_M5_OPEN_PLUS_5_MINUTES"
+            item["history_last_bar_close_utc"] = end.isoformat()
+        else:
+            end = None
+            end_source = "UNAVAILABLE"
+
+        if start is None or end is None:
+            status = "UNAVAILABLE_MISSING_BOUNDARY"
+        elif end < start:
+            status = "UNAVAILABLE_INVERTED_WINDOW"
+        elif end == start:
+            status = "UNAVAILABLE_ZERO_LENGTH_WINDOW"
+        else:
+            status = "AVAILABLE"
+        item["symbol"] = symbol
+        item["history_last_bar_close_source"] = end_source
+        item["frequency_coverage_status"] = status
+        normalized.append(item)
+    return normalized
+
+
+def _coverage_window(
+    item: Mapping[str, Any],
+) -> tuple[datetime | None, datetime | None]:
+    return (
+        _optional_utc(item.get("history_first_bar_utc")),
+        _optional_utc(item.get("history_last_bar_close_utc")),
+    )
+
+
+def _common_asset_coverage(
+    coverage: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    symbols = sorted(
+        {
+            str(item.get("symbol") or "").upper()
+            for item in coverage
+            if str(item.get("symbol") or "").strip()
+        }
+    )
+    if not coverage:
+        return {
+            "status": "UNAVAILABLE_NO_ASSET_COVERAGE",
+            "policy": "INTERSECTION_OF_ALL_DECLARED_ASSET_COVERAGE",
+            "symbols": symbols,
+            "window_start_utc": None,
+            "window_end_utc": None,
+        }
+    windows = [_coverage_window(item) for item in coverage]
+    if any(start is None or end is None for start, end in windows):
+        return {
+            "status": "UNAVAILABLE_INCOMPLETE_ASSET_COVERAGE",
+            "policy": "INTERSECTION_OF_ALL_DECLARED_ASSET_COVERAGE",
+            "symbols": symbols,
+            "window_start_utc": None,
+            "window_end_utc": None,
+        }
+    starts = [start for start, _ in windows if start is not None]
+    ends = [end for _, end in windows if end is not None]
+    window_start = max(starts)
+    window_end = min(ends)
+    if window_end < window_start:
+        status = "UNAVAILABLE_INVERTED_COMMON_ASSET_OVERLAP"
+    elif window_end == window_start:
+        status = "UNAVAILABLE_ZERO_LENGTH_COMMON_ASSET_OVERLAP"
+    else:
+        status = "AVAILABLE_COMMON_ASSET_OVERLAP"
+    return {
+        "status": status,
+        "policy": "INTERSECTION_OF_ALL_DECLARED_ASSET_COVERAGE",
+        "symbols": symbols,
+        "window_start_utc": window_start.isoformat(),
+        "window_end_utc": window_end.isoformat(),
+    }
+
+
+def _records_in_window(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    timestamp_field: str,
+    window_start: datetime | None,
+    window_end: datetime | None,
+) -> list[dict[str, Any]]:
+    if window_start is None or window_end is None:
+        return []
+    return [
+        dict(row)
+        for row in rows
+        if window_start
+        <= _as_utc(row[timestamp_field])
+        <= window_end
+    ]
+
+
+def _holdout_availability_status(
+    *,
+    holdout_start: datetime | None,
+    window_start: datetime | None,
+    window_end: datetime | None,
+    headline_coverage_status: str,
+) -> str:
+    if headline_coverage_status != "AVAILABLE_COMMON_ASSET_OVERLAP":
+        if (
+            headline_coverage_status
+            == "UNAVAILABLE_ZERO_LENGTH_COMMON_ASSET_OVERLAP"
+        ):
+            return "UNAVAILABLE_ZERO_LENGTH_COVERAGE_WINDOW"
+        if (
+            headline_coverage_status
+            == "UNAVAILABLE_INVERTED_COMMON_ASSET_OVERLAP"
+        ):
+            return "UNAVAILABLE_INVERTED_COVERAGE_WINDOW"
+        return "UNAVAILABLE_NO_COMMON_ASSET_COVERAGE"
+    if holdout_start is None:
+        return "UNAVAILABLE_NO_DISTINCT_TEMPORAL_CUTOFF"
+    if window_start is None or window_end is None:
+        return "UNAVAILABLE_NO_COMMON_ASSET_COVERAGE"
+    if holdout_start > window_end:
+        return "UNAVAILABLE_INVERTED_COVERAGE_WINDOW"
+    if holdout_start == window_end:
+        return "UNAVAILABLE_ZERO_LENGTH_COVERAGE_WINDOW"
+    if holdout_start <= window_start:
+        return "UNAVAILABLE_ZERO_OR_INVERTED_DEVELOPMENT_WINDOW"
+    return "AVAILABLE"
+
+
 def compile_backtest_report(
     *,
     candidates: Sequence[HistoricalWatchCandidate],
@@ -2890,10 +3069,7 @@ def compile_backtest_report(
         ),
     )
     by_symbol: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
-    by_family: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
-    by_direction: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     by_symbol_family: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
-    by_rr_bucket: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     execution_cost_models: dict[str, dict[str, Any]] = {
         str(symbol).upper(): (
             model.to_dict()
@@ -2906,28 +3082,51 @@ def compile_backtest_report(
         symbol = str(row["symbol"])
         family = str(row["setup_family"])
         by_symbol[symbol].append(row)
-        by_family[family].append(row)
-        by_direction[str(row["direction"])].append(row)
         by_symbol_family[f"{symbol}|{family}"].append(row)
-        by_rr_bucket[
-            str(row.get("practical_rr_bucket") or "NOT_READY")
-        ].append(row)
         model = row.get("execution_cost_model")
         if symbol not in execution_cost_models and isinstance(model, Mapping):
             execution_cost_models[symbol] = dict(model)
 
-    starts = [
-        _as_utc(item["history_first_bar_utc"])
-        for item in coverage
-        if item.get("history_first_bar_utc")
-    ]
-    ends = [
-        _as_utc(item["history_last_bar_utc"])
-        for item in coverage
-        if item.get("history_last_bar_utc")
-    ]
-    window_start = min(starts) if starts else None
-    window_end = max(ends) if ends else None
+    normalized_coverage = _normalized_coverage_rows(coverage)
+    coverage_by_symbol = {
+        str(item.get("symbol") or "").upper(): item
+        for item in normalized_coverage
+        if item.get("symbol")
+    }
+    for covered_symbol in coverage_by_symbol:
+        by_symbol.setdefault(covered_symbol, [])
+    headline_coverage = _common_asset_coverage(normalized_coverage)
+    window_start = _optional_utc(
+        headline_coverage.get("window_start_utc")
+    )
+    window_end = _optional_utc(headline_coverage.get("window_end_utc"))
+    headline_rows = _records_in_window(
+        ordered_rows,
+        timestamp_field="activated_at_utc",
+        window_start=window_start,
+        window_end=window_end,
+    )
+    headline_coverage.update(
+        {
+            "full_provider_coverage_execution_candidate_count": len(
+                ordered_rows
+            ),
+            "headline_execution_candidate_count": len(headline_rows),
+            "excluded_execution_candidate_count_outside_overlap": (
+                len(ordered_rows) - len(headline_rows)
+            ),
+        }
+    )
+    by_family: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    by_direction: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    by_rr_bucket: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
+    for row in headline_rows:
+        by_family[str(row["setup_family"])].append(row)
+        by_direction[str(row["direction"])].append(row)
+        by_rr_bucket[
+            str(row.get("practical_rr_bucket") or "NOT_READY")
+        ].append(row)
+
     from app.services.otd_orr_event_census import (
         OTD_ORR_EVENT_CENSUS_VERSION,
         compile_event_census,
@@ -2939,23 +3138,26 @@ def compile_backtest_report(
             "status": "NOT_PROVIDED",
             "primary_development_R": float(primary_development_r),
             "holdout_start_utc": None,
+            "holdout_status": (
+                "UNAVAILABLE_NO_DISTINCT_TEMPORAL_CUTOFF"
+            ),
             "records": [],
         }
-        if len(ordered_rows) >= 2:
+        if len(headline_rows) >= 2:
             legacy_split_index = max(
                 1,
                 min(
-                    len(ordered_rows) - 1,
+                    len(headline_rows) - 1,
                     int(
                         round(
-                            len(ordered_rows)
+                            len(headline_rows)
                             * (1.0 - holdout_fraction)
                         )
                     ),
                 ),
             )
             holdout_start = _as_utc(
-                ordered_rows[legacy_split_index]["activated_at_utc"]
+                headline_rows[legacy_split_index]["activated_at_utc"]
             )
         else:
             holdout_start = None
@@ -2968,6 +3170,11 @@ def compile_backtest_report(
             execution_rows=ordered_rows,
             holdout_fraction=holdout_fraction,
             primary_development_r=primary_development_r,
+            headline_window_start=window_start,
+            headline_window_end=window_end,
+            headline_coverage_status=str(
+                headline_coverage["status"]
+            ),
         )
         raw_holdout_start = event_census.get("holdout_start_utc")
         holdout_start = (
@@ -2975,22 +3182,34 @@ def compile_backtest_report(
             if raw_holdout_start
             else None
         )
-        holdout_cutoff_source = "FULL_EVENT_UNIVERSE_CONFIRMED_AT_UTC"
+        holdout_cutoff_source = (
+            "COMMON_ASSET_COVERAGE_EVENT_UNIVERSE_CONFIRMED_AT_UTC"
+        )
     if holdout_start is None:
-        development_rows = ordered_rows
+        development_rows = headline_rows
         holdout_rows: list[dict[str, Any]] = []
     else:
         development_rows = [
             row
-            for row in ordered_rows
+            for row in headline_rows
             if _as_utc(row["activated_at_utc"]) < holdout_start
         ]
         holdout_rows = [
             row
-            for row in ordered_rows
+            for row in headline_rows
             if _as_utc(row["activated_at_utc"]) >= holdout_start
         ]
     split_index = len(development_rows)
+    holdout_status = _holdout_availability_status(
+        holdout_start=holdout_start,
+        window_start=window_start,
+        window_end=window_end,
+        headline_coverage_status=str(headline_coverage["status"]),
+    )
+    if event_records is not None:
+        holdout_status = str(
+            event_census.get("holdout_status") or holdout_status
+        )
     expected_cost_symbols = {
         str(item.get("symbol") or "").upper()
         for item in coverage
@@ -3005,6 +3224,31 @@ def compile_backtest_report(
         expected_symbols=expected_cost_symbols,
         models=execution_cost_models,
     )
+
+    def summarize_symbol_cohort(
+        key: str,
+        values: Sequence[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        symbol = str(key).split("|", 1)[0].upper()
+        symbol_coverage = coverage_by_symbol.get(symbol) or {}
+        symbol_start, symbol_end = _coverage_window(symbol_coverage)
+        scoped_values = (
+            _records_in_window(
+                values,
+                timestamp_field="activated_at_utc",
+                window_start=symbol_start,
+                window_end=symbol_end,
+            )
+            if symbol_start is not None and symbol_end is not None
+            else [dict(row) for row in values]
+        )
+        return summarize_backtest(
+            scoped_values,
+            window_start=symbol_start,
+            window_end=symbol_end,
+            frequency_coverage_scope=f"ASSET_PROVIDER_COVERAGE:{symbol}",
+        )
+
     return {
         "version": LTF_EXECUTION_BACKTEST_VERSION,
         "engine_version": LTF_EXECUTION_STATE_MACHINE_VERSION,
@@ -3033,8 +3277,12 @@ def compile_backtest_report(
                 event_records is not None
             ),
             "development_holdout_frequency_window_policy": (
-                "COVERAGE_START_TO_SHARED_CUTOFF_AND_SHARED_CUTOFF_TO_"
-                "COVERAGE_END"
+                "COMMON_ASSET_COVERAGE_START_TO_SHARED_CUTOFF_AND_SHARED_"
+                "CUTOFF_TO_EXACT_M5_BAR_CLOSE"
+            ),
+            "cohort_frequency_window_policy": (
+                "PER_ASSET_COHORTS_USE_ASSET_PROVIDER_COVERAGE; "
+                "PORTFOLIO_COHORTS_USE_COMMON_ASSET_OVERLAP"
             ),
             "gross_and_net_results": True,
             "primary_expectancy_basis": "NET_R",
@@ -3079,13 +3327,16 @@ def compile_backtest_report(
         "holdout_start_utc": (
             holdout_start.isoformat() if holdout_start else None
         ),
+        "holdout_status": holdout_status,
         "split_index": split_index,
-        "coverage": [dict(item) for item in coverage],
+        "headline_coverage": headline_coverage,
+        "coverage": normalized_coverage,
         "metrics": {
             "all": summarize_backtest(
-                ordered_rows,
+                headline_rows,
                 window_start=window_start,
                 window_end=window_end,
+                frequency_coverage_scope="COMMON_ASSET_OVERLAP",
             ),
             "development": summarize_backtest(
                 development_rows,
@@ -3095,30 +3346,47 @@ def compile_backtest_report(
                     if holdout_start is not None
                     else window_end
                 ),
+                frequency_coverage_scope="COMMON_ASSET_OVERLAP",
             ),
             "holdout": summarize_backtest(
                 holdout_rows,
                 window_start=holdout_start,
                 window_end=window_end,
+                frequency_coverage_scope="COMMON_ASSET_OVERLAP",
             ),
             "by_symbol": {
-                key: summarize_backtest(value)
+                key: summarize_symbol_cohort(key, value)
                 for key, value in sorted(by_symbol.items())
             },
             "by_family": {
-                key: summarize_backtest(value)
+                key: summarize_backtest(
+                    value,
+                    window_start=window_start,
+                    window_end=window_end,
+                    frequency_coverage_scope="COMMON_ASSET_OVERLAP",
+                )
                 for key, value in sorted(by_family.items())
             },
             "by_direction": {
-                key: summarize_backtest(value)
+                key: summarize_backtest(
+                    value,
+                    window_start=window_start,
+                    window_end=window_end,
+                    frequency_coverage_scope="COMMON_ASSET_OVERLAP",
+                )
                 for key, value in sorted(by_direction.items())
             },
             "by_symbol_family": {
-                key: summarize_backtest(value)
+                key: summarize_symbol_cohort(key, value)
                 for key, value in sorted(by_symbol_family.items())
             },
             "by_practical_rr_bucket": {
-                key: summarize_backtest(value)
+                key: summarize_backtest(
+                    value,
+                    window_start=window_start,
+                    window_end=window_end,
+                    frequency_coverage_scope="COMMON_ASSET_OVERLAP",
+                )
                 for key, value in sorted(by_rr_bucket.items())
             },
         },

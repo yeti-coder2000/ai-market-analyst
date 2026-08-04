@@ -1115,7 +1115,13 @@ def _number(value: Any, digits: int = 3) -> str:
 def render_markdown_report(report: Mapping[str, Any]) -> str:
     metrics = report["metrics"]
     all_metrics = metrics["all"]
+    development = metrics["development"]
     holdout = metrics["holdout"]
+    holdout_status = str(
+        report.get("holdout_status")
+        or "UNAVAILABLE_STATUS_NOT_REPORTED"
+    )
+    holdout_available = holdout_status == "AVAILABLE"
     raw_holdout_fraction = report.get("holdout_fraction")
     try:
         holdout_percent_number = float(raw_holdout_fraction) * 100.0
@@ -1125,6 +1131,11 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
     except (TypeError, ValueError):
         holdout_percent = "n/a"
     holdout_start_utc = report.get("holdout_start_utc") or "n/a"
+    headline_coverage = (
+        report.get("headline_coverage")
+        if isinstance(report.get("headline_coverage"), Mapping)
+        else {}
+    )
     event_census = (
         report.get("event_census")
         if isinstance(report.get("event_census"), Mapping)
@@ -1145,6 +1156,26 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
         if isinstance(census_metrics.get("holdout"), Mapping)
         else {}
     )
+    census_development = (
+        census_metrics.get("development")
+        if isinstance(census_metrics.get("development"), Mapping)
+        else {}
+    )
+    census_all_execution = (
+        census_all.get("execution")
+        if isinstance(census_all.get("execution"), Mapping)
+        else {}
+    )
+    census_development_execution = (
+        census_development.get("execution")
+        if isinstance(census_development.get("execution"), Mapping)
+        else {}
+    )
+    census_holdout_execution = (
+        census_holdout.get("execution")
+        if isinstance(census_holdout.get("execution"), Mapping)
+        else {}
+    )
     primary_development_r = (
         event_census.get("definition", {}).get("primary_development_R")
         if isinstance(event_census.get("definition"), Mapping)
@@ -1156,7 +1187,7 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
             "| {symbol} | {first} | {last} | {events} | {candidates} | {provider} |".format(
                 symbol=item.get("symbol"),
                 first=item.get("history_first_bar_utc"),
-                last=item.get("history_last_bar_utc"),
+                last=item.get("history_last_bar_close_utc"),
                 events=item.get(
                     "event_candidate_count",
                     item.get("candidate_count"),
@@ -1172,11 +1203,14 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
     by_symbol_rows = []
     for symbol, values in sorted((metrics.get("by_symbol") or {}).items()):
         by_symbol_rows.append(
-            "| {symbol} | {candidates} | {ready} | {filled} | {winrate} | {gross_r} | {net_r} |".format(
+            "| {symbol} | {candidates} | {ready} | {filled} | {ready_week} | "
+            "{filled_week} | {winrate} | {gross_r} | {net_r} |".format(
                 symbol=symbol,
                 candidates=values.get("candidate_count"),
                 ready=values.get("ready_count"),
                 filled=values.get("filled_count"),
+                ready_week=_number(values.get("ready_signals_per_week")),
+                filled_week=_number(values.get("filled_signals_per_week")),
                 winrate=_pct(values.get("winrate_closed")),
                 gross_r=_number(values.get("average_gross_R_filled")),
                 net_r=_number(values.get("average_net_R_filled")),
@@ -1243,51 +1277,115 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
 
     limitations = report.get("research_scope") or {}
     integrity = report.get("execution_integrity") or {}
+    holdout_count = (
+        lambda key: holdout.get(key) if holdout_available else "n/a"
+    )
+    holdout_number = (
+        lambda key: (
+            _number(holdout.get(key))
+            if holdout_available
+            else "n/a"
+        )
+    )
+    holdout_pct = (
+        lambda key: (
+            _pct(holdout.get(key))
+            if holdout_available
+            else "n/a"
+        )
+    )
+    census_holdout_count = (
+        lambda key: (
+            census_holdout.get(key) if holdout_available else "n/a"
+        )
+    )
+    census_holdout_number = (
+        lambda key: (
+            _number(census_holdout.get(key))
+            if holdout_available
+            else "n/a"
+        )
+    )
+    census_holdout_pct = (
+        lambda key: (
+            _pct(census_holdout.get(key))
+            if holdout_available
+            else "n/a"
+        )
+    )
+    census_holdout_execution_count = (
+        lambda key: (
+            census_holdout_execution.get(key)
+            if holdout_available
+            else "n/a"
+        )
+    )
+    census_holdout_execution_number = (
+        lambda key: (
+            _number(census_holdout_execution.get(key))
+            if holdout_available
+            else "n/a"
+        )
+    )
+    census_holdout_execution_pct = (
+        lambda key: (
+            _pct(census_holdout_execution.get(key))
+            if holdout_available
+            else "n/a"
+        )
+    )
     return "\n".join(
         [
-            "# Backtest Integrity v2.0 — OTD/ORR Event Census",
+            "# Backtest Integrity v2.0.5 — OTD/ORR Event Census",
             "",
             f"Generated: `{report.get('generated_at_utc')}`  ",
             f"Engine: `{report.get('engine_version')}`  ",
             f"Mode: `{report.get('mode')}`  ",
             f"Holdout fraction: `{holdout_percent}`  ",
-            f"Holdout cutoff UTC: `{holdout_start_utc}`",
+            f"Holdout cutoff UTC: `{holdout_start_utc}`  ",
+            f"Holdout status: `{holdout_status}`  ",
+            f"Holdout scheme: Chronological {holdout_percent} holdout  ",
+            "Headline coverage: "
+            f"`{headline_coverage.get('status')}` "
+            f"from `{headline_coverage.get('window_start_utc')}` "
+            f"to `{headline_coverage.get('window_end_utc')}`.",
             "",
             "## Primary results",
             "",
-            f"| Metric | Full history | Chronological {holdout_percent} holdout |",
-            "|---|---:|---:|",
-            f"| Candidates | {all_metrics.get('candidate_count')} | {holdout.get('candidate_count')} |",
-            f"| ENTRY_READY | {all_metrics.get('ready_count')} | {holdout.get('ready_count')} |",
-            f"| Filled | {all_metrics.get('filled_count')} | {holdout.get('filled_count')} |",
-            f"| Closed-trade win rate | {_pct(all_metrics.get('winrate_closed'))} | {_pct(holdout.get('winrate_closed'))} |",
-            f"| Average gross R, filled | {_number(all_metrics.get('average_gross_R_filled'))} | {_number(holdout.get('average_gross_R_filled'))} |",
-            f"| Average net R, filled | {_number(all_metrics.get('average_net_R_filled'))} | {_number(holdout.get('average_net_R_filled'))} |",
-            f"| Gross total R | {_number(all_metrics.get('gross_total_R'))} | {_number(holdout.get('gross_total_R'))} |",
-            f"| Net total R | {_number(all_metrics.get('net_total_R'))} | {_number(holdout.get('net_total_R'))} |",
-            f"| Gross profit factor | {_number(all_metrics.get('gross_profit_factor'))} | {_number(holdout.get('gross_profit_factor'))} |",
-            f"| Net profit factor | {_number(all_metrics.get('net_profit_factor'))} | {_number(holdout.get('net_profit_factor'))} |",
-            f"| Entry-window expired, unfilled | {all_metrics.get('entry_window_expired_unfilled_count')} | {holdout.get('entry_window_expired_unfilled_count')} |",
-            f"| Context cancelled before fill | {all_metrics.get('context_cancelled_before_fill_count')} | {holdout.get('context_cancelled_before_fill_count')} |",
-            f"| Invalidated before fill | {all_metrics.get('invalidated_before_fill_count')} | {holdout.get('invalidated_before_fill_count')} |",
-            f"| Filled signals/week | {_number(all_metrics.get('filled_signals_per_week'))} | {_number(holdout.get('filled_signals_per_week'))} |",
+            "| Metric | Full | Development | Holdout |",
+            "|---|---:|---:|---:|",
+            f"| Candidates | {all_metrics.get('candidate_count')} | {development.get('candidate_count')} | {holdout_count('candidate_count')} |",
+            f"| ENTRY_READY | {all_metrics.get('ready_count')} | {development.get('ready_count')} | {holdout_count('ready_count')} |",
+            f"| Filled | {all_metrics.get('filled_count')} | {development.get('filled_count')} | {holdout_count('filled_count')} |",
+            f"| READY signals/week | {_number(all_metrics.get('ready_signals_per_week'))} | {_number(development.get('ready_signals_per_week'))} | {holdout_number('ready_signals_per_week')} |",
+            f"| Filled signals/week | {_number(all_metrics.get('filled_signals_per_week'))} | {_number(development.get('filled_signals_per_week'))} | {holdout_number('filled_signals_per_week')} |",
+            f"| Closed-trade win rate | {_pct(all_metrics.get('winrate_closed'))} | {_pct(development.get('winrate_closed'))} | {holdout_pct('winrate_closed')} |",
+            f"| Average gross R, filled | {_number(all_metrics.get('average_gross_R_filled'))} | {_number(development.get('average_gross_R_filled'))} | {holdout_number('average_gross_R_filled')} |",
+            f"| Average net R, filled | {_number(all_metrics.get('average_net_R_filled'))} | {_number(development.get('average_net_R_filled'))} | {holdout_number('average_net_R_filled')} |",
+            f"| Gross total R | {_number(all_metrics.get('gross_total_R'))} | {_number(development.get('gross_total_R'))} | {holdout_number('gross_total_R')} |",
+            f"| Net total R | {_number(all_metrics.get('net_total_R'))} | {_number(development.get('net_total_R'))} | {holdout_number('net_total_R')} |",
+            f"| Gross profit factor | {_number(all_metrics.get('gross_profit_factor'))} | {_number(development.get('gross_profit_factor'))} | {holdout_number('gross_profit_factor')} |",
+            f"| Net profit factor | {_number(all_metrics.get('net_profit_factor'))} | {_number(development.get('net_profit_factor'))} | {holdout_number('net_profit_factor')} |",
+            f"| Entry-window expired, unfilled | {all_metrics.get('entry_window_expired_unfilled_count')} | {development.get('entry_window_expired_unfilled_count')} | {holdout_count('entry_window_expired_unfilled_count')} |",
+            f"| Context cancelled before fill | {all_metrics.get('context_cancelled_before_fill_count')} | {development.get('context_cancelled_before_fill_count')} | {holdout_count('context_cancelled_before_fill_count')} |",
+            f"| Invalidated before fill | {all_metrics.get('invalidated_before_fill_count')} | {development.get('invalidated_before_fill_count')} | {holdout_count('invalidated_before_fill_count')} |",
             "",
             "## OTD/ORR event development",
             "",
             f"Primary development threshold: `{_number(primary_development_r, 2)}R`. "
             "Development rate and trade win rate use separate denominators.",
             "",
-            f"| Metric | Full history | Chronological {holdout_percent} holdout |",
-            "|---|---:|---:|",
-            f"| Events | {census_all.get('event_count')} | {census_holdout.get('event_count')} |",
-            f"| Causally evaluable | {census_all.get('event_evaluable_count')} | {census_holdout.get('event_evaluable_count')} |",
-            f"| Developed | {census_all.get('developed_count')} | {census_holdout.get('developed_count')} |",
-            f"| Development rate | {_pct(census_all.get('development_rate'))} | {_pct(census_holdout.get('development_rate'))} |",
-            f"| Median event MFE | {_number(census_all.get('median_event_MFE_R'))}R | {_number(census_holdout.get('median_event_MFE_R'))}R |",
-            f"| Median event MAE | {_number(census_all.get('median_event_MAE_R'))}R | {_number(census_holdout.get('median_event_MAE_R'))}R |",
-            f"| Filled entry model | {census_all.get('execution', {}).get('filled_count')} | {census_holdout.get('execution', {}).get('filled_count')} |",
-            f"| Closed-trade win rate | {_pct(census_all.get('execution', {}).get('trade_winrate_closed'))} | {_pct(census_holdout.get('execution', {}).get('trade_winrate_closed'))} |",
-            f"| Average net R, filled | {_number(census_all.get('execution', {}).get('average_net_R_filled'))} | {_number(census_holdout.get('execution', {}).get('average_net_R_filled'))} |",
+            "| Metric | Full | Development | Holdout |",
+            "|---|---:|---:|---:|",
+            f"| Events | {census_all.get('event_count')} | {census_development.get('event_count')} | {census_holdout_count('event_count')} |",
+            f"| Causally evaluable | {census_all.get('event_evaluable_count')} | {census_development.get('event_evaluable_count')} | {census_holdout_count('event_evaluable_count')} |",
+            f"| Developed | {census_all.get('developed_count')} | {census_development.get('developed_count')} | {census_holdout_count('developed_count')} |",
+            f"| Development rate | {_pct(census_all.get('development_rate'))} | {_pct(census_development.get('development_rate'))} | {census_holdout_pct('development_rate')} |",
+            f"| Median event MFE | {_number(census_all.get('median_event_MFE_R'))}R | {_number(census_development.get('median_event_MFE_R'))}R | {census_holdout_number('median_event_MFE_R')}R |",
+            f"| Median event MAE | {_number(census_all.get('median_event_MAE_R'))}R | {_number(census_development.get('median_event_MAE_R'))}R | {census_holdout_number('median_event_MAE_R')}R |",
+            f"| Filled entry model | {census_all_execution.get('filled_count')} | {census_development_execution.get('filled_count')} | {census_holdout_execution_count('filled_count')} |",
+            f"| Closed-trade win rate | {_pct(census_all_execution.get('trade_winrate_closed'))} | {_pct(census_development_execution.get('trade_winrate_closed'))} | {census_holdout_execution_pct('trade_winrate_closed')} |",
+            f"| Average net R, filled | {_number(census_all_execution.get('average_net_R_filled'))} | {_number(census_development_execution.get('average_net_R_filled'))} | {census_holdout_execution_number('average_net_R_filled')} |",
             "",
             "## Event census by asset, family and direction",
             "",
@@ -1318,14 +1416,14 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
             "",
             "## Provider coverage",
             "",
-            "| Symbol | First M5 bar | Last M5 bar | Events | Execution candidates | Provider |",
+            "| Symbol | First M5 bar | Last M5 close | Events | Execution candidates | Provider |",
             "|---|---|---|---:|---:|---|",
             *coverage_rows,
             "",
             "## By symbol",
             "",
-            "| Symbol | Candidates | Ready | Filled | Win rate | Avg gross R | Avg net R |",
-            "|---|---:|---:|---:|---:|---:|---:|",
+            "| Symbol | Candidates | Ready | Filled | Ready/week | Filled/week | Win rate | Avg gross R | Avg net R |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
             *by_symbol_rows,
             "",
             "## Positioning coverage",

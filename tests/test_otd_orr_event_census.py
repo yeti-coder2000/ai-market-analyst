@@ -1269,6 +1269,9 @@ class OtdOrrEventCensusTest(unittest.TestCase):
                     "history_last_bar_utc": (
                         "2026-07-10T23:55:00+00:00"
                     ),
+                    "history_last_bar_close_utc": (
+                        "2026-07-11T00:00:00+00:00"
+                    ),
                 }
             ],
             holdout_fraction=0.30,
@@ -1300,14 +1303,14 @@ class OtdOrrEventCensusTest(unittest.TestCase):
         self.assertEqual(holdout["window_start_utc"], expected_cutoff)
         self.assertEqual(
             holdout["window_end_utc"],
-            "2026-07-10T23:55:00+00:00",
+            "2026-07-11T00:00:00+00:00",
         )
         development_weeks = (
             datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
             - datetime(2026, 7, 1, 0, 0, tzinfo=UTC)
         ).total_seconds() / 604800.0
         holdout_weeks = (
-            datetime(2026, 7, 10, 23, 55, tzinfo=UTC)
+            datetime(2026, 7, 11, 0, 0, tzinfo=UTC)
             - datetime(2026, 7, 8, 10, 0, tzinfo=UTC)
         ).total_seconds() / 604800.0
         self.assertAlmostEqual(
@@ -1325,6 +1328,298 @@ class OtdOrrEventCensusTest(unittest.TestCase):
         self.assertAlmostEqual(
             holdout["filled_signals_per_week"],
             holdout["filled_count"] / holdout_weeks,
+        )
+
+    def test_headline_metrics_use_common_asset_coverage_overlap(
+        self,
+    ) -> None:
+        base_event = measure_event_development(
+            _candidate(),
+            _history(first_forward_high=101.6),
+        )
+        definitions = [
+            (
+                "eur-old",
+                "EURUSD",
+                datetime(2025, 7, 1, 10, 0, tzinfo=UTC),
+            ),
+            (
+                "eur-overlap",
+                "EURUSD",
+                datetime(2026, 7, 2, 10, 0, tzinfo=UTC),
+            ),
+            (
+                "ger-overlap",
+                "GER40",
+                datetime(2026, 7, 8, 10, 0, tzinfo=UTC),
+            ),
+        ]
+        events = []
+        execution_rows = []
+        for candidate_id, symbol, confirmed in definitions:
+            event = {
+                **base_event,
+                "candidate_id": candidate_id,
+                "symbol": symbol,
+                "session_id": f"{symbol}_{confirmed.date()}_TEST",
+                "session_open_utc": (
+                    confirmed - timedelta(minutes=30)
+                ).isoformat(),
+                "confirmed_at_utc": confirmed.isoformat(),
+                "expires_at_utc": (
+                    confirmed + timedelta(minutes=30)
+                ).isoformat(),
+            }
+            execution = _execution_row(
+                candidate_id=candidate_id,
+                ready=True,
+                outcome="TP_HIT",
+                filled_at_utc=(
+                    confirmed + timedelta(minutes=15)
+                ).isoformat(),
+            )
+            execution.update(
+                {
+                    "symbol": symbol,
+                    "activated_at_utc": confirmed.isoformat(),
+                    "expires_at_utc": (
+                        confirmed + timedelta(minutes=30)
+                    ).isoformat(),
+                }
+            )
+            events.append(event)
+            execution_rows.append(execution)
+
+        report = compile_backtest_report(
+            candidates=[],
+            rows=execution_rows,
+            event_records=events,
+            coverage=[
+                {
+                    "symbol": "EURUSD",
+                    "history_first_bar_utc": (
+                        "2024-07-01T00:00:00+00:00"
+                    ),
+                    "history_last_bar_close_utc": (
+                        "2026-07-11T00:00:00+00:00"
+                    ),
+                },
+                {
+                    "symbol": "GER40",
+                    "history_first_bar_utc": (
+                        "2026-07-01T00:00:00+00:00"
+                    ),
+                    "history_last_bar_close_utc": (
+                        "2026-07-10T00:00:00+00:00"
+                    ),
+                },
+            ],
+            holdout_fraction=0.50,
+        )
+
+        self.assertEqual(
+            report["headline_coverage"]["status"],
+            "AVAILABLE_COMMON_ASSET_OVERLAP",
+        )
+        self.assertEqual(
+            report["headline_coverage"]["window_start_utc"],
+            "2026-07-01T00:00:00+00:00",
+        )
+        self.assertEqual(
+            report["headline_coverage"]["window_end_utc"],
+            "2026-07-10T00:00:00+00:00",
+        )
+        self.assertEqual(
+            report["headline_coverage"][
+                "excluded_execution_candidate_count_outside_overlap"
+            ],
+            1,
+        )
+        self.assertEqual(report["metrics"]["all"]["candidate_count"], 2)
+        self.assertEqual(
+            report["event_census"]["metrics"]["all"]["event_count"],
+            2,
+        )
+        self.assertEqual(len(report["event_census"]["records"]), 3)
+        self.assertEqual(
+            report["event_census"]["metrics"]["by_symbol"]["EURUSD"][
+                "event_count"
+            ],
+            2,
+        )
+        self.assertEqual(
+            report["metrics"]["by_family"]["OPEN_TEST_DRIVE"][
+                "candidate_count"
+            ],
+            2,
+        )
+        self.assertEqual(
+            report["metrics"]["by_direction"]["LONG"]["candidate_count"],
+            2,
+        )
+        self.assertEqual(
+            report["metrics"]["by_symbol"]["EURUSD"]["candidate_count"],
+            2,
+        )
+        eur_window_weeks = (
+            datetime(2026, 7, 11, tzinfo=UTC)
+            - datetime(2024, 7, 1, tzinfo=UTC)
+        ).total_seconds() / 604800.0
+        self.assertAlmostEqual(
+            report["metrics"]["by_symbol"]["EURUSD"][
+                "ready_signals_per_week"
+            ],
+            2 / eur_window_weeks,
+        )
+        self.assertEqual(
+            report["metrics"]["by_symbol"]["EURUSD"][
+                "frequency_coverage_scope"
+            ],
+            "ASSET_PROVIDER_COVERAGE:EURUSD",
+        )
+        self.assertEqual(
+            report["metrics"]["by_symbol_family"][
+                "EURUSD|OPEN_TEST_DRIVE"
+            ]["frequency_coverage_scope"],
+            "ASSET_PROVIDER_COVERAGE:EURUSD",
+        )
+        for cohort in (
+            report["metrics"]["by_family"]["OPEN_TEST_DRIVE"],
+            report["metrics"]["by_direction"]["LONG"],
+            report["metrics"]["by_practical_rr_bucket"]["2_TO_2_49"],
+        ):
+            self.assertEqual(
+                cohort["frequency_coverage_scope"],
+                "COMMON_ASSET_OVERLAP",
+            )
+            self.assertEqual(
+                cohort["window_start_utc"],
+                "2026-07-01T00:00:00+00:00",
+            )
+            self.assertEqual(
+                cohort["window_end_utc"],
+                "2026-07-10T00:00:00+00:00",
+            )
+
+    def test_unavailable_holdout_is_explicit_in_json_and_markdown(
+        self,
+    ) -> None:
+        event = measure_event_development(
+            _candidate(),
+            _history(first_forward_high=101.6),
+        )
+        execution = _execution_row(
+            ready=True,
+            outcome="TP_HIT",
+            filled_at_utc="2026-07-01T10:15:00+00:00",
+        )
+        report = compile_backtest_report(
+            candidates=[_candidate()],
+            rows=[execution],
+            event_records=[event],
+            coverage=[
+                {
+                    "symbol": "EURUSD",
+                    "history_first_bar_utc": (
+                        "2026-07-01T00:00:00+00:00"
+                    ),
+                    "history_last_bar_close_utc": (
+                        "2026-07-02T00:00:00+00:00"
+                    ),
+                }
+            ],
+            holdout_fraction=0.30,
+        )
+
+        self.assertEqual(
+            report["holdout_status"],
+            "UNAVAILABLE_NO_DISTINCT_TEMPORAL_CUTOFF",
+        )
+        self.assertEqual(
+            report["event_census"]["holdout_status"],
+            "UNAVAILABLE_NO_DISTINCT_TEMPORAL_CUTOFF",
+        )
+        self.assertIsNone(
+            report["metrics"]["holdout"]["ready_signals_per_week"]
+        )
+        self.assertIsNone(
+            report["metrics"]["holdout"]["filled_signals_per_week"]
+        )
+
+        markdown = render_markdown_report(report)
+        self.assertIn(
+            "Holdout status: `UNAVAILABLE_NO_DISTINCT_TEMPORAL_CUTOFF`",
+            markdown,
+        )
+        self.assertIn(
+            "| Metric | Full | Development | Holdout |",
+            markdown,
+        )
+        self.assertIn("| READY signals/week |", markdown)
+        self.assertIn("| Filled signals/week |", markdown)
+
+    def test_cutoff_at_coverage_end_does_not_invent_holdout_frequency(
+        self,
+    ) -> None:
+        first = measure_event_development(
+            _candidate(),
+            _history(first_forward_high=101.6),
+        )
+        second = {
+            **first,
+            "candidate_id": "event-at-coverage-end",
+            "session_id": "EURUSD_2026-07-02_TEST",
+            "session_open_utc": "2026-07-02T09:30:00+00:00",
+            "confirmed_at_utc": "2026-07-02T10:00:00+00:00",
+            "expires_at_utc": "2026-07-02T10:30:00+00:00",
+        }
+        first_execution = _execution_row()
+        second_execution = _execution_row(
+            candidate_id="event-at-coverage-end",
+            ready=True,
+            outcome="TP_HIT",
+            filled_at_utc="2026-07-02T10:00:00+00:00",
+        )
+        second_execution.update(
+            {
+                "activated_at_utc": "2026-07-02T10:00:00+00:00",
+                "expires_at_utc": "2026-07-02T10:30:00+00:00",
+            }
+        )
+        report = compile_backtest_report(
+            candidates=[],
+            rows=[first_execution, second_execution],
+            event_records=[first, second],
+            coverage=[
+                {
+                    "symbol": "EURUSD",
+                    "history_first_bar_utc": (
+                        "2026-07-01T00:00:00+00:00"
+                    ),
+                    "history_last_bar_utc": (
+                        "2026-07-02T09:55:00+00:00"
+                    ),
+                    "history_last_bar_close_utc": (
+                        "2026-07-02T10:00:00+00:00"
+                    ),
+                }
+            ],
+            holdout_fraction=0.50,
+        )
+
+        self.assertEqual(
+            report["holdout_status"],
+            "UNAVAILABLE_ZERO_LENGTH_COVERAGE_WINDOW",
+        )
+        self.assertEqual(
+            report["metrics"]["holdout"]["frequency_status"],
+            "UNAVAILABLE_ZERO_LENGTH_WINDOW",
+        )
+        self.assertIsNone(
+            report["metrics"]["holdout"]["ready_signals_per_week"]
+        )
+        self.assertIsNone(
+            report["metrics"]["holdout"]["filled_signals_per_week"]
         )
 
     def test_markdown_renders_actual_holdout_fraction_and_cutoff(

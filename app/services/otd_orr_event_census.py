@@ -28,7 +28,7 @@ from app.services.ltf_execution_backtest import (
 
 
 OTD_ORR_EVENT_CENSUS_VERSION = (
-    "backtest-integrity-v2.0.3-otd-orr-event-census"
+    "backtest-integrity-v2.0.4-otd-orr-event-census"
 )
 DEFAULT_PRIMARY_DEVELOPMENT_R = 1.5
 DEFAULT_DEVELOPMENT_THRESHOLDS_R = (1.0, 1.5, 2.0)
@@ -1314,6 +1314,9 @@ def compile_event_census(
     execution_rows: Sequence[Mapping[str, Any]],
     holdout_fraction: float = 0.30,
     primary_development_r: float = DEFAULT_PRIMARY_DEVELOPMENT_R,
+    headline_window_start: datetime | None = None,
+    headline_window_end: datetime | None = None,
+    headline_coverage_status: str | None = None,
 ) -> dict[str, Any]:
     if not 0.10 <= holdout_fraction <= 0.50:
         raise ValueError("holdout_fraction must be between 0.10 and 0.50")
@@ -1321,24 +1324,75 @@ def compile_event_census(
         event_records,
         execution_rows,
     )
+    if headline_coverage_status is None:
+        headline_joined = joined
+        effective_headline_status = "FULL_EVENT_UNIVERSE_NO_COVERAGE_SCOPE"
+    elif headline_window_start is None or headline_window_end is None:
+        headline_joined = []
+        effective_headline_status = headline_coverage_status
+    else:
+        headline_window_start = _as_utc(headline_window_start)
+        headline_window_end = _as_utc(headline_window_end)
+        headline_joined = [
+            row
+            for row in joined
+            if headline_window_start
+            <= _as_utc(row["confirmed_at_utc"])
+            <= headline_window_end
+        ]
+        effective_headline_status = headline_coverage_status
     holdout_start = _chronological_holdout_start_utc(
-        joined,
+        headline_joined,
         holdout_fraction=holdout_fraction,
     )
     if holdout_start is None:
-        development = joined
+        development = headline_joined
         holdout: list[dict[str, Any]] = []
     else:
         development = [
             row
-            for row in joined
+            for row in headline_joined
             if _as_utc(row["confirmed_at_utc"]) < holdout_start
         ]
         holdout = [
             row
-            for row in joined
+            for row in headline_joined
             if _as_utc(row["confirmed_at_utc"]) >= holdout_start
         ]
+    if headline_coverage_status is None:
+        holdout_status = (
+            "AVAILABLE"
+            if holdout_start is not None
+            else "UNAVAILABLE_NO_DISTINCT_TEMPORAL_CUTOFF"
+        )
+    elif effective_headline_status == "AVAILABLE_COMMON_ASSET_OVERLAP":
+        if holdout_start is None:
+            holdout_status = "UNAVAILABLE_NO_DISTINCT_TEMPORAL_CUTOFF"
+        elif headline_window_end is not None and holdout_start > headline_window_end:
+            holdout_status = "UNAVAILABLE_INVERTED_COVERAGE_WINDOW"
+        elif headline_window_end is not None and holdout_start == headline_window_end:
+            holdout_status = "UNAVAILABLE_ZERO_LENGTH_COVERAGE_WINDOW"
+        elif (
+            headline_window_start is not None
+            and holdout_start <= headline_window_start
+        ):
+            holdout_status = (
+                "UNAVAILABLE_ZERO_OR_INVERTED_DEVELOPMENT_WINDOW"
+            )
+        else:
+            holdout_status = "AVAILABLE"
+    elif (
+        effective_headline_status
+        == "UNAVAILABLE_ZERO_LENGTH_COMMON_ASSET_OVERLAP"
+    ):
+        holdout_status = "UNAVAILABLE_ZERO_LENGTH_COVERAGE_WINDOW"
+    elif (
+        effective_headline_status
+        == "UNAVAILABLE_INVERTED_COMMON_ASSET_OVERLAP"
+    ):
+        holdout_status = "UNAVAILABLE_INVERTED_COVERAGE_WINDOW"
+    else:
+        holdout_status = "UNAVAILABLE_NO_COMMON_ASSET_COVERAGE"
     bounded_split = len(development)
     measured_thresholds = sorted(
         {
@@ -1394,7 +1448,11 @@ def compile_event_census(
                 "HARD_GATES_PRESERVED"
             ),
             "chronological_holdout_cutoff": (
-                "ONE_CONFIRMED_AT_UTC_BOUNDARY_FROM_FULL_EVENT_UNIVERSE"
+                "ONE_CONFIRMED_AT_UTC_BOUNDARY_FROM_COMMON_COVERAGE_"
+                "HEADLINE_EVENT_UNIVERSE"
+            ),
+            "headline_metric_coverage": (
+                "COMMON_ASSET_COVERAGE_OVERLAP_WHEN_SUPPLIED"
             ),
         },
         "integrity": {
@@ -1421,9 +1479,25 @@ def compile_event_census(
         "holdout_start_utc": (
             holdout_start.isoformat() if holdout_start else None
         ),
+        "holdout_status": holdout_status,
+        "headline_coverage": {
+            "status": effective_headline_status,
+            "window_start_utc": (
+                headline_window_start.isoformat()
+                if headline_window_start is not None
+                else None
+            ),
+            "window_end_utc": (
+                headline_window_end.isoformat()
+                if headline_window_end is not None
+                else None
+            ),
+            "headline_event_count": len(headline_joined),
+            "full_per_asset_research_event_count": len(joined),
+        },
         "metrics": {
             "all": summarize_event_census(
-                joined,
+                headline_joined,
                 primary_development_r=primary_development_r,
             ),
             "development": summarize_event_census(

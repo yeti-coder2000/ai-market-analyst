@@ -1406,6 +1406,22 @@ class LtfExecutionBacktestTest(unittest.TestCase):
             report["execution_cost_models"]["BTCUSD"]["source"],
             "BTC_EXPLICIT_TEST_COSTS",
         )
+        self.assertEqual(
+            report["metrics"]["by_symbol"]["BTCUSD"]["candidate_count"],
+            0,
+        )
+        self.assertEqual(
+            report["metrics"]["by_symbol"]["BTCUSD"][
+                "ready_signals_per_week"
+            ],
+            0.0,
+        )
+        self.assertEqual(
+            report["metrics"]["by_symbol"]["BTCUSD"][
+                "frequency_coverage_scope"
+            ],
+            "ASSET_PROVIDER_COVERAGE:BTCUSD",
+        )
 
     def test_report_exposes_chronological_holdout(self) -> None:
         candidate = _candidate()
@@ -1438,6 +1454,53 @@ class LtfExecutionBacktestTest(unittest.TestCase):
             report["metrics"]["all"]["metric_basis"],
             "NET_R",
         )
+
+    def test_reconstruction_coverage_ends_at_exact_last_m5_close(self) -> None:
+        _, audit = reconstruct_tpo_watch_candidates(
+            _history(),
+            symbol="EURUSD",
+        )
+
+        self.assertEqual(
+            audit["history_last_bar_utc"],
+            "2026-07-01T10:30:00+00:00",
+        )
+        self.assertEqual(
+            audit["history_last_bar_close_utc"],
+            "2026-07-01T10:35:00+00:00",
+        )
+
+    def test_zero_or_inverted_frequency_window_is_unavailable(self) -> None:
+        row = replay_candidate(_candidate(), _history())
+        boundary = datetime(2026, 7, 1, 10, 0, tzinfo=UTC)
+        cases = {
+            "zero": (
+                boundary,
+                boundary,
+                "UNAVAILABLE_ZERO_LENGTH_WINDOW",
+            ),
+            "inverted": (
+                boundary,
+                boundary - timedelta(minutes=5),
+                "UNAVAILABLE_INVERTED_WINDOW",
+            ),
+        }
+
+        for name, (window_start, window_end, expected_status) in cases.items():
+            with self.subTest(name=name):
+                summary = summarize_backtest(
+                    [row],
+                    window_start=window_start,
+                    window_end=window_end,
+                )
+
+                self.assertEqual(
+                    summary["frequency_status"],
+                    expected_status,
+                )
+                self.assertIsNone(summary["window_weeks"])
+                self.assertIsNone(summary["ready_signals_per_week"])
+                self.assertIsNone(summary["filled_signals_per_week"])
 
     def test_monday_uses_last_completed_trading_session_not_sunday(self) -> None:
         friday_index = pd.date_range(
@@ -1598,6 +1661,61 @@ class LtfExecutionBacktestTest(unittest.TestCase):
                 "skipped_prior_session_unconfirmed_no_data"
             ),
             1,
+        )
+
+    def test_crypto_weekend_is_not_skipped_as_non_trading_day(self) -> None:
+        friday_index = pd.date_range(
+            "2026-07-03T00:00:00Z",
+            periods=288,
+            freq="5min",
+        )
+        friday = pd.DataFrame(
+            {
+                "open": [100.0] * len(friday_index),
+                "high": [100.1] * len(friday_index),
+                "low": [99.9] * len(friday_index),
+                "close": [100.0] * len(friday_index),
+                "volume": [1000.0] * len(friday_index),
+            },
+            index=friday_index,
+        )
+        sunday_index = pd.date_range(
+            "2026-07-05T00:00:00Z",
+            periods=24,
+            freq="5min",
+        )
+        sunday = pd.DataFrame(
+            {
+                "open": [101.0] * len(sunday_index),
+                "high": [101.1] * len(sunday_index),
+                "low": [100.8] * len(sunday_index),
+                "close": [101.0] * len(sunday_index),
+                "volume": [1000.0] * len(sunday_index),
+            },
+            index=sunday_index,
+        )
+
+        candidates, audit = reconstruct_tpo_watch_candidates(
+            pd.concat([friday, sunday]),
+            symbol="BTCUSD",
+        )
+
+        sunday_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.session_id.startswith("BTCUSD_2026-07-05")
+        ]
+        self.assertEqual(sunday_candidates, [])
+        self.assertEqual(
+            audit["diagnostics"].get(
+                "skipped_prior_session_unconfirmed_no_data"
+            ),
+            1,
+        )
+        self.assertIsNone(
+            audit["diagnostics"].get(
+                "confirmed_non_trading_prior_days_skipped"
+            )
         )
 
     def test_missing_prior_profile_open_rejects_cash_candidate(
