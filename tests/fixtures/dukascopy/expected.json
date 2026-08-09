@@ -1,0 +1,23 @@
+{
+  "expected_m5_rows": 2,
+  "fixtures": {
+    "corrupt_truncated_ticks.bi5.b64": {
+      "decoded_byte_count": 18,
+      "decoded_sha256": "02928cdfdbc030819b1289c27106d20b20e8327274ea23324b8773c138c085c8",
+      "payload_kind": "SYNTHETIC_REAL_FORMAT"
+    },
+    "duplicate_ticks.bi5.b64": {
+      "decoded_byte_count": 40,
+      "decoded_sha256": "d4e7c842cc44d42d05755a5ad959c35350b0ea09584ad39306bced41250c49b3",
+      "payload_kind": "SYNTHETIC_REAL_FORMAT"
+    },
+    "synthetic_real_format_ticks.bi5.b64": {
+      "decoded_byte_count": 68,
+      "decoded_sha256": "d398522cbccb2da44ee5e159bddd00bd35a095eea4caf8b1d21bef44f7f26d90",
+      "payload_kind": "SYNTHETIC_REAL_FORMAT"
+    }
+  },
+  "parity": "NON_PARITY",
+  "source_granularity": "TICK",
+  "valid_fixture": "synthetic_real_format_ticks.bi5.b64"
+}
