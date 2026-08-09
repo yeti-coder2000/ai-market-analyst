@@ -57,6 +57,22 @@ class DukascopyMaxDepthProviderTests(unittest.TestCase):
         )
         return payload
 
+    def _write_source_manifest(self, hashes: dict[str, str]) -> None:
+        partitions = {
+            item.partition_id: {"source_sha256": hashes.get(item.partition_id)}
+            for item in self.provider.plan(self.request)
+        }
+        (self.root / "source_hash_manifest.json").write_text(
+            json.dumps(
+                {
+                    "profile_hash": self.provider.profile_hash(),
+                    "decoder_version": self.provider.policy.decoder_version,
+                    "partitions": partitions,
+                }
+            ),
+            encoding="utf-8",
+        )
+
     def test_profile_is_explicitly_tick_aggregated_non_parity(self) -> None:
         self.assertEqual(self.provider.profile_name, PROFILE_NAME)
         self.assertEqual(self.provider.policy.source_granularity, "TICK")
@@ -105,6 +121,13 @@ class DukascopyMaxDepthProviderTests(unittest.TestCase):
     def test_verification_is_offline_and_reports_missing_partition(self) -> None:
         first = self.provider.plan(self.request)[0]
         self._write(first.cache_path, [(0, 110010, 110000, 1.0, 2.0)])
+        self._write_source_manifest(
+            {
+                first.partition_id: hashlib.sha256(
+                    first.cache_path.read_bytes()
+                ).hexdigest()
+            }
+        )
         audit = self.provider.verify_cache(self.request)
         self.assertFalse(audit["cache_complete"])
         self.assertEqual(audit["partitions"][1]["status"], "MISSING")
@@ -112,6 +135,23 @@ class DukascopyMaxDepthProviderTests(unittest.TestCase):
     def test_network_implementation_is_blocked_until_native_m5_is_proved(self) -> None:
         with self.assertRaisesRegex(DukascopyProviderError, "native Dukascopy"):
             self.provider.download()
+
+    def test_cache_verification_requires_persisted_hash_manifest(self) -> None:
+        with self.assertRaisesRegex(
+            DukascopyProviderError, "SOURCE_HASH_MANIFEST_MISSING"
+        ):
+            self.provider.verify_cache(self.request)
+
+    def test_unverified_symbol_price_scale_fails_closed(self) -> None:
+        request = HistoricalM5Request(
+            "XAUUSD",
+            self.request.start_utc,
+            self.request.end_utc,
+            self.request.data_cutoff_utc,
+            self.root,
+        )
+        with self.assertRaisesRegex(DukascopyProviderError, "UNVERIFIED_PRICE_SCALE"):
+            self.provider.decode_partition(self.provider.plan(request)[0])
 
 
 if __name__ == "__main__":

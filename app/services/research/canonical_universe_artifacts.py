@@ -6,6 +6,7 @@ import gzip
 import hashlib
 import json
 import subprocess
+import tempfile
 import zipfile
 from collections.abc import Mapping, Sequence
 from datetime import datetime
@@ -16,6 +17,21 @@ import pandas as pd
 
 EVENT_ID = "candidate_id"
 CANONICAL_ZIP_NAME = "AI_Market_Analyst_Canonical_Frozen_Universe_v2.zip"
+APPROVED_SYMBOLS = (
+    "XAUUSD",
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "USDCHF",
+    "USDCAD",
+    "AUDUSD",
+    "BTCUSD",
+    "ETHUSD",
+    "GER40",
+    "NAS100",
+    "SPX500",
+    "UKOIL",
+)
 
 
 def code_sha() -> str:
@@ -63,22 +79,51 @@ def semantic_identity(
     source_hashes: Sequence[str],
     data_cutoff_utc: str,
     holdout_cutoff_utc: str,
+    sort_columns: Sequence[str] | None = None,
+    canonical_columns: Sequence[str] | None = None,
 ) -> dict[str, Any]:
-    columns = sorted(str(column) for column in frame.columns)
+    if id_column not in frame.columns or timestamp_column not in frame.columns:
+        raise ValueError("identity and timestamp columns are required")
+    columns = list(canonical_columns or sorted(str(column) for column in frame.columns))
+    if set(columns) != set(frame.columns) or len(columns) != len(frame.columns):
+        raise ValueError("canonical columns must contain every column exactly once")
+    order = list(sort_columns or (timestamp_column, id_column))
+    if any(column not in frame.columns for column in order):
+        raise ValueError("deterministic sort columns are missing")
+    ids = frame[id_column]
+    if ids.isna().any() or ids.astype(str).str.strip().eq("").any():
+        raise ValueError("canonical IDs must be non-null and non-empty")
+    if ids.astype(str).duplicated().any():
+        raise ValueError("canonical IDs must be unique")
+    timestamps = pd.to_datetime(frame[timestamp_column], utc=True, errors="coerce")
+    if timestamps.isna().any():
+        raise ValueError("all primary timestamps must parse")
+    ordered = (
+        frame.assign(_canonical_timestamp=timestamps)
+        .sort_values(
+            [
+                "_canonical_timestamp",
+                *[column for column in order if column != timestamp_column],
+            ],
+            kind="stable",
+        )
+        .drop(columns="_canonical_timestamp")
+    )
     rows = [
         {column: _json_value(row.get(column)) for column in columns}
-        for row in frame.to_dict(orient="records")
+        for row in ordered.to_dict(orient="records")
     ]
     semantic = json.dumps(rows, sort_keys=True, separators=(",", ":"), allow_nan=False)
     schema = [(column, str(frame[column].dtype)) for column in columns]
-    ids = [str(value) for value in frame.get(id_column, pd.Series(dtype=str)).tolist()]
-    timestamps = pd.to_datetime(frame.get(timestamp_column), utc=True, errors="coerce")
+    ordered_ids = [str(value) for value in ordered[id_column].tolist()]
     return {
         "semantic_content_sha256": hashlib.sha256(semantic.encode()).hexdigest(),
         "schema_hash": hashlib.sha256(repr(schema).encode()).hexdigest(),
-        "ordered_id_hash": hashlib.sha256(("\n".join(ids) + "\n").encode()).hexdigest(),
+        "ordered_id_hash": hashlib.sha256(
+            ("\n".join(ordered_ids) + "\n").encode()
+        ).hexdigest(),
         "row_count": len(frame),
-        "unique_id_count": len(set(ids)),
+        "unique_id_count": len(set(ordered_ids)),
         "min_timestamp": timestamps.min().isoformat()
         if timestamps is not None and timestamps.notna().any()
         else None,
@@ -97,16 +142,40 @@ def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(
-        json.dumps(_json_value(value), indent=2, sort_keys=True, allow_nan=False) + "\n"
+        json.dumps(_json_value(value), indent=2, sort_keys=True, allow_nan=False)
+        + "\n",
+        encoding="utf-8",
     )
+    temporary.replace(path)
+
+
+def write_text(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(value, encoding="utf-8")
+    temporary.replace(path)
+
+
+def write_csv(path: Path, frame: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    frame.to_csv(temporary, index=False, lineterminator="\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+def write_parquet(path: Path, frame: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    frame.to_parquet(temporary, index=False)
     temporary.replace(path)
 
 
 def write_compact_csv_gz(
     path: Path, frame: pd.DataFrame, columns: Sequence[str]
 ) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     selected = frame.reindex(columns=list(columns))
-    payload = selected.to_csv(index=False, lineterminator="\n").encode()
+    payload = selected.to_csv(index=False, lineterminator="\n").encode("utf-8")
     temporary = path.with_suffix(path.suffix + ".tmp")
     with (
         temporary.open("wb") as raw,
@@ -144,26 +213,71 @@ def validate_outcome_counts(value: Mapping[str, Any]) -> None:
 
 
 def build_verified_zip(
-    run_dir: Path, files: Sequence[Path], *, universe_frozen: bool
+    run_dir: Path, files: Sequence[Path], *, frozen_manifest: Mapping[str, Any]
 ) -> Path:
-    if not universe_frozen:
+    required_proofs = (
+        "provider_parity_approved",
+        "cache_source_integrity_passed",
+        "canonical_datasets_valid",
+        "hashes_valid",
+        "deterministic_rerun_passed",
+        "restore_preconditions_passed",
+    )
+    if (
+        frozen_manifest.get("bundle_type") != "CANONICAL_FULL_UNIVERSE"
+        or tuple(frozen_manifest.get("symbols") or ()) != APPROVED_SYMBOLS
+        or not all(frozen_manifest.get(key) is True for key in required_proofs)
+    ):
         raise ValueError(
-            "canonical ZIP name is reserved for a frozen 13-asset universe"
+            "frozen-universe manifest does not prove canonical publication"
         )
     destination = run_dir / CANONICAL_ZIP_NAME
     temporary = destination.with_suffix(".zip.tmp")
+    relative = [path.relative_to(run_dir).as_posix() for path in files]
+    if len(relative) != len(set(relative)):
+        raise ValueError("ZIP relative paths must be unique")
     inventory = [
-        {"path": path.name, "sha256": sha256_file(path), "bytes": path.stat().st_size}
-        for path in files
+        {"path": name, "sha256": sha256_file(path), "bytes": path.stat().st_size}
+        for name, path in zip(relative, files, strict=True)
     ]
-    with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for path in sorted(files, key=lambda item: item.name):
-            archive.write(path, path.name)
+    with zipfile.ZipFile(
+        temporary, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
+    ) as archive:
+        for name, path in sorted(zip(relative, files, strict=True)):
+            info = zipfile.ZipInfo(name, (2026, 1, 1, 0, 0, 0))
+            info.external_attr = 0o100644 << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(
+                info,
+                path.read_bytes(),
+                compress_type=zipfile.ZIP_DEFLATED,
+                compresslevel=9,
+            )
         archive.writestr(
             "zip_inventory.json", json.dumps(inventory, indent=2, sort_keys=True) + "\n"
         )
-    with zipfile.ZipFile(temporary) as archive:
-        if archive.testzip() is not None:
-            raise ValueError("ZIP restore verification failed")
+    with tempfile.TemporaryDirectory() as root:
+        with zipfile.ZipFile(temporary) as archive:
+            archive.extractall(root)
+        restored = Path(root)
+        actual = {
+            path.relative_to(restored).as_posix()
+            for path in restored.rglob("*")
+            if path.is_file()
+        }
+        expected = {*relative, "zip_inventory.json"}
+        if actual != expected:
+            raise ValueError("ZIP restore allowlist mismatch")
+        for item in inventory:
+            if sha256_file(restored / item["path"]) != item["sha256"]:
+                raise ValueError("ZIP restore member hash mismatch")
+        for parquet in (
+            "otd_orr_event_census_v2.parquet",
+            "execution_candidates_v2.parquet",
+        ):
+            matches = [path for path in restored.rglob(parquet)]
+            if len(matches) != 1:
+                raise ValueError("ZIP restore canonical Parquet missing")
+            pd.read_parquet(matches[0])
     temporary.replace(destination)
     return destination

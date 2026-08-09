@@ -9,6 +9,7 @@ and the complete 13-instrument mapping.
 """
 
 import argparse
+import json
 import math
 import shlex
 import sys
@@ -30,14 +31,20 @@ from app.services.ltf_execution_backtest import (
     reconstruct_tpo_watch_candidates,
     replay_candidate,
 )
-from app.services.otd_orr_event_census import measure_event_development
+from app.services.otd_orr_event_census import (
+    compile_event_census,
+    measure_event_development,
+)
 from app.services.research.canonical_universe_artifacts import (
     code_sha,
     outcome_counts,
     semantic_identity,
     sha256_file,
     write_compact_csv_gz,
+    write_csv,
     write_json,
+    write_parquet,
+    write_text,
 )
 from app.services.research.dukascopy_max_depth_provider import (
     PROFILE_NAME,
@@ -120,17 +127,17 @@ EXECUTION_COMPACT_COLUMNS = (
     "remaining_target_R_at_fill",
     "remaining_target_fraction_at_ready",
     "remaining_target_fraction_at_fill",
-    "first_0.50R_hit_at_utc",
-    "first_1.00R_hit_at_utc",
-    "first_1.50R_hit_at_utc",
-    "first_2.00R_hit_at_utc",
-    "first_2.50R_hit_at_utc",
-    "first_3.00R_hit_at_utc",
-    "stop_hit_at_utc",
-    "real_target_hit_at_utc",
-    "MFE_R",
-    "MAE_R",
-    "same_bar_ambiguity",
+    "trade_first_0_5R_hit_at_utc",
+    "trade_first_1R_hit_at_utc",
+    "trade_first_1_5R_hit_at_utc",
+    "trade_first_2R_hit_at_utc",
+    "trade_first_2_5R_hit_at_utc",
+    "trade_first_3R_hit_at_utc",
+    "trade_stop_hit_at_utc",
+    "trade_real_target_hit_at_utc",
+    "trade_MFE_R",
+    "trade_MAE_R",
+    "trade_same_bar_ambiguity",
 )
 
 
@@ -149,15 +156,19 @@ def utc(value: Any) -> datetime:
 
 
 def derive_holdout_cutoff(
-    events: Sequence[Mapping[str, Any]], fraction: float
-) -> datetime:
-    times = sorted({utc(row["confirmed_at_utc"]) for row in events})
-    if len(times) < 2:
-        raise CanonicalRunnerError(
-            "cannot derive holdout cutoff without two distinct event times"
-        )
-    index = max(1, min(len(times) - 1, round(len(times) * (1.0 - fraction))))
-    return times[index]
+    events: Sequence[Mapping[str, Any]],
+    executions: Sequence[Mapping[str, Any]],
+    fraction: float,
+    primary_development_r: float = 1.5,
+) -> tuple[datetime | None, dict[str, Any]]:
+    census = compile_event_census(
+        event_records=events,
+        execution_rows=executions,
+        holdout_fraction=fraction,
+        primary_development_r=primary_development_r,
+    )
+    value = census["holdout_start_utc"]
+    return (utc(value) if value else None), census
 
 
 def _threshold_key(value: float) -> str:
@@ -269,47 +280,129 @@ def enrich_execution(
     result = dict(row)
     ready_progress, _ = _progress(candidate, history, result.get("ready_at_utc"))
     fill_progress, _ = _progress(candidate, history, result.get("filled_at_utc"))
-    target_r = result.get("risk_reward_ratio")
-    target_r = float(target_r) if target_r is not None else None
+    closes = pd.to_datetime(history["bar_close_utc"], utc=True)
+    activation = history.loc[closes == pd.Timestamp(candidate.activated_at_utc)]
+    event_reference = (
+        float(activation.iloc[-1]["close"]) if not activation.empty else None
+    )
+    event_risk = (
+        abs(event_reference - candidate.test_extreme)
+        if event_reference is not None
+        else 0.0
+    )
+    target_price = result.get("target_reference_price")
+    event_target_r = None
+    if target_price is not None and event_risk > 0:
+        event_target_r = (
+            (float(target_price) - event_reference) / event_risk
+            if candidate.direction == "LONG"
+            else (event_reference - float(target_price)) / event_risk
+        )
     result.update(
         {
             "event_progress_R_at_ready": ready_progress,
             "event_progress_R_at_fill": fill_progress,
             "max_event_R_before_ready": ready_progress,
             "max_event_R_before_fill": fill_progress,
-            "remaining_target_R_at_ready": max(0.0, target_r - ready_progress)
-            if target_r is not None and ready_progress is not None
+            "remaining_target_R_at_ready": max(0.0, event_target_r - ready_progress)
+            if event_target_r is not None and ready_progress is not None
             else None,
-            "remaining_target_R_at_fill": max(0.0, target_r - fill_progress)
-            if target_r is not None and fill_progress is not None
+            "remaining_target_R_at_fill": max(0.0, event_target_r - fill_progress)
+            if event_target_r is not None and fill_progress is not None
             else None,
-            "remaining_target_fraction_at_ready": max(0.0, target_r - ready_progress)
-            / target_r
-            if target_r and ready_progress is not None
+            "remaining_target_fraction_at_ready": max(
+                0.0, event_target_r - ready_progress
+            )
+            / event_target_r
+            if event_target_r and ready_progress is not None
             else None,
-            "remaining_target_fraction_at_fill": max(0.0, target_r - fill_progress)
-            / target_r
-            if target_r and fill_progress is not None
+            "remaining_target_fraction_at_fill": max(
+                0.0, event_target_r - fill_progress
+            )
+            / event_target_r
+            if event_target_r and fill_progress is not None
             else None,
-            "stop_hit_at_utc": result.get("resolved_at_utc")
-            if result.get("outcome") == "SL_HIT"
-            else None,
-            "real_target_hit_at_utc": result.get("resolved_at_utc")
-            if result.get("outcome") == "TP_HIT"
-            else None,
-            "MFE_R": result.get("mfe_R"),
-            "MAE_R": result.get("mae_R"),
-            "same_bar_ambiguity": "AMBIGUOUS" in str(result.get("outcome") or ""),
         }
     )
-    for value in (0.5, 1.0, 1.5, 2.0, 2.5, 3.0):
-        result[f"first_{value:.2f}R_hit_at_utc"] = _first_hit(
-            candidate,
-            history,
-            result.get("resolved_at_utc") or candidate.expires_at_utc,
-            value,
-        )
+    result.update(_trade_path(result, history, candidate.direction))
     return result
+
+
+def _trade_path(
+    row: Mapping[str, Any], history: pd.DataFrame, direction: str
+) -> dict[str, Any]:
+    names = {0.5: "0_5", 1.0: "1", 1.5: "1_5", 2.0: "2", 2.5: "2_5", 3.0: "3"}
+    output = {f"trade_first_{name}R_hit_at_utc": None for name in names.values()}
+    output.update(
+        {
+            "trade_stop_hit_at_utc": None,
+            "trade_real_target_hit_at_utc": None,
+            "trade_MFE_R": None,
+            "trade_MAE_R": None,
+            "trade_same_bar_ambiguity": False,
+        }
+    )
+    if not row.get("filled_at_utc"):
+        return output
+    entry, stop, target = (
+        row.get(key)
+        for key in (
+            "entry_reference_price",
+            "invalidation_reference_price",
+            "target_reference_price",
+        )
+    )
+    if (
+        entry is None
+        or stop is None
+        or target is None
+        or abs(float(entry) - float(stop)) <= 0
+    ):
+        return output
+    entry, stop, target = float(entry), float(stop), float(target)
+    risk = abs(entry - stop)
+    end = row.get("trade_resolution_expires_at_utc") or row.get("expires_at_utc")
+    closes = pd.to_datetime(history["bar_close_utc"], utc=True)
+    bars = history.loc[
+        (closes > pd.Timestamp(utc(row["filled_at_utc"])))
+        & (closes <= pd.Timestamp(utc(end)))
+    ]
+    mfe = mae = 0.0
+    for _, bar in bars.iterrows():
+        at = utc(bar["bar_close_utc"]).isoformat()
+        favorable = (
+            (float(bar["high"]) - entry) / risk
+            if direction == "LONG"
+            else (entry - float(bar["low"])) / risk
+        )
+        adverse = (
+            (entry - float(bar["low"])) / risk
+            if direction == "LONG"
+            else (float(bar["high"]) - entry) / risk
+        )
+        mfe, mae = max(mfe, favorable), max(mae, adverse)
+        stop_hit = (
+            float(bar["low"]) <= stop
+            if direction == "LONG"
+            else float(bar["high"]) >= stop
+        )
+        target_hit = (
+            float(bar["high"]) >= target
+            if direction == "LONG"
+            else float(bar["low"]) <= target
+        )
+        if stop_hit and output["trade_stop_hit_at_utc"] is None:
+            output["trade_stop_hit_at_utc"] = at
+        if target_hit and output["trade_real_target_hit_at_utc"] is None:
+            output["trade_real_target_hit_at_utc"] = at
+        if stop_hit and target_hit:
+            output["trade_same_bar_ambiguity"] = True
+        for threshold, name in names.items():
+            key = f"trade_first_{name}R_hit_at_utc"
+            if output[key] is None and favorable >= threshold and not stop_hit:
+                output[key] = at
+    output["trade_MFE_R"], output["trade_MAE_R"] = mfe, mae
+    return output
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -354,8 +447,14 @@ def validate_args(
         or args.primary_development_r <= 0
     ):
         raise CanonicalRunnerError("invalid holdout fraction or development R")
-    if not 1 <= args.max_workers <= 16:
-        raise CanonicalRunnerError("max-workers must be between 1 and 16")
+    if args.max_workers != 1:
+        raise CanonicalRunnerError(
+            "NOT_IMPLEMENTED: --max-workers requires authoritative downloader"
+        )
+    if args.resume:
+        raise CanonicalRunnerError(
+            "NOT_IMPLEMENTED: --resume requires authoritative downloader"
+        )
     if args.provider_profile != PROFILE_NAME:
         raise CanonicalRunnerError(
             "only the explicit non-parity diagnostic profile is implemented"
@@ -387,13 +486,81 @@ def _invocation(argv: Sequence[str] | None) -> str:
     )
 
 
-def _aggregate(rows: list[dict[str, Any]], cutoff: datetime) -> dict[str, Any]:
+def verify_canonical_artifacts(run_dir: Path) -> dict[str, Any]:
+    required = {
+        "otd_orr_event_census_v2.parquet",
+        "execution_candidates_v2.parquet",
+        "semantic_hash_manifest.json",
+        "aggregate_summary.json",
+        "frozen_universe_v2_manifest.json",
+        "audit_manifest.json",
+    }
+    missing = sorted(name for name in required if not (run_dir / name).is_file())
+    if missing:
+        raise CanonicalRunnerError(f"canonical verify-only missing files: {missing}")
+    event_frame = pd.read_parquet(run_dir / "otd_orr_event_census_v2.parquet")
+    execution_frame = pd.read_parquet(run_dir / "execution_candidates_v2.parquet")
+    identities = json.loads(
+        (run_dir / "semantic_hash_manifest.json").read_text(encoding="utf-8")
+    )
+    frozen = json.loads(
+        (run_dir / "frozen_universe_v2_manifest.json").read_text(encoding="utf-8")
+    )
+    for name, frame, timestamp in (
+        ("otd_orr_event_census_v2", event_frame, "confirmed_at_utc"),
+        ("execution_candidates_v2", execution_frame, "activated_at_utc"),
+    ):
+        expected = identities[name]
+        path = run_dir / f"{name}.parquet"
+        if sha256_file(path) != expected["file_sha256"]:
+            raise CanonicalRunnerError("canonical file hash mismatch")
+        actual = semantic_identity(
+            frame,
+            id_column="candidate_id",
+            timestamp_column=timestamp,
+            code_revision=expected["code_sha"],
+            environment_versions=expected["environment_versions"],
+            source_hashes=expected["source_hashes"],
+            data_cutoff_utc=expected["data_cutoff_utc"],
+            holdout_cutoff_utc=expected["holdout_cutoff_utc"],
+        )
+        for key in (
+            "semantic_content_sha256",
+            "schema_hash",
+            "ordered_id_hash",
+            "row_count",
+            "unique_id_count",
+        ):
+            if actual[key] != expected[key]:
+                raise CanonicalRunnerError(f"canonical identity mismatch: {name}:{key}")
+    event_ids = set(event_frame["candidate_id"].astype(str))
+    if not set(execution_frame["candidate_id"].astype(str)).issubset(event_ids):
+        raise CanonicalRunnerError(
+            "execution candidate does not join exactly one event"
+        )
+    aggregate = json.loads(
+        (run_dir / "aggregate_summary.json").read_text(encoding="utf-8")
+    )
+    cutoff = frozen.get("holdout_cutoff_utc")
+    restored = _aggregate(
+        execution_frame.to_dict(orient="records"), utc(cutoff) if cutoff else None
+    )
+    if restored != aggregate:
+        raise CanonicalRunnerError("restored aggregate mismatch")
+    return {"mode": "VERIFY_ONLY", "canonical_artifacts_valid": True}
+
+
+def _aggregate(rows: list[dict[str, Any]], cutoff: datetime | None) -> dict[str, Any]:
     full = outcome_counts(rows)
     development = outcome_counts(
-        [row for row in rows if utc(row["activated_at_utc"]) < cutoff]
+        rows
+        if cutoff is None
+        else [row for row in rows if utc(row["activated_at_utc"]) < cutoff]
     )
     holdout = outcome_counts(
-        [row for row in rows if utc(row["activated_at_utc"]) >= cutoff]
+        []
+        if cutoff is None
+        else [row for row in rows if utc(row["activated_at_utc"]) >= cutoff]
     )
     groups = []
     dimensions = {
@@ -460,7 +627,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
         write_json(run_dir / "audit_manifest.json", plan)
         return 0
-    if args.download_only or (not args.replay_only and not args.verify_only):
+    if args.verify_only:
+        result = verify_canonical_artifacts(run_dir)
+        write_json(run_dir / "verification_result.json", {**base, **result})
+        return 0
+    acquisition_mode = args.download_only or (
+        not args.replay_only and not args.verify_only
+    )
+    if acquisition_mode and not args.allow_network_fetch:
+        raise CanonicalRunnerError(
+            "--allow-network-fetch is required before acquisition"
+        )
+    if acquisition_mode:
         provider.download()
     cache_audits = {
         request.symbol: provider.verify_cache(request) for request in requests
@@ -472,10 +650,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         for audit in cache_audits.values()
         for part in audit["partitions"]
     ]
-    if args.verify_only:
+    if args.download_only:
         write_json(
-            run_dir / "audit_manifest.json",
-            {**base, "mode": "VERIFY_ONLY", "cache_completeness": True},
+            run_dir / "raw_source_coverage_manifest.json",
+            {**base, "mode": "DOWNLOAD_ONLY", "symbols": cache_audits},
+        )
+        write_json(
+            run_dir / "raw_source_hash_manifest.json",
+            {**base, "source_hashes": source_hashes},
         )
         return 0
 
@@ -519,12 +701,45 @@ def main(argv: Sequence[str] | None = None) -> int:
         all_rows.extend(rows)
         all_candidates.extend(candidates)
         coverage.append(audit)
-    holdout_cutoff = (
-        utc(args.holdout_cutoff_utc)
-        if args.holdout_cutoff_utc
-        else derive_holdout_cutoff(all_events, args.holdout_fraction)
-    )
-    final_base = {**base, "holdout_cutoff_utc": holdout_cutoff.isoformat()}
+    if args.holdout_cutoff_utc:
+        holdout_cutoff = utc(args.holdout_cutoff_utc)
+        event_times = [utc(row["confirmed_at_utc"]) for row in all_events]
+        if not event_times or not min(event_times) < holdout_cutoff <= max(event_times):
+            raise CanonicalRunnerError(
+                "explicit holdout cutoff is outside the event universe"
+            )
+        census_split = {
+            "holdout_start_utc": holdout_cutoff.isoformat(),
+            "holdout_status": "EXPLICIT_VALIDATED",
+            "realized_event_holdout_fraction": sum(
+                timestamp >= holdout_cutoff for timestamp in event_times
+            )
+            / len(event_times),
+            "realized_execution_holdout_fraction": sum(
+                utc(row["activated_at_utc"]) >= holdout_cutoff for row in all_rows
+            )
+            / len(all_rows)
+            if all_rows
+            else None,
+        }
+    else:
+        holdout_cutoff, census_split = derive_holdout_cutoff(
+            all_events,
+            all_rows,
+            args.holdout_fraction,
+            args.primary_development_r,
+        )
+    final_base = {
+        **base,
+        "holdout_cutoff_utc": holdout_cutoff.isoformat() if holdout_cutoff else None,
+        "holdout_status": census_split["holdout_status"],
+        "realized_event_holdout_fraction": census_split[
+            "realized_event_holdout_fraction"
+        ],
+        "realized_execution_holdout_fraction": census_split[
+            "realized_execution_holdout_fraction"
+        ],
+    }
     write_json(
         run_dir / "raw_source_coverage_manifest.json",
         {**final_base, "cache_completeness": True, "symbols": cache_audits},
@@ -536,13 +751,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     for row in all_events:
         row["holdout_cohort"] = (
             "DEVELOPMENT"
-            if utc(row["confirmed_at_utc"]) < holdout_cutoff
+            if holdout_cutoff is None or utc(row["confirmed_at_utc"]) < holdout_cutoff
             else "HOLDOUT"
         )
     for row in all_rows:
         row["holdout_cohort"] = (
             "DEVELOPMENT"
-            if utc(row["activated_at_utc"]) < holdout_cutoff
+            if holdout_cutoff is None or utc(row["activated_at_utc"]) < holdout_cutoff
             else "HOLDOUT"
         )
     event_frame = pd.DataFrame(
@@ -555,9 +770,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     run_dir.mkdir(parents=True, exist_ok=True)
     event_path = run_dir / "otd_orr_event_census_v2.parquet"
-    event_frame.to_parquet(event_path, index=False)
+    write_parquet(event_path, event_frame)
     execution_path = run_dir / "execution_candidates_v2.parquet"
-    execution_frame.to_parquet(execution_path, index=False)
+    write_parquet(execution_path, execution_frame)
     event_csv = run_dir / "otd_orr_event_census_v2_compact.csv.gz"
     write_compact_csv_gz(event_csv, event_frame, EVENT_COMPACT_COLUMNS)
     execution_csv = run_dir / "execution_candidates_v2_compact.csv.gz"
@@ -572,7 +787,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 environment_versions=environment["versions"],
                 source_hashes=source_hashes,
                 data_cutoff_utc=data_cutoff.isoformat(),
-                holdout_cutoff_utc=holdout_cutoff.isoformat(),
+                holdout_cutoff_utc=holdout_cutoff.isoformat()
+                if holdout_cutoff
+                else "UNAVAILABLE",
             ),
             "file_sha256": sha256_file(event_path),
         },
@@ -585,7 +802,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 environment_versions=environment["versions"],
                 source_hashes=source_hashes,
                 data_cutoff_utc=data_cutoff.isoformat(),
-                holdout_cutoff_utc=holdout_cutoff.isoformat(),
+                holdout_cutoff_utc=holdout_cutoff.isoformat()
+                if holdout_cutoff
+                else "UNAVAILABLE",
             ),
             "file_sha256": sha256_file(execution_path),
         },
@@ -601,13 +820,45 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     write_json(run_dir / "semantic_hash_manifest.json", identities)
     write_json(run_dir / "aggregate_summary.json", aggregate)
+    restored_events = pd.read_parquet(event_path)
+    restored_executions = pd.read_parquet(execution_path)
+    if not set(restored_executions["candidate_id"].astype(str)).issubset(
+        set(restored_events["candidate_id"].astype(str))
+    ):
+        raise CanonicalRunnerError("restored execution/event identity join failed")
+    for name, restored, timestamp in (
+        ("otd_orr_event_census_v2", restored_events, "confirmed_at_utc"),
+        ("execution_candidates_v2", restored_executions, "activated_at_utc"),
+    ):
+        restored_identity = semantic_identity(
+            restored,
+            id_column="candidate_id",
+            timestamp_column=timestamp,
+            code_revision=code_revision,
+            environment_versions=environment["versions"],
+            source_hashes=source_hashes,
+            data_cutoff_utc=data_cutoff.isoformat(),
+            holdout_cutoff_utc=holdout_cutoff.isoformat()
+            if holdout_cutoff
+            else "UNAVAILABLE",
+        )
+        for key in ("semantic_content_sha256", "schema_hash", "ordered_id_hash"):
+            if restored_identity[key] != identities[name][key]:
+                raise CanonicalRunnerError(
+                    f"post-write identity validation failed: {name}:{key}"
+                )
+    if (
+        _aggregate(restored_executions.to_dict(orient="records"), holdout_cutoff)
+        != aggregate
+    ):
+        raise CanonicalRunnerError("post-write aggregate validation failed")
     summary_rows = [
         {"scope": "cohort", "cohort": key, **value}
         for key, value in aggregate.items()
         if key in {"full", "development", "holdout"}
     ]
     summary_rows.extend({"scope": "dimension", **row} for row in aggregate["groups"])
-    pd.DataFrame(summary_rows).to_csv(run_dir / "aggregate_summary.csv", index=False)
+    write_csv(run_dir / "aggregate_summary.csv", pd.DataFrame(summary_rows))
     reconciliation = []
     for cohort in ("full", "development", "holdout"):
         for metric, historical in HISTORICAL_REFERENCE[cohort].items():
@@ -637,14 +888,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "status": "HISTORICAL_DETAIL_UNAVAILABLE",
                 }
             )
-    pd.DataFrame(reconciliation).to_csv(
-        run_dir / "historical_reconciliation.csv", index=False
+    write_csv(run_dir / "historical_reconciliation.csv", pd.DataFrame(reconciliation))
+    write_text(
+        run_dir / "historical_discrepancy_report.md",
+        "# Historical discrepancy report\n\nThe lost report is a comparison reference, not a target. Methodology was not changed to reproduce its counts.\n",
     )
-    (run_dir / "historical_discrepancy_report.md").write_text(
-        "# Historical discrepancy report\n\nThe lost report is a comparison reference, not a target. Methodology was not changed to reproduce its counts.\n"
-    )
-    (run_dir / "canonical_max_depth_v2_report.md").write_text(
-        f"# Canonical Max-Depth Universe v2\n\n- Bundle type: `{bundle_type}`\n- Universe frozen: `{str(universe_frozen).lower()}`\n- Data cutoff: `{data_cutoff.isoformat()}`\n- Holdout cutoff: `{holdout_cutoff.isoformat()}`\n- Provider parity: `{provider.policy.parity_status}`\n"
+    write_text(
+        run_dir / "canonical_max_depth_v2_report.md",
+        f"# Canonical Max-Depth Universe v2\n\n- Bundle type: `{bundle_type}`\n- Universe frozen: `{str(universe_frozen).lower()}`\n- Data cutoff: `{data_cutoff.isoformat()}`\n- Holdout cutoff: `{holdout_cutoff.isoformat() if holdout_cutoff else 'unavailable'}`\n- Provider parity: `{provider.policy.parity_status}`\n",
     )
     frozen = {
         **final_base,
@@ -672,7 +923,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "diagnostic subsets cannot create the canonical ZIP"
             )
         raise CanonicalRunnerError(
-            "universe_frozen requires external restore verification before canonical ZIP publication"
+            "PROVIDER_PARITY_NOT_APPROVED: non-parity provider cannot create canonical ZIP"
         )
     return 0
 

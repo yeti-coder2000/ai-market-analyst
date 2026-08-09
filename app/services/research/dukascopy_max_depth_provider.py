@@ -11,6 +11,7 @@ acquisition remains disabled until an authoritative native-M5 URL, format and
 """
 
 import hashlib
+import json
 import lzma
 import struct
 from collections.abc import Sequence
@@ -59,6 +60,7 @@ DIAGNOSTIC_SYMBOL_MAPPING = {
     "SPX500": "USA500IDXUSD",
     "UKOIL": "BRENTCMDUSD",
 }
+VERIFIED_PRICE_SCALE = {"EURUSD": 100000.0}
 
 
 class DukascopyProviderError(RuntimeError):
@@ -77,6 +79,7 @@ class DukascopyMaxDepthProvider:
                 PROFILE_NAME,
                 SOURCE_POLICY.to_dict(),
                 sorted(DIAGNOSTIC_SYMBOL_MAPPING.items()),
+                sorted(VERIFIED_PRICE_SCALE.items()),
             )
         )
         return hashlib.sha256(payload.encode()).hexdigest()
@@ -114,6 +117,9 @@ class DukascopyMaxDepthProvider:
         )
 
     def decode_partition(self, partition: SourcePartition) -> pd.DataFrame:
+        price_scale = VERIFIED_PRICE_SCALE.get(partition.canonical_symbol)
+        if price_scale is None:
+            raise DukascopyProviderError("UNVERIFIED_PRICE_SCALE")
         try:
             raw = lzma.decompress(partition.cache_path.read_bytes())
         except (OSError, lzma.LZMAError) as error:
@@ -137,7 +143,7 @@ class DukascopyMaxDepthProvider:
             records.append(
                 {
                     "timestamp": partition.start_utc + timedelta(milliseconds=millis),
-                    "price": bid / 100000.0,
+                    "price": bid / price_scale,
                     "volume": float(bid_volume),
                 }
             )
@@ -158,6 +164,26 @@ class DukascopyMaxDepthProvider:
 
     def verify_cache(self, request: HistoricalM5Request) -> dict[str, Any]:
         partitions = self.plan(request)
+        manifest_path = request.cache_root / "source_hash_manifest.json"
+        if not manifest_path.is_file():
+            raise DukascopyProviderError("SOURCE_HASH_MANIFEST_MISSING")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if (
+            manifest.get("profile_hash") != self.profile_hash()
+            or manifest.get("decoder_version") != DECODER_VERSION
+        ):
+            raise DukascopyProviderError("SOURCE_HASH_MANIFEST_PROFILE_MISMATCH")
+        declared = manifest.get("partitions") or {}
+        expected_ids = {item.partition_id for item in partitions}
+        if set(declared) != expected_ids:
+            raise DukascopyProviderError("SOURCE_HASH_MANIFEST_PARTITION_MISMATCH")
+        expected_paths = {item.cache_path.resolve() for item in partitions}
+        extras = {
+            path.resolve()
+            for path in (request.cache_root / request.symbol).rglob("*.bi5")
+        } - expected_paths
+        if extras:
+            raise DukascopyProviderError("UNEXPECTED_SOURCE_PARTITION")
         audits = []
         complete = True
         for item in partitions:
@@ -166,6 +192,8 @@ class DukascopyMaxDepthProvider:
                 complete = False
                 continue
             digest = hashlib.sha256(item.cache_path.read_bytes()).hexdigest()
+            if digest != declared[item.partition_id].get("source_sha256"):
+                raise DukascopyProviderError("SOURCE_HASH_MISMATCH")
             frame = self.decode_partition(item)
             audits.append(
                 {
