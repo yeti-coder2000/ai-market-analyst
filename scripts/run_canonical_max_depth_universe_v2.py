@@ -3,9 +3,8 @@ from __future__ import annotations
 """Research-only canonical max-depth universe v2 orchestration.
 
 This entry point is intentionally separate from the Twelve Data/Yahoo runner.
-The implemented provider profile is tick-aggregated and explicitly non-parity;
-network acquisition is blocked pending proof of native SWFX/CFD bid M5 format
-and the complete 13-instrument mapping.
+It supports the existing tick-aggregated diagnostic profile and the offline
+reader for source chunks exported through the native JForex M5 BID SDK path.
 """
 
 import argparse
@@ -47,28 +46,21 @@ from app.services.research.canonical_universe_artifacts import (
     write_text,
 )
 from app.services.research.dukascopy_max_depth_provider import (
-    PROFILE_NAME,
+    PROFILE_NAME as TICK_PROFILE_NAME,
     DukascopyMaxDepthProvider,
 )
 from app.services.research.historical_m5_provider import HistoricalM5Request
+from app.services.research.jforex_native_m5_provider import (
+    CANONICAL_SYMBOLS as JFOREX_CANONICAL_SYMBOLS,
+    PROFILE_NAME as JFOREX_PROFILE_NAME,
+    JForexNativeM5Provider,
+    qualifies_for_canonical_native_parity,
+)
 from scripts.check_research_environment import check_environment
 
 VERSION = "canonical-max-depth-universe-v2.0.0"
-CANONICAL_SYMBOLS = (
-    "XAUUSD",
-    "EURUSD",
-    "GBPUSD",
-    "USDJPY",
-    "USDCHF",
-    "USDCAD",
-    "AUDUSD",
-    "BTCUSD",
-    "ETHUSD",
-    "GER40",
-    "NAS100",
-    "SPX500",
-    "UKOIL",
-)
+CANONICAL_SYMBOLS = JFOREX_CANONICAL_SYMBOLS
+SUPPORTED_PROVIDER_PROFILES = (TICK_PROFILE_NAME, JFOREX_PROFILE_NAME)
 DEVELOPMENT_THRESHOLDS = (0.50, 0.75, 1.00, 1.25, 1.50, 2.00, 2.50, 3.00)
 HISTORICAL_REFERENCE = {
     "m5_bar_count": 20_442_071,
@@ -411,7 +403,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--cache-root", type=Path, required=True)
-    parser.add_argument("--provider-profile", default=PROFILE_NAME)
+    parser.add_argument("--provider-profile", default=TICK_PROFILE_NAME)
     parser.add_argument("--symbols", default=",".join(CANONICAL_SYMBOLS))
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
@@ -455,9 +447,9 @@ def validate_args(
         raise CanonicalRunnerError(
             "NOT_IMPLEMENTED: --resume requires authoritative downloader"
         )
-    if args.provider_profile != PROFILE_NAME:
+    if args.provider_profile not in SUPPORTED_PROVIDER_PROFILES:
         raise CanonicalRunnerError(
-            "only the explicit non-parity diagnostic profile is implemented"
+            "provider profile must be an implemented research profile"
         )
     if args.build_zip and (args.download_only or args.plan_only or args.verify_only):
         raise CanonicalRunnerError("build-zip requires full or replay-only mode")
@@ -484,6 +476,14 @@ def _invocation(argv: Sequence[str] | None) -> str:
     return "python scripts/run_canonical_max_depth_universe_v2.py " + " ".join(
         shlex.quote(value) for value in values
     )
+
+
+def _provider_for_profile(profile: str) -> Any:
+    if profile == JFOREX_PROFILE_NAME:
+        return JForexNativeM5Provider()
+    if profile == TICK_PROFILE_NAME:
+        return DukascopyMaxDepthProvider()
+    raise CanonicalRunnerError("unsupported research provider profile")
 
 
 def verify_canonical_artifacts(run_dir: Path) -> dict[str, Any]:
@@ -593,7 +593,7 @@ def _aggregate(rows: list[dict[str, Any]], cutoff: datetime | None) -> dict[str,
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     symbols, start, end, data_cutoff = validate_args(args)
-    provider = DukascopyMaxDepthProvider()
+    provider = _provider_for_profile(args.provider_profile)
     run_dir = args.output_root
     environment = check_environment(run_dir, args.cache_root)
     code_revision = code_sha()
@@ -603,6 +603,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "provider_profile_hash": provider.profile_hash(),
         "source_policy": provider.policy.to_dict(),
         "symbols": symbols,
+        "canonical_native_parity_candidate": qualifies_for_canonical_native_parity(
+            provider, symbols
+        ),
         "data_cutoff_utc": data_cutoff.isoformat(),
         "holdout_cutoff_utc": utc(args.holdout_cutoff_utc).isoformat()
         if args.holdout_cutoff_utc
@@ -640,9 +643,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if acquisition_mode:
         provider.download()
-    cache_audits = {
-        request.symbol: provider.verify_cache(request) for request in requests
-    }
+    full_universe_requested = tuple(symbols) == CANONICAL_SYMBOLS
+    if isinstance(provider, JForexNativeM5Provider):
+        cache_audits = provider.verify_universe(
+            requests, require_full_universe=full_universe_requested
+        )
+    else:
+        cache_audits = {
+            request.symbol: provider.verify_cache(request) for request in requests
+        }
     if not all(value["cache_complete"] for value in cache_audits.values()):
         raise CanonicalRunnerError("raw cache is incomplete")
     source_hashes = [
@@ -650,6 +659,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         for audit in cache_audits.values()
         for part in audit["partitions"]
     ]
+    source_hashes.extend(
+        audit["manifest_sha256"]
+        for audit in cache_audits.values()
+        if audit.get("manifest_sha256")
+    )
     if args.download_only:
         write_json(
             run_dir / "raw_source_coverage_manifest.json",
@@ -665,13 +679,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     all_rows: list[dict[str, Any]] = []
     all_candidates: list[HistoricalWatchCandidate] = []
     coverage: list[dict[str, Any]] = []
+    request_by_symbol = {request.symbol: request for request in requests}
     for symbol in symbols:
-        history_path = args.cache_root / "history" / f"{symbol}_5m.parquet"
-        if not history_path.is_file():
-            raise CanonicalRunnerError(
-                f"normalized history is missing for symbol={symbol}"
-            )
-        history = normalize_m5_history(pd.read_parquet(history_path), symbol=symbol)
+        if isinstance(provider, JForexNativeM5Provider):
+            source_history = provider.load_history(request_by_symbol[symbol])
+        else:
+            history_path = args.cache_root / "history" / f"{symbol}_5m.parquet"
+            if not history_path.is_file():
+                raise CanonicalRunnerError(
+                    f"normalized history is missing for symbol={symbol}"
+                )
+            source_history = pd.read_parquet(history_path)
+        history = normalize_m5_history(source_history, symbol=symbol)
         event_candidates, audit = reconstruct_tpo_watch_candidates(
             history, symbol=symbol, include_counter_htf_events=True
         )
@@ -922,8 +941,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise CanonicalRunnerError(
                 "diagnostic subsets cannot create the canonical ZIP"
             )
+        if not qualifies_for_canonical_native_parity(provider, symbols):
+            raise CanonicalRunnerError(
+                "PROVIDER_PARITY_NOT_APPROVED: non-parity provider cannot create canonical ZIP"
+            )
         raise CanonicalRunnerError(
-            "PROVIDER_PARITY_NOT_APPROVED: non-parity provider cannot create canonical ZIP"
+            "CANONICAL_PUBLICATION_GATES_REQUIRED: run deterministic second-run and "
+            "restore verification before creating a frozen-universe ZIP"
         )
     return 0
 
