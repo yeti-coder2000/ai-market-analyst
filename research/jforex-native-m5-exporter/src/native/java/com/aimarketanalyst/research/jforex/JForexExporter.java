@@ -172,6 +172,29 @@ public final class JForexExporter {
             Instant partitionEnd = monthAfter(cursor).isBefore(endExclusive)
                     ? monthAfter(cursor)
                     : endExclusive;
+            if (resume) {
+                SourceManifest.Chunk existing =
+                        ChunkWriter.resumeExisting(
+                                cacheRoot,
+                                canonicalSymbol,
+                                cursor,
+                                partitionEnd);
+                if (existing != null) {
+                    completed.add(existing);
+                    SourceManifest.write(
+                            manifest,
+                            canonicalSymbol,
+                            start,
+                            endExclusive,
+                            false,
+                            completed);
+                    System.out.println(
+                            "JFOREX_RESUME_CHUNK=" + existing.chunkId());
+                    cursor = partitionEnd;
+                    continue;
+                }
+            }
+
             List<IBar> providerBars;
             try {
                 providerBars = history.getBars(

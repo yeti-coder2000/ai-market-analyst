@@ -52,6 +52,26 @@ class CanonicalUniverseRunnerTests(unittest.TestCase):
         )
         self.assertEqual(args.data_cutoff_utc, "2026-01-03T00:00:00Z")
         self.assertEqual(args.holdout_cutoff_utc, "2026-01-02T00:00:00Z")
+        validate_args(args)
+        for invalid_cutoff in (
+            "2025-12-31T23:55:00Z",
+            "2026-01-01T00:00:00Z",
+            "2026-01-03T00:00:00Z",
+            "2026-01-03T00:05:00Z",
+        ):
+            invalid = build_parser().parse_args(
+                BASE
+                + [
+                    "--holdout-cutoff-utc",
+                    invalid_cutoff,
+                    "--plan-only",
+                ]
+            )
+            with self.assertRaisesRegex(
+                CanonicalRunnerError,
+                "strictly inside the replay window",
+            ):
+                validate_args(invalid)
 
     def test_modes_are_mutually_exclusive(self) -> None:
         with self.assertRaises(SystemExit):
@@ -113,10 +133,22 @@ class CanonicalUniverseRunnerTests(unittest.TestCase):
 
     def test_explicit_outcome_fields_enforce_arithmetic(self) -> None:
         value = outcome_counts(
-            [{"outcome": "TP_HIT"}, {"outcome": "SL_HIT"}, {"outcome": "OPEN"}]
+            [
+                {"outcome": "TP_HIT"},
+                {"outcome": "SL_HIT"},
+                {"outcome": "SL_HIT_AMBIGUOUS_BAR_CONSERVATIVE"},
+                {"outcome": "SL_HIT_AMBIGUOUS_ENTRY_BAR_CONSERVATIVE"},
+                {"outcome": "OPEN"},
+            ]
         )
         self.assertEqual(
-            value, {"tp_count": 1, "sl_count": 1, "resolved_count": 2, "win_rate": 0.5}
+            value,
+            {
+                "tp_count": 1,
+                "sl_count": 3,
+                "resolved_count": 4,
+                "win_rate": 0.25,
+            },
         )
         with self.assertRaisesRegex(ValueError, "resolved_count"):
             validate_outcome_counts(

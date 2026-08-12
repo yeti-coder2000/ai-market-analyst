@@ -20,6 +20,41 @@ public final class ChunkWriter {
 
     private ChunkWriter() {}
 
+    public static SourceManifest.Chunk resumeExisting(
+            Path cacheRoot,
+            String canonicalSymbol,
+            Instant startUtc,
+            Instant endExclusiveUtc) throws IOException {
+        Contracts.requireCanonicalSymbol(canonicalSymbol);
+        String month = startUtc.toString().substring(0, 7);
+        String chunkId = canonicalSymbol + "/" + month;
+        Path symbolRoot = cacheRoot.resolve(canonicalSymbol);
+        Path completed =
+                symbolRoot.resolve("completed").resolve(canonicalSymbol + "_" + month + ".csv");
+        Path sidecar =
+                completed.resolveSibling(completed.getFileName() + ".manifest.json");
+
+        boolean completedExists = Files.exists(completed);
+        boolean sidecarExists = Files.exists(sidecar);
+
+        if (!completedExists && !sidecarExists) {
+            return null;
+        }
+        if (!Files.isRegularFile(completed) || !Files.isRegularFile(sidecar)) {
+            throw new IOException("unverified completed namespace artifact");
+        }
+
+        SourceManifest.Chunk existing = SourceManifest.readChunkSidecar(sidecar);
+        validateExisting(
+                completed,
+                existing,
+                chunkId,
+                canonicalSymbol,
+                startUtc,
+                endExclusiveUtc);
+        return existing;
+    }
+
     public static SourceManifest.Chunk write(
             Path cacheRoot,
             String canonicalSymbol,
@@ -28,20 +63,31 @@ public final class ChunkWriter {
             List<NativeBar> bars,
             boolean resume) throws IOException {
         Contracts.requireCanonicalSymbol(canonicalSymbol);
+        String month = startUtc.toString().substring(0, 7);
+        String chunkId = canonicalSymbol + "/" + month;
+        Path symbolRoot = cacheRoot.resolve(canonicalSymbol);
+        Path completed =
+                symbolRoot.resolve("completed").resolve(canonicalSymbol + "_" + month + ".csv");
+        Path sidecar =
+                completed.resolveSibling(completed.getFileName() + ".manifest.json");
+
+        if (resume) {
+            SourceManifest.Chunk existing =
+                    resumeExisting(
+                            cacheRoot,
+                            canonicalSymbol,
+                            startUtc,
+                            endExclusiveUtc);
+            if (existing != null) {
+                return existing;
+            }
+        }
+
         if (bars.isEmpty()) {
             throw new IOException(
                     "empty native history partition; retry in a new JForex process/session");
         }
-        String month = startUtc.toString().substring(0, 7);
-        String chunkId = canonicalSymbol + "/" + month;
-        Path symbolRoot = cacheRoot.resolve(canonicalSymbol);
-        Path completed = symbolRoot.resolve("completed").resolve(canonicalSymbol + "_" + month + ".csv");
-        Path sidecar = completed.resolveSibling(completed.getFileName() + ".manifest.json");
-        if (resume && Files.isRegularFile(completed) && Files.isRegularFile(sidecar)) {
-            SourceManifest.Chunk existing = SourceManifest.readChunkSidecar(sidecar);
-            validateExisting(completed, existing, chunkId, canonicalSymbol, startUtc, endExclusiveUtc);
-            return existing;
-        }
+
         if (Files.exists(completed) || Files.exists(sidecar)) {
             throw new IOException("unverified completed namespace artifact");
         }

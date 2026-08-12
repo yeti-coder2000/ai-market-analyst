@@ -466,6 +466,12 @@ def validate_args(
     cutoff = utc(args.data_cutoff_utc)
     if start > end or end > cutoff:
         raise CanonicalRunnerError("start/end/data cutoff ordering is invalid")
+    if args.holdout_cutoff_utc:
+        explicit_holdout = utc(args.holdout_cutoff_utc)
+        if not start < explicit_holdout < cutoff:
+            raise CanonicalRunnerError(
+                "explicit holdout cutoff must be strictly inside the replay window"
+            )
     if cutoff.minute % 5 or cutoff.second or cutoff.microsecond:
         raise CanonicalRunnerError("data cutoff must be a fully closed M5 boundary")
     return symbols, start, end, cutoff

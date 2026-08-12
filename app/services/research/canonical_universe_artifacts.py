@@ -187,7 +187,7 @@ def write_compact_csv_gz(
 
 def outcome_counts(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     tp = sum(str(row.get("outcome")) == "TP_HIT" for row in rows)
-    sl = sum(str(row.get("outcome")) == "SL_HIT" for row in rows)
+    sl = sum(str(row.get("outcome")).startswith("SL_HIT") for row in rows)
     resolved = tp + sl
     result = {
         "tp_count": tp,
