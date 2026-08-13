@@ -178,6 +178,82 @@ class CanonicalUniverseRunnerTests(unittest.TestCase):
             semantic_identity(frame.iloc[::-1].copy(), **kwargs),
         )
 
+    def test_semantic_identity_is_stable_across_nested_parquet_round_trip(
+        self,
+    ) -> None:
+        frame = pd.DataFrame(
+            {
+                "candidate_id": ["a", "b"],
+                "confirmed_at_utc": [
+                    "2026-01-01T00:00:00Z",
+                    "2026-01-02T00:00:00Z",
+                ],
+                "transition_history": [
+                    [
+                        {
+                            "state": "ARMED",
+                            "reason": None,
+                        },
+                        {
+                            "state": "ENTRY_READY",
+                            "bars": 1,
+                        },
+                    ],
+                    [
+                        {
+                            "state": "ARMED",
+                        },
+                        {
+                            "state": "INVALIDATED",
+                            "reason": "CONTEXT_CHANGED",
+                            "bars": 2.0,
+                        },
+                    ],
+                ],
+                "blockers": [
+                    ("WAIT_RETEST", "WAIT_TRIGGER"),
+                    (),
+                ],
+            }
+        )
+
+        kwargs = {
+            "id_column": "candidate_id",
+            "timestamp_column": "confirmed_at_utc",
+            "code_revision": "abc",
+            "environment_versions": {
+                "python": "3.12.13",
+                "pyarrow": "15.0.2",
+            },
+            "source_hashes": ["source-a"],
+            "data_cutoff_utc":
+                "2026-01-03T00:00:00+00:00",
+            "holdout_cutoff_utc":
+                "2026-01-02T00:00:00+00:00",
+        }
+
+        before = semantic_identity(frame, **kwargs)
+
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "nested.parquet"
+
+            frame.to_parquet(path, index=False)
+            restored = pd.read_parquet(path)
+
+            # A second persisted generation must not alter identity either.
+            second = Path(root) / "nested-second.parquet"
+            restored.to_parquet(second, index=False)
+            restored_twice = pd.read_parquet(second)
+
+        after = semantic_identity(restored, **kwargs)
+        after_twice = semantic_identity(
+            restored_twice,
+            **kwargs,
+        )
+
+        self.assertEqual(before, after)
+        self.assertEqual(after, after_twice)
+
     def test_diagnostic_subset_cannot_use_canonical_zip_name(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / "artifact.json"

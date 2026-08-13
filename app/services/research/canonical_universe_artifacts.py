@@ -13,7 +13,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
+import pyarrow as pa
 
 EVENT_ID = "candidate_id"
 CANONICAL_ZIP_NAME = "AI_Market_Analyst_Canonical_Frozen_Universe_v2.zip"
@@ -61,12 +63,38 @@ def _json_value(value: Any) -> Any:
         )
         return stamp.isoformat()
     if isinstance(value, Mapping):
-        return {str(key): _json_value(nested) for key, nested in sorted(value.items())}
+        return {
+            str(key): _json_value(nested)
+            for key, nested in sorted(value.items())
+        }
+    if isinstance(value, np.ndarray):
+        return _json_value(value.tolist())
     if isinstance(value, (list, tuple)):
         return [_json_value(nested) for nested in value]
-    if hasattr(value, "item"):
-        return value.item()
+    if isinstance(value, np.generic):
+        return _json_value(value.item())
     return value
+
+
+def _arrow_canonical_identity_frame(
+    frame: pd.DataFrame,
+) -> pd.DataFrame:
+    """Normalize Python object columns to Arrow's persisted logical model.
+
+    Semantic identity is defined over the representation that can actually be
+    persisted to canonical Parquet, rather than over transient Python container
+    details such as list-vs-ndarray or sparse dict keys inside list<struct>.
+    """
+    try:
+        table = pa.Table.from_pandas(
+            frame,
+            preserve_index=False,
+        )
+        return table.to_pandas()
+    except Exception as exc:
+        raise ValueError(
+            "frame cannot be normalized to Arrow canonical identity"
+        ) from exc
 
 
 def semantic_identity(
@@ -84,7 +112,13 @@ def semantic_identity(
 ) -> dict[str, Any]:
     if id_column not in frame.columns or timestamp_column not in frame.columns:
         raise ValueError("identity and timestamp columns are required")
-    columns = list(canonical_columns or sorted(str(column) for column in frame.columns))
+
+    frame = _arrow_canonical_identity_frame(frame)
+
+    columns = list(
+        canonical_columns
+        or sorted(str(column) for column in frame.columns)
+    )
     if set(columns) != set(frame.columns) or len(columns) != len(frame.columns):
         raise ValueError("canonical columns must contain every column exactly once")
     order = list(sort_columns or (timestamp_column, id_column))
