@@ -26,6 +26,7 @@ from scripts.run_canonical_max_depth_universe_v2 import (
     _trade_path,
     build_parser,
     derive_holdout_cutoff,
+    enrich_execution,
     flatten_event,
     main,
     validate_args,
@@ -231,6 +232,80 @@ class CanonicalUniverseRunnerTests(unittest.TestCase):
             result["trade_real_target_hit_at_utc"], "2026-01-01T00:15:00+00:00"
         )
         self.assertEqual(row["outcome"], "SL_HIT")
+
+    def test_fill_progress_excludes_ambiguous_fill_bar_excursion(self) -> None:
+        from app.services.ltf_execution_backtest import HistoricalWatchCandidate
+
+        candidate = HistoricalWatchCandidate(
+            candidate_id="fill-bar-causality",
+            symbol="EURUSD",
+            session_id="s",
+            reference_profile_id="p",
+            setup_family="OPEN_TEST_DRIVE",
+            direction="LONG",
+            session_open_utc=datetime(2026, 1, 1, 0, 0, tzinfo=UTC),
+            activated_at_utc=datetime(2026, 1, 1, 0, 5, tzinfo=UTC),
+            expires_at_utc=datetime(2026, 1, 1, 0, 30, tzinfo=UTC),
+            open_price=100.0,
+            previous_vah=101.0,
+            previous_val=99.0,
+            previous_poc=100.0,
+            previous_high=102.0,
+            previous_low=98.0,
+            test_extreme=99.0,
+            htf_bias="LONG",
+            interest_zones=(),
+            payload={},
+        )
+
+        history = pd.DataFrame(
+            [
+                {
+                    "bar_close_utc": "2026-01-01T00:05:00Z",
+                    "high": 100.0,
+                    "low": 100.0,
+                    "close": 100.0,
+                },
+                {
+                    "bar_close_utc": "2026-01-01T00:10:00Z",
+                    "high": 101.0,
+                    "low": 99.5,
+                    "close": 100.5,
+                },
+                {
+                    "bar_close_utc": "2026-01-01T00:15:00Z",
+                    "high": 103.0,
+                    "low": 100.0,
+                    "close": 102.0,
+                },
+                {
+                    "bar_close_utc": "2026-01-01T00:20:00Z",
+                    "high": 102.5,
+                    "low": 100.5,
+                    "close": 102.0,
+                },
+            ]
+        )
+
+        result = enrich_execution(
+            candidate,
+            {
+                "ready_at_utc": "2026-01-01T00:10:00Z",
+                "filled_at_utc": "2026-01-01T00:15:00Z",
+                "entry_reference_price": 100.0,
+                "invalidation_reference_price": 99.0,
+                "target_reference_price": 102.0,
+                "trade_resolution_expires_at_utc":
+                    "2026-01-01T00:20:00Z",
+            },
+            history,
+        )
+
+        self.assertEqual(result["event_progress_R_at_ready"], 1.0)
+        self.assertEqual(result["event_progress_R_at_fill"], 1.0)
+        self.assertEqual(result["max_event_R_before_fill"], 1.0)
+        self.assertEqual(result["remaining_target_R_at_fill"], 1.0)
+        self.assertEqual(result["remaining_target_fraction_at_fill"], 0.5)
 
     def test_trade_same_bar_stop_and_target_is_conservatively_ambiguous(self) -> None:
         history = pd.DataFrame(

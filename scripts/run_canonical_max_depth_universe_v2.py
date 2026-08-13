@@ -271,7 +271,13 @@ def enrich_execution(
 ) -> dict[str, Any]:
     result = dict(row)
     ready_progress, _ = _progress(candidate, history, result.get("ready_at_utc"))
-    fill_progress, _ = _progress(candidate, history, result.get("filled_at_utc"))
+    filled_at = result.get("filled_at_utc")
+    fill_progress_cutoff = (
+        utc(filled_at) - pd.Timedelta(minutes=5)
+        if filled_at
+        else None
+    )
+    fill_progress, _ = _progress(candidate, history, fill_progress_cutoff)
     closes = pd.to_datetime(history["bar_close_utc"], utc=True)
     activation = history.loc[closes == pd.Timestamp(candidate.activated_at_utc)]
     event_reference = (
