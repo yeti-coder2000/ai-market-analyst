@@ -1,0 +1,13 @@
+{
+  "comparison_only_not_target": true,
+  "candidate_count": 3093,
+  "event_count": 13846,
+  "fill_count": 44,
+  "m5_bar_count": 20442071,
+  "ready_count": 115,
+  "cohorts": {
+    "development": {"resolved_count": 14, "sl_count": 11, "tp_count": 3, "win_rate": 0.21428571428571427},
+    "full": {"resolved_count": 32, "sl_count": 26, "tp_count": 6, "win_rate": 0.1875},
+    "holdout": {"resolved_count": 18, "sl_count": 15, "tp_count": 3, "win_rate": 0.16666666666666666}
+  }
+}
