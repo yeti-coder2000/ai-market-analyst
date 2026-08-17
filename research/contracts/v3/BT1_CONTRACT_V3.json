@@ -1,0 +1,156 @@
+{
+  "contract_hash": "d89ef86da730e65f09e281a4c705eeb5b337d9ed3a1fa00063e0a653f0f7d63f",
+  "contract_id": "BT1_CONTRACT_V3",
+  "dependencies": [
+    {
+      "contract_hash": "ce8f993476eb6dcad7242d8eb070d646e4dc744421af8f9f78ea830ac3678a0f",
+      "contract_id": "BASELINE_ENTRY_ADAPTER_V3"
+    },
+    {
+      "contract_hash": "7919dc37ffd79f049386efb236ccc009fe5242048e32aeb2ca8192d67bbd1c90",
+      "contract_id": "COST_CONTRACT_V3"
+    },
+    {
+      "contract_hash": "e6f39ba451c938e7440e4421aba2e5b479a2ca875153560f8dd9417124c81197",
+      "contract_id": "ENUM_REGISTRY_V3"
+    },
+    {
+      "contract_hash": "493a3f99b8d7c7d197128848fc29c3e71da58b0881bbaa074b5c9f610c810526",
+      "contract_id": "EVENT_CONTRACT_V3"
+    },
+    {
+      "contract_hash": "6faa2d25d800c4dcf8cb496db05a7d4255fa6481fa60c8602ffeedd2f145ec9a",
+      "contract_id": "MASTER_PROTOCOL_V3"
+    },
+    {
+      "contract_hash": "f0257ae21494b045cbe71e60de8af49da21c83c48a42a39376392dfe846739ff",
+      "contract_id": "SCHEMA_REGISTRY_V3"
+    }
+  ],
+  "immutable_evidence_code_sha": "6bc6773809375013891db67e21e85f2d149de8c1",
+  "payload": {
+    "bt2_retuning_permitted": false,
+    "candidate_policies": [
+      "CAP_0_50R",
+      "CAP_0_75R",
+      "CAP_1_00R",
+      "CAP_1_25R",
+      "CAP_1_50R",
+      "CAP_2_00R",
+      "CAP_2_50R",
+      "CAP_3_00R",
+      "NO_PROGRESS_CAP",
+      "NO_TRADE"
+    ],
+    "claim_unit": "SYMBOL_X_SETUP_FAMILY_X_DIRECTION_X_SESSION",
+    "decision_logic_order": [
+      "NON_EVALUABLE",
+      "CAP_REACHED_BEFORE_READY",
+      "CAP_REACHED_AFTER_READY_BEFORE_FILL",
+      "AMBIGUOUS_CAP_FILL_ORDER",
+      "OPPORTUNITY_EXHAUSTED",
+      "ALLOW"
+    ],
+    "decision_states": [
+      "BT1_RESEARCH_SUPPORTED",
+      "BT1_KEEP_NO_PROGRESS_CAP",
+      "BT1_RESEARCH_NO_TRADE",
+      "BT1_RESEARCH_REJECTED",
+      "BT1_RESEARCH_INCONCLUSIVE"
+    ],
+    "diagnostic_payoff": {
+      "break_even": false,
+      "costs": [
+        "BASE",
+        "STRESS"
+      ],
+      "entry": "BASELINE_FILL",
+      "partial_exit": false,
+      "position_weight": 1.0,
+      "same_bar": "STOP_FIRST",
+      "stop": "ORIGINAL_STRUCTURAL_INVALIDATION",
+      "target": "REAL_STRUCTURAL_TARGET_KNOWN_CAUSALLY",
+      "terminal": "EVENT_EXPIRY",
+      "trailing": false
+    },
+    "fallback_hierarchy": [
+      "SYMBOL_FAMILY_DIRECTION_SESSION",
+      "SYMBOL_FAMILY_DIRECTION",
+      "SYMBOL_FAMILY",
+      "SYMBOL",
+      "POOLED_FAMILY_PRIOR"
+    ],
+    "fill_bar_fields_forbidden": [
+      "HIGH",
+      "LOW",
+      "CLOSE",
+      "VOLUME",
+      "TARGET_TOUCH",
+      "STOP_TOUCH",
+      "EVENT_PROGRESS"
+    ],
+    "historical_support": {
+      "base_net_expectancy_gt": 0.0,
+      "base_net_pf_min": 1.1,
+      "cluster_n_min": 40,
+      "inference": "ONE_SIDED_90_LOWER_GT_0_OR_ADJUSTED_P_LE_0_10",
+      "latest_two_combined_positive": true,
+      "outer_folds_min": 3,
+      "positive_fold_fraction_min": 0.6,
+      "resolved_n_min": 60,
+      "stress_net_expectancy_min": 0.0
+    },
+    "later_cap_preference_when_comparable": false,
+    "post_outer_rescue_permitted": false,
+    "pre_fill_bar_rule": "BAR_CLOSE_UTC < FILL_AT_UTC",
+    "primary_gate_location": "READY_AND_FILL",
+    "research_question": "WHEN_IS_AN_OTHERWISE_VALID_ENTRY_FRESH_ENOUGH_AND_WHEN_IS_AUCTION_DEVELOPMENT_TOO_ADVANCED",
+    "selection_algorithm": [
+      "HARD_CAUSAL_DATA_FILTERS",
+      "ECONOMIC_ELIGIBILITY",
+      "HANSEN_SPA_FAMILY_TEST",
+      "PAIRED_BOOTSTRAP_ONE_SE_SET",
+      "SELECT_LOWEST_CAP",
+      "TIE_STRESS_DD_COVERAGE_AMBIGUITY_LEXICAL",
+      "KEEP_NO_PROGRESS_CAP_OR_NO_TRADE"
+    ],
+    "selection_eligibility": {
+      "base_net_expectancy_per_event_gt_no_cap": true,
+      "base_net_pf_min": 1.05,
+      "max_drawdown_relative_limit": 1.05,
+      "retained_coverage_min": 0.2,
+      "stress_not_worse_than_baseline_by_more_than_one_bootstrap_se": true
+    },
+    "selection_objective": "MAXIMIZE_OUT_OF_SAMPLE_BASE_NET_EXPECTANCY_PER_ELIGIBLE_EVENT_AND_CAPTURED_R_SUBJECT_TO_RISK_SAMPLE_STABILITY_COST_GATES",
+    "sensitivity_gate_locations": [
+      "READY_ONLY",
+      "FILL_ONLY"
+    ],
+    "sensitivity_outcomes_not_selectable": [
+      "FIXED_1R_FIRST_TOUCH",
+      "FIXED_1_5R_FIRST_TOUCH"
+    ],
+    "threshold_first_reach_availability": "FIRST_COMPLETED_BAR_CLOSE_WHEN_TOUCH_IS_KNOWABLE",
+    "threshold_semantics": "UPPER_PERMISSION_CAP_NOT_ENTRY_TRIGGER",
+    "training_eligibility": {
+      "cluster_n_min": 50,
+      "context_feature_coverage_min": 0.7,
+      "inner_fold_n_min": 3,
+      "resolved_n_min": 80,
+      "resolved_per_inner_fold_min": 10
+    },
+    "win_rate_primary_objective": false
+  },
+  "source_documents": [
+    {
+      "name": "BT1_V3_CONTRACT.md",
+      "sha256": "76d54a1d9d97cfd50c64873b3a1e3f7762305438d87c08b4b8cf14947a0a4941"
+    },
+    {
+      "name": "MASTER_RESEARCH_PROTOCOL_V3.md",
+      "sha256": "dfd0ed356c8efe4590197d0176cd2ebb5a2da0d35a52dea54b679a23622a5403"
+    }
+  ],
+  "status": "FROZEN_METHOD_PENDING_UPSTREAM_AUDITS",
+  "version": "3.0.0"
+}
