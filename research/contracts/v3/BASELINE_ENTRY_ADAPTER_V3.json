@@ -1,0 +1,77 @@
+{
+  "contract_hash": "ce8f993476eb6dcad7242d8eb070d646e4dc744421af8f9f78ea830ac3678a0f",
+  "contract_id": "BASELINE_ENTRY_ADAPTER_V3",
+  "dependencies": [
+    {
+      "contract_hash": "493a3f99b8d7c7d197128848fc29c3e71da58b0881bbaa074b5c9f610c810526",
+      "contract_id": "EVENT_CONTRACT_V3"
+    },
+    {
+      "contract_hash": "6faa2d25d800c4dcf8cb496db05a7d4255fa6481fa60c8602ffeedd2f145ec9a",
+      "contract_id": "MASTER_PROTOCOL_V3"
+    },
+    {
+      "contract_hash": "f0257ae21494b045cbe71e60de8af49da21c83c48a42a39376392dfe846739ff",
+      "contract_id": "SCHEMA_REGISTRY_V3"
+    },
+    {
+      "contract_hash": "3974bcaba23b1d8cc6b5248e82b208cf1ed241f0435a936dcf4a6279f816f1b2",
+      "contract_id": "SESSION_CONTRACT_V3"
+    }
+  ],
+  "immutable_evidence_code_sha": "6bc6773809375013891db67e21e85f2d149de8c1",
+  "payload": {
+    "adapter_id": "BASELINE_ENTRY_ADAPTER_V3",
+    "causal_rules": {
+      "fill_bar_excluded_from_features": true,
+      "pre_fill_source_available_operator": "<",
+      "same_bar_ambiguity": "FAIL_CLOSED"
+    },
+    "failure_action": "STOP_NO_BT1",
+    "implementation_mode": "RESEARCH_ONLY_READ_ONLY_ADAPTER",
+    "parity_fixture_requirements": [
+      "READY_TRANSITION",
+      "NO_READY",
+      "FILL",
+      "NO_FILL",
+      "EXPIRY",
+      "STOP_KNOWN_AT_FILL",
+      "SAME_BAR_BEHAVIOR",
+      "FILL_PRICE_BASIS"
+    ],
+    "parity_gate": "PASS_REQUIRED_BEFORE_BT1",
+    "production_import_or_behavior_mutation_permitted": false,
+    "proposed_source": "EXISTING_LTF_EXECUTION_STATE_MACHINE",
+    "required_outputs": [
+      "READY_AT_UTC",
+      "READY_SIGNAL_AVAILABLE_AT_UTC",
+      "FILL_AT_UTC",
+      "FILL_BAR_ID",
+      "FILL_PRICE_BASIS",
+      "FILL_PRICE_I64_GROSS",
+      "STOP_PRICE_I64",
+      "TRADE_R_PRICE_I64",
+      "CANDIDATE_EXPIRY_AT_UTC",
+      "NO_CANDIDATE_REASON",
+      "ADAPTER_HASH"
+    ],
+    "source_execution_code_sha": "6bc6773809375013891db67e21e85f2d149de8c1",
+    "trigger_redesign_in_scope": false
+  },
+  "source_documents": [
+    {
+      "name": "BT1_V3_CONTRACT.md",
+      "sha256": "76d54a1d9d97cfd50c64873b3a1e3f7762305438d87c08b4b8cf14947a0a4941"
+    },
+    {
+      "name": "MASTER_RESEARCH_PROTOCOL_V3.md",
+      "sha256": "dfd0ed356c8efe4590197d0176cd2ebb5a2da0d35a52dea54b679a23622a5403"
+    },
+    {
+      "name": "V3_DECISION_LOG.md",
+      "sha256": "adc6acc6bada8d8774ba544ab1cd28c375228f8ff200b313f31f683316be45ad"
+    }
+  ],
+  "status": "FROZEN_INTENT_PENDING_BOUNDED_PARITY",
+  "version": "3.0.0"
+}
