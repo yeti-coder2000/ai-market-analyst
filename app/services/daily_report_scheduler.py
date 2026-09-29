@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from app.core.runtime_flags import tpo_runtime_enabled, tpo_telegram_enabled
 from app.core.settings import settings
 
 
@@ -132,7 +133,11 @@ def parse_report_time(value: str) -> dtime:
 
 def load_config() -> SchedulerConfig:
     return SchedulerConfig(
-        enabled=env_bool("ENABLE_DAILY_REPORT_SCHEDULER", True),
+        enabled=(
+            env_bool("ENABLE_DAILY_REPORT_SCHEDULER", True)
+            and tpo_runtime_enabled()
+            and tpo_telegram_enabled()
+        ),
         timezone_name=os.getenv("DAILY_REPORT_TIMEZONE", DEFAULT_TIMEZONE).strip()
         or DEFAULT_TIMEZONE,
         report_time=parse_report_time(os.getenv("DAILY_REPORT_TIME", DEFAULT_REPORT_TIME)),
@@ -419,7 +424,10 @@ def main() -> None:
     )
 
     if not cfg.enabled:
-        log("Scheduler disabled by ENABLE_DAILY_REPORT_SCHEDULER=false.")
+        log(
+            "Scheduler disabled by ENABLE_DAILY_REPORT_SCHEDULER=false or legacy "
+            "TPO runtime/Telegram flags."
+        )
         return
 
     tz = get_timezone(cfg.timezone_name)

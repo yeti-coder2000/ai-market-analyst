@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 from urllib import error, request
 
+from app.core.runtime_flags import tpo_telegram_enabled
 from app.core.settings import settings
 from app.services.daily_signal_report import (
     DEFAULT_TIMEZONE,
@@ -155,6 +156,12 @@ def send_telegram_message(
     disable_notification: bool = False,
     timeout_sec: int = 20,
 ) -> dict[str, Any]:
+    if not tpo_telegram_enabled():
+        return {
+            "ok": False,
+            "error": "legacy TPO Telegram disabled by TPO_TELEGRAM_ENABLED=false",
+        }
+
     if not bot_token:
         return {
             "ok": False,

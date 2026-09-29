@@ -32,6 +32,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from app.core.runtime_flags import tpo_runtime_enabled
+
 
 SUPERVISOR_VERSION = "render-supervisor-v1.1-auto-runtime-retention"
 
@@ -295,6 +297,10 @@ def maybe_run_runtime_retention(scheduler: RetentionScheduler) -> None:
 
 
 def main() -> int:
+    if not tpo_runtime_enabled():
+        log("legacy TPO runtime disabled by TPO_RUNTIME_ENABLED=false; supervisor exiting")
+        return 0
+
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
