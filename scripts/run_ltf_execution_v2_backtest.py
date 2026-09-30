@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-"""Fetch maximum available M5 history and replay LTF Execution v2.
+"""Fetch M5 history, replay LTF Execution v2 and build the OTD/ORR census.
 
 The command is research-only.  It writes isolated, versioned artifacts under
 ``/var/data/runtime/research`` by default and never mutates production cache,
 signal state, Battle Gate state, or Telegram delivery state.
+
+Backtest Integrity v2.0 measures auction-event development independently from
+the LTF entry model, then reports both denominators side by side.
 
 Twelve Data history is paged backwards from the newest closed bar until the
 provider's ``earliest_timestamp`` boundary.  Yahoo-backed GER40 is requested
@@ -32,15 +35,20 @@ from app.core.instrument_batches import INSTRUMENT_BATCHES
 from app.services.ltf_execution_backtest import (
     ExecutionCostModel,
     HistoricalWatchCandidate,
+    _execution_cost_model_integrity,
     compile_backtest_report,
     normalize_m5_history,
     reconstruct_tpo_watch_candidates,
     replay_candidate,
 )
+from app.services.otd_orr_event_census import (
+    DEFAULT_PRIMARY_DEVELOPMENT_R,
+    measure_event_development,
+)
 
 
 RUNNER_VERSION = (
-    "ltf-execution-v2-provider-depth-runner-v1.2-backtest-integrity-v1.1"
+    "ltf-execution-v2-provider-depth-runner-v2.0.1"
 )
 DEFAULT_OUTPUT_ROOT = Path(
     os.getenv(
@@ -914,10 +922,12 @@ def run_streamed_backtest(
     symbols: Sequence[str],
     provider_manifest: Mapping[str, Any],
     holdout_fraction: float,
+    primary_development_r: float = DEFAULT_PRIMARY_DEVELOPMENT_R,
     cost_models: Mapping[str, ExecutionCostModel] | None = None,
 ) -> dict[str, Any]:
     candidates: list[HistoricalWatchCandidate] = []
     records: list[dict[str, Any]] = []
+    event_records: list[dict[str, Any]] = []
     coverage: list[dict[str, Any]] = []
     provider_symbols = provider_manifest.get("symbols")
     if not isinstance(provider_symbols, Mapping):
@@ -953,11 +963,34 @@ def run_streamed_backtest(
             pd.read_parquet(history_path),
             symbol=symbol,
         )
-        symbol_candidates, symbol_coverage = reconstruct_tpo_watch_candidates(
+        event_candidates, symbol_coverage = reconstruct_tpo_watch_candidates(
             history,
             symbol=symbol,
+            include_counter_htf_events=True,
         )
+        symbol_candidates = [
+            candidate
+            for candidate in event_candidates
+            if bool(
+                candidate.payload.get(
+                    "event_census_execution_eligible"
+                )
+            )
+        ]
+        symbol_coverage["event_candidate_count"] = len(event_candidates)
+        symbol_coverage["execution_candidate_count"] = len(
+            symbol_candidates
+        )
+        symbol_coverage["candidate_count"] = len(symbol_candidates)
         symbol_rows: list[dict[str, Any]] = []
+        symbol_event_rows = [
+            measure_event_development(
+                candidate,
+                history,
+                primary_development_r=primary_development_r,
+            )
+            for candidate in event_candidates
+        ]
         for index, candidate in enumerate(symbol_candidates, start=1):
             symbol_rows.append(
                 replay_candidate(
@@ -980,6 +1013,20 @@ def run_streamed_backtest(
                     flush=True,
                 )
 
+        if not symbol_candidates and event_candidates:
+            print(
+                json.dumps(
+                    {
+                        "event": "symbol_execution_universe_empty",
+                        "symbol": symbol,
+                        "event_candidate_count": len(event_candidates),
+                        "reason": "ALL_EVENTS_EXCLUDED_BY_HARD_GATE",
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+
         symbol_coverage["provider"] = provider_audit.get("provider")
         symbol_coverage["provider_earliest_5m_utc"] = provider_audit.get(
             "provider_earliest_5m_utc"
@@ -996,6 +1043,7 @@ def run_streamed_backtest(
         )
         candidates.extend(symbol_candidates)
         records.extend(symbol_rows)
+        event_records.extend(symbol_event_rows)
         coverage.append(symbol_coverage)
         del history
 
@@ -1004,9 +1052,15 @@ def run_streamed_backtest(
                 {
                     "event": "symbol_replay_completed",
                     "symbol": symbol,
-                    "candidate_count": len(symbol_candidates),
+                    "event_candidate_count": len(event_candidates),
+                    "execution_candidate_count": len(symbol_candidates),
                     "ready_count": sum(
                         1 for row in symbol_rows if bool(row.get("ready"))
+                    ),
+                    "developed_count": sum(
+                        1
+                        for row in symbol_event_rows
+                        if bool(row.get("primary_development_reached"))
                     ),
                     "elapsed_seconds": symbol_coverage[
                         "replay_elapsed_seconds"
@@ -1020,8 +1074,10 @@ def run_streamed_backtest(
     report = compile_backtest_report(
         candidates=candidates,
         rows=records,
+        event_records=event_records,
         coverage=coverage,
         holdout_fraction=holdout_fraction,
+        primary_development_r=primary_development_r,
     )
     report["provider_depth"] = dict(provider_manifest)
     report["run_dir"] = str(run_dir)
@@ -1032,10 +1088,11 @@ def run_streamed_backtest(
         for symbol in symbols
     }
     report["execution_cost_models"] = dict(sorted(effective_models.items()))
-    report["execution_integrity"]["cost_model_status"] = (
-        "EXPLICIT_PER_SYMBOL_CONFIG"
-        if cost_models
-        else "UNCONFIGURED_ZERO_COST"
+    report["execution_integrity"].update(
+        _execution_cost_model_integrity(
+            expected_symbols=set(symbols),
+            models=effective_models,
+        )
     )
     return report
 
@@ -1058,15 +1115,100 @@ def _number(value: Any, digits: int = 3) -> str:
 def render_markdown_report(report: Mapping[str, Any]) -> str:
     metrics = report["metrics"]
     all_metrics = metrics["all"]
+    development = metrics["development"]
     holdout = metrics["holdout"]
+    holdout_status = str(
+        report.get("holdout_status")
+        or "UNAVAILABLE_STATUS_NOT_REPORTED"
+    )
+    holdout_available = holdout_status == "AVAILABLE"
+    def holdout_percent(value: Any) -> str:
+        try:
+            percent_number = float(value) * 100.0
+            return (
+                f"{percent_number:.2f}".rstrip("0").rstrip(".") + "%"
+            )
+        except (TypeError, ValueError):
+            return "n/a"
+
+    target_holdout_percent = holdout_percent(
+        report.get(
+            "target_holdout_fraction",
+            report.get("holdout_fraction"),
+        )
+    )
+    realized_event_holdout_percent = holdout_percent(
+        report.get("realized_event_holdout_fraction")
+    )
+    realized_execution_holdout_percent = holdout_percent(
+        report.get("realized_execution_holdout_fraction")
+    )
+    holdout_start_utc = report.get("holdout_start_utc") or "n/a"
+    headline_coverage = (
+        report.get("headline_coverage")
+        if isinstance(report.get("headline_coverage"), Mapping)
+        else {}
+    )
+    event_census = (
+        report.get("event_census")
+        if isinstance(report.get("event_census"), Mapping)
+        else {}
+    )
+    census_metrics = (
+        event_census.get("metrics")
+        if isinstance(event_census.get("metrics"), Mapping)
+        else {}
+    )
+    census_all = (
+        census_metrics.get("all")
+        if isinstance(census_metrics.get("all"), Mapping)
+        else {}
+    )
+    census_holdout = (
+        census_metrics.get("holdout")
+        if isinstance(census_metrics.get("holdout"), Mapping)
+        else {}
+    )
+    census_development = (
+        census_metrics.get("development")
+        if isinstance(census_metrics.get("development"), Mapping)
+        else {}
+    )
+    census_all_execution = (
+        census_all.get("execution")
+        if isinstance(census_all.get("execution"), Mapping)
+        else {}
+    )
+    census_development_execution = (
+        census_development.get("execution")
+        if isinstance(census_development.get("execution"), Mapping)
+        else {}
+    )
+    census_holdout_execution = (
+        census_holdout.get("execution")
+        if isinstance(census_holdout.get("execution"), Mapping)
+        else {}
+    )
+    primary_development_r = (
+        event_census.get("definition", {}).get("primary_development_R")
+        if isinstance(event_census.get("definition"), Mapping)
+        else None
+    )
     coverage_rows = []
     for item in report.get("coverage") or []:
         coverage_rows.append(
-            "| {symbol} | {first} | {last} | {candidates} | {provider} |".format(
+            "| {symbol} | {first} | {last} | {events} | {candidates} | {provider} |".format(
                 symbol=item.get("symbol"),
                 first=item.get("history_first_bar_utc"),
-                last=item.get("history_last_bar_utc"),
-                candidates=item.get("candidate_count"),
+                last=item.get("history_last_bar_close_utc"),
+                events=item.get(
+                    "event_candidate_count",
+                    item.get("candidate_count"),
+                ),
+                candidates=item.get(
+                    "execution_candidate_count",
+                    item.get("candidate_count"),
+                ),
                 provider=item.get("provider"),
             )
         )
@@ -1074,14 +1216,46 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
     by_symbol_rows = []
     for symbol, values in sorted((metrics.get("by_symbol") or {}).items()):
         by_symbol_rows.append(
-            "| {symbol} | {candidates} | {ready} | {filled} | {winrate} | {gross_r} | {net_r} |".format(
+            "| {symbol} | {candidates} | {ready} | {filled} | {ready_week} | "
+            "{filled_week} | {winrate} | {gross_r} | {net_r} |".format(
                 symbol=symbol,
                 candidates=values.get("candidate_count"),
                 ready=values.get("ready_count"),
                 filled=values.get("filled_count"),
+                ready_week=_number(values.get("ready_signals_per_week")),
+                filled_week=_number(values.get("filled_signals_per_week")),
                 winrate=_pct(values.get("winrate_closed")),
                 gross_r=_number(values.get("average_gross_R_filled")),
                 net_r=_number(values.get("average_net_R_filled")),
+            )
+        )
+
+    census_cohort_rows = []
+    for key, values in sorted(
+        (
+            census_metrics.get("by_symbol_family_direction") or {}
+        ).items()
+    ):
+        symbol, family, direction = (
+            [*str(key).split("|", 2), "UNKNOWN", "UNKNOWN"][:3]
+        )
+        execution = (
+            values.get("execution")
+            if isinstance(values.get("execution"), Mapping)
+            else {}
+        )
+        census_cohort_rows.append(
+            "| {symbol} | {family} | {direction} | {events} | {developed} | "
+            "{development_rate} | {filled} | {winrate} | {net_r} |".format(
+                symbol=symbol,
+                family=family,
+                direction=direction,
+                events=values.get("event_count"),
+                developed=values.get("developed_count"),
+                development_rate=_pct(values.get("development_rate")),
+                filled=execution.get("filled_count"),
+                winrate=_pct(execution.get("trade_winrate_closed")),
+                net_r=_number(execution.get("average_net_R_filled")),
             )
         )
 
@@ -1116,32 +1290,128 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
 
     limitations = report.get("research_scope") or {}
     integrity = report.get("execution_integrity") or {}
+    holdout_count = (
+        lambda key: holdout.get(key) if holdout_available else "n/a"
+    )
+    holdout_number = (
+        lambda key: (
+            _number(holdout.get(key))
+            if holdout_available
+            else "n/a"
+        )
+    )
+    holdout_pct = (
+        lambda key: (
+            _pct(holdout.get(key))
+            if holdout_available
+            else "n/a"
+        )
+    )
+    census_holdout_count = (
+        lambda key: (
+            census_holdout.get(key) if holdout_available else "n/a"
+        )
+    )
+    census_holdout_number = (
+        lambda key: (
+            _number(census_holdout.get(key))
+            if holdout_available
+            else "n/a"
+        )
+    )
+    census_holdout_pct = (
+        lambda key: (
+            _pct(census_holdout.get(key))
+            if holdout_available
+            else "n/a"
+        )
+    )
+    census_holdout_execution_count = (
+        lambda key: (
+            census_holdout_execution.get(key)
+            if holdout_available
+            else "n/a"
+        )
+    )
+    census_holdout_execution_number = (
+        lambda key: (
+            _number(census_holdout_execution.get(key))
+            if holdout_available
+            else "n/a"
+        )
+    )
+    census_holdout_execution_pct = (
+        lambda key: (
+            _pct(census_holdout_execution.get(key))
+            if holdout_available
+            else "n/a"
+        )
+    )
     return "\n".join(
         [
-            "# Backtest Integrity v1.1 — LTF Execution State Machine v2",
+            "# Backtest Integrity v2.0.6 — OTD/ORR Event Census",
             "",
             f"Generated: `{report.get('generated_at_utc')}`  ",
             f"Engine: `{report.get('engine_version')}`  ",
-            f"Mode: `{report.get('mode')}`",
+            f"Mode: `{report.get('mode')}`  ",
+            f"Target holdout fraction: `{target_holdout_percent}`  ",
+            "Realized event holdout fraction: "
+            f"`{realized_event_holdout_percent}`  ",
+            "Realized execution holdout fraction: "
+            f"`{realized_execution_holdout_percent}`  ",
+            f"Holdout cutoff UTC: `{holdout_start_utc}`  ",
+            f"Holdout status: `{holdout_status}`  ",
+            "Holdout scheme: Chronological target "
+            f"{target_holdout_percent} holdout; realized events "
+            f"{realized_event_holdout_percent}; realized executions "
+            f"{realized_execution_holdout_percent}  ",
+            "Headline coverage: "
+            f"`{headline_coverage.get('status')}` "
+            f"from `{headline_coverage.get('window_start_utc')}` "
+            f"to `{headline_coverage.get('window_end_utc')}`.",
             "",
             "## Primary results",
             "",
-            "| Metric | Full history | Chronological 30% holdout |",
-            "|---|---:|---:|",
-            f"| Candidates | {all_metrics.get('candidate_count')} | {holdout.get('candidate_count')} |",
-            f"| ENTRY_READY | {all_metrics.get('ready_count')} | {holdout.get('ready_count')} |",
-            f"| Filled | {all_metrics.get('filled_count')} | {holdout.get('filled_count')} |",
-            f"| Closed-trade win rate | {_pct(all_metrics.get('winrate_closed'))} | {_pct(holdout.get('winrate_closed'))} |",
-            f"| Average gross R, filled | {_number(all_metrics.get('average_gross_R_filled'))} | {_number(holdout.get('average_gross_R_filled'))} |",
-            f"| Average net R, filled | {_number(all_metrics.get('average_net_R_filled'))} | {_number(holdout.get('average_net_R_filled'))} |",
-            f"| Gross total R | {_number(all_metrics.get('gross_total_R'))} | {_number(holdout.get('gross_total_R'))} |",
-            f"| Net total R | {_number(all_metrics.get('net_total_R'))} | {_number(holdout.get('net_total_R'))} |",
-            f"| Gross profit factor | {_number(all_metrics.get('gross_profit_factor'))} | {_number(holdout.get('gross_profit_factor'))} |",
-            f"| Net profit factor | {_number(all_metrics.get('net_profit_factor'))} | {_number(holdout.get('net_profit_factor'))} |",
-            f"| Entry-window expired, unfilled | {all_metrics.get('entry_window_expired_unfilled_count')} | {holdout.get('entry_window_expired_unfilled_count')} |",
-            f"| Context cancelled before fill | {all_metrics.get('context_cancelled_before_fill_count')} | {holdout.get('context_cancelled_before_fill_count')} |",
-            f"| Invalidated before fill | {all_metrics.get('invalidated_before_fill_count')} | {holdout.get('invalidated_before_fill_count')} |",
-            f"| Filled signals/week | {_number(all_metrics.get('filled_signals_per_week'))} | {_number(holdout.get('filled_signals_per_week'))} |",
+            "| Metric | Full | Development | Holdout |",
+            "|---|---:|---:|---:|",
+            f"| Candidates | {all_metrics.get('candidate_count')} | {development.get('candidate_count')} | {holdout_count('candidate_count')} |",
+            f"| ENTRY_READY | {all_metrics.get('ready_count')} | {development.get('ready_count')} | {holdout_count('ready_count')} |",
+            f"| Filled | {all_metrics.get('filled_count')} | {development.get('filled_count')} | {holdout_count('filled_count')} |",
+            f"| READY signals/week | {_number(all_metrics.get('ready_signals_per_week'))} | {_number(development.get('ready_signals_per_week'))} | {holdout_number('ready_signals_per_week')} |",
+            f"| Filled signals/week | {_number(all_metrics.get('filled_signals_per_week'))} | {_number(development.get('filled_signals_per_week'))} | {holdout_number('filled_signals_per_week')} |",
+            f"| Closed-trade win rate | {_pct(all_metrics.get('winrate_closed'))} | {_pct(development.get('winrate_closed'))} | {holdout_pct('winrate_closed')} |",
+            f"| Average gross R, filled | {_number(all_metrics.get('average_gross_R_filled'))} | {_number(development.get('average_gross_R_filled'))} | {holdout_number('average_gross_R_filled')} |",
+            f"| Average net R, filled | {_number(all_metrics.get('average_net_R_filled'))} | {_number(development.get('average_net_R_filled'))} | {holdout_number('average_net_R_filled')} |",
+            f"| Gross total R | {_number(all_metrics.get('gross_total_R'))} | {_number(development.get('gross_total_R'))} | {holdout_number('gross_total_R')} |",
+            f"| Net total R | {_number(all_metrics.get('net_total_R'))} | {_number(development.get('net_total_R'))} | {holdout_number('net_total_R')} |",
+            f"| Gross profit factor | {_number(all_metrics.get('gross_profit_factor'))} | {_number(development.get('gross_profit_factor'))} | {holdout_number('gross_profit_factor')} |",
+            f"| Net profit factor | {_number(all_metrics.get('net_profit_factor'))} | {_number(development.get('net_profit_factor'))} | {holdout_number('net_profit_factor')} |",
+            f"| Entry-window expired, unfilled | {all_metrics.get('entry_window_expired_unfilled_count')} | {development.get('entry_window_expired_unfilled_count')} | {holdout_count('entry_window_expired_unfilled_count')} |",
+            f"| Context cancelled before fill | {all_metrics.get('context_cancelled_before_fill_count')} | {development.get('context_cancelled_before_fill_count')} | {holdout_count('context_cancelled_before_fill_count')} |",
+            f"| Invalidated before fill | {all_metrics.get('invalidated_before_fill_count')} | {development.get('invalidated_before_fill_count')} | {holdout_count('invalidated_before_fill_count')} |",
+            "",
+            "## OTD/ORR event development",
+            "",
+            f"Primary development threshold: `{_number(primary_development_r, 2)}R`. "
+            "Development rate and trade win rate use separate denominators.",
+            "",
+            "| Metric | Full | Development | Holdout |",
+            "|---|---:|---:|---:|",
+            f"| Events | {census_all.get('event_count')} | {census_development.get('event_count')} | {census_holdout_count('event_count')} |",
+            f"| Causally evaluable | {census_all.get('event_evaluable_count')} | {census_development.get('event_evaluable_count')} | {census_holdout_count('event_evaluable_count')} |",
+            f"| Developed | {census_all.get('developed_count')} | {census_development.get('developed_count')} | {census_holdout_count('developed_count')} |",
+            f"| Development rate | {_pct(census_all.get('development_rate'))} | {_pct(census_development.get('development_rate'))} | {census_holdout_pct('development_rate')} |",
+            f"| Median event MFE | {_number(census_all.get('median_event_MFE_R'))}R | {_number(census_development.get('median_event_MFE_R'))}R | {census_holdout_number('median_event_MFE_R')}R |",
+            f"| Median event MAE | {_number(census_all.get('median_event_MAE_R'))}R | {_number(census_development.get('median_event_MAE_R'))}R | {census_holdout_number('median_event_MAE_R')}R |",
+            f"| Filled entry model | {census_all_execution.get('filled_count')} | {census_development_execution.get('filled_count')} | {census_holdout_execution_count('filled_count')} |",
+            f"| Closed-trade win rate | {_pct(census_all_execution.get('trade_winrate_closed'))} | {_pct(census_development_execution.get('trade_winrate_closed'))} | {census_holdout_execution_pct('trade_winrate_closed')} |",
+            f"| Average net R, filled | {_number(census_all_execution.get('average_net_R_filled'))} | {_number(census_development_execution.get('average_net_R_filled'))} | {census_holdout_execution_number('average_net_R_filled')} |",
+            "",
+            "## Event census by asset, family and direction",
+            "",
+            "| Symbol | Family | Direction | Events | Developed | Development rate | Filled | Trade win rate | Avg net R |",
+            "|---|---|---|---:|---:|---:|---:|---:|---:|",
+            *census_cohort_rows,
             "",
             "## Integrity controls",
             "",
@@ -1150,20 +1420,30 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
             f"- Dynamic context cancellation: "
             f"`{integrity.get('dynamic_context_timeline')}`.",
             f"- Cost model status: `{integrity.get('cost_model_status')}`; "
+            "explicit symbols: "
+            f"`{integrity.get('cost_model_explicit_symbols')}`; "
+            "missing symbols: "
+            f"`{integrity.get('cost_model_missing_symbols')}`; "
             "primary expectancy uses net R.",
             "- Unconfigured costs remain explicit zero; no broker costs are "
             "silently guessed.",
+            "- Event R uses only confirmation close and the structural test "
+            "extreme already known at confirmation.",
+            "- Same-bar development plus invalidation/context cancellation is "
+            "ambiguous and excluded from the development denominator.",
+            "- Counter-HTF OTD/ORR remain in the event census to avoid "
+            "survivorship bias, but the execution hard gate still excludes them.",
             "",
             "## Provider coverage",
             "",
-            "| Symbol | First M5 bar | Last M5 bar | Candidates | Provider |",
-            "|---|---|---|---:|---|",
+            "| Symbol | First M5 bar | Last M5 close | Events | Execution candidates | Provider |",
+            "|---|---|---|---:|---:|---|",
             *coverage_rows,
             "",
             "## By symbol",
             "",
-            "| Symbol | Candidates | Ready | Filled | Win rate | Avg gross R | Avg net R |",
-            "|---|---:|---:|---:|---:|---:|---:|",
+            "| Symbol | Candidates | Ready | Filled | Ready/week | Filled/week | Win rate | Avg gross R | Avg net R |",
+            "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
             *by_symbol_rows,
             "",
             "## Positioning coverage",
@@ -1177,6 +1457,11 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
             f"with funding: `{operational.get('snapshots_with_funding')}`.",
             "- Positioning remains research-only and is excluded from the core "
             "LTF execution winrate.",
+            "- Per-event weekly COT cohorts remain `NO_DATA` until actual "
+            "publication timestamps can be joined causally; report dates alone "
+            "are not treated as availability timestamps.",
+            "- Per-event operational positioning remains `NO_DATA` outside the "
+            "coverage of persisted as-of snapshots.",
             "",
             "| Symbol | COT weeks | Latest report | Current tag | Quality |",
             "|---|---:|---|---|---|",
@@ -1191,6 +1476,9 @@ def render_markdown_report(report: Mapping[str, Any]) -> str:
             "fully filtered production-system win rate.",
             "- Same-bar entry+target events are excluded as ambiguous; same-bar "
             "stop+target events are scored stop-first.",
+            "- The census does not infer the best invalidation from one fixed "
+            "basis; alternative invalidation models require a later controlled "
+            "comparison.",
             "- A limit can fill only through its production entry window; a "
             "filled trade can continue through the separate resolution horizon.",
             "- Session/Profile parity is deliberately deferred to P1 and is not "
@@ -1210,6 +1498,8 @@ def write_report_artifacts(
     report_path = run_dir / "backtest_report.json"
     markdown_path = run_dir / "backtest_report.md"
     records_path = run_dir / "backtest_records.parquet"
+    census_path = run_dir / "otd_orr_event_census.parquet"
+    census_csv_path = run_dir / "otd_orr_event_census.csv"
     _assert_no_sensitive_keys(report)
     _atomic_json(report_path, report)
     markdown_temporary = markdown_path.with_suffix(
@@ -1237,11 +1527,57 @@ def write_report_artifacts(
                     )
                 )
         _atomic_parquet(records_path, record_frame)
+    else:
+        records_path.unlink(missing_ok=True)
+        records_path.with_suffix(
+            records_path.suffix + ".tmp"
+        ).unlink(missing_ok=True)
+    event_census = report.get("event_census")
+    census_records = (
+        event_census.get("records")
+        if isinstance(event_census, Mapping)
+        else []
+    )
+    census_frame = pd.DataFrame(census_records or [])
+    if not census_frame.empty:
+        for column in (
+            "threshold_hits_utc",
+            "ambiguous_thresholds_R",
+        ):
+            if column in census_frame.columns:
+                census_frame[column] = census_frame[column].map(
+                    lambda value: json.dumps(
+                        value,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                    )
+                )
+        _atomic_parquet(census_path, census_frame)
+        census_csv_temporary = census_csv_path.with_suffix(
+            census_csv_path.suffix + ".tmp"
+        )
+        census_frame.to_csv(census_csv_temporary, index=False)
+        census_csv_temporary.replace(census_csv_path)
+    else:
+        census_path.unlink(missing_ok=True)
+        census_csv_path.unlink(missing_ok=True)
+        census_path.with_suffix(
+            census_path.suffix + ".tmp"
+        ).unlink(missing_ok=True)
+        census_csv_path.with_suffix(
+            census_csv_path.suffix + ".tmp"
+        ).unlink(missing_ok=True)
     return {
         "report_json": str(report_path),
         "report_markdown": str(markdown_path),
         "records_parquet": (
             str(records_path) if records_path.exists() else None
+        ),
+        "event_census_parquet": (
+            str(census_path) if census_path.exists() else None
+        ),
+        "event_census_csv": (
+            str(census_csv_path) if census_csv_path.exists() else None
         ),
     }
 
@@ -1299,6 +1635,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--holdout-fraction", default=0.30, type=float)
+    parser.add_argument(
+        "--development-threshold-r",
+        default=DEFAULT_PRIMARY_DEVELOPMENT_R,
+        type=float,
+        help=(
+            "Primary event-development threshold in structural R. "
+            "Default: 1.5R."
+        ),
+    )
     parser.add_argument("--allow-network-fetch", action="store_true")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
@@ -1322,6 +1667,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.cot_lookback_weeks != DEFAULT_CFTC_LOOKBACK_WEEKS:
         raise ProviderDepthBacktestError(
             f"COT lookback must be {DEFAULT_CFTC_LOOKBACK_WEEKS} weeks"
+        )
+    if (
+        not math.isfinite(args.development_threshold_r)
+        or args.development_threshold_r <= 0
+    ):
+        raise ProviderDepthBacktestError(
+            "development threshold R must be a finite positive number"
         )
     symbols = [
         item.strip().upper()
@@ -1366,6 +1718,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         symbols=symbols,
         provider_manifest=provider_manifest,
         holdout_fraction=args.holdout_fraction,
+        primary_development_r=args.development_threshold_r,
         cost_models=cost_models,
     )
     report["positioning_coverage"] = collect_positioning_coverage(
@@ -1382,6 +1735,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "symbols": symbols,
         "artifacts": artifacts,
         "metrics": report["metrics"],
+        "event_census_metrics": report.get("event_census", {}).get(
+            "metrics"
+        ),
     }
     print(json.dumps(result, indent=2, sort_keys=True), flush=True)
     return 0
