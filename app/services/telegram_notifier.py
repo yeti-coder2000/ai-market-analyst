@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 from urllib import error, parse, request
 
+from app.core.runtime_flags import tpo_telegram_enabled
 from app.services.battle_permission import apply_battle_permission
 from app.services.battle_permission_telemetry import record_battle_permission_event
 from app.services.telegram_formatter import format_signal_message
@@ -979,7 +980,10 @@ class TelegramNotifier:
 
     def __init__(self, config: Optional[TelegramConfig] = None) -> None:
         self.config = config or TelegramConfig(
-            enabled=_env_bool("TELEGRAM_ENABLED", False),
+            enabled=(
+                _env_bool("TELEGRAM_ENABLED", False)
+                and tpo_telegram_enabled()
+            ),
             bot_token=os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
             chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
             parse_mode=(os.getenv("TELEGRAM_PARSE_MODE", "HTML").strip() or "HTML"),

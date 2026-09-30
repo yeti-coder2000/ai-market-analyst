@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.core.logger import bind_logger, get_logger, log_exception, setup_logging
+from app.core.runtime_flags import tpo_runtime_enabled
 from app.core.settings import settings
 from app.services.alert_deduper import AlertDeduper
 from app.services.heartbeat import HeartbeatService
@@ -437,6 +438,13 @@ def main() -> int:
     setup_logging()
 
     worker_logger = bind_logger(logger, component="main_worker", cycle_id="-", symbol="-")
+
+    if not tpo_runtime_enabled():
+        worker_logger.warning(
+            "Legacy TPO runtime disabled by TPO_RUNTIME_ENABLED=false; worker exiting."
+        )
+        return 0
+
     worker_logger.info("Starting main worker...")
 
     shutdown = GracefulShutdown()

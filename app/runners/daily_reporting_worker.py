@@ -40,6 +40,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from app.core.runtime_flags import tpo_runtime_enabled, tpo_telegram_enabled
+
 try:
     from app.core.settings import settings
 except Exception:  # pragma: no cover
@@ -478,6 +480,20 @@ def run_due_reports_once(
 
 def main() -> int:
     import argparse
+
+    if not tpo_runtime_enabled() or not tpo_telegram_enabled():
+        print(
+            json.dumps(
+                {
+                    "version": WORKER_VERSION,
+                    "status": "disabled",
+                    "reason": "legacy TPO runtime/Telegram flags are false",
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return 0
 
     parser = argparse.ArgumentParser(description="Run scheduled AI Market Analyst Telegram reports.")
     parser.add_argument("--run-once", action="store_true", default=_env_bool("RUN_ONCE", False))

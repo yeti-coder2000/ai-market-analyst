@@ -52,13 +52,23 @@ services:
       # TELEGRAM
       # -------------------------
       - key: ENABLE_TELEGRAM
-        value: "true"
+        value: "false"
 
       - key: WATCH_ALERTS_ENABLED
-        value: "true"
+        value: "false"
 
       - key: TELEGRAM_ENABLED
-        value: "true"
+        value: "false"
+
+      # Reversible retirement gates for the legacy TPO analyst.
+      - key: TPO_RUNTIME_ENABLED
+        value: "false"
+
+      - key: TPO_TELEGRAM_ENABLED
+        value: "false"
+
+      - key: ENABLE_DAILY_REPORT_SCHEDULER
+        value: "false"
 
       - key: TELEGRAM_PARSE_MODE
         value: HTML

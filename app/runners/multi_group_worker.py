@@ -44,6 +44,7 @@ from typing import Any
 
 from app.core.instrument_batches import get_batch_symbols, list_available_batches
 from app.core.logger import bind_logger, get_logger, log_exception, setup_logging
+from app.core.runtime_flags import tpo_runtime_enabled
 from app.core.settings import settings
 from app.runners.stateful_batch_runner import run_batch_cycle
 from app.services.heartbeat import HeartbeatService
@@ -484,6 +485,13 @@ def main() -> int:
         cycle_id="-",
         symbol="-",
     )
+
+    if not tpo_runtime_enabled():
+        worker_logger.warning(
+            "Legacy TPO runtime disabled by TPO_RUNTIME_ENABLED=false; worker exiting."
+        )
+        return 0
+
     worker_logger.info("Starting multi-group worker...")
 
     shutdown = GracefulShutdown()
